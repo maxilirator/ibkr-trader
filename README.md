@@ -24,6 +24,20 @@ Relevant official sources:
 - https://ibkrcampus.com/campus/ibkr-api-page/market-data-subscriptions/
 - https://interactivebrokers.github.io/tws-api/tick_types.html
 
+## First runnable broker step
+
+We now include a small IB Gateway probe that is meant to validate the official TWS API connection path before we build order placement on top.
+
+Expected paper-trading defaults:
+
+- `IBKR_HOST=127.0.0.1`
+- `IBKR_PORT=4002`
+- `IBKR_CLIENT_ID=0`
+
+The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality.
+
+See [docs/ib-gateway-setup.md](docs/ib-gateway-setup.md) for setup notes.
+
 ## What belongs in this system
 
 - Instruction API: receives strategy output from AI or research systems.
@@ -63,3 +77,18 @@ should not be treated as a single broker order. Some pieces can be expressed wit
 5. Add shortability and fee-rate ingestion where available.
 6. Add replay and reconciliation tooling for restart safety.
 
+## Running the gateway probe
+
+After installing the official TWS API Python client and starting IB Gateway paper trading:
+
+```bash
+PYTHONPATH=src python3 -m ibkr_trader.ibkr.probe
+```
+
+This probe attempts to connect through the official IBKR Python API and returns:
+
+- connection target
+- the broker-reported current time
+- the next valid order ID
+
+Those are enough to prove the basic API path is healthy before we add live order workflows.

@@ -16,7 +16,7 @@ class IbkrConnectionConfig:
         return cls(
             host=getenv("IBKR_HOST", "127.0.0.1"),
             port=int(getenv("IBKR_PORT", "4002")),
-            client_id=int(getenv("IBKR_CLIENT_ID", "101")),
+            client_id=int(getenv("IBKR_CLIENT_ID", "0")),
             account_id=getenv("IBKR_ACCOUNT_ID", ""),
         )
 
@@ -39,4 +39,3 @@ class AppConfig:
             ),
             ibkr=IbkrConnectionConfig.from_env(),
         )
-
