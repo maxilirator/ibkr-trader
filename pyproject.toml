@@ -18,6 +18,10 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.5",
 ]
+server = [
+  "fastapi",
+  "uvicorn",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -27,4 +31,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+from unittest import TestCase
+
+from ibkr_trader.api.server import (
+    enforce_loopback_binding,
+    is_loopback_host,
+    parse_execution_batch_payload,
+    serialize_execution_batch,
+)
+
+
+class ApiServerTests(TestCase):
+    def test_is_loopback_host_accepts_loopback_names_and_ips(self) -> None:
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("::1"))
+        self.assertTrue(is_loopback_host("localhost"))
+        self.assertFalse(is_loopback_host("0.0.0.0"))
+        self.assertFalse(is_loopback_host("192.168.1.15"))
+
+    def test_enforce_loopback_binding_rejects_nonlocal_host(self) -> None:
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            enforce_loopback_binding("0.0.0.0", require_loopback_only=True)
+
+    def test_parse_execution_batch_payload_validates_contract(self) -> None:
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "trial_27-2026-04-10-prod-long-01",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                    "release_id": "release-1",
+                    "strategy_id": "trial_27",
+                    "policy_id": "policy-1",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "2026-04-10-GTW05-long_risk_book-SIVE-long-01",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                            "book_role": "prod",
+                            "book_side": "long",
+                        },
+                        "instrument": {
+                            "symbol": "sive",
+                            "security_type": "stk",
+                            "exchange": "xsto",
+                            "currency": "sek",
+                            "isin": "SE0003917798",
+                            "aliases": ["SIVE.ST", "sivers-ima"],
+                        },
+                        "intent": {
+                            "side": "buy",
+                            "position_side": "long",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "1.0",
+                        },
+                        "entry": {
+                            "order_type": "limit",
+                            "submit_at": "2026-04-10T09:25:00+02:00",
+                            "expire_at": "2026-04-10T17:30:00+02:00",
+                            "limit_price": "11.3131",
+                            "time_in_force": "day",
+                            "max_submit_count": 1,
+                            "cancel_unfilled_at_expiry": True,
+                        },
+                        "exit": {
+                            "take_profit_pct": "0.02",
+                            "catastrophic_stop_loss_pct": "0.15",
+                            "force_exit_next_session_open": True,
+                        },
+                        "trace": {
+                            "reason_code": "risk_policy_orderbook",
+                            "execution_policy": "policy-x",
+                            "trade_date": "2026-04-10",
+                            "data_cutoff_date": "2026-04-09",
+                            "company_name": "Sivers Semiconductors",
+                            "metadata": {
+                                "entry_reference_type": "prev_close",
+                                "entry_reference_price": "11.37",
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+
+        serialized = serialize_execution_batch(batch)
+
+        self.assertEqual(serialized["schema_version"], "2026-04-10")
+        self.assertEqual(serialized["instructions"][0]["instrument"]["symbol"], "SIVE")
+        self.assertEqual(serialized["instructions"][0]["instrument"]["exchange"], "XSTO")
+        self.assertEqual(serialized["instructions"][0]["entry"]["limit_price"], "11.3131")
+        self.assertEqual(
+            serialized["instructions"][0]["sizing"]["target_fraction_of_account"],
+            "1.0",
+        )
+
+    def test_parse_execution_batch_payload_requires_absolute_timestamps(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            parse_execution_batch_payload(
+                {
+                    "schema_version": "2026-04-10",
+                    "source": {
+                        "system": "q-training",
+                        "batch_id": "trial_27-2026-04-10-prod-long-01",
+                        "generated_at": "2026-04-10T02:15:44Z",
+                    },
+                    "instructions": [
+                        {
+                            "instruction_id": "demo-1",
+                            "account": {
+                                "account_key": "GTW05",
+                                "book_key": "long_risk_book",
+                            },
+                            "instrument": {
+                                "symbol": "SIVE",
+                                "security_type": "STK",
+                                "exchange": "XSTO",
+                                "currency": "SEK",
+                            },
+                            "intent": {
+                                "side": "BUY",
+                                "position_side": "LONG",
+                            },
+                            "sizing": {
+                                "mode": "fraction_of_account_nav",
+                                "target_fraction_of_account": "1.0",
+                            },
+                            "entry": {
+                                "order_type": "LIMIT",
+                                "submit_at": "2026-04-10T09:25:00",
+                                "expire_at": "2026-04-10T17:30:00+02:00",
+                                "limit_price": "11.3131",
+                            },
+                            "exit": {
+                                "take_profit_pct": "0.02",
+                            },
+                            "trace": {
+                                "reason_code": "risk_policy_orderbook",
+                            },
+                        }
+                    ],
+                }
+            )
+
+    def test_parse_execution_batch_payload_requires_single_sizing_target(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            parse_execution_batch_payload(
+                {
+                    "schema_version": "2026-04-10",
+                    "source": {
+                        "system": "q-training",
+                        "batch_id": "trial_27-2026-04-10-prod-long-01",
+                        "generated_at": "2026-04-10T02:15:44Z",
+                    },
+                    "instructions": [
+                        {
+                            "instruction_id": "demo-1",
+                            "account": {
+                                "account_key": "GTW05",
+                                "book_key": "long_risk_book",
+                            },
+                            "instrument": {
+                                "symbol": "SIVE",
+                                "security_type": "STK",
+                                "exchange": "XSTO",
+                                "currency": "SEK",
+                            },
+                            "intent": {
+                                "side": "BUY",
+                                "position_side": "LONG",
+                            },
+                            "sizing": {
+                                "mode": "fraction_of_account_nav",
+                                "target_fraction_of_account": "1.0",
+                                "target_notional": "100000",
+                            },
+                            "entry": {
+                                "order_type": "LIMIT",
+                                "submit_at": "2026-04-10T09:25:00+02:00",
+                                "expire_at": "2026-04-10T17:30:00+02:00",
+                                "limit_price": "11.3131",
+                            },
+                            "exit": {
+                                "take_profit_pct": "0.02",
+                            },
+                            "trace": {
+                                "reason_code": "risk_policy_orderbook",
+                            },
+                        }
+                    ],
+                }
+            )

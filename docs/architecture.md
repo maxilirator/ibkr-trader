@@ -49,6 +49,17 @@ Responsibilities:
 - subscribe to order status, execution, account, and market-data callbacks
 - translate broker events into internal events
 
+### 3A. Local Control API
+
+Thin local-only FastAPI service in front of the execution runtime.
+
+Responsibilities:
+
+- accept validated local HTTP calls from internal services
+- keep the official IBKR Python API isolated in one process boundary
+- expose probe, validation, and later order-management endpoints
+- enforce loopback-only access by default
+
 ### 4. Risk and Controls
 
 Independent guardrail layer between instruction intake and broker execution.
@@ -111,4 +122,3 @@ If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar 
 4. Add scheduled-entry and next-open-exit flows.
 5. Add market-data ingestion for a small symbol set.
 6. Add shortability collection and nightly snapshots.
-

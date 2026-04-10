@@ -38,6 +38,39 @@ The `0` client ID is intentional. IBKR's current TWS API docs recommend connecti
 
 See [docs/ib-gateway-setup.md](docs/ib-gateway-setup.md) for setup notes.
 
+## Environment config
+
+Important runtime settings now live in a repo-root `.env` file.
+
+- the app auto-loads `.env` before building config
+- real environment variables still win over `.env` values
+- `.env` is gitignored, while `.env.example` remains the template
+
+Current important settings include:
+
+- app mode and timezone
+- database URL
+- local API bind host and port
+- IB Gateway host, port, client ID, and account ID
+
+## Local API wrapper
+
+The recommended service shape is:
+
+- keep the official IBKR Python API as the broker core
+- expose a small FastAPI control plane around it
+- bind the API only to loopback, not to public or LAN interfaces
+
+This gives the AI and orchestration layers a clean local HTTP interface without exposing the raw broker session to the network.
+
+The initial FastAPI wrapper includes:
+
+- `GET /healthz`
+- `POST /v1/ibkr/probe`
+- `POST /v1/instructions/validate`
+
+See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
+
 ## What belongs in this system
 
 - Instruction API: receives strategy output from AI or research systems.
@@ -82,6 +115,7 @@ should not be treated as a single broker order. Some pieces can be expressed wit
 After installing the official TWS API Python client and starting IB Gateway paper trading:
 
 ```bash
+source .venv/bin/activate
 PYTHONPATH=src python3 -m ibkr_trader.ibkr.probe
 ```
 
@@ -92,3 +126,20 @@ This probe attempts to connect through the official IBKR Python API and returns:
 - the next valid order ID
 
 Those are enough to prove the basic API path is healthy before we add live order workflows.
+
+## Running the local API
+
+After installing the server dependencies in your environment:
+
+```bash
+source .venv/bin/activate
+python3 -m ibkr_trader.api.server
+```
+
+Expected local defaults:
+
+- `API_HOST=127.0.0.1`
+- `API_PORT=8000`
+- `API_REQUIRE_LOOPBACK_ONLY=true`
+
+Even if the server is started incorrectly, the app refuses non-loopback bind targets when loopback-only mode is enabled.
