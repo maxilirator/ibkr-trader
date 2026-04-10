@@ -9,6 +9,7 @@ from ibkr_trader.api.server import (
     parse_contract_resolve_payload,
     parse_execution_batch_payload,
     parse_historical_bars_payload,
+    parse_tick_stream_payload,
     serialize_execution_batch,
     serialize_runtime_schedule_preview,
 )
@@ -79,6 +80,39 @@ class ApiServerTests(TestCase):
         self.assertEqual(query.what_to_show, "TRADES")
         self.assertTrue(query.use_rth)
         self.assertEqual(query.end_at.isoformat(), "2026-04-10T17:30:00+02:00")
+
+    def test_parse_tick_stream_payload_normalizes_tick_types(self) -> None:
+        query = parse_tick_stream_payload(
+            {
+                "symbol": "aapl",
+                "security_type": "stk",
+                "exchange": "smart",
+                "currency": "usd",
+                "primary_exchange": "nasdaq",
+                "tick_types": ["last", "bid_ask", "mid-point"],
+                "duration_seconds": 3,
+                "max_events": 100,
+            }
+        )
+
+        self.assertEqual(query.symbol, "AAPL")
+        self.assertEqual(query.exchange, "SMART")
+        self.assertEqual(query.currency, "USD")
+        self.assertEqual(query.primary_exchange, "NASDAQ")
+        self.assertEqual(query.tick_types, ("Last", "BidAsk", "MidPoint"))
+        self.assertEqual(query.duration_seconds, 3)
+        self.assertEqual(query.max_events, 100)
+
+    def test_parse_tick_stream_payload_rejects_empty_tick_types(self) -> None:
+        with self.assertRaisesRegex(ValueError, "tick_types"):
+            parse_tick_stream_payload(
+                {
+                    "symbol": "AAPL",
+                    "exchange": "SMART",
+                    "currency": "USD",
+                    "tick_types": [],
+                }
+            )
 
     def test_parse_execution_batch_payload_validates_contract(self) -> None:
         batch = parse_execution_batch_payload(

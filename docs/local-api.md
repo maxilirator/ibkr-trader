@@ -127,6 +127,29 @@ Example request body:
 }
 ```
 
+### `POST /v1/market-data/tick-stream-sample`
+
+Collects a short live sample from IBKR's tick-by-tick streaming API through the dedicated streaming client session.
+
+Use it to:
+
+- verify streaming connectivity separately from execution and diagnostic sessions
+- collect raw live ticks for a short sampling window
+- validate which tick-by-tick streams are entitled for the current IBKR session
+
+It currently supports:
+
+- `Last`
+- `AllLast`
+- `BidAsk`
+- `MidPoint`
+
+Important current behavior:
+
+- this is a timed sample endpoint, not a long-lived socket relay yet
+- it is intended as the first raw-data primitive for the future parquet ingestion service
+- if IBKR rejects the requested tick-by-tick stream, the endpoint returns the broker error directly
+
 ### `POST /v1/orders/preview`
 
 Builds a read-only broker preview for an instruction batch using one diagnostic IBKR session.
@@ -280,5 +303,5 @@ The natural next endpoints are:
 
 1. persist broker callbacks and fills beyond submit/cancel
 2. add restart reconciliation against IBKR open orders and executions
-3. `GET /v1/orders/{id}`
-4. `GET /v1/positions`
+3. turn tick-stream sampling into a long-lived local streaming service
+4. `GET /v1/orders/{id}`

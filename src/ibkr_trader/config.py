@@ -60,13 +60,17 @@ class IbkrConnectionConfig:
     port: int
     client_id: int
     diagnostic_client_id: int
-    account_id: str
+    streaming_client_id: int = 8
+    account_id: str = ""
 
     def primary_session(self) -> "IbkrConnectionConfig":
         return replace(self, client_id=self.client_id)
 
     def diagnostic_session(self) -> "IbkrConnectionConfig":
         return replace(self, client_id=self.diagnostic_client_id)
+
+    def streaming_session(self) -> "IbkrConnectionConfig":
+        return replace(self, client_id=self.streaming_client_id)
 
     @classmethod
     def from_env(cls) -> "IbkrConnectionConfig":
@@ -75,6 +79,7 @@ class IbkrConnectionConfig:
             port=int(getenv("IBKR_PORT", "7497")),
             client_id=int(getenv("IBKR_CLIENT_ID", "0")),
             diagnostic_client_id=int(getenv("IBKR_DIAGNOSTIC_CLIENT_ID", "7")),
+            streaming_client_id=int(getenv("IBKR_STREAMING_CLIENT_ID", "8")),
             account_id=getenv("IBKR_ACCOUNT_ID", ""),
         )
 

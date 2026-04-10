@@ -48,6 +48,7 @@ Expected paper-trading defaults:
 - `IBKR_PORT=7497`
 - `IBKR_CLIENT_ID=0`
 - `IBKR_DIAGNOSTIC_CLIENT_ID=7`
+- `IBKR_STREAMING_CLIENT_ID=8`
 
 The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo we reserve `0` for the future long-lived trading runtime and use a separate diagnostic client ID for probe and read-only resolution calls.
 
@@ -67,7 +68,7 @@ Current important settings include:
 - session calendar path
 - database URL
 - local API bind host and port
-- IBKR host, port, primary client ID, diagnostic client ID, and account ID
+- IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, and account ID
 
 ## Local API wrapper
 
@@ -86,6 +87,7 @@ The initial FastAPI wrapper includes:
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
 - `POST /v1/market-data/historical-bars`
+- `POST /v1/market-data/tick-stream-sample`
 - `POST /v1/orders/preview`
 - `POST /v1/orders/submit`
 - `POST /v1/orders/{order_id}/cancel`

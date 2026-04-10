@@ -18,6 +18,7 @@ This document is the operational snapshot of where the repo is right now.
 - [x] Read-only contract resolution
 - [x] Read-only account summary
 - [x] Historical bars endpoint
+- [x] Tick-stream sample endpoint
 - [x] Read-only order preview
 - [x] Manual paper order submit/cancel endpoints
 - [x] Durable instruction submit endpoint
@@ -34,6 +35,7 @@ This document is the operational snapshot of where the repo is right now.
 - Contract resolution works against live broker metadata.
 - Account summary works through the diagnostic client.
 - Historical bars work for entitled symbols.
+- Tick-stream sampling is wired, and currently surfaces broker entitlement errors directly.
 - Order preview keeps prices and notionals in instrument currency.
 - Manual paper submit/cancel works on NY paper symbols through the local API.
 - Submit persists instructions and an initial `instruction_submitted` event in Postgres.
@@ -55,6 +57,7 @@ This document is the operational snapshot of where the repo is right now.
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
 - `POST /v1/market-data/historical-bars`
+- `POST /v1/market-data/tick-stream-sample`
 - `POST /v1/orders/preview`
 - `POST /v1/orders/submit`
 - `POST /v1/orders/{order_id}/cancel`
@@ -75,4 +78,4 @@ This document is the operational snapshot of where the repo is right now.
 
 ## Next implementation step
 
-Persist broker callbacks and fills beyond submit/cancel, then add restart reconciliation against IBKR open orders and executions.
+Persist broker callbacks and fills beyond submit/cancel, then add restart reconciliation against IBKR open orders and executions. After that, promote tick-stream sampling into a long-lived local stream for parquet ingestion.

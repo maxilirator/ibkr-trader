@@ -17,6 +17,7 @@ class ConfigTests(TestCase):
         self.assertEqual(config.port, 7497)
         self.assertEqual(config.client_id, 0)
         self.assertEqual(config.diagnostic_client_id, 7)
+        self.assertEqual(config.streaming_client_id, 8)
 
     def test_ibkr_connection_can_create_diagnostic_session(self) -> None:
         config = IbkrConnectionConfig(
@@ -24,6 +25,7 @@ class ConfigTests(TestCase):
             port=7497,
             client_id=0,
             diagnostic_client_id=7,
+            streaming_client_id=8,
             account_id="DU1234567",
         )
 
@@ -32,6 +34,22 @@ class ConfigTests(TestCase):
         self.assertEqual(diagnostic.client_id, 7)
         self.assertEqual(diagnostic.host, "127.0.0.1")
         self.assertEqual(diagnostic.port, 7497)
+
+    def test_ibkr_connection_can_create_streaming_session(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=7497,
+            client_id=0,
+            diagnostic_client_id=7,
+            streaming_client_id=8,
+            account_id="DU1234567",
+        )
+
+        streaming = config.streaming_session()
+
+        self.assertEqual(streaming.client_id, 8)
+        self.assertEqual(streaming.host, "127.0.0.1")
+        self.assertEqual(streaming.port, 7497)
 
     def test_api_defaults_match_local_only_expectation(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
