@@ -35,6 +35,7 @@ from ibkr_trader.ibkr.contracts import (
     resolve_contracts,
     serialize_contract_resolve_result,
 )
+from ibkr_trader.ibkr.order_preview import preview_execution_batch
 from ibkr_trader.ibkr.probe import IbkrDependencyError, probe_gateway
 
 
@@ -466,6 +467,26 @@ def create_app(config: AppConfig | None = None) -> Any:
                 timeout=timeout,
             )
         except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+    @app.post("/v1/orders/preview")
+    def preview_orders(payload: dict[str, Any], timeout: int = 10) -> dict[str, Any]:
+        try:
+            batch = parse_execution_batch_payload(payload)
+            return preview_execution_batch(
+                app_config.ibkr.diagnostic_session(),
+                batch,
+                timeout=timeout,
+            )
+        except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except IbkrDependencyError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc

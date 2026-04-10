@@ -91,6 +91,26 @@ Example request body:
 }
 ```
 
+### `POST /v1/orders/preview`
+
+Builds a read-only broker preview for an instruction batch using one diagnostic IBKR session.
+
+It currently:
+
+- validates the instruction batch
+- reads account summary
+- resolves the broker contract
+- constructs the broker order fields we would send at execution time
+- reports unresolved cases explicitly instead of guessing
+
+Current safe behavior:
+
+- ready for `target_quantity`
+- ready for `target_notional` when `limit_price` is present
+- unresolved for `fraction_of_account_nav` when account currency and instrument currency differ
+
+This is intentional. We should not guess FX sizing in a production trading system.
+
 ### `POST /v1/instructions/validate`
 
 Accepts a JSON instruction batch payload and validates it against the execution contract.

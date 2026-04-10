@@ -70,6 +70,7 @@ The initial FastAPI wrapper includes:
 - `POST /v1/ibkr/probe`
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
+- `POST /v1/orders/preview`
 - `POST /v1/instructions/validate`
 
 See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
