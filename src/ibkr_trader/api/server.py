@@ -41,6 +41,8 @@ from ibkr_trader.orchestration.entry_submission import cancel_persisted_instruct
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_cancellation
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_submission
 from ibkr_trader.orchestration.entry_submission import submit_persisted_instruction_entry
+from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
+from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_result
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
@@ -142,6 +144,31 @@ def parse_historical_bars_payload(payload: Mapping[str, Any]) -> HistoricalBarsQ
     )
     query.validate()
     return query
+
+
+def parse_runtime_cycle_payload(
+    payload: Mapping[str, Any],
+) -> tuple[datetime | None, int, tuple[str, ...] | None]:
+    now_at = (
+        parse_datetime(payload["now_at"], "now_at")
+        if payload.get("now_at") is not None
+        else None
+    )
+    timeout = int(payload.get("timeout", 10))
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    raw_instruction_ids = payload.get("instruction_ids")
+    instruction_ids: tuple[str, ...] | None = None
+    if raw_instruction_ids is not None:
+        if not isinstance(raw_instruction_ids, list) or not raw_instruction_ids:
+            raise ValueError("instruction_ids must be a non-empty array of strings")
+        parsed_instruction_ids = tuple(str(item).strip() for item in raw_instruction_ids)
+        if not all(parsed_instruction_ids):
+            raise ValueError("instruction_ids must contain only non-empty strings")
+        if len(set(parsed_instruction_ids)) != len(parsed_instruction_ids):
+            raise ValueError("instruction_ids must not contain duplicates")
+        instruction_ids = parsed_instruction_ids
+    return now_at, timeout, instruction_ids
 
 
 def parse_tick_stream_payload(payload: Mapping[str, Any]) -> TickStreamQuery:
@@ -549,6 +576,38 @@ def create_app(config: AppConfig | None = None) -> Any:
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
             "schedule": serialize_runtime_schedule_preview(schedule),
+        }
+
+    @app.post("/v1/runtime/run-once")
+    def run_runtime_cycle_once(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload or {}
+        try:
+            now_at, timeout, instruction_ids = parse_runtime_cycle_payload(request_payload)
+            result = run_runtime_cycle(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                runtime_timezone=app_config.timezone,
+                session_calendar_path=app_config.session_calendar_path,
+                now=now_at,
+                timeout=timeout,
+                instruction_ids=instruction_ids,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "runtime_timezone": app_config.timezone,
+            "session_calendar_path": str(app_config.session_calendar_path),
+            "runtime_cycle": serialize_runtime_cycle_result(result),
         }
 
     return app

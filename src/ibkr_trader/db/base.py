@@ -81,6 +81,54 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
         upgrade_statements.append(
             "ALTER TABLE instruction ADD COLUMN broker_order_status VARCHAR(32)"
         )
+    if "entry_submitted_quantity" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN entry_submitted_quantity VARCHAR(64)"
+        )
+    if "entry_filled_quantity" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN entry_filled_quantity VARCHAR(64)"
+        )
+    if "entry_avg_fill_price" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN entry_avg_fill_price VARCHAR(64)"
+        )
+    if "entry_filled_at" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN entry_filled_at TIMESTAMP WITH TIME ZONE"
+        )
+    if "exit_order_id" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_order_id INTEGER"
+        )
+    if "exit_perm_id" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_perm_id INTEGER"
+        )
+    if "exit_client_id" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_client_id INTEGER"
+        )
+    if "exit_order_status" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_order_status VARCHAR(32)"
+        )
+    if "exit_submitted_quantity" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_submitted_quantity VARCHAR(64)"
+        )
+    if "exit_filled_quantity" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_filled_quantity VARCHAR(64)"
+        )
+    if "exit_avg_fill_price" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_avg_fill_price VARCHAR(64)"
+        )
+    if "exit_filled_at" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN exit_filled_at TIMESTAMP WITH TIME ZONE"
+        )
 
     with engine.begin() as connection:
         for statement in upgrade_statements:
@@ -95,5 +143,11 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_instruction_broker_perm_id "
                 "ON instruction (broker_perm_id)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_instruction_exit_order_id "
+                "ON instruction (exit_order_id)"
             )
         )

@@ -19,6 +19,8 @@ This repo is currently scoped to **Stockholm equities first**.
 - initial broker integration: official IBKR Python API through local TWS / IB Gateway
 - current work is focused on broker-safe validation, durable submit, and order preview before live broker submit
 - manual NY paper order submit/cancel is now available for broker-path smoke testing
+- an MVP runtime cycle now exists for durable submit -> broker entry -> fill reconciliation -> take-profit/next-session exit
+- the runtime cycle can be targeted to specific instruction IDs for safer paper operation while we harden it
 
 ## Current direction
 
@@ -96,6 +98,7 @@ The initial FastAPI wrapper includes:
 - `POST /v1/instructions/{instruction_id}/cancel-entry`
 - `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
+- `POST /v1/runtime/run-once`
 
 See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
 
@@ -162,8 +165,8 @@ should not be treated as a single broker order. Some pieces can be expressed wit
 
 ## First milestones
 
-1. Persist broker callbacks and fills beyond submit/cancel.
-2. Add execution reconciliation on startup.
+1. Promote the MVP runtime cycle into a long-lived broker-owning process.
+2. Persist broker callbacks and add execution/position reconciliation on startup.
 3. Add Stockholm market-data ingestion into the parquet data backend.
 4. Add shortability and fee-rate collection where IBKR exposes it.
 5. Add live/paper environment separation and operator controls.

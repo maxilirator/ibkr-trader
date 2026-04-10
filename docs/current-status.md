@@ -24,6 +24,7 @@ This document is the operational snapshot of where the repo is right now.
 - [x] Durable instruction submit endpoint
 - [x] Instruction persistence in Postgres
 - [x] Persisted entry submit/cancel flow
+- [x] MVP runtime cycle for due-entry submit, fill reconciliation, take-profit submit, and next-session forced exit
 - [x] FX-aware sizing for `fraction_of_account_nav`
 - [x] Stockholm-first schedule preview
 - [x] Next-session-open resolution from q-data Stockholm session calendar
@@ -40,6 +41,14 @@ This document is the operational snapshot of where the repo is right now.
 - Manual paper submit/cancel works on NY paper symbols through the local API.
 - Submit persists instructions and an initial `instruction_submitted` event in Postgres.
 - Persisted instructions can move through `ENTRY_PENDING -> ENTRY_SUBMITTED -> ENTRY_CANCELLED` with broker IDs stored on the instruction record.
+- The runtime can now:
+  - auto-submit due `ENTRY_PENDING` instructions
+  - reconcile entry fills from IBKR executions
+  - submit a take-profit exit after a full entry fill
+  - submit a forced market exit at the resolved next Stockholm session open
+  - mark an instruction `COMPLETED` after exit fill reconciliation
+  - run against a selected `instruction_ids` set for safer operator-driven paper testing
+  - retry transient IBKR client-id reuse / reconnect churn within the MVP cycle
 - Stockholm schedule preview resolves the next session open from the local q-data calendar.
 
 ## Not built yet
@@ -66,6 +75,7 @@ This document is the operational snapshot of where the repo is right now.
 - `POST /v1/instructions/{instruction_id}/cancel-entry`
 - `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
+- `POST /v1/runtime/run-once`
 
 ## Current design decisions
 
@@ -78,4 +88,9 @@ This document is the operational snapshot of where the repo is right now.
 
 ## Next implementation step
 
-Persist broker callbacks and fills beyond submit/cancel, then add restart reconciliation against IBKR open orders and executions. After that, promote tick-stream sampling into a long-lived local stream for parquet ingestion.
+Harden the runtime into a long-lived broker-owning process:
+
+- keep one persistent IBKR runtime connection instead of reconnecting per action
+- persist broker callbacks directly instead of polling only
+- add restart reconciliation against IBKR open orders, executions, and positions
+- then promote tick-stream sampling into a long-lived local stream for parquet ingestion

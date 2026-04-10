@@ -9,6 +9,7 @@ from ibkr_trader.api.server import (
     parse_contract_resolve_payload,
     parse_execution_batch_payload,
     parse_historical_bars_payload,
+    parse_runtime_cycle_payload,
     parse_tick_stream_payload,
     serialize_execution_batch,
     serialize_runtime_schedule_preview,
@@ -113,6 +114,19 @@ class ApiServerTests(TestCase):
                     "tick_types": [],
                 }
             )
+
+    def test_parse_runtime_cycle_payload_accepts_optional_timestamp(self) -> None:
+        now_at, timeout, instruction_ids = parse_runtime_cycle_payload(
+            {
+                "now_at": "2026-04-13T09:00:00+02:00",
+                "timeout": 15,
+                "instruction_ids": ["instruction-1", "instruction-2"],
+            }
+        )
+
+        self.assertEqual(now_at.isoformat(), "2026-04-13T09:00:00+02:00")
+        self.assertEqual(timeout, 15)
+        self.assertEqual(instruction_ids, ("instruction-1", "instruction-2"))
 
     def test_parse_execution_batch_payload_validates_contract(self) -> None:
         batch = parse_execution_batch_payload(

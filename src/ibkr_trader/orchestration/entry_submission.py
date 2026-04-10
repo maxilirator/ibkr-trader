@@ -157,6 +157,12 @@ def submit_persisted_instruction_entry(
             if broker_status.get("status") is not None
             else None
         )
+        submitted_order = broker_submission.get("order", {})
+        if isinstance(submitted_order, dict):
+            total_quantity = submitted_order.get("total_quantity")
+            instruction_record.entry_submitted_quantity = (
+                str(total_quantity) if total_quantity not in (None, "") else None
+            )
 
         event = InstructionEventRecord(
             instruction_id=instruction_record.id,

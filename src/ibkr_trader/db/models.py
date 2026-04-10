@@ -70,6 +70,7 @@ class InstructionRecord(TimestampMixin, Base):
         Index("ix_instruction_account", "account_key"),
         Index("ix_instruction_broker_order_id", "broker_order_id"),
         Index("ix_instruction_broker_perm_id", "broker_perm_id"),
+        Index("ix_instruction_exit_order_id", "exit_order_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -91,6 +92,18 @@ class InstructionRecord(TimestampMixin, Base):
     broker_perm_id: Mapped[int | None] = mapped_column(Integer)
     broker_client_id: Mapped[int | None] = mapped_column(Integer)
     broker_order_status: Mapped[str | None] = mapped_column(String(32))
+    entry_submitted_quantity: Mapped[str | None] = mapped_column(String(64))
+    entry_filled_quantity: Mapped[str | None] = mapped_column(String(64))
+    entry_avg_fill_price: Mapped[str | None] = mapped_column(String(64))
+    entry_filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_order_id: Mapped[int | None] = mapped_column(Integer)
+    exit_perm_id: Mapped[int | None] = mapped_column(Integer)
+    exit_client_id: Mapped[int | None] = mapped_column(Integer)
+    exit_order_status: Mapped[str | None] = mapped_column(String(32))
+    exit_submitted_quantity: Mapped[str | None] = mapped_column(String(64))
+    exit_filled_quantity: Mapped[str | None] = mapped_column(String(64))
+    exit_avg_fill_price: Mapped[str | None] = mapped_column(String(64))
+    exit_filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
     events: Mapped[list["InstructionEventRecord"]] = relationship(

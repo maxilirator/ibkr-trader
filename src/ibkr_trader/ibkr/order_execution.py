@@ -109,27 +109,104 @@ def _normalize_quantity_for_stock(quantity: Decimal | None) -> Decimal:
 
 
 def _build_ibkr_order(
-    instruction: ExecutionInstruction,
     *,
+    action: str,
+    order_ref: str,
+    order_type: OrderType,
     broker_account_id: str,
     quantity: Decimal,
+    time_in_force: str,
+    limit_price: Decimal | None,
     order_cls: type[Any] | None = None,
 ) -> Any:
     runtime_order_cls = order_cls or _load_order_class()
     order = runtime_order_cls()
     order.account = broker_account_id
-    order.action = instruction.intent.side
-    order.orderType = "LMT" if instruction.entry.order_type.value == "LIMIT" else "MKT"
+    order.action = action
+    order.orderType = "LMT" if order_type is OrderType.LIMIT else "MKT"
     order.totalQuantity = int(quantity)
-    order.tif = instruction.entry.time_in_force.value
+    order.tif = time_in_force
     order.outsideRth = False
     order.transmit = True
-    order.orderRef = instruction.instruction_id
+    order.orderRef = order_ref
 
-    if instruction.entry.limit_price is not None:
-        order.lmtPrice = float(instruction.entry.limit_price)
+    if limit_price is not None:
+        order.lmtPrice = float(limit_price)
 
     return order
+
+
+def _opposite_action(action: str) -> str:
+    if action == "BUY":
+        return "SELL"
+    if action == "SELL":
+        return "BUY"
+    raise ValueError(f"Unsupported action: {action}")
+
+
+def _resolve_instruction_contract_and_account(
+    app: OrderExecutionSyncWrapperProtocol,
+    config: IbkrConnectionConfig,
+    instruction: ExecutionInstruction,
+    *,
+    timeout: int,
+    timeout_cls: type[Exception],
+    contract_cls: type[Any] | None,
+) -> tuple[str, list[str], dict[str, Any], Any, dict[str, Any]]:
+    runtime_contract_cls = contract_cls or _load_contract_class()
+    raw_summary = app.get_account_summary(
+        tags=",".join(DEFAULT_ACCOUNT_SUMMARY_TAGS),
+        group="All",
+        timeout=timeout,
+    )
+    normalized_summary = normalize_account_summary_payload(
+        raw_summary,
+        requested_tags=DEFAULT_ACCOUNT_SUMMARY_TAGS,
+        account_id=None,
+        group="All",
+    )
+    broker_account_id, account_warnings = _select_broker_account_id(
+        configured_account_id=config.account_id,
+        normalized_summary=normalized_summary,
+    )
+    if broker_account_id is None:
+        raise LookupError("; ".join(account_warnings) or "No broker account could be selected.")
+
+    raw_contract = build_ibkr_contract(
+        ContractResolveQuery(
+            symbol=instruction.instrument.symbol,
+            security_type=instruction.instrument.security_type.value,
+            exchange=instruction.instrument.exchange,
+            currency=instruction.instrument.currency,
+            primary_exchange=instruction.instrument.primary_exchange,
+            isin=instruction.instrument.isin,
+        ),
+        contract_cls=runtime_contract_cls,
+    )
+    try:
+        contract_matches = app.get_contract_details(raw_contract, timeout=timeout)
+    except timeout_cls as exc:
+        broker_error = _extract_broker_error_message(app)
+        if broker_error is not None:
+            raise LookupError(
+                f"IBKR rejected the contract lookup: {broker_error}"
+            ) from exc
+        raise TimeoutError(
+            f"Timed out while resolving {instruction.instrument.symbol}."
+        ) from exc
+
+    if len(contract_matches) != 1:
+        raise LookupError(
+            f"Expected exactly one resolved contract, got {len(contract_matches)}."
+        )
+    resolved_contract = _serialize_resolved_contract(contract_matches[0])
+    return (
+        broker_account_id,
+        account_warnings,
+        normalized_summary,
+        contract_matches[0].contract,
+        resolved_contract,
+    )
 
 
 def _serialize_resolved_contract(raw_detail: Any) -> dict[str, Any]:
@@ -196,10 +273,19 @@ def submit_order_from_instruction(
 
     try:
         try:
-            raw_summary = app.get_account_summary(
-                tags=",".join(DEFAULT_ACCOUNT_SUMMARY_TAGS),
-                group="All",
+            (
+                broker_account_id,
+                account_warnings,
+                normalized_summary,
+                resolved_ibkr_contract,
+                resolved_contract,
+            ) = _resolve_instruction_contract_and_account(
+                app,
+                config,
+                instruction,
                 timeout=timeout,
+                timeout_cls=timeout_cls,
+                contract_cls=runtime_contract_cls,
             )
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(app)
@@ -208,48 +294,6 @@ def submit_order_from_instruction(
                     f"IBKR rejected the account summary request: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while requesting IBKR account summary.") from exc
-
-        normalized_summary = normalize_account_summary_payload(
-            raw_summary,
-            requested_tags=DEFAULT_ACCOUNT_SUMMARY_TAGS,
-            account_id=None,
-            group="All",
-        )
-        broker_account_id, account_warnings = _select_broker_account_id(
-            configured_account_id=config.account_id,
-            normalized_summary=normalized_summary,
-        )
-        if broker_account_id is None:
-            raise LookupError("; ".join(account_warnings) or "No broker account could be selected.")
-
-        raw_contract = build_ibkr_contract(
-            ContractResolveQuery(
-                symbol=instruction.instrument.symbol,
-                security_type=instruction.instrument.security_type.value,
-                exchange=instruction.instrument.exchange,
-                currency=instruction.instrument.currency,
-                primary_exchange=instruction.instrument.primary_exchange,
-                isin=instruction.instrument.isin,
-            ),
-            contract_cls=runtime_contract_cls,
-        )
-        try:
-            contract_matches = app.get_contract_details(raw_contract, timeout=timeout)
-        except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
-            if broker_error is not None:
-                raise LookupError(
-                    f"IBKR rejected the contract lookup: {broker_error}"
-                ) from exc
-            raise TimeoutError(
-                f"Timed out while resolving {instruction.instrument.symbol}."
-            ) from exc
-
-        if len(contract_matches) != 1:
-            raise LookupError(
-                f"Expected exactly one resolved contract, got {len(contract_matches)}."
-            )
-        resolved_contract = _serialize_resolved_contract(contract_matches[0])
 
         sizing_preview = _resolve_sizing_preview(
             instruction,
@@ -268,15 +312,19 @@ def submit_order_from_instruction(
             sizing_preview["estimated_quantity"]
         )
         order = _build_ibkr_order(
-            instruction,
+            action=instruction.intent.side,
+            order_ref=instruction.instruction_id,
+            order_type=instruction.entry.order_type,
             broker_account_id=broker_account_id,
             quantity=normalized_quantity,
+            time_in_force=instruction.entry.time_in_force.value,
+            limit_price=instruction.entry.limit_price,
             order_cls=runtime_order_cls,
         )
 
         try:
             order_status = app.place_order_sync(
-                contract_matches[0].contract,
+                resolved_ibkr_contract,
                 order,
                 timeout=timeout,
             )
@@ -306,6 +354,114 @@ def submit_order_from_instruction(
                     if instruction.entry.limit_price is not None
                     else None
                 ),
+                "total_quantity": str(normalized_quantity),
+                "outside_rth": order.outsideRth,
+                "transmit": order.transmit,
+            },
+            "broker_order_status": order_status,
+        }
+    )
+
+
+def submit_exit_order_from_instruction(
+    config: IbkrConnectionConfig,
+    instruction: ExecutionInstruction,
+    *,
+    quantity: Decimal,
+    order_type: OrderType,
+    order_ref: str,
+    timeout: int = 10,
+    limit_price: Decimal | None = None,
+    sync_wrapper_cls: type[OrderExecutionSyncWrapperProtocol] | None = None,
+    response_timeout_cls: type[Exception] | None = None,
+    contract_cls: type[Any] | None = None,
+    order_cls: type[Any] | None = None,
+) -> dict[str, Any]:
+    normalized_quantity = _normalize_quantity_for_stock(quantity)
+    if order_type is OrderType.LIMIT and limit_price is None:
+        raise ValueError("limit_price is required for LIMIT exit orders.")
+    if order_type is OrderType.MARKET and limit_price is not None:
+        raise ValueError("limit_price must be omitted for MARKET exit orders.")
+
+    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+    timeout_cls = response_timeout_cls or _load_response_timeout_class()
+    runtime_contract_cls = contract_cls or _load_contract_class()
+    runtime_order_cls = order_cls or _load_order_class()
+    app = wrapper_cls(timeout=timeout)
+
+    if not app.connect_and_start(
+        host=config.host,
+        port=config.port,
+        client_id=config.client_id,
+    ):
+        raise ConnectionError(
+            f"Failed to connect to IBKR at {config.host}:{config.port} "
+            f"with client_id={config.client_id}."
+        )
+
+    try:
+        try:
+            (
+                broker_account_id,
+                account_warnings,
+                _normalized_summary,
+                resolved_ibkr_contract,
+                resolved_contract,
+            ) = _resolve_instruction_contract_and_account(
+                app,
+                config,
+                instruction,
+                timeout=timeout,
+                timeout_cls=timeout_cls,
+                contract_cls=runtime_contract_cls,
+            )
+        except timeout_cls as exc:
+            broker_error = _extract_broker_error_message(app)
+            if broker_error is not None:
+                raise LookupError(
+                    f"IBKR rejected the account summary request: {broker_error}"
+                ) from exc
+            raise TimeoutError("Timed out while requesting IBKR account summary.") from exc
+
+        order = _build_ibkr_order(
+            action=_opposite_action(instruction.intent.side),
+            order_ref=order_ref,
+            order_type=order_type,
+            broker_account_id=broker_account_id,
+            quantity=normalized_quantity,
+            time_in_force=instruction.entry.time_in_force.value,
+            limit_price=limit_price,
+            order_cls=runtime_order_cls,
+        )
+
+        try:
+            order_status = app.place_order_sync(
+                resolved_ibkr_contract,
+                order,
+                timeout=timeout,
+            )
+        except timeout_cls as exc:
+            broker_error = _extract_broker_error_message(app)
+            if broker_error is not None:
+                raise LookupError(
+                    f"IBKR rejected the order submission: {broker_error}"
+                ) from exc
+            raise TimeoutError("Timed out while placing the IBKR order.") from exc
+    finally:
+        app.disconnect_and_stop()
+
+    return _serialize_for_json(
+        {
+            "instruction_id": instruction.instruction_id,
+            "account": broker_account_id,
+            "warnings": list(account_warnings),
+            "resolved_contract": resolved_contract,
+            "order": {
+                "order_ref": order_ref,
+                "action": order.action,
+                "order_type": order.orderType,
+                "time_in_force": order.tif,
+                "limit_price": str(limit_price) if limit_price is not None else None,
                 "total_quantity": str(normalized_quantity),
                 "outside_rth": order.outsideRth,
                 "transmit": order.transmit,

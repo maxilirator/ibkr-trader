@@ -255,6 +255,38 @@ It currently:
 - writes an `entry_order_cancelled` event
 - moves instruction state to `ENTRY_CANCELLED`
 
+### `POST /v1/runtime/run-once`
+
+Runs one MVP execution-runtime cycle against persisted instructions.
+
+It currently:
+
+- submits any due `ENTRY_PENDING` instructions
+- fetches IBKR open orders and executions
+- reconciles entry fills into persisted state
+- submits a take-profit exit after a full entry fill when `exit.take_profit_pct` is present
+- submits a forced market exit when `force_exit_next_session_open` is due from the Stockholm session calendar
+- marks instructions `COMPLETED` after exit fills are reconciled
+
+Example request body:
+
+```json
+{
+  "now_at": "2026-04-13T09:00:00+02:00",
+  "instruction_ids": ["2026-04-13-GTW05-long_risk_book-AAPL-long-01"],
+  "timeout": 10
+}
+```
+
+Important current behavior:
+
+- this is a polling-style MVP runtime cycle, not the final long-lived broker process
+- it uses the primary IBKR client session
+- it is safe for manual operator-driven paper testing
+- when `instruction_ids` is provided, the cycle only touches that selected set
+- it now retries transient IBKR client-id reuse / reconnect churn a small number of times before failing the cycle
+- a persistent runtime-owned IBKR connection is still the next step
+
 ### `POST /v1/instructions/schedule-preview`
 
 Accepts the canonical instruction batch and returns a read-only runtime schedule view.
@@ -301,7 +333,7 @@ python3 -m ibkr_trader.api.server --reload
 
 The natural next endpoints are:
 
-1. persist broker callbacks and fills beyond submit/cancel
-2. add restart reconciliation against IBKR open orders and executions
-3. turn tick-stream sampling into a long-lived local streaming service
-4. `GET /v1/orders/{id}`
+1. keep a long-lived runtime-owned IBKR connection instead of reconnecting per cycle
+2. persist broker callbacks and fills beyond polling-only reconciliation
+3. add restart reconciliation against IBKR open orders, executions, and positions
+4. turn tick-stream sampling into a long-lived local streaming service
