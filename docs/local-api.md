@@ -2,6 +2,12 @@
 
 This repository now includes a small FastAPI control plane intended for **local-only** access.
 
+Current runtime scope:
+
+- Stockholm equities first
+- `Europe/Stockholm` as the runtime timezone
+- q-data Stockholm session calendar as the next-session scheduler input
+
 ## Why this shape
 
 For this system, using the official IBKR Python API directly inside a local service is a good fit:
@@ -149,6 +155,83 @@ Current safe behavior:
 
 This is intentional. We should not guess FX sizing in a production trading system, so the preview only uses broker-derived FX data.
 
+### `POST /v1/orders/submit`
+
+Submits a **manual paper broker order** immediately through the primary IBKR client session.
+
+This endpoint is intentionally narrower than the durable instruction flow:
+
+- exactly one instruction per request
+- stock orders only
+- `LIMIT` orders only
+- whole-share quantities only
+- uses the canonical instruction contract, but submits immediately instead of scheduling
+
+It currently:
+
+- validates the canonical instruction batch
+- resolves the broker account
+- resolves the IBKR contract
+- computes quantity using the same sizing logic as preview
+- places the paper order through the primary IBKR client session
+- returns the broker order status payload
+
+Important current behavior:
+
+- this is an operator/manual paper-trading path
+- it is not wired to persisted `ENTRY_PENDING` instructions yet
+- use it for broker-path smoke tests and careful manual paper validation
+
+### `POST /v1/orders/{order_id}/cancel`
+
+Cancels a paper broker order by IBKR order ID through the primary client session.
+
+This endpoint is the cleanup companion to `POST /v1/orders/submit`.
+
+### `POST /v1/instructions/submit`
+
+Accepts the canonical instruction batch, validates it, computes the Stockholm runtime schedule, and persists the instruction into Postgres.
+
+It currently:
+
+- validates the instruction batch
+- computes runtime schedule metadata, including next-session-open for Stockholm instruments
+- persists the instruction in `ENTRY_PENDING` state
+- writes an initial `instruction_submitted` lifecycle event
+- returns the stored instruction state back to the caller
+
+Important current behavior:
+
+- this endpoint does **not** place a broker order yet
+- it is a durable control-plane submit, not a live execution submit
+
+### `POST /v1/instructions/{instruction_id}/submit-entry`
+
+Submits a persisted `ENTRY_PENDING` instruction to the broker through the primary IBKR client session.
+
+It currently:
+
+- loads the persisted canonical instruction from Postgres
+- requires current state `ENTRY_PENDING`
+- resolves and submits the broker order using the same sizing and contract logic as manual submit
+- stores `broker_order_id`, `broker_perm_id`, `broker_client_id`, and `broker_order_status` on the instruction record
+- writes an `entry_order_submitted` event
+- moves instruction state to `ENTRY_SUBMITTED`
+
+This is the first DB-backed execution bridge between durable instructions and IBKR.
+
+### `POST /v1/instructions/{instruction_id}/cancel-entry`
+
+Cancels a persisted `ENTRY_SUBMITTED` entry order through the primary IBKR client session.
+
+It currently:
+
+- looks up the persisted instruction and its `broker_order_id`
+- cancels the broker order
+- updates `broker_order_status`
+- writes an `entry_order_cancelled` event
+- moves instruction state to `ENTRY_CANCELLED`
+
 ### `POST /v1/instructions/schedule-preview`
 
 Accepts the canonical instruction batch and returns a read-only runtime schedule view.
@@ -157,15 +240,15 @@ It currently:
 
 - projects `entry.submit_at` and `entry.expire_at` into both UTC and the configured runtime timezone
 - makes the active entry window explicit before we wire order submission to it
-- resolves `force_exit_next_session_open` for Stockholm instruments from the shared q-data session calendar when available
-- otherwise keeps the instruction explicitly unresolved until a market calendar resolves it
+- resolves `force_exit_next_session_open` for Stockholm instruments from the shared q-data session calendar
 
 Current scheduling rule:
 
 - the runtime default timezone is `Europe/Stockholm`
 - Stockholm next-session exits come from the local q-data session calendar
 - next-session exits are not guessed from wall-clock dates
-- non-Stockholm or unresolved markets stay explicitly unresolved until a real exchange calendar resolves them
+
+This matches the current project scope: Stockholm first.
 
 ### `POST /v1/instructions/validate`
 
@@ -195,9 +278,7 @@ python3 -m ibkr_trader.api.server --reload
 
 The natural next endpoints are:
 
-1. `POST /v1/orders/preview`
-2. `POST /v1/instructions/submit`
-3. `POST /v1/orders/{id}/cancel`
-4. `GET /v1/orders/{id}`
-5. `GET /v1/positions`
-6. `POST /v1/market-data/subscribe`
+1. persist broker callbacks and fills beyond submit/cancel
+2. add restart reconciliation against IBKR open orders and executions
+3. `GET /v1/orders/{id}`
+4. `GET /v1/positions`

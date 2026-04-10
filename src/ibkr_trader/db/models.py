@@ -68,6 +68,8 @@ class InstructionRecord(TimestampMixin, Base):
         Index("ix_instruction_batch_id", "batch_id"),
         Index("ix_instruction_state", "state"),
         Index("ix_instruction_account", "account_key"),
+        Index("ix_instruction_broker_order_id", "broker_order_id"),
+        Index("ix_instruction_broker_perm_id", "broker_perm_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -85,6 +87,10 @@ class InstructionRecord(TimestampMixin, Base):
     expire_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     order_type: Mapped[str] = mapped_column(String(16), nullable=False)
     side: Mapped[str] = mapped_column(String(8), nullable=False)
+    broker_order_id: Mapped[int | None] = mapped_column(Integer)
+    broker_perm_id: Mapped[int | None] = mapped_column(Integer)
+    broker_client_id: Mapped[int | None] = mapped_column(Integer)
+    broker_order_status: Mapped[str | None] = mapped_column(String(32))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
     events: Mapped[list["InstructionEventRecord"]] = relationship(

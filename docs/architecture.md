@@ -10,6 +10,14 @@ Build a production-capable execution platform for Interactive Brokers that separ
 - broker integration
 - data ingestion and storage
 
+## Current implementation scope
+
+The runtime is currently being built for **Stockholm equities first**.
+
+- operator timezone: `Europe/Stockholm`
+- next-session scheduling source: shared q-data Stockholm session calendar
+- current broker-facing work: validation, preview, and scheduling before submit
+
 ## Core services
 
 ### 1. Instruction Ingest
@@ -41,7 +49,7 @@ Scheduling rule:
 
 - actionable timestamps should be normalized into UTC for execution and into `Europe/Stockholm` for operator-facing runtime views
 - Stockholm session transitions should use the shared q-data session calendar as the primary source
-- exchange-session transitions such as "next session open" must be resolved from an exchange calendar, not guessed from wall-clock dates
+- "next session open" must be resolved from the Stockholm session calendar, not guessed from wall-clock dates
 
 ### 3. IBKR Broker Adapter
 
@@ -131,9 +139,8 @@ If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar 
 
 ## Recommended near-term roadmap
 
-1. Build a paper-trading TWS API connection through IB Gateway.
-2. Implement contract lookup and order placement for US equities.
+1. Keep the local TWS / IB Gateway paper connection healthy and stable.
+2. Add Stockholm paper order placement and cancel flow on top of persisted `ENTRY_PENDING` instructions.
 3. Add execution-event persistence and replay.
-4. Add scheduled-entry and next-open-exit flows.
-5. Add market-data ingestion for a small symbol set.
-6. Add shortability collection and nightly snapshots.
+4. Add Stockholm market-data ingestion for a small symbol set.
+5. Add shortability collection and nightly snapshots.

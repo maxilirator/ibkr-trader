@@ -10,6 +10,16 @@ This repository is the starting point for a stateful execution platform that can
 - react to fills, cancels, market open/close events, and risk events
 - collect intraday market data and broker-side metadata such as shortability
 
+## Current scope
+
+This repo is currently scoped to **Stockholm equities first**.
+
+- runtime timezone: `Europe/Stockholm`
+- session calendar: shared q-data Stockholm session calendar
+- initial broker integration: official IBKR Python API through local TWS / IB Gateway
+- current work is focused on broker-safe validation, durable submit, and order preview before live broker submit
+- manual NY paper order submit/cancel is now available for broker-path smoke testing
+
 ## Current direction
 
 We are optimizing for a production-style architecture rather than a simple script.
@@ -23,6 +33,10 @@ Relevant official sources:
 - https://ibkrcampus.com/campus/ibkr-api-page/cpapi-v1/
 - https://ibkrcampus.com/campus/ibkr-api-page/market-data-subscriptions/
 - https://interactivebrokers.github.io/tws-api/tick_types.html
+
+## Current status
+
+See [docs/current-status.md](docs/current-status.md) for the working checklist, verified pieces, and the next implementation steps.
 
 ## First runnable broker step
 
@@ -50,6 +64,7 @@ Important runtime settings now live in a repo-root `.env` file.
 Current important settings include:
 
 - app mode and timezone
+- session calendar path
 - database URL
 - local API bind host and port
 - IBKR host, port, primary client ID, diagnostic client ID, and account ID
@@ -72,6 +87,11 @@ The initial FastAPI wrapper includes:
 - `POST /v1/accounts/summary`
 - `POST /v1/market-data/historical-bars`
 - `POST /v1/orders/preview`
+- `POST /v1/orders/submit`
+- `POST /v1/orders/{order_id}/cancel`
+- `POST /v1/instructions/submit`
+- `POST /v1/instructions/{instruction_id}/submit-entry`
+- `POST /v1/instructions/{instruction_id}/cancel-entry`
 - `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
 
@@ -106,7 +126,6 @@ The runtime scheduler is Stockholm-first.
 - `SESSION_CALENDAR_PATH` defaults to `../q-data/xsto/calendars/day_sessions.parquet`
 - schedule preview converts every instruction into both UTC and Stockholm-local times
 - Stockholm next-session exits resolve from the shared q-data session calendar when the instrument maps to Stockholm exchange codes
-- if no local calendar applies, the schedule preview stays explicit and unresolved instead of guessing
 
 ## What belongs in this system
 
@@ -141,12 +160,11 @@ should not be treated as a single broker order. Some pieces can be expressed wit
 
 ## First milestones
 
-1. Stand up an IB Gateway paper-trading connection.
-2. Implement contract resolution, market data subscription, and order placement.
-3. Persist instruction state and broker callbacks in Postgres.
-4. Build a scheduler for market-open and market-close transitions.
-5. Add shortability and fee-rate ingestion where available.
-6. Add replay and reconciliation tooling for restart safety.
+1. Persist broker callbacks and fills beyond submit/cancel.
+2. Add execution reconciliation on startup.
+3. Add Stockholm market-data ingestion into the parquet data backend.
+4. Add shortability and fee-rate collection where IBKR exposes it.
+5. Add live/paper environment separation and operator controls.
 
 ## Running the gateway probe
 

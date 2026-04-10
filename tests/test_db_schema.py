@@ -36,6 +36,17 @@ class DatabaseSchemaTests(unittest.TestCase):
             set(inspector.get_table_names()),
             {"instruction", "instruction_event", "instrument"},
         )
+        instruction_columns = {
+            column["name"] for column in inspector.get_columns("instruction")
+        }
+        self.assertTrue(
+            {
+                "broker_order_id",
+                "broker_perm_id",
+                "broker_client_id",
+                "broker_order_status",
+            }.issubset(instruction_columns)
+        )
 
     def test_instruction_event_relationship_round_trips(self) -> None:
         session = self.session_factory()

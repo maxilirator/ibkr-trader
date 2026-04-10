@@ -83,8 +83,10 @@ def _extract_broker_error_message(app: Any) -> str | None:
     if not raw_errors:
         return None
 
-    positive_req_ids = [req_id for req_id in raw_errors if isinstance(req_id, int) and req_id >= 0]
-    ordered_req_ids = sorted(positive_req_ids or raw_errors.keys())
+    nonnegative_req_ids = [
+        req_id for req_id in raw_errors if isinstance(req_id, int) and req_id >= 0
+    ]
+    ordered_req_ids = sorted(nonnegative_req_ids)
     if not ordered_req_ids:
         return None
 

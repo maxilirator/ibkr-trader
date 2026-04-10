@@ -8,6 +8,12 @@ The design goal is simple:
 - the execution API should validate, persist, and act on that contract
 - normalization should be minimal
 
+Current runtime scope:
+
+- the contract is designed to stay reusable
+- the current runtime implementation is Stockholm-first
+- examples in this document should prefer Stockholm equities and Stockholm-local timestamps
+
 ## Design rules
 
 ### 1. No tabular transport wrapper
@@ -28,7 +34,8 @@ Do **not** embed transport behavior into the instruction itself.
 Instead:
 
 - `POST /v1/instructions/validate` means validate only
-- `POST /v1/instructions/submit` will later mean persist and execute
+- `POST /v1/instructions/submit` currently means validate, schedule, and persist for execution
+- live broker order placement happens later in the execution worker
 
 The endpoint determines the action. The payload stays the same.
 

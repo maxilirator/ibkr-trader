@@ -10,6 +10,7 @@ class ExecutionState(StrEnum):
     RECEIVED = "RECEIVED"
     ENTRY_PENDING = "ENTRY_PENDING"
     ENTRY_SUBMITTED = "ENTRY_SUBMITTED"
+    ENTRY_CANCELLED = "ENTRY_CANCELLED"
     POSITION_OPEN = "POSITION_OPEN"
     EXIT_PENDING = "EXIT_PENDING"
     COMPLETED = "COMPLETED"
@@ -28,6 +29,9 @@ class InstructionRuntime:
     def on_entry_submitted(self) -> None:
         self.state = ExecutionState.ENTRY_SUBMITTED
 
+    def on_entry_cancelled(self) -> None:
+        self.state = ExecutionState.ENTRY_CANCELLED
+
     def on_entry_filled(self) -> None:
         self.state = ExecutionState.POSITION_OPEN
 
@@ -36,4 +40,3 @@ class InstructionRuntime:
 
     def on_completed(self) -> None:
         self.state = ExecutionState.COMPLETED
-

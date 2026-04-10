@@ -53,3 +53,24 @@ class InstructionModelTests(TestCase):
 
         self.assertEqual(runtime.state, ExecutionState.POSITION_OPEN)
 
+    def test_instruction_runtime_can_mark_entry_cancelled(self) -> None:
+        instruction = TradeInstruction(
+            instruction_id="demo-2",
+            created_at=datetime.now(timezone.utc),
+            entry=TimedEntry(
+                symbol="AAPL",
+                side=Side.BUY,
+                quantity=Decimal("10"),
+                order_type=EntryOrderType.LIMIT,
+                activate_at=datetime.now(timezone.utc),
+                limit_price=Decimal("180.50"),
+            ),
+            exit_policy=ExitPolicy(),
+        )
+
+        runtime = InstructionRuntime(instruction=instruction)
+        runtime.schedule_entry()
+        runtime.on_entry_submitted()
+        runtime.on_entry_cancelled()
+
+        self.assertEqual(runtime.state, ExecutionState.ENTRY_CANCELLED)
