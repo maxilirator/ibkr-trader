@@ -70,10 +70,43 @@ The initial FastAPI wrapper includes:
 - `POST /v1/ibkr/probe`
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
+- `POST /v1/market-data/historical-bars`
 - `POST /v1/orders/preview`
+- `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
 
 See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
+
+## Database foundation
+
+The control-plane database is now set up to start with SQLAlchemy ORM models first.
+
+- SQLAlchemy ORM models define the initial control-plane tables.
+- `create_all()` is acceptable for this first bootstrap stage.
+- Once the schema starts changing in a non-trivial way, we should add Alembic migrations rather than keep evolving tables ad hoc.
+
+The first ORM tables are intentionally small:
+
+- `instrument`
+- `instruction`
+- `instruction_event`
+
+Create the initial schema with:
+
+```bash
+source .venv/bin/activate
+python3 -m ibkr_trader.db.init_schema
+```
+
+## Scheduling default
+
+The runtime scheduler is Stockholm-first.
+
+- `APP_TIMEZONE` defaults to `Europe/Stockholm`
+- `SESSION_CALENDAR_PATH` defaults to `../q-data/xsto/calendars/day_sessions.parquet`
+- schedule preview converts every instruction into both UTC and Stockholm-local times
+- Stockholm next-session exits resolve from the shared q-data session calendar when the instrument maps to Stockholm exchange codes
+- if no local calendar applies, the schedule preview stays explicit and unresolved instead of guessing
 
 ## What belongs in this system
 
@@ -83,6 +116,7 @@ See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instr
 - Risk engine: account guards, symbol guards, price band checks, kill switch.
 - Event store: durable audit trail for every decision, callback, fill, and cancel.
 - Data backend: captures intraday bars, ticks, account snapshots, and shortability.
+- Currency rule: market data and execution prices stay in the instrument's native trading currency; account-currency views are derived separately.
 
 ## Why the orchestrator matters
 

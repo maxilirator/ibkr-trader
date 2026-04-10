@@ -77,6 +77,32 @@ Examples of trace data:
 - research file paths
 - anchor price and offset used to derive the order price
 
+### 6. Keep market prices and trades in instrument currency
+
+The execution contract should treat the instrument's trading currency as the price currency.
+
+That means:
+
+- `instrument.currency` is the native trading currency for the resolved IBKR contract
+- `entry.limit_price` is expressed in `instrument.currency`
+- `sizing.target_notional`, when used directly, is expressed in `instrument.currency`
+- future bars, ticks, fills, and execution prices should also be stored in `instrument.currency`
+
+Do **not** send converted account-currency prices as the primary trading price.
+
+Account-currency math is still allowed for:
+
+- account NAV
+- buying power and margin checks
+- portfolio-level risk
+- `fraction_of_account_nav` sizing before conversion into instrument currency
+
+So the rule is:
+
+- market data and execution stay in instrument currency
+- account and portfolio controls may use account currency
+- FX conversion is an explicit step, not an implicit normalization
+
 ## Canonical payload
 
 ```json
@@ -198,3 +224,17 @@ Not allowed:
 - account-level and book-level sizing targets that disagree
 
 If the portfolio construction layer needs richer intermediate math, keep that upstream and emit one final execution sizing decision.
+
+## Currency semantics
+
+To avoid ambiguity, the contract uses two currencies with different roles:
+
+- `instrument.currency`: the native price currency of the tradable contract
+- broker account currency: used for NAV, buying power, and account-level controls
+
+Examples:
+
+- `SIVE` on Stockholm should use `SEK` bars, `SEK` limit prices, `SEK` fills, and `SEK` direct notionals
+- `AAPL` on NASDAQ should use `USD` bars, `USD` limit prices, `USD` fills, and `USD` direct notionals
+
+If an instruction uses `fraction_of_account_nav`, the execution service may convert account currency into `instrument.currency` for sizing. After that conversion, the downstream order preview and execution remain in `instrument.currency`.

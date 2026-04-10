@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
 
@@ -22,6 +23,9 @@ class _FakeContract:
 
 
 class _FakePreviewSyncWrapper:
+    account_currency = "USD"
+    net_liquidation = "100000.00"
+
     def __init__(self, timeout: int) -> None:
         self.timeout = timeout
         self.connected = False
@@ -43,10 +47,13 @@ class _FakePreviewSyncWrapper:
     ) -> dict[str, dict[str, dict[str, str]]]:
         return {
             "DU1234567": {
-                "NetLiquidation": {"value": "100000.00", "currency": "USD"},
-                "BuyingPower": {"value": "200000.00", "currency": "USD"},
-                "AvailableFunds": {"value": "90000.00", "currency": "USD"},
-                "ExcessLiquidity": {"value": "85000.00", "currency": "USD"},
+                "NetLiquidation": {
+                    "value": self.net_liquidation,
+                    "currency": self.account_currency,
+                },
+                "BuyingPower": {"value": "200000.00", "currency": self.account_currency},
+                "AvailableFunds": {"value": "90000.00", "currency": self.account_currency},
+                "ExcessLiquidity": {"value": "85000.00", "currency": self.account_currency},
                 "AccountType": {"value": "INDIVIDUAL", "currency": ""},
             }
         }
@@ -79,6 +86,24 @@ class _FakePreviewSyncWrapper:
                 secIdList=[SimpleNamespace(tag="ISIN", value="US0378331005")],
             )
         ]
+
+    def get_historical_data(
+        self,
+        contract: _FakeContract,
+        end_date_time: str,
+        duration_str: str,
+        bar_size_setting: str,
+        what_to_show: str,
+        use_rth: bool = True,
+        format_date: int = 1,
+        timeout: int | None = None,
+    ) -> list[object]:
+        pair = (contract.symbol, contract.currency)
+        if pair == ("EUR", "USD"):
+            return [SimpleNamespace(date="20260410", close="1.20")]
+        if pair == ("EUR", "SEK"):
+            return [SimpleNamespace(date="20260410", close="10.00")]
+        raise TimeoutError(f"Unsupported FX pair {contract.symbol}.{contract.currency}")
 
 
 class OrderPreviewTests(TestCase):
@@ -150,7 +175,10 @@ class OrderPreviewTests(TestCase):
         self.assertEqual(preview["order"]["order_type"], "LMT")
         self.assertEqual(preview["instrument"]["resolved"]["con_id"], 265598)
 
-    def test_preview_flags_fx_requirement_for_fraction_sizing(self) -> None:
+    def test_preview_uses_historical_fx_rate_for_fraction_sizing(self) -> None:
+        class _EuroAccountPreviewSyncWrapper(_FakePreviewSyncWrapper):
+            account_currency = "EUR"
+
         batch = parse_execution_batch_payload(
             {
                 "schema_version": "2026-04-10",
@@ -167,11 +195,11 @@ class OrderPreviewTests(TestCase):
                             "book_key": "long_risk_book",
                         },
                         "instrument": {
-                            "symbol": "SIVE",
+                            "symbol": "AAPL",
                             "security_type": "STK",
                             "exchange": "SMART",
-                            "currency": "SEK",
-                            "primary_exchange": "SFB",
+                            "currency": "USD",
+                            "primary_exchange": "NASDAQ",
                         },
                         "intent": {
                             "side": "BUY",
@@ -183,9 +211,81 @@ class OrderPreviewTests(TestCase):
                         },
                         "entry": {
                             "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00-04:00",
+                            "expire_at": "2026-04-10T16:00:00-04:00",
+                            "limit_price": "120.00",
+                        },
+                        "exit": {
+                            "take_profit_pct": "0.02",
+                        },
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_EuroAccountPreviewSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("12000.00"))
+        self.assertEqual(Decimal(preview["order"]["total_quantity"]), Decimal("100"))
+        self.assertEqual(preview["sizing"]["fx_conversion"]["rate"], "1.20")
+        self.assertEqual(
+            preview["sizing"]["fx_conversion"]["lookup_contract"]["symbol"],
+            "EUR",
+        )
+
+    def test_preview_inverts_fx_pair_when_only_inverse_exists(self) -> None:
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-3",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-3",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "SAP",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "EUR",
+                            "primary_exchange": "IBIS",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "0.12",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
                             "submit_at": "2026-04-10T09:25:00+02:00",
                             "expire_at": "2026-04-10T17:30:00+02:00",
-                            "limit_price": "11.3131",
+                            "limit_price": "100.00",
                         },
                         "exit": {
                             "take_profit_pct": "0.02",
@@ -213,6 +313,11 @@ class OrderPreviewTests(TestCase):
         )
 
         preview = payload["previews"][0]
-        self.assertEqual(preview["status"], "unresolved")
-        self.assertIn("FX-aware conversion", " ".join(preview["issues"]))
-        self.assertIsNone(preview["order"]["total_quantity"])
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("10000.00"))
+        self.assertEqual(Decimal(preview["order"]["total_quantity"]), Decimal("100"))
+        self.assertTrue(preview["sizing"]["fx_conversion"]["inverted"])
+        self.assertEqual(
+            preview["sizing"]["fx_conversion"]["lookup_contract"]["symbol"],
+            "EUR",
+        )

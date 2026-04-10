@@ -18,6 +18,10 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.5",
 ]
+db = [
+  "SQLAlchemy>=2.0",
+  "psycopg[binary]>=3.2",
+]
 server = [
   "fastapi",
   "uvicorn",

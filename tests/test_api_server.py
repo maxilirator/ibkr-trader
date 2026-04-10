@@ -8,8 +8,11 @@ from ibkr_trader.api.server import (
     parse_account_summary_payload,
     parse_contract_resolve_payload,
     parse_execution_batch_payload,
+    parse_historical_bars_payload,
     serialize_execution_batch,
+    serialize_runtime_schedule_preview,
 )
+from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 
 
 class ApiServerTests(TestCase):
@@ -49,6 +52,33 @@ class ApiServerTests(TestCase):
         self.assertIn("NetLiquidation", tags)
         self.assertEqual(group, "All")
         self.assertIsNone(account_id)
+
+    def test_parse_historical_bars_payload_normalizes_values(self) -> None:
+        query = parse_historical_bars_payload(
+            {
+                "symbol": "sive",
+                "security_type": "stk",
+                "exchange": "smart",
+                "currency": "sek",
+                "primary_exchange": "sfb",
+                "duration": "2 D",
+                "bar_size": "5 mins",
+                "what_to_show": "trades",
+                "use_rth": True,
+                "end_at": "2026-04-10T17:30:00+02:00",
+            }
+        )
+
+        self.assertEqual(query.symbol, "SIVE")
+        self.assertEqual(query.security_type, "STK")
+        self.assertEqual(query.exchange, "SMART")
+        self.assertEqual(query.currency, "SEK")
+        self.assertEqual(query.primary_exchange, "SFB")
+        self.assertEqual(query.duration, "2 D")
+        self.assertEqual(query.bar_size, "5 mins")
+        self.assertEqual(query.what_to_show, "TRADES")
+        self.assertTrue(query.use_rth)
+        self.assertEqual(query.end_at.isoformat(), "2026-04-10T17:30:00+02:00")
 
     def test_parse_execution_batch_payload_validates_contract(self) -> None:
         batch = parse_execution_batch_payload(
@@ -224,3 +254,64 @@ class ApiServerTests(TestCase):
                     ],
                 }
             )
+
+    def test_serialize_runtime_schedule_preview_projects_stockholm_times(self) -> None:
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "trial_27-2026-04-10-prod-long-01",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-1",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "SIVE",
+                            "security_type": "STK",
+                            "exchange": "XSTO",
+                            "currency": "SEK",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "1.0",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T07:25:00Z",
+                            "expire_at": "2026-04-10T15:30:00Z",
+                            "limit_price": "11.3131",
+                        },
+                        "exit": {
+                            "force_exit_next_session_open": True,
+                        },
+                        "trace": {
+                            "reason_code": "risk_policy_orderbook",
+                        },
+                    }
+                ],
+            }
+        )
+
+        preview = serialize_runtime_schedule_preview(
+            build_batch_runtime_schedule(batch, runtime_timezone="Europe/Stockholm")
+        )
+
+        self.assertEqual(preview["runtime_timezone"], "Europe/Stockholm")
+        self.assertEqual(
+            preview["instructions"][0]["submit_at_runtime"],
+            "2026-04-10T09:25:00+02:00",
+        )
+        self.assertEqual(
+            preview["instructions"][0]["next_session_exit"]["status"],
+            "calendar_required",
+        )

@@ -37,6 +37,12 @@ Responsibilities:
 
 The orchestrator is where multi-day logic belongs.
 
+Scheduling rule:
+
+- actionable timestamps should be normalized into UTC for execution and into `Europe/Stockholm` for operator-facing runtime views
+- Stockholm session transitions should use the shared q-data session calendar as the primary source
+- exchange-session transitions such as "next session open" must be resolved from an exchange calendar, not guessed from wall-clock dates
+
 ### 3. IBKR Broker Adapter
 
 Wraps the chosen IBKR API and exposes a clean internal interface.
@@ -85,12 +91,21 @@ Suggested responsibilities:
 - shortability and borrow metadata
 - fills, order events, and account snapshots
 
+Currency rule for stored market and execution data:
+
+- bars, ticks, quotes, order prices, and fills should be stored in the instrument's native trading currency
+- every stored market or execution record should carry an explicit currency code
+- account-NAV and portfolio-risk views may also keep account-currency projections as separate derived fields
+- account-currency projections must not replace the native instrument-currency record
+
 ## Storage
 
 Suggested first pass:
 
 - Postgres for instructions, events, positions, and reconciled broker state
 - object storage or partitioned tables for larger raw market-data payloads
+
+For control-plane tables, start with SQLAlchemy ORM models so the execution and metadata schema stays close to the Python domain model. Use `create_all()` only for the initial bootstrap phase; once the schema is moving, add migrations.
 
 If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar store later.
 
@@ -111,7 +126,7 @@ If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar 
 - idempotent action dispatch
 - restart-safe reconciliation on boot
 - clear separation between paper and live trading
-- New York market calendar awareness
+- exchange calendar awareness with Europe/Stockholm as the default runtime timezone
 - complete audit history for compliance and debugging
 
 ## Recommended near-term roadmap

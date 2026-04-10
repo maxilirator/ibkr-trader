@@ -11,6 +11,7 @@ def main() -> None:
         {
             "environment": config.environment,
             "timezone": config.timezone,
+            "session_calendar_path": str(config.session_calendar_path),
             "ibkr_host": config.ibkr.host,
             "ibkr_port": config.ibkr.port,
             "account_id_configured": bool(config.ibkr.account_id),
@@ -20,4 +21,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

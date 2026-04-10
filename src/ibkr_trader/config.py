@@ -47,6 +47,13 @@ def load_dotenv_file(path: Path = DEFAULT_ENV_FILE) -> None:
         environ.setdefault(key, value)
 
 
+def _resolve_project_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
 @dataclass(slots=True)
 class IbkrConnectionConfig:
     host: str
@@ -95,6 +102,7 @@ class AppConfig:
     environment: str
     timezone: str
     database_url: str
+    session_calendar_path: Path
     api: ApiServerConfig
     ibkr: IbkrConnectionConfig
 
@@ -103,10 +111,16 @@ class AppConfig:
         load_dotenv_file()
         return cls(
             environment=getenv("APP_ENV", "dev"),
-            timezone=getenv("APP_TIMEZONE", "America/New_York"),
+            timezone=getenv("APP_TIMEZONE", "Europe/Stockholm"),
             database_url=getenv(
                 "DATABASE_URL",
                 "postgresql://postgres:postgres@localhost:5432/ibkr_trader",
+            ),
+            session_calendar_path=_resolve_project_path(
+                getenv(
+                    "SESSION_CALENDAR_PATH",
+                    "../q-data/xsto/calendars/day_sessions.parquet",
+                )
             ),
             api=ApiServerConfig.from_env(),
             ibkr=IbkrConnectionConfig.from_env(),

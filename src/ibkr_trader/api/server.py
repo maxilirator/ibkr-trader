@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any, Mapping
 
 from ibkr_trader.config import AppConfig
@@ -35,8 +36,10 @@ from ibkr_trader.ibkr.contracts import (
     resolve_contracts,
     serialize_contract_resolve_result,
 )
+from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
 from ibkr_trader.ibkr.order_preview import preview_execution_batch
 from ibkr_trader.ibkr.probe import IbkrDependencyError, probe_gateway
+from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 
 
 class ApiDependencyError(RuntimeError):
@@ -149,6 +152,38 @@ def parse_account_summary_payload(payload: Mapping[str, Any]) -> tuple[tuple[str
         else None
     )
     return tags, group, account_id
+
+
+def parse_historical_bars_payload(payload: Mapping[str, Any]) -> HistoricalBarsQuery:
+    end_at = (
+        _parse_datetime(payload["end_at"], "end_at")
+        if payload.get("end_at") is not None
+        else None
+    )
+    query = HistoricalBarsQuery(
+        symbol=str(payload["symbol"]).upper(),
+        security_type=str(payload.get("security_type", "STK")).upper(),
+        exchange=str(payload["exchange"]).upper(),
+        currency=str(payload["currency"]).upper(),
+        primary_exchange=(
+            str(payload["primary_exchange"]).upper()
+            if payload.get("primary_exchange") is not None
+            else None
+        ),
+        local_symbol=(
+            str(payload["local_symbol"])
+            if payload.get("local_symbol") is not None
+            else None
+        ),
+        isin=str(payload["isin"]) if payload.get("isin") is not None else None,
+        duration=str(payload["duration"]),
+        bar_size=str(payload["bar_size"]),
+        what_to_show=str(payload.get("what_to_show", "TRADES")).upper(),
+        use_rth=bool(payload.get("use_rth", True)),
+        end_at=end_at,
+    )
+    query.validate()
+    return query
 
 
 def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> ExecutionInstruction:
@@ -351,6 +386,8 @@ def parse_execution_batch_payload(payload: Mapping[str, Any]) -> ExecutionInstru
 
 
 def _serialize_for_json(payload: Any) -> Any:
+    if isinstance(payload, Enum):
+        return payload.value
     if isinstance(payload, Decimal):
         return str(payload)
     if isinstance(payload, datetime):
@@ -370,6 +407,11 @@ def serialize_execution_batch(batch: ExecutionInstructionBatch) -> dict[str, Any
     payload = asdict(batch)
     payload = _serialize_for_json(payload)
     return payload
+
+
+def serialize_runtime_schedule_preview(payload: Any) -> dict[str, Any]:
+    serialized = asdict(payload)
+    return _serialize_for_json(serialized)
 
 
 def _load_fastapi_runtime() -> tuple[Any, Any, Any, Any]:
@@ -419,6 +461,8 @@ def create_app(config: AppConfig | None = None) -> Any:
             "local_only": app_config.api.require_loopback_only,
             "api_host": app_config.api.host,
             "api_port": app_config.api.port,
+            "runtime_timezone": app_config.timezone,
+            "session_calendar_path": str(app_config.session_calendar_path),
         }
 
     @app.post("/v1/ibkr/probe")
@@ -477,6 +521,26 @@ def create_app(config: AppConfig | None = None) -> Any:
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
 
+    @app.post("/v1/market-data/historical-bars")
+    def get_historical_bars(payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
+        try:
+            query = parse_historical_bars_payload(payload)
+            return read_historical_bars(
+                app_config.ibkr.diagnostic_session(),
+                query,
+                timeout=timeout,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
     @app.post("/v1/orders/preview")
     def preview_orders(payload: dict[str, Any], timeout: int = 10) -> dict[str, Any]:
         try:
@@ -508,6 +572,25 @@ def create_app(config: AppConfig | None = None) -> Any:
             "accepted": True,
             "instruction_count": len(batch.instructions),
             "batch": serialize_execution_batch(batch),
+        }
+
+    @app.post("/v1/instructions/schedule-preview")
+    def preview_instruction_schedule(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            batch = parse_execution_batch_payload(payload)
+            schedule = build_batch_runtime_schedule(
+                batch,
+                runtime_timezone=app_config.timezone,
+                session_calendar_path=app_config.session_calendar_path,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "runtime_timezone": app_config.timezone,
+            "session_calendar_path": str(app_config.session_calendar_path),
+            "schedule": serialize_runtime_schedule_preview(schedule),
         }
 
     return app

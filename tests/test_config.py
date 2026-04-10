@@ -41,6 +41,13 @@ class ConfigTests(TestCase):
         self.assertEqual(config.port, 8000)
         self.assertTrue(config.require_loopback_only)
 
+    def test_app_defaults_use_stockholm_timezone(self) -> None:
+        with patch("ibkr_trader.config.load_dotenv_file"), patch.dict("os.environ", {}, clear=True):
+            config = AppConfig.from_env()
+
+        self.assertEqual(config.timezone, "Europe/Stockholm")
+        self.assertTrue(str(config.session_calendar_path).endswith("/q-data/xsto/calendars/day_sessions.parquet"))
+
     def test_dotenv_file_populates_missing_values(self) -> None:
         with TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
