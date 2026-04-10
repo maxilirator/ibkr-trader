@@ -5,6 +5,8 @@ from unittest import TestCase
 from ibkr_trader.api.server import (
     enforce_loopback_binding,
     is_loopback_host,
+    parse_account_summary_payload,
+    parse_contract_resolve_payload,
     parse_execution_batch_payload,
     serialize_execution_batch,
 )
@@ -21,6 +23,32 @@ class ApiServerTests(TestCase):
     def test_enforce_loopback_binding_rejects_nonlocal_host(self) -> None:
         with self.assertRaisesRegex(ValueError, "loopback"):
             enforce_loopback_binding("0.0.0.0", require_loopback_only=True)
+
+    def test_parse_contract_resolve_payload_normalizes_values(self) -> None:
+        query = parse_contract_resolve_payload(
+            {
+                "symbol": "sive",
+                "security_type": "stk",
+                "exchange": "xsto",
+                "currency": "sek",
+                "primary_exchange": "xsto",
+                "isin": "SE0003917798",
+            }
+        )
+
+        self.assertEqual(query.symbol, "SIVE")
+        self.assertEqual(query.security_type, "STK")
+        self.assertEqual(query.exchange, "XSTO")
+        self.assertEqual(query.currency, "SEK")
+        self.assertEqual(query.primary_exchange, "XSTO")
+        self.assertEqual(query.isin, "SE0003917798")
+
+    def test_parse_account_summary_payload_accepts_defaults(self) -> None:
+        tags, group, account_id = parse_account_summary_payload({})
+
+        self.assertIn("NetLiquidation", tags)
+        self.assertEqual(group, "All")
+        self.assertIsNone(account_id)
 
     def test_parse_execution_batch_payload_validates_contract(self) -> None:
         batch = parse_execution_batch_payload(

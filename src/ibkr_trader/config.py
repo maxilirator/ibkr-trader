@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from dataclasses import dataclass
 from os import environ, getenv
 from pathlib import Path
@@ -51,14 +52,22 @@ class IbkrConnectionConfig:
     host: str
     port: int
     client_id: int
+    diagnostic_client_id: int
     account_id: str
+
+    def primary_session(self) -> "IbkrConnectionConfig":
+        return replace(self, client_id=self.client_id)
+
+    def diagnostic_session(self) -> "IbkrConnectionConfig":
+        return replace(self, client_id=self.diagnostic_client_id)
 
     @classmethod
     def from_env(cls) -> "IbkrConnectionConfig":
         return cls(
             host=getenv("IBKR_HOST", "127.0.0.1"),
-            port=int(getenv("IBKR_PORT", "4002")),
+            port=int(getenv("IBKR_PORT", "7497")),
             client_id=int(getenv("IBKR_CLIENT_ID", "0")),
+            diagnostic_client_id=int(getenv("IBKR_DIAGNOSTIC_CLIENT_ID", "7")),
             account_id=getenv("IBKR_ACCOUNT_ID", ""),
         )
 

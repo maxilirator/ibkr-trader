@@ -46,13 +46,21 @@ IBKR's setup lessons call out these API settings:
 
 ## Repo defaults
 
-This repository uses the paper IB Gateway defaults:
+This repository's current local `.env` is set up for paper **TWS** on this machine:
 
 ```dotenv
 IBKR_HOST=127.0.0.1
-IBKR_PORT=4002
+IBKR_PORT=7497
 IBKR_CLIENT_ID=0
+IBKR_DIAGNOSTIC_CLIENT_ID=7
 ```
+
+Recommended repo usage:
+
+- reserve `IBKR_CLIENT_ID=0` for the main long-lived trading runtime
+- use `IBKR_DIAGNOSTIC_CLIENT_ID` for probe and contract-resolution calls during development
+
+If you switch from TWS to IB Gateway later, the usual paper port is `4002`.
 
 ## First live validation
 

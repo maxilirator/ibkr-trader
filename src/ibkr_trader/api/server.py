@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from ibkr_trader.config import AppConfig
+from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import (
     AccountRef,
     EntrySpec,
@@ -25,6 +26,14 @@ from ibkr_trader.domain.execution_contract import (
     SourceContext,
     TimeInForce,
     TraceSpec,
+)
+from ibkr_trader.ibkr.account_summary import (
+    DEFAULT_ACCOUNT_SUMMARY_TAGS,
+    read_account_summary,
+)
+from ibkr_trader.ibkr.contracts import (
+    resolve_contracts,
+    serialize_contract_resolve_result,
 )
 from ibkr_trader.ibkr.probe import IbkrDependencyError, probe_gateway
 
@@ -96,6 +105,49 @@ def _parse_string_map(value: Any, field_name: str) -> dict[str, str]:
             raise ValueError(f"{field_name} must be a string-to-string object")
         parsed[key] = item
     return parsed
+
+
+def parse_contract_resolve_payload(payload: Mapping[str, Any]) -> ContractResolveQuery:
+    query = ContractResolveQuery(
+        symbol=str(payload["symbol"]).upper(),
+        security_type=str(payload.get("security_type", "STK")).upper(),
+        exchange=str(payload["exchange"]).upper(),
+        currency=str(payload["currency"]).upper(),
+        primary_exchange=(
+            str(payload["primary_exchange"]).upper()
+            if payload.get("primary_exchange") is not None
+            else None
+        ),
+        local_symbol=(
+            str(payload["local_symbol"])
+            if payload.get("local_symbol") is not None
+            else None
+        ),
+        include_expired=bool(payload.get("include_expired", False)),
+        isin=str(payload["isin"]) if payload.get("isin") is not None else None,
+    )
+    query.validate()
+    return query
+
+
+def parse_account_summary_payload(payload: Mapping[str, Any]) -> tuple[tuple[str, ...], str, str | None]:
+    raw_tags = payload.get("tags")
+    if raw_tags is None:
+        tags = DEFAULT_ACCOUNT_SUMMARY_TAGS
+    else:
+        if not isinstance(raw_tags, list) or not raw_tags:
+            raise ValueError("tags must be a non-empty array of strings")
+        tags = tuple(str(tag) for tag in raw_tags)
+        if not all(tag for tag in tags):
+            raise ValueError("tags must contain only non-empty strings")
+
+    group = str(payload.get("group", "All"))
+    account_id = (
+        str(payload["account_id"])
+        if payload.get("account_id") is not None
+        else None
+    )
+    return tags, group, account_id
 
 
 def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> ExecutionInstruction:
@@ -371,13 +423,58 @@ def create_app(config: AppConfig | None = None) -> Any:
     @app.post("/v1/ibkr/probe")
     def run_ibkr_probe(timeout: int = 5) -> dict[str, Any]:
         try:
-            result = probe_gateway(app_config.ibkr, timeout=timeout)
+            result = probe_gateway(app_config.ibkr.diagnostic_session(), timeout=timeout)
         except IbkrDependencyError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ConnectionError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         return json.loads(result.to_json())
+
+    @app.post("/v1/contracts/resolve")
+    def resolve_ibkr_contract(payload: dict[str, Any], timeout: int = 10) -> dict[str, Any]:
+        try:
+            query = parse_contract_resolve_payload(payload)
+            result = resolve_contracts(
+                app_config.ibkr.diagnostic_session(),
+                query,
+                timeout=timeout,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return serialize_contract_resolve_result(result)
+
+    @app.post("/v1/accounts/summary")
+    def get_account_summary(payload: dict[str, Any] | None = None, timeout: int = 10) -> dict[str, Any]:
+        request_payload = payload or {}
+        try:
+            tags, group, account_id = parse_account_summary_payload(request_payload)
+            return read_account_summary(
+                app_config.ibkr.diagnostic_session(),
+                tags=tags,
+                group=group,
+                account_id=account_id,
+                timeout=timeout,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
 
     @app.post("/v1/instructions/validate")
     def validate_instruction(payload: dict[str, Any]) -> dict[str, Any]:

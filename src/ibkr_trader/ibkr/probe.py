@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    config = AppConfig.from_env().ibkr
+    config = AppConfig.from_env().ibkr.diagnostic_session()
     result = probe_gateway(config, timeout=args.timeout)
     print(result.to_json())
     return 0

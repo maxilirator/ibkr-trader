@@ -26,15 +26,16 @@ Relevant official sources:
 
 ## First runnable broker step
 
-We now include a small IB Gateway probe that is meant to validate the official TWS API connection path before we build order placement on top.
+We now include a small broker probe that is meant to validate the official TWS API connection path before we build order placement on top.
 
 Expected paper-trading defaults:
 
 - `IBKR_HOST=127.0.0.1`
-- `IBKR_PORT=4002`
+- `IBKR_PORT=7497`
 - `IBKR_CLIENT_ID=0`
+- `IBKR_DIAGNOSTIC_CLIENT_ID=7`
 
-The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality.
+The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo we reserve `0` for the future long-lived trading runtime and use a separate diagnostic client ID for probe and read-only resolution calls.
 
 See [docs/ib-gateway-setup.md](docs/ib-gateway-setup.md) for setup notes.
 
@@ -51,7 +52,7 @@ Current important settings include:
 - app mode and timezone
 - database URL
 - local API bind host and port
-- IB Gateway host, port, client ID, and account ID
+- IBKR host, port, primary client ID, diagnostic client ID, and account ID
 
 ## Local API wrapper
 
@@ -67,6 +68,8 @@ The initial FastAPI wrapper includes:
 
 - `GET /healthz`
 - `POST /v1/ibkr/probe`
+- `POST /v1/contracts/resolve`
+- `POST /v1/accounts/summary`
 - `POST /v1/instructions/validate`
 
 See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
@@ -112,7 +115,7 @@ should not be treated as a single broker order. Some pieces can be expressed wit
 
 ## Running the gateway probe
 
-After installing the official TWS API Python client and starting IB Gateway paper trading:
+After installing the official TWS API Python client and starting TWS or IB Gateway paper trading:
 
 ```bash
 source .venv/bin/activate

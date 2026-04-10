@@ -14,8 +14,24 @@ class ConfigTests(TestCase):
             config = IbkrConnectionConfig.from_env()
 
         self.assertEqual(config.host, "127.0.0.1")
-        self.assertEqual(config.port, 4002)
+        self.assertEqual(config.port, 7497)
         self.assertEqual(config.client_id, 0)
+        self.assertEqual(config.diagnostic_client_id, 7)
+
+    def test_ibkr_connection_can_create_diagnostic_session(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=7497,
+            client_id=0,
+            diagnostic_client_id=7,
+            account_id="DU1234567",
+        )
+
+        diagnostic = config.diagnostic_session()
+
+        self.assertEqual(diagnostic.client_id, 7)
+        self.assertEqual(diagnostic.host, "127.0.0.1")
+        self.assertEqual(diagnostic.port, 7497)
 
     def test_api_defaults_match_local_only_expectation(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

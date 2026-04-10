@@ -36,7 +36,7 @@ Returns basic process status and local-only configuration.
 
 ### `POST /v1/ibkr/probe`
 
-Runs the current IB Gateway probe and returns:
+Runs the current broker probe and returns:
 
 - host
 - port
@@ -45,6 +45,51 @@ Runs the current IB Gateway probe and returns:
 - next valid order ID
 
 This is the fastest end-to-end check that the official IBKR API path is healthy.
+
+### `POST /v1/contracts/resolve`
+
+Runs a read-only IBKR contract lookup using `reqContractDetails`.
+
+Use it to verify:
+
+- whether a symbol resolves uniquely
+- the IBKR `conId`
+- primary exchange and currency
+- valid exchanges and trading class
+- basic market metadata before any order-preview logic exists
+
+Example request body:
+
+```json
+{
+  "symbol": "SIVE",
+  "security_type": "STK",
+  "exchange": "XSTO",
+  "currency": "SEK",
+  "primary_exchange": "XSTO",
+  "isin": "SE0003917798"
+}
+```
+
+### `POST /v1/accounts/summary`
+
+Runs a read-only IBKR account summary query through the diagnostic client ID.
+
+Use it to fetch the fields we need for sizing and risk checks, especially:
+
+- `NetLiquidation`
+- `BuyingPower`
+- `AvailableFunds`
+- `ExcessLiquidity`
+
+Example request body:
+
+```json
+{
+  "account_id": "DU1234567",
+  "tags": ["NetLiquidation", "BuyingPower", "AvailableFunds", "ExcessLiquidity"]
+}
+```
 
 ### `POST /v1/instructions/validate`
 

@@ -35,6 +35,7 @@ class ProbeTests(TestCase):
             host="127.0.0.1",
             port=4002,
             client_id=0,
+            diagnostic_client_id=7,
             account_id="DU1234567",
         )
 
@@ -67,4 +68,3 @@ class ProbeTests(TestCase):
         self.assertIn('"client_id": 0', payload)
         self.assertIn('"next_valid_order_id": 100', payload)
         self.assertIn("2026-04-10T12:30:00+00:00", payload)
-
