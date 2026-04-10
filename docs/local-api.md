@@ -228,6 +228,22 @@ Important current behavior:
 - this endpoint does **not** place a broker order yet
 - it is a durable control-plane submit, not a live execution submit
 
+### `GET /v1/instructions/{instruction_id}`
+
+Returns the persisted control-plane status for one instruction.
+
+It currently includes:
+
+- current execution state
+- submit/expire timestamps
+- entry broker IDs and broker status
+- entry/exit fill fields already reconciled into Postgres
+- the instruction event trail by default
+
+Optional query parameter:
+
+- `include_events=true|false`
+
 ### `POST /v1/instructions/{instruction_id}/submit-entry`
 
 Submits a persisted `ENTRY_PENDING` instruction to the broker through the primary IBKR client session.

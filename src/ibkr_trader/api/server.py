@@ -41,6 +41,9 @@ from ibkr_trader.orchestration.entry_submission import cancel_persisted_instruct
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_cancellation
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_submission
 from ibkr_trader.orchestration.entry_submission import submit_persisted_instruction_entry
+from ibkr_trader.orchestration.instruction_status import InstructionStatusNotFoundError
+from ibkr_trader.orchestration.instruction_status import read_instruction_status
+from ibkr_trader.orchestration.instruction_status import serialize_instruction_status
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_result
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
@@ -470,6 +473,25 @@ def create_app(config: AppConfig | None = None) -> Any:
             "accepted": True,
             "instruction_count": len(batch.instructions),
             "batch": serialize_execution_batch(batch),
+        }
+
+    @app.get("/v1/instructions/{instruction_id}")
+    def get_instruction_status(
+        instruction_id: str,
+        include_events: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            result = read_instruction_status(
+                session_factory,
+                instruction_id,
+                include_events=include_events,
+            )
+        except InstructionStatusNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "instruction": serialize_instruction_status(result),
         }
 
     @app.post("/v1/instructions/submit")

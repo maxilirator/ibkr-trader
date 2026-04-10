@@ -94,6 +94,7 @@ The initial FastAPI wrapper includes:
 - `POST /v1/orders/submit`
 - `POST /v1/orders/{order_id}/cancel`
 - `POST /v1/instructions/submit`
+- `GET /v1/instructions/{instruction_id}`
 - `POST /v1/instructions/{instruction_id}/submit-entry`
 - `POST /v1/instructions/{instruction_id}/cancel-entry`
 - `POST /v1/instructions/schedule-preview`
