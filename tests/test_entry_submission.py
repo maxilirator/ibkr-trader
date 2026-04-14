@@ -151,6 +151,15 @@ class PersistedEntrySubmissionTests(TestCase):
                     "whyHeld": "",
                     "mktCapPrice": 0.0,
                 },
+                "tws_submission": {
+                    "source": "openOrder",
+                    "order_id": 11,
+                    "order_ref": "persisted-aapl-1",
+                    "order_state": {
+                        "status": "Inactive",
+                        "warning_text": "Order held in TWS pending manual transmit.",
+                    },
+                },
             }
 
         result = submit_persisted_instruction_entry(
@@ -166,6 +175,10 @@ class PersistedEntrySubmissionTests(TestCase):
         self.assertEqual(result.broker_client_id, 0)
         self.assertEqual(result.broker_order_status, "PreSubmitted")
         self.assertEqual(result.submission_event.event_type, "entry_order_submitted")
+        self.assertEqual(
+            result.broker_submission["tws_submission"]["order_state"]["warning_text"],
+            "Order held in TWS pending manual transmit.",
+        )
 
         session = self.session_factory()
         try:
@@ -189,6 +202,10 @@ class PersistedEntrySubmissionTests(TestCase):
             self.assertEqual(events[0].event_type, "entry_order_submitted")
             self.assertEqual(events[0].state_before, ExecutionState.ENTRY_PENDING.value)
             self.assertEqual(events[0].state_after, ExecutionState.ENTRY_SUBMITTED.value)
+            self.assertEqual(
+                events[0].payload["broker_submission"]["tws_submission"]["order_state"]["warning_text"],
+                "Order held in TWS pending manual transmit.",
+            )
         finally:
             session.close()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -32,6 +33,21 @@ class BrokerOpenOrder:
     action: str | None
     total_quantity: Decimal | None
     symbol: str | None
+    account: str | None = None
+    security_type: str | None = None
+    exchange: str | None = None
+    primary_exchange: str | None = None
+    currency: str | None = None
+    local_symbol: str | None = None
+    order_type: str | None = None
+    limit_price: Decimal | None = None
+    aux_price: Decimal | None = None
+    outside_rth: bool | None = None
+    transmit: bool | None = None
+    warning_text: str | None = None
+    reject_reason: str | None = None
+    completed_status: str | None = None
+    completed_time: str | None = None
 
 
 @dataclass(slots=True)
@@ -53,6 +69,29 @@ class BrokerExecution:
 class BrokerRuntimeSnapshot:
     open_orders: dict[int, BrokerOpenOrder]
     executions: tuple[BrokerExecution, ...]
+
+
+def _serialize_for_json(payload: Any) -> Any:
+    if isinstance(payload, Decimal):
+        return str(payload)
+    if isinstance(payload, datetime):
+        return payload.isoformat()
+    if isinstance(payload, dict):
+        return {key: _serialize_for_json(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_serialize_for_json(value) for value in payload]
+    if isinstance(payload, tuple):
+        return [_serialize_for_json(value) for value in payload]
+    return payload
+
+
+def serialize_broker_runtime_snapshot(snapshot: BrokerRuntimeSnapshot) -> dict[str, Any]:
+    return _serialize_for_json(
+        {
+            "open_orders": [asdict(order) for order in snapshot.open_orders.values()],
+            "executions": [asdict(execution) for execution in snapshot.executions],
+        }
+    )
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -120,6 +159,73 @@ def _serialize_open_order(raw_payload: Any) -> BrokerOpenOrder | None:
         symbol=(
             str(getattr(contract, "symbol"))
             if getattr(contract, "symbol", None) not in (None, "")
+            else None
+        ),
+        account=(
+            str(getattr(order, "account"))
+            if getattr(order, "account", None) not in (None, "")
+            else None
+        ),
+        security_type=(
+            str(getattr(contract, "secType"))
+            if getattr(contract, "secType", None) not in (None, "")
+            else None
+        ),
+        exchange=(
+            str(getattr(contract, "exchange"))
+            if getattr(contract, "exchange", None) not in (None, "")
+            else None
+        ),
+        primary_exchange=(
+            str(getattr(contract, "primaryExchange"))
+            if getattr(contract, "primaryExchange", None) not in (None, "")
+            else None
+        ),
+        currency=(
+            str(getattr(contract, "currency"))
+            if getattr(contract, "currency", None) not in (None, "")
+            else None
+        ),
+        local_symbol=(
+            str(getattr(contract, "localSymbol"))
+            if getattr(contract, "localSymbol", None) not in (None, "")
+            else None
+        ),
+        order_type=(
+            str(getattr(order, "orderType"))
+            if getattr(order, "orderType", None) not in (None, "")
+            else None
+        ),
+        limit_price=_to_decimal(getattr(order, "lmtPrice", None)),
+        aux_price=_to_decimal(getattr(order, "auxPrice", None)),
+        outside_rth=(
+            bool(getattr(order, "outsideRth"))
+            if getattr(order, "outsideRth", None) is not None
+            else None
+        ),
+        transmit=(
+            bool(getattr(order, "transmit"))
+            if getattr(order, "transmit", None) is not None
+            else None
+        ),
+        warning_text=(
+            str(getattr(order_state, "warningText"))
+            if getattr(order_state, "warningText", None) not in (None, "")
+            else None
+        ),
+        reject_reason=(
+            str(getattr(order_state, "rejectReason"))
+            if getattr(order_state, "rejectReason", None) not in (None, "")
+            else None
+        ),
+        completed_status=(
+            str(getattr(order_state, "completedStatus"))
+            if getattr(order_state, "completedStatus", None) not in (None, "")
+            else None
+        ),
+        completed_time=(
+            str(getattr(order_state, "completedTime"))
+            if getattr(order_state, "completedTime", None) not in (None, "")
             else None
         ),
     )

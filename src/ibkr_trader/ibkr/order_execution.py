@@ -85,6 +85,151 @@ def _serialize_for_json(payload: Any) -> Any:
     return payload
 
 
+def _serialize_tws_submission(raw_payload: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_payload, dict):
+        return None
+
+    order_id = raw_payload.get("orderId")
+    order = raw_payload.get("order")
+    contract = raw_payload.get("contract")
+    order_state = raw_payload.get("orderState")
+
+    payload = {
+        "source": "openOrder",
+        "order_id": int(order_id) if order_id not in (None, "") else None,
+        "perm_id": (
+            int(getattr(order, "permId"))
+            if getattr(order, "permId", None) not in (None, "")
+            else None
+        ),
+        "client_id": (
+            int(getattr(order, "clientId"))
+            if getattr(order, "clientId", None) not in (None, "")
+            else None
+        ),
+        "account": (
+            str(getattr(order, "account"))
+            if getattr(order, "account", None) not in (None, "")
+            else None
+        ),
+        "order_ref": (
+            str(getattr(order, "orderRef"))
+            if getattr(order, "orderRef", None) not in (None, "")
+            else None
+        ),
+        "action": (
+            str(getattr(order, "action"))
+            if getattr(order, "action", None) not in (None, "")
+            else None
+        ),
+        "order_type": (
+            str(getattr(order, "orderType"))
+            if getattr(order, "orderType", None) not in (None, "")
+            else None
+        ),
+        "total_quantity": (
+            str(getattr(order, "totalQuantity"))
+            if getattr(order, "totalQuantity", None) not in (None, "")
+            else None
+        ),
+        "limit_price": (
+            str(getattr(order, "lmtPrice"))
+            if getattr(order, "lmtPrice", None) not in (None, "")
+            else None
+        ),
+        "aux_price": (
+            str(getattr(order, "auxPrice"))
+            if getattr(order, "auxPrice", None) not in (None, "")
+            else None
+        ),
+        "outside_rth": (
+            bool(getattr(order, "outsideRth"))
+            if getattr(order, "outsideRth", None) is not None
+            else None
+        ),
+        "transmit": (
+            bool(getattr(order, "transmit"))
+            if getattr(order, "transmit", None) is not None
+            else None
+        ),
+        "contract": {
+            "symbol": (
+                str(getattr(contract, "symbol"))
+                if getattr(contract, "symbol", None) not in (None, "")
+                else None
+            ),
+            "local_symbol": (
+                str(getattr(contract, "localSymbol"))
+                if getattr(contract, "localSymbol", None) not in (None, "")
+                else None
+            ),
+            "security_type": (
+                str(getattr(contract, "secType"))
+                if getattr(contract, "secType", None) not in (None, "")
+                else None
+            ),
+            "exchange": (
+                str(getattr(contract, "exchange"))
+                if getattr(contract, "exchange", None) not in (None, "")
+                else None
+            ),
+            "primary_exchange": (
+                str(getattr(contract, "primaryExchange"))
+                if getattr(contract, "primaryExchange", None) not in (None, "")
+                else None
+            ),
+            "currency": (
+                str(getattr(contract, "currency"))
+                if getattr(contract, "currency", None) not in (None, "")
+                else None
+            ),
+        },
+        "order_state": {
+            "status": (
+                str(getattr(order_state, "status"))
+                if getattr(order_state, "status", None) not in (None, "")
+                else None
+            ),
+            "warning_text": (
+                str(getattr(order_state, "warningText"))
+                if getattr(order_state, "warningText", None) not in (None, "")
+                else None
+            ),
+            "reject_reason": (
+                str(getattr(order_state, "rejectReason"))
+                if getattr(order_state, "rejectReason", None) not in (None, "")
+                else None
+            ),
+            "completed_status": (
+                str(getattr(order_state, "completedStatus"))
+                if getattr(order_state, "completedStatus", None) not in (None, "")
+                else None
+            ),
+            "completed_time": (
+                str(getattr(order_state, "completedTime"))
+                if getattr(order_state, "completedTime", None) not in (None, "")
+                else None
+            ),
+        },
+    }
+    return _serialize_for_json(payload)
+
+
+def _extract_tws_submission(
+    app: OrderExecutionSyncWrapperProtocol,
+    broker_status: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw_open_orders = getattr(app, "open_orders", None)
+    if not isinstance(raw_open_orders, dict):
+        return None
+
+    order_id = broker_status.get("orderId")
+    if order_id in (None, ""):
+        return None
+
+    return _serialize_tws_submission(raw_open_orders.get(int(order_id)))
+
+
 def _require_single_instruction(batch: ExecutionInstructionBatch) -> ExecutionInstruction:
     if len(batch.instructions) != 1:
         raise ValueError("Paper order submit currently supports exactly one instruction.")
@@ -335,6 +480,7 @@ def submit_order_from_instruction(
                     f"IBKR rejected the order submission: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while placing the IBKR order.") from exc
+        tws_submission = _extract_tws_submission(app, order_status)
     finally:
         app.disconnect_and_stop()
 
@@ -359,6 +505,7 @@ def submit_order_from_instruction(
                 "transmit": order.transmit,
             },
             "broker_order_status": order_status,
+            "tws_submission": tws_submission,
         }
     )
 

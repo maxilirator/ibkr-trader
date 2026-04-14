@@ -101,6 +101,22 @@ Example request body:
 }
 ```
 
+### `GET /v1/broker/runtime-snapshot`
+
+Returns the current broker-visible runtime snapshot from the primary IBKR session.
+
+Use it to see:
+
+- live broker open orders
+- executions already reported by IBKR
+- the current gap between broker-live state and local control-plane state
+
+Important visibility limit:
+
+- this endpoint shows what IBKR currently exposes as broker-live
+- it does **not** show TWS-local orders that remain untransmitted
+- untransmitted rows that still show a `Transmit` button in TWS must be captured from the submit-time `openOrder` handoff, not rediscovered later through the open-order API
+
 ### `POST /v1/market-data/historical-bars`
 
 Runs a read-only IBKR historical-bars request through the diagnostic client ID.
@@ -198,6 +214,7 @@ It currently:
 - computes quantity using the same sizing logic as preview
 - places the paper order through the primary IBKR client session
 - returns the broker order status payload
+- returns the immediate TWS `openOrder` handoff when available, including `orderState.status`, `warning_text`, and related TWS-local diagnostics
 
 Important current behavior:
 

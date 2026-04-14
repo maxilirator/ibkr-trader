@@ -32,6 +32,10 @@ from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
 from ibkr_trader.ibkr.order_preview import preview_execution_batch
 from ibkr_trader.ibkr.probe import IbkrDependencyError, probe_gateway
+from ibkr_trader.ibkr.runtime_snapshot import (
+    fetch_broker_runtime_snapshot,
+    serialize_broker_runtime_snapshot,
+)
 from ibkr_trader.ibkr.tick_stream import TickStreamQuery
 from ibkr_trader.ibkr.tick_stream import _normalize_tick_type
 from ibkr_trader.ibkr.tick_stream import collect_tick_stream_sample
@@ -346,6 +350,36 @@ def create_app(config: AppConfig | None = None) -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+    @app.get("/v1/broker/runtime-snapshot")
+    def get_broker_runtime_snapshot(timeout: int = 10) -> dict[str, Any]:
+        try:
+            snapshot = fetch_broker_runtime_snapshot(
+                app_config.ibkr.primary_session(),
+                timeout=timeout,
+            )
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "session_client_id": app_config.ibkr.client_id,
+            "visibility_limits": {
+                "live_broker_open_orders_only": True,
+                "untransmitted_tws_orders_visible_via_api": False,
+                "note": (
+                    "IBKR does not expose untransmitted TWS-local orders through the "
+                    "normal open-order API path while they remain untransmitted."
+                ),
+            },
+            "broker_runtime": serialize_broker_runtime_snapshot(snapshot),
+        }
 
     @app.post("/v1/market-data/historical-bars")
     def get_historical_bars(payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:

@@ -43,6 +43,7 @@ class _FakeOrderExecutionSyncWrapper:
         self.disconnected = False
         self.placed_orders: list[tuple[object, object, int | None]] = []
         self.cancelled_orders: list[tuple[int, int]] = []
+        self.open_orders: dict[int, object] = {}
 
     def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
         self.connected = True
@@ -112,6 +113,19 @@ class _FakeOrderExecutionSyncWrapper:
 
     def place_order_sync(self, contract: object, order: object, timeout: int | None = None) -> dict[str, object]:
         self.placed_orders.append((contract, order, timeout))
+        order.orderId = 17
+        self.open_orders[17] = {
+            "orderId": 17,
+            "contract": contract,
+            "order": order,
+            "orderState": SimpleNamespace(
+                status="Inactive",
+                warningText="Order held in TWS pending manual transmit.",
+                rejectReason="",
+                completedStatus="",
+                completedTime="",
+            ),
+        }
         return {
             "orderId": 17,
             "status": "Submitted",
@@ -226,6 +240,12 @@ class OrderExecutionTests(TestCase):
         self.assertEqual(result["order"]["limit_price"], "120.00")
         self.assertEqual(result["order"]["total_quantity"], "10")
         self.assertEqual(result["broker_order_status"]["status"], "Submitted")
+        self.assertEqual(result["tws_submission"]["source"], "openOrder")
+        self.assertEqual(result["tws_submission"]["order_state"]["status"], "Inactive")
+        self.assertEqual(
+            result["tws_submission"]["order_state"]["warning_text"],
+            "Order held in TWS pending manual transmit.",
+        )
 
     def test_submit_order_from_batch_rejects_fractional_stock_quantity(self) -> None:
         payload = _base_payload()
