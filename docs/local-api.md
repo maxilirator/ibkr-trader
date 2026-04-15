@@ -183,6 +183,7 @@ It currently:
 - reads account summary
 - resolves the broker contract
 - constructs the broker order fields we would send at execution time
+- normalizes dynamic stock sizing down to whole shares before execution
 - reports unresolved cases explicitly instead of guessing
 
 Current safe behavior:
@@ -190,6 +191,8 @@ Current safe behavior:
 - ready for `target_quantity`
 - ready for `target_notional` when `limit_price` is present
 - ready for `fraction_of_account_nav`, including cross-currency sizing via IBKR historical FX midpoint data when the pair is available
+- explicit `target_quantity` must already be whole shares for stock orders
+- dynamic stock sizing from notional or NAV is rounded down to whole shares for execution
 - unresolved when IBKR cannot provide a usable FX conversion for the requested currency pair
 
 This is intentional. We should not guess FX sizing in a production trading system, so the preview only uses broker-derived FX data.
@@ -298,6 +301,7 @@ It currently:
 - fetches IBKR open orders and executions
 - reconciles entry fills into persisted state
 - submits a take-profit exit after a full entry fill when `exit.take_profit_pct` is present
+- submits stop-loss and catastrophic stop-loss exits after a full entry fill when configured
 - submits a forced market exit when `force_exit_next_session_open` is due from the Stockholm session calendar
 - marks instructions `COMPLETED` after exit fills are reconciled
 

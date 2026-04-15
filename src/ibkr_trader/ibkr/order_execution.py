@@ -10,6 +10,7 @@ from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
 from ibkr_trader.domain.execution_contract import OrderType
+from ibkr_trader.domain.execution_contract import SizingMode
 from ibkr_trader.ibkr.account_summary import DEFAULT_ACCOUNT_SUMMARY_TAGS
 from ibkr_trader.ibkr.account_summary import normalize_account_summary_payload
 from ibkr_trader.ibkr.contracts import _extract_broker_error_message
@@ -147,6 +148,16 @@ def _serialize_tws_submission(raw_payload: Any) -> dict[str, Any] | None:
             if getattr(order, "outsideRth", None) is not None
             else None
         ),
+        "oca_group": (
+            str(getattr(order, "ocaGroup"))
+            if getattr(order, "ocaGroup", None) not in (None, "")
+            else None
+        ),
+        "oca_type": (
+            int(getattr(order, "ocaType"))
+            if getattr(order, "ocaType", None) not in (None, "")
+            else None
+        ),
         "transmit": (
             bool(getattr(order, "transmit"))
             if getattr(order, "transmit", None) is not None
@@ -236,7 +247,12 @@ def _require_single_instruction(batch: ExecutionInstructionBatch) -> ExecutionIn
     return batch.instructions[0]
 
 
-def _normalize_quantity_for_stock(quantity: Decimal | None) -> Decimal:
+def _normalize_quantity_for_stock(
+    quantity: Decimal | None,
+    *,
+    allow_round_down: bool,
+) -> tuple[Decimal, list[str]]:
+    warnings: list[str] = []
     if quantity is None:
         raise ValueError("Order quantity could not be resolved.")
     if quantity <= 0:
@@ -246,29 +262,36 @@ def _normalize_quantity_for_stock(quantity: Decimal | None) -> Decimal:
     if normalized <= 0:
         raise ValueError("Order quantity rounds down to zero.")
     if normalized != quantity:
-        raise ValueError(
-            "Paper order submit currently requires an integral share quantity. "
-            f"Resolved quantity was {quantity}."
+        if not allow_round_down:
+            raise ValueError(
+                "Paper order submit currently requires an integral share quantity. "
+                f"Resolved quantity was {quantity}."
+            )
+        warnings.append(
+            "Resolved stock quantity was rounded down to a whole share for execution."
         )
-    return normalized
+    return normalized, warnings
 
 
 def _build_ibkr_order(
     *,
     action: str,
     order_ref: str,
-    order_type: OrderType,
+    ibkr_order_type: str,
     broker_account_id: str,
     quantity: Decimal,
     time_in_force: str,
     limit_price: Decimal | None,
+    stop_price: Decimal | None = None,
+    oca_group: str | None = None,
+    oca_type: int | None = None,
     order_cls: type[Any] | None = None,
 ) -> Any:
     runtime_order_cls = order_cls or _load_order_class()
     order = runtime_order_cls()
     order.account = broker_account_id
     order.action = action
-    order.orderType = "LMT" if order_type is OrderType.LIMIT else "MKT"
+    order.orderType = ibkr_order_type
     order.totalQuantity = int(quantity)
     order.tif = time_in_force
     order.outsideRth = False
@@ -277,6 +300,12 @@ def _build_ibkr_order(
 
     if limit_price is not None:
         order.lmtPrice = float(limit_price)
+    if stop_price is not None:
+        order.auxPrice = float(stop_price)
+    if oca_group is not None:
+        order.ocaGroup = oca_group
+    if oca_type is not None:
+        order.ocaType = int(oca_type)
 
     return order
 
@@ -287,6 +316,36 @@ def _opposite_action(action: str) -> str:
     if action == "SELL":
         return "BUY"
     raise ValueError(f"Unsupported action: {action}")
+
+
+def _resolve_ibkr_order_type(
+    order_type: OrderType | str,
+    *,
+    limit_price: Decimal | None,
+    stop_price: Decimal | None,
+) -> str:
+    if order_type is OrderType.LIMIT or order_type == "STOP_LIMIT":
+        if limit_price is None:
+            raise ValueError("limit_price is required for LIMIT orders.")
+        if stop_price is not None:
+            raise ValueError("stop_price must be omitted for LIMIT orders.")
+        return "LMT"
+
+    if order_type is OrderType.MARKET:
+        if limit_price is not None:
+            raise ValueError("limit_price must be omitted for MARKET orders.")
+        if stop_price is not None:
+            raise ValueError("stop_price must be omitted for MARKET orders.")
+        return "MKT"
+
+    if order_type == "STOP":
+        if stop_price is None:
+            raise ValueError("stop_price is required for STOP orders.")
+        if limit_price is not None:
+            raise ValueError("limit_price must be omitted for STOP orders.")
+        return "STP"
+
+    raise ValueError(f"Unsupported order type: {order_type}")
 
 
 def _resolve_instruction_contract_and_account(
@@ -453,13 +512,18 @@ def submit_order_from_instruction(
         if sizing_preview["issues"]:
             raise ValueError("; ".join(sizing_preview["issues"]))
 
-        normalized_quantity = _normalize_quantity_for_stock(
-            sizing_preview["estimated_quantity"]
+        normalized_quantity, quantity_warnings = _normalize_quantity_for_stock(
+            sizing_preview["estimated_quantity"],
+            allow_round_down=instruction.sizing.mode is not SizingMode.TARGET_QUANTITY,
         )
         order = _build_ibkr_order(
             action=instruction.intent.side,
             order_ref=instruction.instruction_id,
-            order_type=instruction.entry.order_type,
+            ibkr_order_type=_resolve_ibkr_order_type(
+                instruction.entry.order_type,
+                limit_price=instruction.entry.limit_price,
+                stop_price=None,
+            ),
             broker_account_id=broker_account_id,
             quantity=normalized_quantity,
             time_in_force=instruction.entry.time_in_force.value,
@@ -488,7 +552,7 @@ def submit_order_from_instruction(
         {
             "instruction_id": instruction.instruction_id,
             "account": broker_account_id,
-            "warnings": list(account_warnings),
+            "warnings": [*list(account_warnings), *quantity_warnings],
             "resolved_contract": resolved_contract,
             "order": {
                 "order_ref": instruction.instruction_id,
@@ -515,20 +579,27 @@ def submit_exit_order_from_instruction(
     instruction: ExecutionInstruction,
     *,
     quantity: Decimal,
-    order_type: OrderType,
+    order_type: OrderType | str,
     order_ref: str,
     timeout: int = 10,
     limit_price: Decimal | None = None,
+    stop_price: Decimal | None = None,
+    oca_group: str | None = None,
+    oca_type: int | None = None,
     sync_wrapper_cls: type[OrderExecutionSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
     order_cls: type[Any] | None = None,
 ) -> dict[str, Any]:
-    normalized_quantity = _normalize_quantity_for_stock(quantity)
-    if order_type is OrderType.LIMIT and limit_price is None:
-        raise ValueError("limit_price is required for LIMIT exit orders.")
-    if order_type is OrderType.MARKET and limit_price is not None:
-        raise ValueError("limit_price must be omitted for MARKET exit orders.")
+    normalized_quantity, quantity_warnings = _normalize_quantity_for_stock(
+        quantity,
+        allow_round_down=False,
+    )
+    ibkr_order_type = _resolve_ibkr_order_type(
+        order_type,
+        limit_price=limit_price,
+        stop_price=stop_price,
+    )
 
     wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
@@ -573,11 +644,14 @@ def submit_exit_order_from_instruction(
         order = _build_ibkr_order(
             action=_opposite_action(instruction.intent.side),
             order_ref=order_ref,
-            order_type=order_type,
+            ibkr_order_type=ibkr_order_type,
             broker_account_id=broker_account_id,
             quantity=normalized_quantity,
             time_in_force=instruction.entry.time_in_force.value,
             limit_price=limit_price,
+            stop_price=stop_price,
+            oca_group=oca_group,
+            oca_type=oca_type,
             order_cls=runtime_order_cls,
         )
 
@@ -594,6 +668,7 @@ def submit_exit_order_from_instruction(
                     f"IBKR rejected the order submission: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while placing the IBKR order.") from exc
+        tws_submission = _extract_tws_submission(app, order_status)
     finally:
         app.disconnect_and_stop()
 
@@ -601,7 +676,7 @@ def submit_exit_order_from_instruction(
         {
             "instruction_id": instruction.instruction_id,
             "account": broker_account_id,
-            "warnings": list(account_warnings),
+            "warnings": [*list(account_warnings), *quantity_warnings],
             "resolved_contract": resolved_contract,
             "order": {
                 "order_ref": order_ref,
@@ -609,11 +684,15 @@ def submit_exit_order_from_instruction(
                 "order_type": order.orderType,
                 "time_in_force": order.tif,
                 "limit_price": str(limit_price) if limit_price is not None else None,
+                "stop_price": str(stop_price) if stop_price is not None else None,
                 "total_quantity": str(normalized_quantity),
                 "outside_rth": order.outsideRth,
+                "oca_group": oca_group,
+                "oca_type": oca_type,
                 "transmit": order.transmit,
             },
             "broker_order_status": order_status,
+            "tws_submission": tws_submission,
         }
     )
 

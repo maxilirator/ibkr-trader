@@ -43,6 +43,8 @@ class BrokerOpenOrder:
     limit_price: Decimal | None = None
     aux_price: Decimal | None = None
     outside_rth: bool | None = None
+    oca_group: str | None = None
+    oca_type: int | None = None
     transmit: bool | None = None
     warning_text: str | None = None
     reject_reason: str | None = None
@@ -203,6 +205,12 @@ def _serialize_open_order(raw_payload: Any) -> BrokerOpenOrder | None:
             if getattr(order, "outsideRth", None) is not None
             else None
         ),
+        oca_group=(
+            str(getattr(order, "ocaGroup"))
+            if getattr(order, "ocaGroup", None) not in (None, "")
+            else None
+        ),
+        oca_type=_to_optional_int(getattr(order, "ocaType", None)),
         transmit=(
             bool(getattr(order, "transmit"))
             if getattr(order, "transmit", None) is not None

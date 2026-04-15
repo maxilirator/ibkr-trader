@@ -24,8 +24,9 @@ This document is the operational snapshot of where the repo is right now.
 - [x] Durable instruction submit endpoint
 - [x] Instruction persistence in Postgres
 - [x] Persisted entry submit/cancel flow
-- [x] MVP runtime cycle for due-entry submit, fill reconciliation, take-profit submit, and next-session forced exit
+- [x] MVP runtime cycle for due-entry submit, fill reconciliation, protective exit submit, and next-session forced exit
 - [x] FX-aware sizing for `fraction_of_account_nav`
+- [x] Whole-share normalization for dynamic stock sizing
 - [x] Stockholm-first schedule preview
 - [x] Next-session-open resolution from q-data Stockholm session calendar
 - [x] Initial SQLAlchemy ORM control-plane schema
@@ -38,6 +39,7 @@ This document is the operational snapshot of where the repo is right now.
 - Historical bars work for entitled symbols.
 - Tick-stream sampling is wired, and currently surfaces broker entitlement errors directly.
 - Order preview keeps prices and notionals in instrument currency.
+- Dynamic stock sizing from notional or NAV is rounded down to whole shares before execution.
 - Manual paper submit/cancel works on NY paper symbols through the local API.
 - Submit persists instructions and an initial `instruction_submitted` event in Postgres.
 - Persisted instructions can move through `ENTRY_PENDING -> ENTRY_SUBMITTED -> ENTRY_CANCELLED` with broker IDs stored on the instruction record.
@@ -45,6 +47,7 @@ This document is the operational snapshot of where the repo is right now.
   - auto-submit due `ENTRY_PENDING` instructions
   - reconcile entry fills from IBKR executions
   - submit a take-profit exit after a full entry fill
+  - submit stop-loss and catastrophic stop-loss exits after a full entry fill when configured
   - submit a forced market exit at the resolved next Stockholm session open
   - mark an instruction `COMPLETED` after exit fill reconciliation
   - run against a selected `instruction_ids` set for safer operator-driven paper testing

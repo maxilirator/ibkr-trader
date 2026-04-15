@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN
 from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
@@ -178,6 +179,40 @@ def _estimate_quantity_from_notional(
     return target_notional / limit_price, []
 
 
+def _normalize_stock_quantity_for_execution(
+    quantity: Decimal | None,
+    *,
+    allow_round_down: bool,
+) -> tuple[Decimal | None, list[str], list[str]]:
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    if quantity is None:
+        issues.append("Order quantity could not be resolved.")
+        return None, issues, warnings
+    if quantity <= 0:
+        issues.append("Order quantity must be positive.")
+        return None, issues, warnings
+
+    normalized = quantity.quantize(Decimal("1"), rounding=ROUND_DOWN)
+    if normalized <= 0:
+        issues.append("Order quantity rounds down to zero.")
+        return None, issues, warnings
+
+    if normalized != quantity:
+        if allow_round_down:
+            warnings.append(
+                "Resolved stock quantity was rounded down to a whole share for execution."
+            )
+        else:
+            issues.append(
+                "Explicit stock target_quantity must already be a whole-share amount."
+            )
+            return None, issues, warnings
+
+    return normalized, issues, warnings
+
+
 def _build_fx_contract(
     *,
     base_currency: str,
@@ -312,6 +347,7 @@ def _resolve_sizing_preview(
     fx_rate_cache: dict[tuple[str, str], tuple[FxConversionDetail | None, tuple[str, ...]]],
 ) -> dict[str, Any]:
     issues: list[str] = []
+    warnings: list[str] = []
     account_net_liquidation = None
     account_currency = None
 
@@ -326,6 +362,7 @@ def _resolve_sizing_preview(
 
     target_notional = None
     estimated_quantity = None
+    normalized_quantity = None
     fx_conversion = None
     sizing_mode = instruction.sizing.mode
 
@@ -374,12 +411,21 @@ def _resolve_sizing_preview(
                         )
                         issues.extend(sizing_issues)
 
+    normalized_quantity, quantity_issues, quantity_warnings = _normalize_stock_quantity_for_execution(
+        estimated_quantity,
+        allow_round_down=sizing_mode is not SizingMode.TARGET_QUANTITY,
+    )
+    issues.extend(quantity_issues)
+    warnings.extend(quantity_warnings)
+
     return {
         "issues": issues,
+        "warnings": warnings,
         "account_net_liquidation": account_net_liquidation,
         "account_currency": account_currency,
         "target_notional": target_notional,
         "estimated_quantity": estimated_quantity,
+        "normalized_quantity": normalized_quantity,
         "fx_conversion": fx_conversion,
     }
 
@@ -393,7 +439,7 @@ def _build_instruction_preview(
     sizing_preview: dict[str, Any],
 ) -> dict[str, Any]:
     issues = list(sizing_preview["issues"])
-    warnings: list[str] = []
+    warnings = list(sizing_preview["warnings"])
 
     if broker_account_id is None:
         issues.append("No broker account could be selected for preview.")
@@ -412,6 +458,7 @@ def _build_instruction_preview(
 
     target_notional = sizing_preview["target_notional"]
     estimated_quantity = sizing_preview["estimated_quantity"]
+    normalized_quantity = sizing_preview["normalized_quantity"]
     account_net_liquidation = sizing_preview["account_net_liquidation"]
     account_currency = sizing_preview["account_currency"]
     sizing_mode = instruction.sizing.mode
@@ -426,7 +473,9 @@ def _build_instruction_preview(
             if instruction.entry.limit_price is not None
             else None
         ),
-        "total_quantity": str(estimated_quantity) if estimated_quantity is not None else None,
+        "total_quantity": (
+            str(normalized_quantity) if normalized_quantity is not None else None
+        ),
     }
 
     return {
@@ -484,6 +533,9 @@ def _build_instruction_preview(
             "instrument_currency": instruction.instrument.currency,
             "fx_conversion": _serialize_fx_conversion(sizing_preview["fx_conversion"]),
             "estimated_quantity": str(estimated_quantity) if estimated_quantity is not None else None,
+            "normalized_quantity": (
+                str(normalized_quantity) if normalized_quantity is not None else None
+            ),
         },
         "order": order_preview,
     }

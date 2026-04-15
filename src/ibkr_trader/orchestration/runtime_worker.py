@@ -325,6 +325,39 @@ def _compute_take_profit_price(
     return _quantize_like(raw_price, reference_price)
 
 
+def _compute_stop_price(
+    instruction: ExecutionInstruction,
+    entry_average_price: Decimal,
+    *,
+    stop_loss_pct: Decimal,
+) -> Decimal:
+    if instruction.intent.side == "BUY":
+        raw_price = entry_average_price * (Decimal("1") - stop_loss_pct)
+    elif instruction.intent.side == "SELL":
+        raw_price = entry_average_price * (Decimal("1") + stop_loss_pct)
+    else:
+        raise ValueError(f"Unsupported instruction side: {instruction.intent.side}")
+
+    if raw_price <= 0:
+        raise ValueError("Computed stop price is not positive.")
+
+    reference_price = instruction.entry.limit_price or entry_average_price
+    return _quantize_like(raw_price, reference_price)
+
+
+def _open_order_ids_with_ref_prefix(
+    snapshot: BrokerRuntimeSnapshot,
+    *,
+    order_ref_prefix: str,
+) -> tuple[int, ...]:
+    return tuple(
+        order_id
+        for order_id, open_order in snapshot.open_orders.items()
+        if open_order.order_ref is not None
+        and open_order.order_ref.startswith(order_ref_prefix)
+    )
+
+
 def _remaining_position_quantity(
     record: InstructionRecord,
     exit_fill: ExecutionAggregate,
@@ -344,8 +377,8 @@ def _record_entry_fill_and_optional_exit(
     entry_fill: ExecutionAggregate,
     timeout: int,
     exit_submitter: Callable[..., dict[str, Any]] | None,
-) -> tuple[RuntimeCycleAction, RuntimeCycleAction | None]:
-    submitted_exit: RuntimeCycleAction | None = None
+) -> tuple[RuntimeCycleAction, tuple[RuntimeCycleAction, ...]]:
+    submitted_exits: list[RuntimeCycleAction] = []
     with session_scope(session_factory) as session:
         record = session.execute(
             select(InstructionRecord)
@@ -360,7 +393,7 @@ def _record_entry_fill_and_optional_exit(
                     state=record.state,
                     detail={},
                 ),
-                None,
+                (),
             )
 
         instruction = _instruction_payload(record)
@@ -408,58 +441,138 @@ def _record_entry_fill_and_optional_exit(
             },
         )
 
-        if instruction.exit.take_profit_pct is None:
-            return entry_action, None
-
-        if entry_fill.average_price is None:
-            raise ValueError(
-                f"Instruction '{instruction_id}' has fills but no average fill price."
+        protective_exits: list[dict[str, Any]] = []
+        if instruction.exit.take_profit_pct is not None:
+            if entry_fill.average_price is None:
+                raise ValueError(
+                    f"Instruction '{instruction_id}' has fills but no average fill price."
+                )
+            protective_exits.append(
+                {
+                    "event_type": "take_profit_exit_submitted",
+                    "action": "take_profit_exit_submitted",
+                    "order_ref": f"{instruction_id}:exit:take_profit",
+                    "order_type": OrderType.LIMIT,
+                    "limit_price": _compute_take_profit_price(
+                        instruction,
+                        entry_fill.average_price,
+                    ),
+                    "stop_price": None,
+                    "note": "Submitted take-profit exit order after entry fill.",
+                }
             )
 
-        exit_limit_price = _compute_take_profit_price(instruction, entry_fill.average_price)
+        if instruction.exit.stop_loss_pct is not None:
+            if entry_fill.average_price is None:
+                raise ValueError(
+                    f"Instruction '{instruction_id}' has fills but no average fill price."
+                )
+            protective_exits.append(
+                {
+                    "event_type": "stop_loss_exit_submitted",
+                    "action": "stop_loss_exit_submitted",
+                    "order_ref": f"{instruction_id}:exit:stop_loss",
+                    "order_type": "STOP",
+                    "limit_price": None,
+                    "stop_price": _compute_stop_price(
+                        instruction,
+                        entry_fill.average_price,
+                        stop_loss_pct=instruction.exit.stop_loss_pct,
+                    ),
+                    "note": "Submitted stop-loss exit order after entry fill.",
+                }
+            )
+
+        if instruction.exit.catastrophic_stop_loss_pct is not None:
+            if entry_fill.average_price is None:
+                raise ValueError(
+                    f"Instruction '{instruction_id}' has fills but no average fill price."
+                )
+            protective_exits.append(
+                {
+                    "event_type": "catastrophic_stop_exit_submitted",
+                    "action": "catastrophic_stop_exit_submitted",
+                    "order_ref": f"{instruction_id}:exit:catastrophic_stop",
+                    "order_type": "STOP",
+                    "limit_price": None,
+                    "stop_price": _compute_stop_price(
+                        instruction,
+                        entry_fill.average_price,
+                        stop_loss_pct=instruction.exit.catastrophic_stop_loss_pct,
+                    ),
+                    "note": "Submitted catastrophic stop-loss exit order after entry fill.",
+                }
+            )
+
+        if not protective_exits:
+            return entry_action, ()
+
         runtime_exit_submitter = exit_submitter or submit_exit_order_from_instruction
-        broker_submission = runtime_exit_submitter(
-            broker_config,
-            instruction,
-            quantity=entry_fill.quantity,
-            order_type=OrderType.LIMIT,
-            limit_price=exit_limit_price,
-            order_ref=f"{instruction_id}:exit:take_profit",
-            timeout=timeout,
+        oca_group = (
+            f"{instruction_id}:exit:oca"
+            if len(protective_exits) > 1
+            else None
         )
-        broker_status = broker_submission["broker_order_status"]
-        record.exit_order_id = int(broker_status["orderId"])
-        record.exit_perm_id = int(broker_status["permId"])
-        record.exit_client_id = int(broker_status["clientId"])
-        record.exit_order_status = str(broker_status["status"])
-        record.exit_submitted_quantity = str(entry_fill.quantity)
 
-        state_before_exit = record.state
-        record.state = ExecutionState.EXIT_PENDING.value
-        session.add(
-            InstructionEventRecord(
-                instruction_id=record.id,
-                event_type="take_profit_exit_submitted",
-                source="runtime_cycle",
-                state_before=state_before_exit,
-                state_after=record.state,
-                payload={"broker_submission": broker_submission},
-                note="Submitted take-profit exit order after entry fill.",
+        for index, exit_spec in enumerate(protective_exits):
+            broker_submission = runtime_exit_submitter(
+                broker_config,
+                instruction,
+                quantity=entry_fill.quantity,
+                order_type=exit_spec["order_type"],
+                limit_price=exit_spec["limit_price"],
+                stop_price=exit_spec["stop_price"],
+                order_ref=exit_spec["order_ref"],
+                oca_group=oca_group,
+                oca_type=1 if oca_group is not None else None,
+                timeout=timeout,
             )
-        )
-        submitted_exit = RuntimeCycleAction(
-            instruction_id=instruction_id,
-            action="take_profit_exit_submitted",
-            state=record.state,
-            detail={
-                "broker_order_id": record.exit_order_id,
-                "broker_order_status": record.exit_order_status,
-                "exit_submitted_quantity": record.exit_submitted_quantity,
-                "limit_price": str(exit_limit_price),
-            },
-        )
+            broker_status = broker_submission["broker_order_status"]
+            if index == 0:
+                record.exit_order_id = int(broker_status["orderId"])
+                record.exit_perm_id = int(broker_status["permId"])
+                record.exit_client_id = int(broker_status["clientId"])
+                record.exit_order_status = str(broker_status["status"])
+                record.exit_submitted_quantity = str(entry_fill.quantity)
 
-        return entry_action, submitted_exit
+            state_before_exit = record.state
+            record.state = ExecutionState.EXIT_PENDING.value
+            session.add(
+                InstructionEventRecord(
+                    instruction_id=record.id,
+                    event_type=exit_spec["event_type"],
+                    source="runtime_cycle",
+                    state_before=state_before_exit,
+                    state_after=record.state,
+                    payload={"broker_submission": broker_submission},
+                    note=exit_spec["note"],
+                )
+            )
+            submitted_exits.append(
+                RuntimeCycleAction(
+                    instruction_id=instruction_id,
+                    action=exit_spec["action"],
+                    state=record.state,
+                    detail={
+                        "broker_order_id": int(broker_status["orderId"]),
+                        "broker_order_status": str(broker_status["status"]),
+                        "exit_submitted_quantity": str(entry_fill.quantity),
+                        "limit_price": (
+                            str(exit_spec["limit_price"])
+                            if exit_spec["limit_price"] is not None
+                            else None
+                        ),
+                        "stop_price": (
+                            str(exit_spec["stop_price"])
+                            if exit_spec["stop_price"] is not None
+                            else None
+                        ),
+                        "oca_group": oca_group,
+                    },
+                )
+            )
+
+        return entry_action, tuple(submitted_exits)
 
 
 def _mark_unfilled_entry_cancelled(
@@ -792,10 +905,11 @@ def run_runtime_cycle(
                 record.broker_order_id is not None
                 and record.broker_order_id in snapshot.open_orders
             )
-            exit_open = (
-                record.exit_order_id is not None
-                and record.exit_order_id in snapshot.open_orders
+            exit_open_order_ids = _open_order_ids_with_ref_prefix(
+                snapshot,
+                order_ref_prefix=f"{instruction.instruction_id}:exit:",
             )
+            exit_open = bool(exit_open_order_ids)
             expire_at = _ensure_utc(record.expire_at) or record.expire_at
 
             if record.state == ExecutionState.ENTRY_SUBMITTED.value:
@@ -812,7 +926,7 @@ def run_runtime_cycle(
                             retry_delays=broker_retry_delays,
                             sleep_fn=sleep_fn,
                         )
-                    entry_action, exit_action = _run_with_broker_retries(
+                    entry_action, exit_actions = _run_with_broker_retries(
                         lambda: _record_entry_fill_and_optional_exit(
                             session_factory,
                             broker_config,
@@ -825,8 +939,7 @@ def run_runtime_cycle(
                         sleep_fn=sleep_fn,
                     )
                     filled_entries.append(entry_action)
-                    if exit_action is not None:
-                        submitted_exits.append(exit_action)
+                    submitted_exits.extend(exit_actions)
                     continue
 
                 if (
@@ -910,11 +1023,11 @@ def run_runtime_cycle(
                 if remaining_quantity <= 0:
                     continue
 
-                if exit_open and record.exit_order_id is not None:
+                for open_exit_order_id in exit_open_order_ids:
                     _run_with_broker_retries(
-                        lambda: runtime_order_canceler(
+                        lambda order_id=open_exit_order_id: runtime_order_canceler(
                             broker_config,
-                            record.exit_order_id,
+                            order_id,
                             timeout=timeout,
                         ),
                         retry_delays=broker_retry_delays,

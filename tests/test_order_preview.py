@@ -174,6 +174,7 @@ class OrderPreviewTests(TestCase):
         self.assertEqual(preview["order"]["total_quantity"], "10")
         self.assertEqual(preview["order"]["order_type"], "LMT")
         self.assertEqual(preview["instrument"]["resolved"]["con_id"], 265598)
+        self.assertEqual(preview["sizing"]["normalized_quantity"], "10")
 
     def test_preview_uses_historical_fx_rate_for_fraction_sizing(self) -> None:
         class _EuroAccountPreviewSyncWrapper(_FakePreviewSyncWrapper):
@@ -244,6 +245,7 @@ class OrderPreviewTests(TestCase):
         self.assertEqual(preview["status"], "ready")
         self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("12000.00"))
         self.assertEqual(Decimal(preview["order"]["total_quantity"]), Decimal("100"))
+        self.assertEqual(Decimal(preview["sizing"]["normalized_quantity"]), Decimal("100"))
         self.assertEqual(preview["sizing"]["fx_conversion"]["rate"], "1.20")
         self.assertEqual(
             preview["sizing"]["fx_conversion"]["lookup_contract"]["symbol"],
@@ -321,3 +323,70 @@ class OrderPreviewTests(TestCase):
             preview["sizing"]["fx_conversion"]["lookup_contract"]["symbol"],
             "EUR",
         )
+
+    def test_preview_rounds_down_fractional_stock_quantity_for_execution(self) -> None:
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-4",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-4",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "AAPL",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "USD",
+                            "primary_exchange": "NASDAQ",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "0.10",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00-04:00",
+                            "expire_at": "2026-04-10T16:00:00-04:00",
+                            "limit_price": "123.00",
+                        },
+                        "exit": {},
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_FakePreviewSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(preview["sizing"]["estimated_quantity"], "81.30081300813008130081300813")
+        self.assertEqual(preview["sizing"]["normalized_quantity"], "81")
+        self.assertEqual(preview["order"]["total_quantity"], "81")
+        self.assertIn("rounded down to a whole share", " ".join(preview["warnings"]))

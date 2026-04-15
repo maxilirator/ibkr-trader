@@ -34,6 +34,9 @@ class _FakeOrder:
         self.transmit = False
         self.orderRef = ""
         self.lmtPrice = None
+        self.auxPrice = None
+        self.ocaGroup = None
+        self.ocaType = None
 
 
 class _FakeOrderExecutionSyncWrapper:
@@ -252,7 +255,7 @@ class OrderExecutionTests(TestCase):
         payload["instructions"][0]["sizing"]["target_quantity"] = "10.5"
         batch = parse_execution_batch_payload(payload)
 
-        with self.assertRaisesRegex(ValueError, "integral share quantity"):
+        with self.assertRaisesRegex(ValueError, "whole-share amount"):
             submit_order_from_batch(
                 self.config,
                 batch,
@@ -261,6 +264,27 @@ class OrderExecutionTests(TestCase):
                 contract_cls=_FakeContract,
                 order_cls=_FakeOrder,
             )
+
+    def test_submit_order_from_batch_rounds_down_fraction_of_nav_quantity(self) -> None:
+        payload = _base_payload()
+        payload["instructions"][0]["sizing"] = {
+            "mode": "fraction_of_account_nav",
+            "target_fraction_of_account": "0.10",
+        }
+        payload["instructions"][0]["entry"]["limit_price"] = "123.00"
+        batch = parse_execution_batch_payload(payload)
+
+        result = submit_order_from_batch(
+            self.config,
+            batch,
+            sync_wrapper_cls=_FakeOrderExecutionSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["order"]["total_quantity"], "81")
+        self.assertIn("rounded down to a whole share", " ".join(result["warnings"]))
 
     def test_cancel_broker_order_returns_cancel_status(self) -> None:
         result = cancel_broker_order(
