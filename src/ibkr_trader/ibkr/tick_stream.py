@@ -15,7 +15,7 @@ from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.ibkr.contracts import build_ibkr_contract
 from ibkr_trader.ibkr.contracts import serialize_contract_details
-from ibkr_trader.ibkr.probe import IbkrDependencyError
+from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 
 ALLOWED_TICK_TYPES = {
@@ -107,6 +107,9 @@ class _TickStreamApp:
                 eclient_cls.__init__(self, self)
                 self._outer = outer
 
+            def connectAck(self) -> None:  # noqa: N802
+                self._outer.on_connect_ack()
+
             def nextValidId(self, orderId: int) -> None:  # noqa: N802
                 self._outer.on_next_valid_id(orderId)
 
@@ -194,7 +197,7 @@ class _TickStreamApp:
         self.client = TickStreamRuntime(self)
         self._thread: Thread | None = None
         self._connected_event = Event()
-        self._next_request_id: int | None = None
+        self._next_request_id: int = 1
         self._request_id_lock = Lock()
         self._contract_details: dict[int, list[Any]] = {}
         self._contract_detail_events: dict[int, Event] = {}
@@ -219,10 +222,10 @@ class _TickStreamApp:
         if self._thread is not None:
             self._thread.join(timeout=2)
 
+    def on_connect_ack(self) -> None:
+        self._connected_event.set()
+
     def on_next_valid_id(self, order_id: int) -> None:
-        with self._request_id_lock:
-            if self._next_request_id is None:
-                self._next_request_id = order_id
         self._connected_event.set()
 
     def on_error(
@@ -344,8 +347,6 @@ class _TickStreamApp:
         if not self._connected_event.wait(timeout=self.timeout):
             raise TimeoutError("Timed out while waiting for IBKR connection readiness.")
         with self._request_id_lock:
-            if self._next_request_id is None:
-                raise TimeoutError("IBKR did not provide a usable request ID.")
             request_id = self._next_request_id
             self._next_request_id += 1
             return request_id
@@ -407,7 +408,8 @@ class _TickStreamApp:
         started_at = datetime.now(timezone.utc)
         self._stop_collection.wait(timeout=query.duration_seconds)
         for req_id in stream_req_ids:
-            self.client.cancelTickByTickData(req_id)
+            if self.client.isConnected() and self.client.serverVersion() is not None:
+                self.client.cancelTickByTickData(req_id)
         sleep(0.25)
         ended_at = datetime.now(timezone.utc)
 

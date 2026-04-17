@@ -21,7 +21,7 @@ from ibkr_trader.ibkr.order_preview import _load_response_timeout_class
 from ibkr_trader.ibkr.order_preview import _load_sync_wrapper_class
 from ibkr_trader.ibkr.order_preview import _resolve_sizing_preview
 from ibkr_trader.ibkr.order_preview import _select_broker_account_id
-from ibkr_trader.ibkr.probe import IbkrDependencyError
+from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 
 @runtime_checkable
@@ -433,6 +433,7 @@ def submit_order_from_batch(
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
     order_cls: type[Any] | None = None,
+    app: OrderExecutionSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
     instruction = _require_single_instruction(batch)
     return submit_order_from_instruction(
@@ -443,6 +444,7 @@ def submit_order_from_batch(
         response_timeout_cls=response_timeout_cls,
         contract_cls=contract_cls,
         order_cls=order_cls,
+        app=app,
     )
 
 
@@ -455,25 +457,28 @@ def submit_order_from_instruction(
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
     order_cls: type[Any] | None = None,
+    app: OrderExecutionSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
     if instruction.entry.order_type is not OrderType.LIMIT:
-        raise ValueError("Manual paper order submit currently supports LIMIT orders only.")
+        raise ValueError("Manual broker order submit currently supports LIMIT orders only.")
 
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
     runtime_contract_cls = contract_cls or _load_contract_class()
     runtime_order_cls = order_cls or _load_order_class()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
@@ -484,7 +489,7 @@ def submit_order_from_instruction(
                 resolved_ibkr_contract,
                 resolved_contract,
             ) = _resolve_instruction_contract_and_account(
-                app,
+                runtime_app,
                 config,
                 instruction,
                 timeout=timeout,
@@ -492,7 +497,7 @@ def submit_order_from_instruction(
                 contract_cls=runtime_contract_cls,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the account summary request: {broker_error}"
@@ -503,7 +508,7 @@ def submit_order_from_instruction(
             instruction,
             broker_account_id=broker_account_id,
             normalized_summary=normalized_summary,
-            app=app,
+            app=runtime_app,
             timeout=timeout,
             timeout_cls=timeout_cls,
             contract_cls=runtime_contract_cls,
@@ -532,21 +537,22 @@ def submit_order_from_instruction(
         )
 
         try:
-            order_status = app.place_order_sync(
+            order_status = runtime_app.place_order_sync(
                 resolved_ibkr_contract,
                 order,
                 timeout=timeout,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the order submission: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while placing the IBKR order.") from exc
-        tws_submission = _extract_tws_submission(app, order_status)
+        tws_submission = _extract_tws_submission(runtime_app, order_status)
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return _serialize_for_json(
         {
@@ -590,6 +596,7 @@ def submit_exit_order_from_instruction(
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
     order_cls: type[Any] | None = None,
+    app: OrderExecutionSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
     normalized_quantity, quantity_warnings = _normalize_quantity_for_stock(
         quantity,
@@ -601,21 +608,23 @@ def submit_exit_order_from_instruction(
         stop_price=stop_price,
     )
 
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
     runtime_contract_cls = contract_cls or _load_contract_class()
     runtime_order_cls = order_cls or _load_order_class()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
@@ -626,7 +635,7 @@ def submit_exit_order_from_instruction(
                 resolved_ibkr_contract,
                 resolved_contract,
             ) = _resolve_instruction_contract_and_account(
-                app,
+                runtime_app,
                 config,
                 instruction,
                 timeout=timeout,
@@ -634,7 +643,7 @@ def submit_exit_order_from_instruction(
                 contract_cls=runtime_contract_cls,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the account summary request: {broker_error}"
@@ -656,21 +665,22 @@ def submit_exit_order_from_instruction(
         )
 
         try:
-            order_status = app.place_order_sync(
+            order_status = runtime_app.place_order_sync(
                 resolved_ibkr_contract,
                 order,
                 timeout=timeout,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the order submission: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while placing the IBKR order.") from exc
-        tws_submission = _extract_tws_submission(app, order_status)
+        tws_submission = _extract_tws_submission(runtime_app, order_status)
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return _serialize_for_json(
         {
@@ -704,32 +714,36 @@ def cancel_broker_order(
     timeout: int = 10,
     sync_wrapper_cls: type[OrderExecutionSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
+    app: OrderExecutionSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
-            order_status = app.cancel_order_sync(order_id, timeout=timeout)
+            order_status = runtime_app.cancel_order_sync(order_id, timeout=timeout)
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the order cancel request: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while cancelling the IBKR order.") from exc
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return _serialize_for_json({"broker_order_status": order_status})

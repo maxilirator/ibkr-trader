@@ -7,10 +7,11 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import AppConfig, IbkrConnectionConfig
-
-
-class IbkrDependencyError(RuntimeError):
-    """Raised when the official IBKR Python client is unavailable."""
+from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.sync_wrapper import (
+    load_response_timeout_class as _load_response_timeout_class,
+)
+from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
 
 
 @runtime_checkable
@@ -38,46 +39,44 @@ class GatewayProbeResult:
         return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def _load_sync_wrapper_class() -> type[SyncWrapperProtocol]:
-    try:
-        from ibapi.sync_wrapper import TWSSyncWrapper
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return TWSSyncWrapper
-
-
 def probe_gateway(
     config: IbkrConnectionConfig,
     *,
     timeout: int = 5,
     sync_wrapper_cls: type[SyncWrapperProtocol] | None = None,
+    response_timeout_cls: type[Exception] | None = None,
+    app: SyncWrapperProtocol | None = None,
 ) -> GatewayProbeResult:
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    timeout_cls = response_timeout_cls or _load_response_timeout_class()
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
-        broker_current_time = datetime.fromtimestamp(
-            app.get_current_time(timeout=timeout),
-            tz=UTC,
-        )
-        next_valid_order_id = app.get_next_valid_id(timeout=timeout)
+        try:
+            broker_current_time = datetime.fromtimestamp(
+                runtime_app.get_current_time(timeout=timeout),
+                tz=UTC,
+            )
+            next_valid_order_id = runtime_app.get_next_valid_id(timeout=timeout)
+        except timeout_cls as exc:
+            raise TimeoutError(
+                "Connected to IBKR, but the Gateway did not answer the probe requests."
+            ) from exc
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return GatewayProbeResult(
         host=config.host,

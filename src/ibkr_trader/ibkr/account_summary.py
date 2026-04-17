@@ -4,7 +4,11 @@ from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.ibkr.contracts import _extract_broker_error_message
-from ibkr_trader.ibkr.probe import IbkrDependencyError
+from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.sync_wrapper import (
+    load_response_timeout_class as _load_response_timeout_class,
+)
+from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
 
 
 DEFAULT_ACCOUNT_SUMMARY_TAGS: tuple[str, ...] = (
@@ -35,32 +39,6 @@ class AccountSummarySyncWrapperProtocol(Protocol):
         group: str = "All",
         timeout: int = 5,
     ) -> dict[str, dict[str, dict[str, str]]]: ...
-
-
-def _load_ibkr_account_runtime() -> type[Exception]:
-    try:
-        from ibapi.sync_wrapper import ResponseTimeout
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return ResponseTimeout
-
-
-def _load_sync_wrapper_class() -> type[AccountSummarySyncWrapperProtocol]:
-    try:
-        from ibapi.sync_wrapper import TWSSyncWrapper
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return TWSSyncWrapper
 
 
 def normalize_account_summary_payload(
@@ -102,37 +80,41 @@ def read_account_summary(
     timeout: int = 10,
     sync_wrapper_cls: type[AccountSummarySyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
+    app: AccountSummarySyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
-    timeout_cls = response_timeout_cls or _load_ibkr_account_runtime()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    timeout_cls = response_timeout_cls or _load_response_timeout_class()
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
-            raw_summary = app.get_account_summary(
+            raw_summary = runtime_app.get_account_summary(
                 tags=",".join(tags),
                 group=group,
                 timeout=timeout,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the account summary request: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while requesting IBKR account summary.") from exc
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return normalize_account_summary_payload(
         raw_summary,

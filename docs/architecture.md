@@ -139,8 +139,8 @@ If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar 
 
 ## Recommended near-term roadmap
 
-1. Keep the local TWS / IB Gateway paper connection healthy and stable.
-2. Add Stockholm paper order placement and cancel flow on top of persisted `ENTRY_PENDING` instructions.
+1. Keep the configured IB Gateway connection healthy and stable.
+2. Add Stockholm broker order placement and cancel flow on top of persisted `ENTRY_PENDING` instructions.
 3. Add execution-event persistence and replay.
 4. Add Stockholm market-data ingestion for a small symbol set.
 5. Add shortability collection and nightly snapshots.

@@ -16,11 +16,11 @@ This repo is currently scoped to **Stockholm equities first**.
 
 - runtime timezone: `Europe/Stockholm`
 - session calendar: shared q-data Stockholm session calendar
-- initial broker integration: official IBKR Python API through local TWS / IB Gateway
+- initial broker integration: official IBKR Python API through IB Gateway
 - current work is focused on broker-safe validation, durable submit, and order preview before live broker submit
-- manual NY paper order submit/cancel is now available for broker-path smoke testing
+- manual broker submit/cancel is now available for broker-path smoke testing
 - an MVP runtime cycle now exists for durable submit -> broker entry -> fill reconciliation -> take-profit/next-session exit
-- the runtime cycle can be targeted to specific instruction IDs for safer paper operation while we harden it
+- the runtime cycle can be targeted to specific instruction IDs while we harden it
 
 ## Current direction
 
@@ -44,15 +44,23 @@ See [docs/current-status.md](docs/current-status.md) for the working checklist, 
 
 We now include a small broker probe that is meant to validate the official TWS API connection path before we build order placement on top.
 
-Expected paper-trading defaults:
+Current repo template defaults:
 
-- `IBKR_HOST=127.0.0.1`
-- `IBKR_PORT=7497`
+- `IBKR_HOST=quant.geisler.se`
+- `IBKR_PORT=4001`
 - `IBKR_CLIENT_ID=0`
 - `IBKR_DIAGNOSTIC_CLIENT_ID=7`
-- `IBKR_STREAMING_CLIENT_ID=8`
+- `IBKR_STREAMING_CLIENT_ID=9`
 
-The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo we reserve `0` for the future long-lived trading runtime and use a separate diagnostic client ID for probe and read-only resolution calls.
+The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo the canonical client-ID policy is:
+
+- `0` for the main long-lived runtime
+- `7` for diagnostic and read-only broker traffic
+- `9` for streaming
+
+We do not treat "pick a fresh client ID" as the normal recovery path. If one of these fixed IDs is already in use, that is an ownership problem to resolve rather than sidestep.
+
+See [docs/client-id-policy.md](docs/client-id-policy.md) for the canonical policy.
 
 See [docs/ib-gateway-setup.md](docs/ib-gateway-setup.md) for setup notes.
 
@@ -68,6 +76,8 @@ Current important settings include:
 
 - app mode and timezone
 - session calendar path
+- Stockholm listing-universe path
+- Stockholm identity metadata path
 - database URL
 - local API bind host and port
 - IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, and account ID
@@ -89,6 +99,7 @@ The initial FastAPI wrapper includes:
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
 - `POST /v1/market-data/historical-bars`
+- `POST /v1/market-data/shortability-snapshot`
 - `POST /v1/market-data/tick-stream-sample`
 - `POST /v1/orders/preview`
 - `POST /v1/orders/submit`
@@ -102,6 +113,22 @@ The initial FastAPI wrapper includes:
 - `POST /v1/runtime/run-once`
 
 See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
+
+## Shortability Refresh
+
+To persist the full Stockholm shortability universe into `q-data`, run:
+
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m ibkr_trader.ibkr.shortability_refresh
+```
+
+That writes:
+
+- `../q-data/xsto/instruments/shortable.txt`
+- `../q-data/xsto/instruments/shortable_or_locate.txt`
+- `../q-data/xsto/meta/shortability/shortability_snapshot_<date>.json`
+- `../q-data/xsto/meta/shortability/shortability_latest.json`
 
 ## Database foundation
 
@@ -174,7 +201,7 @@ should not be treated as a single broker order. Some pieces can be expressed wit
 
 ## Running the gateway probe
 
-After installing the official TWS API Python client and starting TWS or IB Gateway paper trading:
+After installing the official TWS API Python client and starting the configured IB Gateway session:
 
 ```bash
 source .venv/bin/activate
@@ -186,6 +213,7 @@ This probe attempts to connect through the official IBKR Python API and returns:
 - connection target
 - the broker-reported current time
 - the next valid order ID
+- a Stockholm shortability canary check for `VOLV-B`
 
 Those are enough to prove the basic API path is healthy before we add live order workflows.
 

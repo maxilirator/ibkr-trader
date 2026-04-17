@@ -46,25 +46,28 @@ IBKR's setup lessons call out these API settings:
 
 ## Repo defaults
 
-This repository's current local `.env` is set up for paper **TWS** on this machine:
+This repository's current config template targets the dedicated live **IB Gateway** host:
 
 ```dotenv
-IBKR_HOST=127.0.0.1
-IBKR_PORT=7497
+IBKR_HOST=quant.geisler.se
+IBKR_PORT=4001
 IBKR_CLIENT_ID=0
 IBKR_DIAGNOSTIC_CLIENT_ID=7
+IBKR_STREAMING_CLIENT_ID=9
 ```
 
 Recommended repo usage:
 
 - reserve `IBKR_CLIENT_ID=0` for the main long-lived trading runtime
-- use `IBKR_DIAGNOSTIC_CLIENT_ID` for probe and contract-resolution calls during development
+- reserve `IBKR_DIAGNOSTIC_CLIENT_ID=7` for probe and contract-resolution calls
+- reserve `IBKR_STREAMING_CLIENT_ID=9` for streaming and market-data sampling
+- do not work around ownership problems by generating fresh client IDs during normal operation
 
-If you switch from TWS to IB Gateway later, the usual paper port is `4002`.
+See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.
 
 ## First live validation
 
-Once IB Gateway paper is running and the official Python API client is installed:
+Once the remote IB Gateway is running and the official Python API client is installed:
 
 ```bash
 PYTHONPATH=src python3 -m ibkr_trader.ibkr.probe

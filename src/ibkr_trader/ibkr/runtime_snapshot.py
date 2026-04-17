@@ -287,34 +287,38 @@ def fetch_broker_runtime_snapshot(
     timeout: int = 10,
     sync_wrapper_cls: type[RuntimeSnapshotSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
+    app: RuntimeSnapshotSyncWrapperProtocol | None = None,
 ) -> BrokerRuntimeSnapshot:
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
-            raw_open_orders = app.get_open_orders(timeout=timeout)
-            raw_executions = app.get_executions(timeout=timeout)
+            raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
+            raw_executions = runtime_app.get_executions(timeout=timeout)
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the runtime snapshot request: {broker_error}"
                 ) from exc
             raise TimeoutError("Timed out while requesting the IBKR runtime snapshot.") from exc
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     open_orders: dict[int, BrokerOpenOrder] = {}
     for raw_order in (raw_open_orders or {}).values():

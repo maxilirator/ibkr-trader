@@ -10,7 +10,11 @@ from ibkr_trader.domain.contract_resolution import (
     ContractResolveResult,
     ResolvedContract,
 )
-from ibkr_trader.ibkr.probe import IbkrDependencyError
+from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.sync_wrapper import (
+    load_response_timeout_class as _load_response_timeout_class,
+)
+from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
 
 
 @runtime_checkable
@@ -22,10 +26,9 @@ class ContractDetailsSyncWrapperProtocol(Protocol):
     def get_contract_details(self, contract: Any, timeout: int | None = None) -> list[Any]: ...
 
 
-def _load_ibkr_contract_runtime() -> tuple[type[Any], type[Exception]]:
+def _load_ibkr_contract_runtime() -> type[Any]:
     try:
         from ibapi.contract import Contract
-        from ibapi.sync_wrapper import ResponseTimeout
     except ModuleNotFoundError as exc:
         raise IbkrDependencyError(
             "The official IBKR Python client is not installed. "
@@ -33,20 +36,7 @@ def _load_ibkr_contract_runtime() -> tuple[type[Any], type[Exception]]:
             "the `ibapi` module is available in this environment."
         ) from exc
 
-    return Contract, ResponseTimeout
-
-
-def _load_sync_wrapper_class() -> type[ContractDetailsSyncWrapperProtocol]:
-    try:
-        from ibapi.sync_wrapper import TWSSyncWrapper
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return TWSSyncWrapper
+    return Contract
 
 
 def _split_csv(value: str | None) -> tuple[str, ...]:
@@ -108,7 +98,7 @@ def build_ibkr_contract(query: ContractResolveQuery, *, contract_cls: type[Any] 
     query.validate()
     runtime_contract_cls = contract_cls
     if runtime_contract_cls is None:
-        runtime_contract_cls, _ = _load_ibkr_contract_runtime()
+        runtime_contract_cls = _load_ibkr_contract_runtime()
 
     contract = runtime_contract_cls()
     contract.symbol = query.symbol
@@ -185,30 +175,32 @@ def resolve_contracts(
     sync_wrapper_cls: type[ContractDetailsSyncWrapperProtocol] | None = None,
     contract_cls: type[Any] | None = None,
     response_timeout_cls: type[Exception] | None = None,
+    app: ContractDetailsSyncWrapperProtocol | None = None,
 ) -> ContractResolveResult:
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
-
     if response_timeout_cls is None:
-        _, response_timeout_cls = _load_ibkr_contract_runtime()
+        response_timeout_cls = _load_response_timeout_class()
 
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         ib_contract = build_ibkr_contract(query, contract_cls=contract_cls)
         try:
-            raw_matches = app.get_contract_details(ib_contract, timeout=timeout)
+            raw_matches = runtime_app.get_contract_details(ib_contract, timeout=timeout)
         except response_timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the contract lookup for {query.symbol}: {broker_error}"
@@ -217,7 +209,8 @@ def resolve_contracts(
                 f"Timed out while resolving {query.symbol} on {query.exchange}."
             ) from exc
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return ContractResolveResult(
         query=query,

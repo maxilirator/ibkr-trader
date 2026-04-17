@@ -6,32 +6,35 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from ibkr_trader.config import ApiServerConfig, AppConfig, IbkrConnectionConfig, load_dotenv_file
+from ibkr_trader.ibkr.client_ids import DIAGNOSTIC_CLIENT_ID
+from ibkr_trader.ibkr.client_ids import PRIMARY_RUNTIME_CLIENT_ID
+from ibkr_trader.ibkr.client_ids import STREAMING_CLIENT_ID
 
 
 class ConfigTests(TestCase):
-    def test_ibkr_defaults_match_paper_gateway_recommendation(self) -> None:
+    def test_ibkr_defaults_match_canonical_client_id_policy(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             config = IbkrConnectionConfig.from_env()
 
         self.assertEqual(config.host, "127.0.0.1")
         self.assertEqual(config.port, 7497)
-        self.assertEqual(config.client_id, 0)
-        self.assertEqual(config.diagnostic_client_id, 7)
-        self.assertEqual(config.streaming_client_id, 8)
+        self.assertEqual(config.client_id, PRIMARY_RUNTIME_CLIENT_ID)
+        self.assertEqual(config.diagnostic_client_id, DIAGNOSTIC_CLIENT_ID)
+        self.assertEqual(config.streaming_client_id, STREAMING_CLIENT_ID)
 
     def test_ibkr_connection_can_create_diagnostic_session(self) -> None:
         config = IbkrConnectionConfig(
             host="127.0.0.1",
             port=7497,
-            client_id=0,
-            diagnostic_client_id=7,
-            streaming_client_id=8,
+            client_id=PRIMARY_RUNTIME_CLIENT_ID,
+            diagnostic_client_id=DIAGNOSTIC_CLIENT_ID,
+            streaming_client_id=STREAMING_CLIENT_ID,
             account_id="DU1234567",
         )
 
         diagnostic = config.diagnostic_session()
 
-        self.assertEqual(diagnostic.client_id, 7)
+        self.assertEqual(diagnostic.client_id, DIAGNOSTIC_CLIENT_ID)
         self.assertEqual(diagnostic.host, "127.0.0.1")
         self.assertEqual(diagnostic.port, 7497)
 
@@ -39,15 +42,15 @@ class ConfigTests(TestCase):
         config = IbkrConnectionConfig(
             host="127.0.0.1",
             port=7497,
-            client_id=0,
-            diagnostic_client_id=7,
-            streaming_client_id=8,
+            client_id=PRIMARY_RUNTIME_CLIENT_ID,
+            diagnostic_client_id=DIAGNOSTIC_CLIENT_ID,
+            streaming_client_id=STREAMING_CLIENT_ID,
             account_id="DU1234567",
         )
 
         streaming = config.streaming_session()
 
-        self.assertEqual(streaming.client_id, 8)
+        self.assertEqual(streaming.client_id, STREAMING_CLIENT_ID)
         self.assertEqual(streaming.host, "127.0.0.1")
         self.assertEqual(streaming.port, 7497)
 
@@ -65,6 +68,8 @@ class ConfigTests(TestCase):
 
         self.assertEqual(config.timezone, "Europe/Stockholm")
         self.assertTrue(str(config.session_calendar_path).endswith("/q-data/xsto/calendars/day_sessions.parquet"))
+        self.assertTrue(str(config.stockholm_instruments_path).endswith("/q-data/xsto/instruments/all.txt"))
+        self.assertTrue(str(config.stockholm_identity_path).endswith("/q-data/xsto/meta/instrument_identity.parquet"))
 
     def test_dotenv_file_populates_missing_values(self) -> None:
         with TemporaryDirectory() as temp_dir:

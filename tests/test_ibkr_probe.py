@@ -29,6 +29,25 @@ class _FakeSyncWrapper:
         return 42
 
 
+class _TimeoutingSyncWrapper(_FakeSyncWrapper):
+    def get_current_time(self, *, timeout: int | None = None) -> int:
+        raise TimeoutError("library timeout")
+
+
+class _ExistingConnectedApp:
+    def __init__(self) -> None:
+        self.disconnect_calls = 0
+
+    def get_current_time(self, *, timeout: int | None = None) -> int:
+        return 1_710_000_000
+
+    def get_next_valid_id(self, *, timeout: int | None = None) -> int:
+        return 42
+
+    def disconnect_and_stop(self) -> None:
+        self.disconnect_calls += 1
+
+
 class ProbeTests(TestCase):
     def test_probe_gateway_uses_config_and_returns_snapshot(self) -> None:
         config = IbkrConnectionConfig(
@@ -68,3 +87,42 @@ class ProbeTests(TestCase):
         self.assertIn('"client_id": 0', payload)
         self.assertIn('"next_valid_order_id": 100', payload)
         self.assertIn("2026-04-10T12:30:00+00:00", payload)
+
+    def test_probe_gateway_maps_library_timeout_to_timeout_error(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+            diagnostic_client_id=7,
+            account_id="DU1234567",
+        )
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "Gateway did not answer the probe requests",
+        ):
+            probe_gateway(
+                config,
+                timeout=7,
+                sync_wrapper_cls=_TimeoutingSyncWrapper,
+                response_timeout_cls=TimeoutError,
+            )
+
+    def test_probe_gateway_can_reuse_existing_connected_app(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+            diagnostic_client_id=7,
+            account_id="DU1234567",
+        )
+        existing_app = _ExistingConnectedApp()
+
+        result = probe_gateway(
+            config,
+            timeout=7,
+            app=existing_app,
+        )
+
+        self.assertEqual(result.next_valid_order_id, 42)
+        self.assertEqual(existing_app.disconnect_calls, 0)

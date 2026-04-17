@@ -18,9 +18,10 @@ This document is the operational snapshot of where the repo is right now.
 - [x] Read-only contract resolution
 - [x] Read-only account summary
 - [x] Historical bars endpoint
+- [x] Shortability snapshot endpoint
 - [x] Tick-stream sample endpoint
 - [x] Read-only order preview
-- [x] Manual paper order submit/cancel endpoints
+- [x] Manual broker order submit/cancel endpoints
 - [x] Durable instruction submit endpoint
 - [x] Instruction persistence in Postgres
 - [x] Persisted entry submit/cancel flow
@@ -33,14 +34,17 @@ This document is the operational snapshot of where the repo is right now.
 
 ## Verified behavior
 
-- TWS API connection works from this repo through the local IBKR desktop session.
+- The IBKR connectivity probe path is wired against the configured IB Gateway target.
 - Contract resolution works against live broker metadata.
 - Account summary works through the diagnostic client.
 - Historical bars work for entitled symbols.
+- Shortability snapshot now works against IBKR's official Sweden shortable list and classifies the configured Stockholm listed universe without depending on live per-symbol shortability ticks.
+- Shortability scans can now persist both symbol lists and dated JSON metadata into the shared `q-data/xsto` tree.
+- A dedicated `python -m ibkr_trader.ibkr.shortability_refresh` command now exists for full-universe persistence runs.
 - Tick-stream sampling is wired, and currently surfaces broker entitlement errors directly.
 - Order preview keeps prices and notionals in instrument currency.
 - Dynamic stock sizing from notional or NAV is rounded down to whole shares before execution.
-- Manual paper submit/cancel works on NY paper symbols through the local API.
+- Manual broker submit/cancel is wired through the primary IBKR session and should be treated as live or paper depending on the configured Gateway target.
 - Submit persists instructions and an initial `instruction_submitted` event in Postgres.
 - Persisted instructions can move through `ENTRY_PENDING -> ENTRY_SUBMITTED -> ENTRY_CANCELLED` with broker IDs stored on the instruction record.
 - The runtime can now:
@@ -50,7 +54,7 @@ This document is the operational snapshot of where the repo is right now.
   - submit stop-loss and catastrophic stop-loss exits after a full entry fill when configured
   - submit a forced market exit at the resolved next Stockholm session open
   - mark an instruction `COMPLETED` after exit fill reconciliation
-  - run against a selected `instruction_ids` set for safer operator-driven paper testing
+  - run against a selected `instruction_ids` set for safer operator-driven testing
   - retry transient IBKR client-id reuse / reconnect churn within the MVP cycle
 - Stockholm schedule preview resolves the next session open from the local q-data calendar.
 
@@ -69,6 +73,7 @@ This document is the operational snapshot of where the repo is right now.
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
 - `POST /v1/market-data/historical-bars`
+- `POST /v1/market-data/shortability-snapshot`
 - `POST /v1/market-data/tick-stream-sample`
 - `POST /v1/orders/preview`
 - `POST /v1/orders/submit`

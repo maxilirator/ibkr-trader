@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from os import environ, getenv
 from pathlib import Path
 
+from ibkr_trader.ibkr.client_ids import DIAGNOSTIC_CLIENT_ID
+from ibkr_trader.ibkr.client_ids import PRIMARY_RUNTIME_CLIENT_ID
+from ibkr_trader.ibkr.client_ids import STREAMING_CLIENT_ID
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
@@ -60,7 +64,7 @@ class IbkrConnectionConfig:
     port: int
     client_id: int
     diagnostic_client_id: int
-    streaming_client_id: int = 8
+    streaming_client_id: int = STREAMING_CLIENT_ID
     account_id: str = ""
 
     def primary_session(self) -> "IbkrConnectionConfig":
@@ -77,9 +81,13 @@ class IbkrConnectionConfig:
         return cls(
             host=getenv("IBKR_HOST", "127.0.0.1"),
             port=int(getenv("IBKR_PORT", "7497")),
-            client_id=int(getenv("IBKR_CLIENT_ID", "0")),
-            diagnostic_client_id=int(getenv("IBKR_DIAGNOSTIC_CLIENT_ID", "7")),
-            streaming_client_id=int(getenv("IBKR_STREAMING_CLIENT_ID", "8")),
+            client_id=int(getenv("IBKR_CLIENT_ID", str(PRIMARY_RUNTIME_CLIENT_ID))),
+            diagnostic_client_id=int(
+                getenv("IBKR_DIAGNOSTIC_CLIENT_ID", str(DIAGNOSTIC_CLIENT_ID))
+            ),
+            streaming_client_id=int(
+                getenv("IBKR_STREAMING_CLIENT_ID", str(STREAMING_CLIENT_ID))
+            ),
             account_id=getenv("IBKR_ACCOUNT_ID", ""),
         )
 
@@ -108,6 +116,8 @@ class AppConfig:
     timezone: str
     database_url: str
     session_calendar_path: Path
+    stockholm_instruments_path: Path
+    stockholm_identity_path: Path
     api: ApiServerConfig
     ibkr: IbkrConnectionConfig
 
@@ -125,6 +135,18 @@ class AppConfig:
                 getenv(
                     "SESSION_CALENDAR_PATH",
                     "../q-data/xsto/calendars/day_sessions.parquet",
+                )
+            ),
+            stockholm_instruments_path=_resolve_project_path(
+                getenv(
+                    "XSTO_INSTRUMENTS_PATH",
+                    "../q-data/xsto/instruments/all.txt",
+                )
+            ),
+            stockholm_identity_path=_resolve_project_path(
+                getenv(
+                    "XSTO_IDENTITY_PATH",
+                    "../q-data/xsto/meta/instrument_identity.parquet",
                 )
             ),
             api=ApiServerConfig.from_env(),

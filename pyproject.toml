@@ -25,6 +25,8 @@ db = [
 server = [
   "fastapi",
   "uvicorn",
+  "pandas",
+  "pyarrow",
 ]
 
 [tool.setuptools]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from unittest import TestCase
 
 from ibkr_trader.api.server import (
@@ -10,10 +11,13 @@ from ibkr_trader.api.server import (
     parse_execution_batch_payload,
     parse_historical_bars_payload,
     parse_runtime_cycle_payload,
+    parse_shortability_snapshot_payload,
     parse_tick_stream_payload,
     serialize_execution_batch,
     serialize_runtime_schedule_preview,
 )
+from ibkr_trader.ibkr.shortability import ShortabilityMarketDataType
+from ibkr_trader.ibkr.shortability import ShortabilitySource
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 
 
@@ -114,6 +118,83 @@ class ApiServerTests(TestCase):
                     "tick_types": [],
                 }
             )
+
+    def test_parse_shortability_snapshot_payload_uses_stockholm_defaults(self) -> None:
+        query = parse_shortability_snapshot_payload({})
+
+        self.assertEqual(query.exchange, "SMART")
+        self.assertEqual(query.primary_exchange, "SFB")
+        self.assertEqual(query.currency, "SEK")
+        self.assertEqual(query.security_type, "STK")
+        self.assertEqual(query.source, ShortabilitySource.OFFICIAL_IBKR_PAGE)
+        self.assertEqual(query.market_data_type, ShortabilityMarketDataType.LIVE)
+        self.assertTrue(query.only_shortable)
+        self.assertIsNone(query.as_of_date)
+
+    def test_parse_shortability_snapshot_payload_accepts_symbols_date_source_and_delayed_type(self) -> None:
+        query = parse_shortability_snapshot_payload(
+            {
+                "symbols": ["sive", "abb"],
+                "as_of_date": "2026-04-14",
+                "source": "broker_ticks",
+                "market_data_type": "delayed_frozen",
+                "max_symbols": 25,
+                "max_concurrent": 10,
+                "per_symbol_timeout_seconds": 1.5,
+            }
+        )
+
+        self.assertEqual(query.symbols, ("SIVE", "ABB"))
+        self.assertEqual(query.source, ShortabilitySource.BROKER_TICKS)
+        self.assertEqual(
+            query.market_data_type,
+            ShortabilityMarketDataType.DELAYED_FROZEN,
+        )
+        self.assertEqual(query.as_of_date, date(2026, 4, 14))
+        self.assertEqual(query.max_symbols, 25)
+        self.assertEqual(query.max_concurrent, 10)
+        self.assertEqual(query.per_symbol_timeout_seconds, 1.5)
+
+    def test_ibkr_telemetry_limit_must_be_positive(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        from ibkr_trader.api.server import create_app
+        from ibkr_trader.config import AppConfig
+        from ibkr_trader.config import ApiServerConfig
+        from ibkr_trader.config import IbkrConnectionConfig
+        from pathlib import Path
+
+        app = create_app(
+            AppConfig(
+                environment="test",
+                timezone="Europe/Stockholm",
+                database_url="sqlite+pysqlite:///:memory:",
+                session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                stockholm_instruments_path=Path("/tmp/all.txt"),
+                stockholm_identity_path=Path("/tmp/identity.parquet"),
+                api=ApiServerConfig(
+                    host="127.0.0.1",
+                    port=8000,
+                    require_loopback_only=False,
+                ),
+                ibkr=IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4001,
+                    client_id=0,
+                    diagnostic_client_id=7,
+                    streaming_client_id=9,
+                    account_id="DU1234567",
+                ),
+            )
+        )
+
+        client = TestClient(app)
+        response = client.get("/v1/ibkr/telemetry?recent_limit=0")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("recent_limit", response.text)
 
     def test_parse_runtime_cycle_payload_accepts_optional_timestamp(self) -> None:
         now_at, timeout, instruction_ids = parse_runtime_cycle_payload(

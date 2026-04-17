@@ -12,7 +12,11 @@ from ibkr_trader.ibkr.contracts import (
     build_ibkr_contract,
     serialize_contract_details,
 )
-from ibkr_trader.ibkr.probe import IbkrDependencyError
+from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.sync_wrapper import (
+    load_response_timeout_class as _load_response_timeout_runtime_class,
+)
+from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
 
 
 @dataclass(slots=True)
@@ -70,30 +74,8 @@ class HistoricalBarsSyncWrapperProtocol(Protocol):
     ) -> list[Any]: ...
 
 
-def _load_sync_wrapper_class() -> type[HistoricalBarsSyncWrapperProtocol]:
-    try:
-        from ibapi.sync_wrapper import TWSSyncWrapper
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return TWSSyncWrapper
-
-
 def _load_response_timeout_class() -> type[Exception]:
-    try:
-        from ibapi.sync_wrapper import ResponseTimeout
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return ResponseTimeout
+    return _load_response_timeout_runtime_class()
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -140,26 +122,29 @@ def read_historical_bars(
     sync_wrapper_cls: type[HistoricalBarsSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
+    app: HistoricalBarsSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
     query.validate()
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
-    app = wrapper_cls(timeout=timeout)
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
-            if hasattr(app, "contract_details"):
-                app.contract_details.clear()
+            if hasattr(runtime_app, "contract_details"):
+                runtime_app.contract_details.clear()
             contract_query = ContractResolveQuery(
                 symbol=query.symbol,
                 security_type=query.security_type,
@@ -170,9 +155,9 @@ def read_historical_bars(
                 isin=query.isin,
             )
             ib_contract = build_ibkr_contract(contract_query, contract_cls=contract_cls)
-            raw_matches = app.get_contract_details(ib_contract, timeout=timeout)
+            raw_matches = runtime_app.get_contract_details(ib_contract, timeout=timeout)
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the contract lookup for {query.symbol}: {broker_error}"
@@ -194,7 +179,7 @@ def read_historical_bars(
         resolved_contract = raw_matches[0].contract
 
         try:
-            raw_bars = app.get_historical_data(
+            raw_bars = runtime_app.get_historical_data(
                 resolved_contract,
                 _format_end_date_time(query.end_at),
                 query.duration,
@@ -205,7 +190,7 @@ def read_historical_bars(
                 timeout,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the historical data request for {query.symbol}: {broker_error}"
@@ -214,7 +199,8 @@ def read_historical_bars(
                 f"Timed out while requesting historical bars for {query.symbol}."
             ) from exc
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     currency = resolved_detail.currency or query.currency
     return {

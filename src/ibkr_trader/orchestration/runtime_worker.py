@@ -31,10 +31,12 @@ from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import OrderType
 from ibkr_trader.domain.execution_payloads import parse_execution_instruction_payload
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
+from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
 from ibkr_trader.ibkr.order_execution import submit_exit_order_from_instruction
 from ibkr_trader.ibkr.runtime_snapshot import BrokerExecution
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.ibkr.runtime_snapshot import fetch_broker_runtime_snapshot
+from ibkr_trader.ibkr.session_manager import CanonicalSyncSessions
 from ibkr_trader.orchestration.entry_submission import (
     cancel_persisted_instruction_entry,
     submit_persisted_instruction_entry,
@@ -1106,19 +1108,104 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     app_config = AppConfig.from_env()
     session_factory = create_session_factory(build_engine(app_config.database_url))
+    broker_sessions = CanonicalSyncSessions(app_config.ibkr)
 
-    while True:
-        result = run_runtime_cycle(
-            session_factory,
-            app_config.ibkr.primary_session(),
-            runtime_timezone=app_config.timezone,
-            session_calendar_path=app_config.session_calendar_path,
-            timeout=args.timeout,
+    def submit_entry_with_primary(
+        broker_config: IbkrConnectionConfig,
+        instruction: ExecutionInstruction,
+        *,
+        timeout: int = 10,
+    ) -> dict[str, Any]:
+        return broker_sessions.primary.execute(
+            "runtime_entry_submit",
+            lambda broker_app: submit_order_from_instruction(
+                broker_config,
+                instruction,
+                timeout=timeout,
+                app=broker_app,
+            ),
         )
-        print(json.dumps(serialize_runtime_cycle_result(result), indent=2))
-        if args.once:
-            break
-        time.sleep(args.interval_seconds)
+
+    def submit_exit_with_primary(
+        broker_config: IbkrConnectionConfig,
+        instruction: ExecutionInstruction,
+        *,
+        quantity: Decimal,
+        order_type: OrderType | str,
+        order_ref: str,
+        timeout: int = 10,
+        limit_price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        oca_group: str | None = None,
+        oca_type: int | None = None,
+    ) -> dict[str, Any]:
+        return broker_sessions.primary.execute(
+            "runtime_exit_submit",
+            lambda broker_app: submit_exit_order_from_instruction(
+                broker_config,
+                instruction,
+                quantity=quantity,
+                order_type=order_type,
+                order_ref=order_ref,
+                timeout=timeout,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                oca_group=oca_group,
+                oca_type=oca_type,
+                app=broker_app,
+            ),
+        )
+
+    def fetch_snapshot_with_primary(
+        broker_config: IbkrConnectionConfig,
+        *,
+        timeout: int = 10,
+    ) -> BrokerRuntimeSnapshot:
+        return broker_sessions.primary.execute(
+            "runtime_snapshot",
+            lambda broker_app: fetch_broker_runtime_snapshot(
+                broker_config,
+                timeout=timeout,
+                app=broker_app,
+            ),
+        )
+
+    def cancel_order_with_primary(
+        broker_config: IbkrConnectionConfig,
+        order_id: int,
+        *,
+        timeout: int = 10,
+    ) -> dict[str, Any]:
+        return broker_sessions.primary.execute(
+            "runtime_cancel",
+            lambda broker_app: cancel_broker_order(
+                broker_config,
+                order_id,
+                timeout=timeout,
+                app=broker_app,
+            ),
+        )
+
+    broker_sessions.warmup()
+    try:
+        while True:
+            result = run_runtime_cycle(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                runtime_timezone=app_config.timezone,
+                session_calendar_path=app_config.session_calendar_path,
+                timeout=args.timeout,
+                entry_submitter=submit_entry_with_primary,
+                exit_submitter=submit_exit_with_primary,
+                broker_snapshot_fetcher=fetch_snapshot_with_primary,
+                broker_order_canceler=cancel_order_with_primary,
+            )
+            print(json.dumps(serialize_runtime_cycle_result(result), indent=2))
+            if args.once:
+                break
+            time.sleep(args.interval_seconds)
+    finally:
+        broker_sessions.shutdown()
     return 0
 
 

@@ -21,6 +21,8 @@ This is especially useful once multiple internal components need to submit instr
 
 The runtime scheduler uses `Europe/Stockholm` as the default local timezone and reads the Stockholm session calendar from `SESSION_CALENDAR_PATH`.
 
+The Stockholm shortability snapshot endpoint reads its default symbol universe from `XSTO_INSTRUMENTS_PATH` and enriches Stockholm names with `XSTO_IDENTITY_PATH` when available.
+
 If the configured parquet file cannot be read directly, the scheduler will use the sibling `.csv` file when it exists.
 
 ## Security posture
@@ -166,6 +168,72 @@ Important current behavior:
 - it is intended as the first raw-data primitive for the future parquet ingestion service
 - if IBKR rejects the requested tick-by-tick stream, the endpoint returns the broker error directly
 
+### `POST /v1/market-data/shortability-snapshot`
+
+Collects a current Stockholm shortability snapshot.
+
+Use it to:
+
+- scan the configured Stockholm universe and return the names that are currently shortable
+- classify the full Stockholm universe cleanly as `shortable` or `not_shortable` from IBKR's official Sweden shortable list
+- persist a dated daily snapshot into our own data backend
+
+Important current behavior:
+
+- the default source is `OFFICIAL_IBKR_PAGE`, which fetches IBKR's public Sweden shortable list directly
+- the official page is the current authoritative path for the Stockholm shortable universe in this repo
+- the older `BROKER_TICKS` path is still available as a diagnostic source, but it depends on generic tick `236` and the live Gateway session being healthy
+- calling it with no body uses the latest completed listing date from `XSTO_INSTRUMENTS_PATH`
+- set `as_of_date` to query the Stockholm listed universe for a specific day
+- the official page already includes symbols such as `VOLV.B` and `SIVE`; the API normalizes Swedish share-class dots into our canonical dash form, such as `VOLV-B`
+- `VOLV-B` is still a practical Stockholm canary for smoke checks
+- `only_shortable=true` is the default, so the response is already filtered to `shortable` and `locate_required`
+- set `only_shortable=false` when you want the full scan, including `not_shortable`
+- full-universe scans persist by default; smaller samples or explicit symbol requests persist only when `persist=true`
+- persisted artifacts are written to:
+  `../q-data/xsto/instruments/shortable.txt`
+  `../q-data/xsto/instruments/shortable_or_locate.txt`
+  `../q-data/xsto/meta/shortability/shortability_snapshot_<date>.json`
+  `../q-data/xsto/meta/shortability/shortability_latest.json`
+- the persisted JSON keeps the full evaluated universe metadata even when the HTTP response is filtered to shortable names
+- the response includes `source`, `source_url`, `source_updated_text`, `snapshot_at`, `universe_as_of_date`, `status_counts`, and the universe source used for the scan
+- IBKR does not expose historical shortability snapshots through this path, so daily history still needs to be stored by us after each run
+
+Current status vocabulary:
+
+- `shortable`: the name appears on IBKR's official Sweden shortable list
+- `not_shortable`: the name does not appear on IBKR's official Sweden shortable list for the current snapshot
+- `locate_required`, `not_found`, `timeout`, `error`, `unknown_status`: these remain possible when the source is `BROKER_TICKS`
+
+Example request body for a small sample:
+
+```json
+{
+  "as_of_date": "2026-04-14",
+  "max_symbols": 50
+}
+```
+
+Example request body for explicit symbols:
+
+```json
+{
+  "symbols": ["ABB", "SIVE", "VOLV-B"],
+  "only_shortable": false,
+  "market_data_type": "LIVE",
+  "persist": true
+}
+```
+
+For a deliberate full-universe refresh outside the API server, use:
+
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m ibkr_trader.ibkr.shortability_refresh
+```
+
+That command always requests the full Stockholm universe and persists the results into the same `q-data` files listed above.
+
 ### `POST /v1/orders/preview`
 
 Builds a read-only broker preview for an instruction batch using one diagnostic IBKR session.
@@ -199,7 +267,7 @@ This is intentional. We should not guess FX sizing in a production trading syste
 
 ### `POST /v1/orders/submit`
 
-Submits a **manual paper broker order** immediately through the primary IBKR client session.
+Submits a **manual broker order** immediately through the primary IBKR client session.
 
 This endpoint is intentionally narrower than the durable instruction flow:
 
@@ -215,19 +283,20 @@ It currently:
 - resolves the broker account
 - resolves the IBKR contract
 - computes quantity using the same sizing logic as preview
-- places the paper order through the primary IBKR client session
+- places the broker order through the primary IBKR client session
 - returns the broker order status payload
 - returns the immediate TWS `openOrder` handoff when available, including `orderState.status`, `warning_text`, and related TWS-local diagnostics
 
 Important current behavior:
 
-- this is an operator/manual paper-trading path
+- this is an operator/manual broker path
 - it is not wired to persisted `ENTRY_PENDING` instructions yet
-- use it for broker-path smoke tests and careful manual paper validation
+- it does not add a paper-safety wrapper; live or paper behavior depends entirely on the configured IBKR session
+- use it only for explicit operator-driven submits
 
 ### `POST /v1/orders/{order_id}/cancel`
 
-Cancels a paper broker order by IBKR order ID through the primary client session.
+Cancels a broker order by IBKR order ID through the primary client session.
 
 This endpoint is the cleanup companion to `POST /v1/orders/submit`.
 
@@ -319,7 +388,7 @@ Important current behavior:
 
 - this is a polling-style MVP runtime cycle, not the final long-lived broker process
 - it uses the primary IBKR client session
-- it is safe for manual operator-driven paper testing
+- it is safe for manual operator-driven testing when pointed at a non-production broker session
 - when `instruction_ids` is provided, the cycle only touches that selected set
 - it now retries transient IBKR client-id reuse / reconnect churn a small number of times before failing the cycle
 - a persistent runtime-owned IBKR connection is still the next step

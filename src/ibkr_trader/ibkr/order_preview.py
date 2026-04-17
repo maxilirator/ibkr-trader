@@ -22,7 +22,11 @@ from ibkr_trader.ibkr.contracts import (
     build_ibkr_contract,
     serialize_contract_details,
 )
-from ibkr_trader.ibkr.probe import IbkrDependencyError
+from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.sync_wrapper import (
+    load_response_timeout_class as _load_response_timeout_runtime_class,
+)
+from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
 
 
 @runtime_checkable
@@ -53,30 +57,8 @@ class PreviewSyncWrapperProtocol(Protocol):
     ) -> list[Any]: ...
 
 
-def _load_sync_wrapper_class() -> type[PreviewSyncWrapperProtocol]:
-    try:
-        from ibapi.sync_wrapper import TWSSyncWrapper
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return TWSSyncWrapper
-
-
 def _load_response_timeout_class() -> type[Exception]:
-    try:
-        from ibapi.sync_wrapper import ResponseTimeout
-    except ModuleNotFoundError as exc:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        ) from exc
-
-    return ResponseTimeout
+    return _load_response_timeout_runtime_class()
 
 
 def _load_contract_class() -> type[Any]:
@@ -549,31 +531,34 @@ def preview_execution_batch(
     sync_wrapper_cls: type[PreviewSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
+    app: PreviewSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
-    wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
-    app = wrapper_cls(timeout=timeout)
     runtime_contract_cls = contract_cls or _load_contract_class()
-
-    if not app.connect_and_start(
-        host=config.host,
-        port=config.port,
-        client_id=config.client_id,
-    ):
-        raise ConnectionError(
-            f"Failed to connect to IBKR at {config.host}:{config.port} "
-            f"with client_id={config.client_id}."
-        )
+    runtime_app = app
+    owns_connection = runtime_app is None
+    if runtime_app is None:
+        wrapper_cls = sync_wrapper_cls or _load_sync_wrapper_class()
+        runtime_app = wrapper_cls(timeout=timeout)
+        if not runtime_app.connect_and_start(
+            host=config.host,
+            port=config.port,
+            client_id=config.client_id,
+        ):
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {config.host}:{config.port} "
+                f"with client_id={config.client_id}."
+            )
 
     try:
         try:
-            raw_summary = app.get_account_summary(
+            raw_summary = runtime_app.get_account_summary(
                 tags=",".join(DEFAULT_ACCOUNT_SUMMARY_TAGS),
                 group="All",
                 timeout=timeout,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(app)
+            broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the account summary request: {broker_error}"
@@ -600,8 +585,8 @@ def preview_execution_batch(
             contract_error = None
             contract_matches = None
             try:
-                if hasattr(app, "contract_details"):
-                    app.contract_details.clear()
+                if hasattr(runtime_app, "contract_details"):
+                    runtime_app.contract_details.clear()
                 raw_contract = build_ibkr_contract(
                     ContractResolveQuery(
                         symbol=instruction.instrument.symbol,
@@ -613,9 +598,12 @@ def preview_execution_batch(
                     ),
                     contract_cls=runtime_contract_cls,
                 )
-                contract_matches = app.get_contract_details(raw_contract, timeout=timeout)
+                contract_matches = runtime_app.get_contract_details(
+                    raw_contract,
+                    timeout=timeout,
+                )
             except timeout_cls as exc:
-                broker_error = _extract_broker_error_message(app)
+                broker_error = _extract_broker_error_message(runtime_app)
                 contract_error = (
                     f"IBKR rejected the contract lookup: {broker_error}"
                     if broker_error is not None
@@ -625,7 +613,7 @@ def preview_execution_batch(
                 instruction,
                 broker_account_id=broker_account_id,
                 normalized_summary=normalized_summary,
-                app=app,
+                app=runtime_app,
                 timeout=timeout,
                 timeout_cls=timeout_cls,
                 contract_cls=runtime_contract_cls,
@@ -641,7 +629,8 @@ def preview_execution_batch(
             preview["warnings"].extend(account_warnings)
             previews.append(preview)
     finally:
-        app.disconnect_and_stop()
+        if owns_connection:
+            runtime_app.disconnect_and_stop()
 
     return {
         "account_summary": normalized_summary,
