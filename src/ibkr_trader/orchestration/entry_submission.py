@@ -14,11 +14,16 @@ from sqlalchemy.orm import sessionmaker
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import session_scope
+from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.domain.execution_payloads import parse_execution_instruction_payload
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
+from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
+from ibkr_trader.ledger.persistence import persist_broker_order_cancellation
+from ibkr_trader.ledger.persistence import persist_broker_order_submission
+from ibkr_trader.orchestration.operator_controls import assert_kill_switch_inactive
 from ibkr_trader.orchestration.state_machine import ExecutionState
 
 
@@ -110,6 +115,7 @@ def submit_persisted_instruction_entry(
     timeout: int = 10,
     submitter: Callable[..., dict[str, Any]] | None = None,
 ) -> PersistedBrokerSubmission:
+    assert_kill_switch_inactive(session_factory)
     with session_scope(session_factory) as session:
         instruction_record = session.execute(
             select(InstructionRecord)
@@ -164,10 +170,23 @@ def submit_persisted_instruction_entry(
                 str(total_quantity) if total_quantity not in (None, "") else None
             )
 
+        event_at = utc_now()
+        persist_broker_order_submission(
+            session,
+            broker_kind=BROKER_KIND_IBKR,
+            instruction_record=instruction_record,
+            broker_submission=broker_submission,
+            observed_at=event_at,
+            fallback_account_key=broker_config.account_id,
+            order_role="ENTRY",
+            event_type="entry_order_submitted",
+            note="Persisted instruction entry broker order submitted to IBKR.",
+        )
         event = InstructionEventRecord(
             instruction_id=instruction_record.id,
             event_type="entry_order_submitted",
             source="broker_submit",
+            event_at=event_at,
             state_before=previous_state,
             state_after=instruction_record.state,
             payload={"broker_submission": broker_submission},
@@ -242,10 +261,22 @@ def cancel_persisted_instruction_entry(
             else instruction_record.broker_order_status
         )
 
+        event_at = utc_now()
+        persist_broker_order_cancellation(
+            session,
+            broker_kind=BROKER_KIND_IBKR,
+            broker_cancellation=broker_cancellation,
+            observed_at=event_at,
+            instruction_record=instruction_record,
+            fallback_account_key=broker_config.account_id,
+            event_type="entry_order_cancelled",
+            note="Persisted instruction entry broker order cancelled at IBKR.",
+        )
         event = InstructionEventRecord(
             instruction_id=instruction_record.id,
             event_type="entry_order_cancelled",
             source="broker_cancel",
+            event_at=event_at,
             state_before=previous_state,
             state_after=instruction_record.state,
             payload={"broker_cancellation": broker_cancellation},

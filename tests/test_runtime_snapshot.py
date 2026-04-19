@@ -60,12 +60,20 @@ class _FakeRuntimeSnapshotSyncWrapper:
     def get_executions(self, exec_filter: object | None = None, timeout: int = 10) -> list[object]:
         return [
             {
-                "contract": SimpleNamespace(symbol="SAAB.B"),
+                "contract": SimpleNamespace(
+                    symbol="SAAB.B",
+                    localSymbol="SAAB-B",
+                    secType="STK",
+                    exchange="SFB",
+                    primaryExchange="SFB",
+                    currency="SEK",
+                ),
                 "execution": SimpleNamespace(
                     execId="00014800.69ddd749.01.01",
                     orderId=2,
                     permId=600952471,
                     clientId=0,
+                    acctNumber="U25245596",
                     orderRef="live-saab-buy-20260414-2",
                     side="BOT",
                     shares="1",
@@ -75,6 +83,53 @@ class _FakeRuntimeSnapshotSyncWrapper:
                 ),
             }
         ]
+
+    def get_account_updates(self, account_code: str = "", timeout: int = 10) -> dict[str, object]:
+        return {
+            "portfolio": [
+                {
+                    "contract": SimpleNamespace(
+                        symbol="MSFT",
+                        localSymbol="MSFT",
+                        secType="STK",
+                        exchange="SMART",
+                        primaryExchange="NASDAQ",
+                        currency="USD",
+                    ),
+                    "accountName": "U25245596",
+                    "position": "2",
+                    "marketPrice": "410.50",
+                    "marketValue": "821.00",
+                    "averageCost": "401.25",
+                    "unrealizedPNL": "18.50",
+                    "realizedPNL": "0",
+                }
+            ],
+            "account_values": {
+                "U25245596": {
+                    "NetLiquidation": {"value": "100000.00", "currency": "USD"},
+                    "BuyingPower": {"value": "200000.00", "currency": "USD"},
+                }
+            },
+        }
+
+    def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
+        return {
+            "U25245596": [
+                {
+                    "contract": SimpleNamespace(
+                        symbol="MSFT",
+                        localSymbol="MSFT",
+                        secType="STK",
+                        exchange="SMART",
+                        primaryExchange="NASDAQ",
+                        currency="USD",
+                    ),
+                    "position": "2",
+                    "avgCost": "401.25",
+                }
+            ]
+        }
 
 
 class RuntimeSnapshotTests(TestCase):
@@ -99,5 +154,15 @@ class RuntimeSnapshotTests(TestCase):
         self.assertEqual(serialized["open_orders"][0]["warning_text"], "Order held in TWS pending manual transmit.")
         self.assertEqual(serialized["open_orders"][0]["transmit"], True)
         self.assertEqual(len(serialized["executions"]), 1)
+        self.assertEqual(serialized["executions"][0]["account"], "U25245596")
         self.assertEqual(serialized["executions"][0]["order_ref"], "live-saab-buy-20260414-2")
         self.assertEqual(serialized["executions"][0]["price"], "615.5")
+        self.assertEqual(serialized["executions"][0]["currency"], "SEK")
+        self.assertEqual(len(serialized["portfolio"]), 1)
+        self.assertEqual(serialized["portfolio"][0]["market_value"], "821.00")
+        self.assertEqual(len(serialized["positions"]), 1)
+        self.assertEqual(serialized["positions"][0]["position"], "2")
+        self.assertEqual(
+            serialized["account_values"]["U25245596"]["NetLiquidation"]["value"],
+            "100000.00",
+        )

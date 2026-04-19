@@ -30,6 +30,9 @@ class _FakeSyncWrapper:
     def isConnected(self) -> bool:  # noqa: N802
         return self.connected
 
+    def drain_broker_callback_events(self) -> list[dict[str, object]]:
+        return [{"event_type": "order_status"}]
+
 
 class SessionManagerTests(TestCase):
     def setUp(self) -> None:
@@ -137,3 +140,22 @@ class SessionManagerTests(TestCase):
         telemetry = tracker.snapshot(recent_limit=5)
         self.assertEqual(telemetry["failed_operations"], 1)
         self.assertEqual(telemetry["per_operation"]["probe"]["failure"], 1)
+
+    def test_drain_broker_callback_events_uses_managed_session(self) -> None:
+        session = ManagedSyncSession(
+            "primary",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=0,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FakeSyncWrapper,
+        )
+
+        events = session.drain_broker_callback_events()
+
+        self.assertEqual(events, [{"event_type": "order_status"}])
+        status = session.status()
+        self.assertEqual(status.metrics.checkout_count, 1)

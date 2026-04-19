@@ -364,6 +364,25 @@ class ManagedSyncSession:
         with self.checkout(operation_name=operation_name) as app:
             return operation(app)
 
+    def drain_broker_callback_events(self) -> list[dict[str, Any]]:
+        def _drain(app: Any) -> list[dict[str, Any]]:
+            drainer = getattr(app, "drain_broker_callback_events", None)
+            if drainer is None:
+                return []
+            if not callable(drainer):
+                raise TypeError(
+                    f"Managed IBKR session '{self.role}' exposes a non-callable "
+                    "drain_broker_callback_events attribute."
+                )
+            events = drainer()
+            if not isinstance(events, list):
+                raise TypeError(
+                    f"Managed IBKR session '{self.role}' returned a non-list broker callback payload."
+                )
+            return events
+
+        return self.execute("drain_broker_callbacks", _drain)
+
 
 class CanonicalSyncSessions:
     def __init__(

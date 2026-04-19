@@ -59,13 +59,29 @@ from ibkr_trader.orchestration.entry_submission import serialize_persisted_broke
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_submission
 from ibkr_trader.orchestration.entry_submission import submit_persisted_instruction_entry
 from ibkr_trader.orchestration.instruction_status import InstructionStatusNotFoundError
+from ibkr_trader.orchestration.instruction_status import list_instruction_statuses
 from ibkr_trader.orchestration.instruction_status import read_instruction_status
 from ibkr_trader.orchestration.instruction_status import serialize_instruction_status
+from ibkr_trader.orchestration.operator_controls import (
+    InstructionSetCancellationNotFoundError,
+    InstructionSetCancellationSelectorError,
+    KillSwitchActiveError,
+    cancel_instruction_set,
+    read_kill_switch_state,
+    serialize_instruction_set_cancellation_result,
+    serialize_kill_switch_status,
+    set_kill_switch_state,
+)
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
+from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
 from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_result
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
+from ibkr_trader.read_models import build_operator_dashboard_snapshot
+from ibkr_trader.read_models import build_ledger_dashboard_snapshot
+from ibkr_trader.read_models import serialize_ledger_dashboard_snapshot
+from ibkr_trader.read_models import serialize_operator_dashboard_snapshot
 
 
 class ApiDependencyError(RuntimeError):
@@ -89,6 +105,19 @@ def enforce_loopback_binding(host: str, *, require_loopback_only: bool) -> None:
         raise ValueError(
             "API host must be loopback when API_REQUIRE_LOOPBACK_ONLY is enabled."
         )
+
+
+def parse_positive_limit(
+    value: int,
+    *,
+    field_name: str,
+    maximum: int,
+) -> int:
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    if value > maximum:
+        raise ValueError(f"{field_name} must be at most {maximum}")
+    return value
 
 
 def parse_contract_resolve_payload(payload: Mapping[str, Any]) -> ContractResolveQuery:
@@ -189,6 +218,64 @@ def parse_runtime_cycle_payload(
             raise ValueError("instruction_ids must not contain duplicates")
         instruction_ids = parsed_instruction_ids
     return now_at, timeout, instruction_ids
+
+
+def parse_kill_switch_payload(payload: Mapping[str, Any]) -> tuple[bool, str | None, str]:
+    if "enabled" not in payload:
+        raise ValueError("enabled is required")
+    enabled = payload["enabled"]
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+
+    reason = payload.get("reason")
+    if reason is not None:
+        reason = str(reason).strip()
+        if not reason:
+            reason = None
+
+    updated_by = str(payload.get("updated_by", "api")).strip()
+    if not updated_by:
+        raise ValueError("updated_by must be a non-empty string")
+
+    return enabled, reason, updated_by
+
+
+def parse_instruction_set_cancellation_payload(
+    payload: Mapping[str, Any],
+) -> tuple[str, str | None, str | None, str | None, str | None, tuple[str, ...] | None, int]:
+    requested_by = str(payload.get("requested_by", "api")).strip()
+    if not requested_by:
+        raise ValueError("requested_by must be a non-empty string")
+
+    reason = payload.get("reason")
+    if reason is not None:
+        reason = str(reason).strip()
+        if not reason:
+            reason = None
+
+    batch_id = str(payload["batch_id"]).strip() if payload.get("batch_id") is not None else None
+    account_key = (
+        str(payload["account_key"]).strip() if payload.get("account_key") is not None else None
+    )
+    book_key = str(payload["book_key"]).strip() if payload.get("book_key") is not None else None
+
+    raw_instruction_ids = payload.get("instruction_ids")
+    instruction_ids: tuple[str, ...] | None = None
+    if raw_instruction_ids is not None:
+        if not isinstance(raw_instruction_ids, list) or not raw_instruction_ids:
+            raise ValueError("instruction_ids must be a non-empty array of strings")
+        normalized_instruction_ids = tuple(str(item).strip() for item in raw_instruction_ids)
+        if not all(normalized_instruction_ids):
+            raise ValueError("instruction_ids must contain only non-empty strings")
+        if len(set(normalized_instruction_ids)) != len(normalized_instruction_ids):
+            raise ValueError("instruction_ids must not contain duplicates")
+        instruction_ids = normalized_instruction_ids
+
+    timeout = int(payload.get("timeout", 10))
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+
+    return requested_by, reason, batch_id, account_key, book_key, instruction_ids, timeout
 
 
 def parse_tick_stream_payload(payload: Mapping[str, Any]) -> TickStreamQuery:
@@ -442,6 +529,9 @@ def create_app(config: AppConfig | None = None) -> Any:
             )
         )
 
+    def drain_broker_callbacks_with_primary() -> list[dict[str, Any]]:
+        return broker_sessions.primary.drain_broker_callback_events()
+
     @app.middleware("http")
     async def require_local_client(request: Request, call_next: Any) -> Any:
         client_host = request.client.host if request.client else None
@@ -553,7 +643,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
 
     @app.get("/v1/broker/runtime-snapshot")
-    def get_broker_runtime_snapshot(timeout: int = 10) -> dict[str, Any]:
+    def get_broker_runtime_snapshot(timeout: int = 20) -> dict[str, Any]:
         try:
             snapshot = with_primary_session(
                 "broker_runtime_snapshot",
@@ -784,6 +874,27 @@ def create_app(config: AppConfig | None = None) -> Any:
             "batch": serialize_execution_batch(batch),
         }
 
+    @app.get("/v1/instructions")
+    def list_instructions(limit: int = 100, state: str | None = None) -> dict[str, Any]:
+        if limit <= 0:
+            raise HTTPException(status_code=400, detail="limit must be positive")
+        if limit > 500:
+            raise HTTPException(status_code=400, detail="limit must be at most 500")
+
+        normalized_state = state.strip().upper() if state is not None else None
+        instructions = list_instruction_statuses(
+            session_factory,
+            limit=limit,
+            state=normalized_state,
+        )
+        return {
+            "accepted": True,
+            "instruction_count": len(instructions),
+            "instructions": [
+                serialize_instruction_status(instruction) for instruction in instructions
+            ],
+        }
+
     @app.get("/v1/instructions/{instruction_id}")
     def get_instruction_status(
         instruction_id: str,
@@ -803,6 +914,156 @@ def create_app(config: AppConfig | None = None) -> Any:
             "instruction": serialize_instruction_status(result),
         }
 
+    @app.get("/v1/read/operator-snapshot")
+    def get_operator_snapshot(
+        instruction_limit: int = 50,
+        order_limit: int = 50,
+        fill_limit: int = 50,
+        attention_limit: int = 25,
+        reconciliation_run_limit: int = 20,
+        include_flat_positions: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            validated_instruction_limit = parse_positive_limit(
+                instruction_limit,
+                field_name="instruction_limit",
+                maximum=500,
+            )
+            validated_order_limit = parse_positive_limit(
+                order_limit,
+                field_name="order_limit",
+                maximum=500,
+            )
+            validated_fill_limit = parse_positive_limit(
+                fill_limit,
+                field_name="fill_limit",
+                maximum=500,
+            )
+            validated_attention_limit = parse_positive_limit(
+                attention_limit,
+                field_name="attention_limit",
+                maximum=200,
+            )
+            validated_reconciliation_run_limit = parse_positive_limit(
+                reconciliation_run_limit,
+                field_name="reconciliation_run_limit",
+                maximum=200,
+            )
+            operator_snapshot = build_operator_dashboard_snapshot(
+                session_factory,
+                include_flat_positions=include_flat_positions,
+                order_limit=validated_order_limit,
+                fill_limit=validated_fill_limit,
+                attention_limit=validated_attention_limit,
+                reconciliation_run_limit=validated_reconciliation_run_limit,
+            )
+            instructions = list_instruction_statuses(
+                session_factory,
+                limit=validated_instruction_limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "operator_snapshot": {
+                **serialize_operator_dashboard_snapshot(operator_snapshot),
+                "instructions": [
+                    serialize_instruction_status(instruction)
+                    for instruction in instructions
+                ],
+            },
+        }
+
+    @app.get("/v1/read/ledger-snapshot")
+    def get_ledger_snapshot(
+        focus_instruction_id: str | None = None,
+        instruction_event_limit: int = 100,
+        order_event_limit: int = 100,
+        fill_limit: int = 100,
+        control_event_limit: int = 50,
+        cancellation_limit: int = 50,
+        reconciliation_issue_limit: int = 50,
+    ) -> dict[str, Any]:
+        try:
+            validated_instruction_event_limit = parse_positive_limit(
+                instruction_event_limit,
+                field_name="instruction_event_limit",
+                maximum=500,
+            )
+            validated_order_event_limit = parse_positive_limit(
+                order_event_limit,
+                field_name="order_event_limit",
+                maximum=500,
+            )
+            validated_fill_limit = parse_positive_limit(
+                fill_limit,
+                field_name="fill_limit",
+                maximum=500,
+            )
+            validated_control_event_limit = parse_positive_limit(
+                control_event_limit,
+                field_name="control_event_limit",
+                maximum=200,
+            )
+            validated_cancellation_limit = parse_positive_limit(
+                cancellation_limit,
+                field_name="cancellation_limit",
+                maximum=200,
+            )
+            validated_reconciliation_issue_limit = parse_positive_limit(
+                reconciliation_issue_limit,
+                field_name="reconciliation_issue_limit",
+                maximum=200,
+            )
+            normalized_focus_instruction_id = (
+                focus_instruction_id.strip() if focus_instruction_id else None
+            )
+            ledger_snapshot = build_ledger_dashboard_snapshot(
+                session_factory,
+                focus_instruction_id=normalized_focus_instruction_id,
+                instruction_event_limit=validated_instruction_event_limit,
+                order_event_limit=validated_order_event_limit,
+                fill_limit=validated_fill_limit,
+                control_event_limit=validated_control_event_limit,
+                cancellation_limit=validated_cancellation_limit,
+                reconciliation_issue_limit=validated_reconciliation_issue_limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "ledger_snapshot": serialize_ledger_dashboard_snapshot(ledger_snapshot),
+        }
+
+    @app.get("/v1/controls/kill-switch")
+    def get_kill_switch() -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "kill_switch": serialize_kill_switch_status(
+                read_kill_switch_state(session_factory)
+            ),
+        }
+
+    @app.post("/v1/controls/kill-switch")
+    def update_kill_switch(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            enabled, reason, updated_by = parse_kill_switch_payload(payload)
+            result = set_kill_switch_state(
+                session_factory,
+                enabled=enabled,
+                reason=reason,
+                updated_by=updated_by,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "kill_switch": serialize_kill_switch_status(result),
+        }
+
     @app.post("/v1/instructions/submit")
     def submit_instruction(payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -815,6 +1076,8 @@ def create_app(config: AppConfig | None = None) -> Any:
             )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KillSwitchActiveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SubmissionConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -824,6 +1087,54 @@ def create_app(config: AppConfig | None = None) -> Any:
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
             "submitted": serialize_submitted_batch(result),
+        }
+
+    @app.post("/v1/instructions/cancel-set")
+    def cancel_instruction_batch(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            (
+                requested_by,
+                reason,
+                batch_id,
+                account_key,
+                book_key,
+                instruction_ids,
+                timeout,
+            ) = parse_instruction_set_cancellation_payload(payload)
+            result = cancel_instruction_set(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                requested_by=requested_by,
+                reason=reason,
+                batch_id=batch_id,
+                account_key=account_key,
+                book_key=book_key,
+                instruction_ids=instruction_ids,
+                timeout=timeout,
+                canceler=cancel_order_with_primary,
+            )
+        except InstructionSetCancellationSelectorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except InstructionSetCancellationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PersistedInstructionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "cancelled_instruction_set": serialize_instruction_set_cancellation_result(
+                result
+            ),
         }
 
     @app.post("/v1/instructions/{instruction_id}/submit-entry")
@@ -839,6 +1150,8 @@ def create_app(config: AppConfig | None = None) -> Any:
         except PersistedInstructionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except PersistedInstructionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KillSwitchActiveError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -927,6 +1240,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 entry_submitter=submit_order_with_primary,
                 exit_submitter=submit_exit_with_primary,
                 broker_snapshot_fetcher=fetch_runtime_snapshot_with_primary,
+                broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
             )
         except ValueError as exc:
@@ -945,6 +1259,42 @@ def create_app(config: AppConfig | None = None) -> Any:
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
             "runtime_cycle": serialize_runtime_cycle_result(result),
+        }
+
+    @app.post("/v1/runtime/startup-reconcile")
+    def run_startup_reconciliation_once(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload = payload or {}
+        try:
+            now_at, timeout, instruction_ids = parse_runtime_cycle_payload(request_payload)
+            result = run_startup_reconciliation(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                runtime_timezone=app_config.timezone,
+                session_calendar_path=app_config.session_calendar_path,
+                now=now_at,
+                timeout=timeout,
+                instruction_ids=instruction_ids,
+                exit_submitter=submit_exit_with_primary,
+                broker_snapshot_fetcher=fetch_runtime_snapshot_with_primary,
+                broker_callback_fetcher=drain_broker_callbacks_with_primary,
+                broker_order_canceler=cancel_order_with_primary,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "runtime_timezone": app_config.timezone,
+            "session_calendar_path": str(app_config.session_calendar_path),
+            "startup_reconciliation": serialize_runtime_cycle_result(result),
         }
 
     return app

@@ -46,8 +46,8 @@ We now include a small broker probe that is meant to validate the official TWS A
 
 Current repo template defaults:
 
-- `IBKR_HOST=quant.geisler.se`
-- `IBKR_PORT=4001`
+- `IBKR_HOST=127.0.0.1`
+- `IBKR_PORT=4002`
 - `IBKR_CLIENT_ID=0`
 - `IBKR_DIAGNOSTIC_CLIENT_ID=7`
 - `IBKR_STREAMING_CLIENT_ID=9`

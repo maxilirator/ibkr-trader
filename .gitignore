@@ -6,9 +6,10 @@ __pycache__/
 .coverage
 build/
 dist/
+node_modules/
+.svelte-kit/
 *.egg-info/
 .env
 .DS_Store
 .idea/
 .vscode/
-

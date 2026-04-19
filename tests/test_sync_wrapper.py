@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from unittest import TestCase
 
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class
@@ -61,3 +62,116 @@ class SyncWrapperTests(TestCase):
 
         self.assertFalse(connected)
         self.assertEqual(disconnect_calls, 1)
+
+    def test_drain_broker_callback_events_records_live_order_callbacks(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app.openOrder(
+            11,
+            SimpleNamespace(
+                symbol="AAPL",
+                localSymbol="AAPL",
+                secType="STK",
+                exchange="SMART",
+                primaryExchange="NASDAQ",
+                currency="USD",
+            ),
+            SimpleNamespace(
+                permId=9001,
+                clientId=0,
+                account="DU1234567",
+                orderRef="sync-aapl-1",
+                action="BUY",
+                totalQuantity="1",
+                orderType="LMT",
+                lmtPrice="200.00",
+                auxPrice="",
+                outsideRth=False,
+                transmit=True,
+            ),
+            SimpleNamespace(
+                status="PreSubmitted",
+                warningText="Held in TWS.",
+                rejectReason="",
+                completedStatus="",
+                completedTime="",
+            ),
+        )
+        app.orderStatus(
+            11,
+            "Submitted",
+            "0",
+            "1",
+            0.0,
+            9001,
+            0,
+            0.0,
+            0,
+            "",
+            0.0,
+        )
+        app.error(11, 0, 202, "Rejected by exchange", '{"reason":"test"}')
+
+        events = app.drain_broker_callback_events()
+
+        self.assertEqual(
+            [item["event_type"] for item in events],
+            ["open_order", "order_status", "order_error"],
+        )
+        self.assertEqual(events[0]["order"]["order_ref"], "sync-aapl-1")
+        self.assertEqual(events[1]["order_status"]["status"], "Submitted")
+        self.assertEqual(events[2]["error"]["errorCode"], 202)
+        self.assertEqual(app.drain_broker_callback_events(), [])
+
+    def test_suppressed_open_order_callbacks_do_not_hit_journal(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        with app._suppress_broker_callback_events("open_order", "order_status"):
+            app.openOrder(
+                11,
+                SimpleNamespace(
+                    symbol="AAPL",
+                    localSymbol="AAPL",
+                    secType="STK",
+                    exchange="SMART",
+                    primaryExchange="NASDAQ",
+                    currency="USD",
+                ),
+                SimpleNamespace(
+                    permId=9001,
+                    clientId=0,
+                    account="DU1234567",
+                    orderRef="sync-aapl-1",
+                    action="BUY",
+                    totalQuantity="1",
+                    orderType="LMT",
+                    lmtPrice="200.00",
+                    auxPrice="",
+                    outsideRth=False,
+                    transmit=True,
+                ),
+                SimpleNamespace(
+                    status="PreSubmitted",
+                    warningText="Held in TWS.",
+                    rejectReason="",
+                    completedStatus="",
+                    completedTime="",
+                ),
+            )
+            app.orderStatus(
+                11,
+                "Submitted",
+                "0",
+                "1",
+                0.0,
+                9001,
+                0,
+                0.0,
+                0,
+                "",
+                0.0,
+            )
+
+        self.assertEqual(app.drain_broker_callback_events(), [])

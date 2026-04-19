@@ -18,6 +18,7 @@ from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import InstrumentRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
+from ibkr_trader.orchestration.operator_controls import assert_kill_switch_inactive
 from ibkr_trader.orchestration.scheduling import InstructionRuntimeSchedule
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.state_machine import ExecutionState
@@ -172,6 +173,7 @@ def submit_execution_batch(
     runtime_timezone: str,
     session_calendar_path: Path,
 ) -> SubmittedBatch:
+    assert_kill_switch_inactive(session_factory)
     batch.validate()
     _ensure_unique_instruction_ids(batch)
 

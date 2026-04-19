@@ -22,6 +22,14 @@ class RuntimeSnapshotSyncWrapperProtocol(Protocol):
 
     def get_executions(self, exec_filter: Any | None = None, timeout: int = 10) -> list[Any]: ...
 
+    def get_account_updates(
+        self,
+        account_code: str = "",
+        timeout: int = 10,
+    ) -> dict[str, Any]: ...
+
+    def get_positions(self, timeout: int = 10) -> dict[str, list[Any]]: ...
+
 
 @dataclass(slots=True)
 class BrokerOpenOrder:
@@ -65,12 +73,50 @@ class BrokerExecution:
     exchange: str | None
     executed_at: datetime | None
     symbol: str | None
+    account: str | None = None
+    security_type: str | None = None
+    primary_exchange: str | None = None
+    currency: str | None = None
+    local_symbol: str | None = None
+
+
+@dataclass(slots=True)
+class BrokerPortfolioItem:
+    account: str | None
+    symbol: str | None
+    local_symbol: str | None
+    security_type: str | None
+    exchange: str | None
+    primary_exchange: str | None
+    currency: str | None
+    position: Decimal | None
+    market_price: Decimal | None
+    market_value: Decimal | None
+    average_cost: Decimal | None
+    unrealized_pnl: Decimal | None
+    realized_pnl: Decimal | None
+
+
+@dataclass(slots=True)
+class BrokerPosition:
+    account: str | None
+    symbol: str | None
+    local_symbol: str | None
+    security_type: str | None
+    exchange: str | None
+    primary_exchange: str | None
+    currency: str | None
+    position: Decimal | None
+    average_cost: Decimal | None
 
 
 @dataclass(slots=True)
 class BrokerRuntimeSnapshot:
     open_orders: dict[int, BrokerOpenOrder]
     executions: tuple[BrokerExecution, ...]
+    portfolio: tuple[BrokerPortfolioItem, ...]
+    positions: tuple[BrokerPosition, ...]
+    account_values: dict[str, dict[str, dict[str, str | None]]]
 
 
 def _serialize_for_json(payload: Any) -> Any:
@@ -92,6 +138,9 @@ def serialize_broker_runtime_snapshot(snapshot: BrokerRuntimeSnapshot) -> dict[s
         {
             "open_orders": [asdict(order) for order in snapshot.open_orders.values()],
             "executions": [asdict(execution) for execution in snapshot.executions],
+            "portfolio": [asdict(item) for item in snapshot.portfolio],
+            "positions": [asdict(item) for item in snapshot.positions],
+            "account_values": snapshot.account_values,
         }
     )
 
@@ -247,6 +296,11 @@ def _serialize_execution(raw_payload: Any) -> BrokerExecution | None:
     if execution is None:
         return None
     return BrokerExecution(
+        account=(
+            str(getattr(execution, "acctNumber"))
+            if getattr(execution, "acctNumber", None) not in (None, "")
+            else None
+        ),
         exec_id=(
             str(getattr(execution, "execId"))
             if getattr(execution, "execId", None) not in (None, "")
@@ -272,12 +326,122 @@ def _serialize_execution(raw_payload: Any) -> BrokerExecution | None:
             if getattr(execution, "exchange", None) not in (None, "")
             else None
         ),
+        security_type=(
+            str(getattr(contract, "secType"))
+            if getattr(contract, "secType", None) not in (None, "")
+            else None
+        ),
+        primary_exchange=(
+            str(getattr(contract, "primaryExchange"))
+            if getattr(contract, "primaryExchange", None) not in (None, "")
+            else None
+        ),
+        currency=(
+            str(getattr(contract, "currency"))
+            if getattr(contract, "currency", None) not in (None, "")
+            else None
+        ),
+        local_symbol=(
+            str(getattr(contract, "localSymbol"))
+            if getattr(contract, "localSymbol", None) not in (None, "")
+            else None
+        ),
         executed_at=_parse_ibkr_execution_time(getattr(execution, "time", None)),
         symbol=(
             str(getattr(contract, "symbol"))
             if getattr(contract, "symbol", None) not in (None, "")
             else None
         ),
+    )
+
+
+def _serialize_portfolio_item(raw_payload: Any) -> BrokerPortfolioItem | None:
+    if not isinstance(raw_payload, dict):
+        return None
+    contract = raw_payload.get("contract")
+    return BrokerPortfolioItem(
+        account=(
+            str(raw_payload.get("accountName"))
+            if raw_payload.get("accountName") not in (None, "")
+            else None
+        ),
+        symbol=(
+            str(getattr(contract, "symbol"))
+            if getattr(contract, "symbol", None) not in (None, "")
+            else None
+        ),
+        local_symbol=(
+            str(getattr(contract, "localSymbol"))
+            if getattr(contract, "localSymbol", None) not in (None, "")
+            else None
+        ),
+        security_type=(
+            str(getattr(contract, "secType"))
+            if getattr(contract, "secType", None) not in (None, "")
+            else None
+        ),
+        exchange=(
+            str(getattr(contract, "exchange"))
+            if getattr(contract, "exchange", None) not in (None, "")
+            else None
+        ),
+        primary_exchange=(
+            str(getattr(contract, "primaryExchange"))
+            if getattr(contract, "primaryExchange", None) not in (None, "")
+            else None
+        ),
+        currency=(
+            str(getattr(contract, "currency"))
+            if getattr(contract, "currency", None) not in (None, "")
+            else None
+        ),
+        position=_to_decimal(raw_payload.get("position")),
+        market_price=_to_decimal(raw_payload.get("marketPrice")),
+        market_value=_to_decimal(raw_payload.get("marketValue")),
+        average_cost=_to_decimal(raw_payload.get("averageCost")),
+        unrealized_pnl=_to_decimal(raw_payload.get("unrealizedPNL")),
+        realized_pnl=_to_decimal(raw_payload.get("realizedPNL")),
+    )
+
+
+def _serialize_position(account: str, raw_payload: Any) -> BrokerPosition | None:
+    if not isinstance(raw_payload, dict):
+        return None
+    contract = raw_payload.get("contract")
+    return BrokerPosition(
+        account=account or None,
+        symbol=(
+            str(getattr(contract, "symbol"))
+            if getattr(contract, "symbol", None) not in (None, "")
+            else None
+        ),
+        local_symbol=(
+            str(getattr(contract, "localSymbol"))
+            if getattr(contract, "localSymbol", None) not in (None, "")
+            else None
+        ),
+        security_type=(
+            str(getattr(contract, "secType"))
+            if getattr(contract, "secType", None) not in (None, "")
+            else None
+        ),
+        exchange=(
+            str(getattr(contract, "exchange"))
+            if getattr(contract, "exchange", None) not in (None, "")
+            else None
+        ),
+        primary_exchange=(
+            str(getattr(contract, "primaryExchange"))
+            if getattr(contract, "primaryExchange", None) not in (None, "")
+            else None
+        ),
+        currency=(
+            str(getattr(contract, "currency"))
+            if getattr(contract, "currency", None) not in (None, "")
+            else None
+        ),
+        position=_to_decimal(raw_payload.get("position")),
+        average_cost=_to_decimal(raw_payload.get("avgCost")),
     )
 
 
@@ -309,6 +473,11 @@ def fetch_broker_runtime_snapshot(
         try:
             raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
             raw_executions = runtime_app.get_executions(timeout=timeout)
+            raw_account_updates = runtime_app.get_account_updates(
+                account_code=config.account_id,
+                timeout=timeout,
+            )
+            raw_positions = runtime_app.get_positions(timeout=timeout)
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
@@ -319,6 +488,14 @@ def fetch_broker_runtime_snapshot(
     finally:
         if owns_connection:
             runtime_app.disconnect_and_stop()
+
+    raw_portfolio = []
+    raw_account_values: dict[str, dict[str, dict[str, str | None]]] = {}
+    if isinstance(raw_account_updates, dict):
+        raw_portfolio = raw_account_updates.get("portfolio") or []
+        account_values_payload = raw_account_updates.get("account_values")
+        if isinstance(account_values_payload, dict):
+            raw_account_values = account_values_payload
 
     open_orders: dict[int, BrokerOpenOrder] = {}
     for raw_order in (raw_open_orders or {}).values():
@@ -332,7 +509,23 @@ def fetch_broker_runtime_snapshot(
         if serialized is not None:
             executions.append(serialized)
 
+    portfolio: list[BrokerPortfolioItem] = []
+    for raw_item in raw_portfolio or []:
+        serialized = _serialize_portfolio_item(raw_item)
+        if serialized is not None:
+            portfolio.append(serialized)
+
+    positions: list[BrokerPosition] = []
+    for account, account_positions in (raw_positions or {}).items():
+        for raw_position in account_positions or []:
+            serialized = _serialize_position(account, raw_position)
+            if serialized is not None:
+                positions.append(serialized)
+
     return BrokerRuntimeSnapshot(
         open_orders=open_orders,
         executions=tuple(executions),
+        portfolio=tuple(portfolio),
+        positions=tuple(positions),
+        account_values=raw_account_values,
     )

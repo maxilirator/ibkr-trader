@@ -93,6 +93,68 @@ def serialize_instruction_status(payload: InstructionStatus) -> dict[str, Any]:
     return _serialize_for_json(asdict(payload))
 
 
+def _build_instruction_status(
+    record: InstructionRecord,
+    *,
+    events: tuple[InstructionEventStatus, ...] = (),
+) -> InstructionStatus:
+    return InstructionStatus(
+        record_id=record.id,
+        instruction_id=record.instruction_id,
+        schema_version=record.schema_version,
+        source_system=record.source_system,
+        batch_id=record.batch_id,
+        account_key=record.account_key,
+        book_key=record.book_key,
+        symbol=record.symbol,
+        exchange=record.exchange,
+        currency=record.currency,
+        state=record.state,
+        submit_at=record.submit_at,
+        expire_at=record.expire_at,
+        order_type=record.order_type,
+        side=record.side,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        broker_order_id=record.broker_order_id,
+        broker_perm_id=record.broker_perm_id,
+        broker_client_id=record.broker_client_id,
+        broker_order_status=record.broker_order_status,
+        entry_submitted_quantity=record.entry_submitted_quantity,
+        entry_filled_quantity=record.entry_filled_quantity,
+        entry_avg_fill_price=record.entry_avg_fill_price,
+        entry_filled_at=record.entry_filled_at,
+        exit_order_id=record.exit_order_id,
+        exit_perm_id=record.exit_perm_id,
+        exit_client_id=record.exit_client_id,
+        exit_order_status=record.exit_order_status,
+        exit_submitted_quantity=record.exit_submitted_quantity,
+        exit_filled_quantity=record.exit_filled_quantity,
+        exit_avg_fill_price=record.exit_avg_fill_price,
+        exit_filled_at=record.exit_filled_at,
+        events=events,
+    )
+
+
+def list_instruction_statuses(
+    session_factory: sessionmaker[Session],
+    *,
+    limit: int = 100,
+    state: str | None = None,
+) -> tuple[InstructionStatus, ...]:
+    statement = select(InstructionRecord)
+    if state is not None:
+        statement = statement.where(InstructionRecord.state == state)
+    statement = statement.order_by(
+        InstructionRecord.updated_at.desc(),
+        InstructionRecord.id.desc(),
+    ).limit(limit)
+
+    with session_scope(session_factory) as session:
+        records = session.execute(statement).scalars()
+        return tuple(_build_instruction_status(record) for record in records)
+
+
 def read_instruction_status(
     session_factory: sessionmaker[Session],
     instruction_id: str,
@@ -131,39 +193,4 @@ def read_instruction_status(
                 for event in raw_events
             )
 
-        return InstructionStatus(
-            record_id=record.id,
-            instruction_id=record.instruction_id,
-            schema_version=record.schema_version,
-            source_system=record.source_system,
-            batch_id=record.batch_id,
-            account_key=record.account_key,
-            book_key=record.book_key,
-            symbol=record.symbol,
-            exchange=record.exchange,
-            currency=record.currency,
-            state=record.state,
-            submit_at=record.submit_at,
-            expire_at=record.expire_at,
-            order_type=record.order_type,
-            side=record.side,
-            created_at=record.created_at,
-            updated_at=record.updated_at,
-            broker_order_id=record.broker_order_id,
-            broker_perm_id=record.broker_perm_id,
-            broker_client_id=record.broker_client_id,
-            broker_order_status=record.broker_order_status,
-            entry_submitted_quantity=record.entry_submitted_quantity,
-            entry_filled_quantity=record.entry_filled_quantity,
-            entry_avg_fill_price=record.entry_avg_fill_price,
-            entry_filled_at=record.entry_filled_at,
-            exit_order_id=record.exit_order_id,
-            exit_perm_id=record.exit_perm_id,
-            exit_client_id=record.exit_client_id,
-            exit_order_status=record.exit_order_status,
-            exit_submitted_quantity=record.exit_submitted_quantity,
-            exit_filled_quantity=record.exit_filled_quantity,
-            exit_avg_fill_price=record.exit_avg_fill_price,
-            exit_filled_at=record.exit_filled_at,
-            events=events,
-        )
+        return _build_instruction_status(record, events=events)

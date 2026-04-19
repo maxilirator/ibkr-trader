@@ -8,6 +8,8 @@ from ibkr_trader.api.server import parse_execution_batch_payload
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
+from ibkr_trader.orchestration.operator_controls import KillSwitchActiveError
+from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
@@ -134,6 +136,34 @@ class SubmissionTests(TestCase):
                 submit_execution_batch(
                     self.session_factory,
                     batch,
+                    runtime_timezone="Europe/Stockholm",
+                    session_calendar_path=schedule_path,
+                )
+
+    def test_submit_execution_batch_rejects_when_kill_switch_is_enabled(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            set_kill_switch_state(
+                self.session_factory,
+                enabled=True,
+                reason="Freeze new entries.",
+                updated_by="test",
+            )
+
+            with self.assertRaisesRegex(KillSwitchActiveError, "kill switch"):
+                submit_execution_batch(
+                    self.session_factory,
+                    parse_execution_batch_payload(_sample_payload()),
                     runtime_timezone="Europe/Stockholm",
                     session_calendar_path=schedule_path,
                 )

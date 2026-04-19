@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
+from ibkr_trader.db.models import ReconciliationIssueRecord
+from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import OrderType
 from ibkr_trader.domain.execution_payloads import parse_execution_instruction_payload
@@ -37,10 +40,15 @@ from ibkr_trader.ibkr.runtime_snapshot import BrokerExecution
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.ibkr.runtime_snapshot import fetch_broker_runtime_snapshot
 from ibkr_trader.ibkr.session_manager import CanonicalSyncSessions
+from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
+from ibkr_trader.ledger.persistence import persist_broker_callback_events
+from ibkr_trader.ledger.persistence import persist_broker_order_submission
+from ibkr_trader.ledger.persistence import persist_broker_runtime_snapshot
 from ibkr_trader.orchestration.entry_submission import (
     cancel_persisted_instruction_entry,
     submit_persisted_instruction_entry,
 )
+from ibkr_trader.orchestration.operator_controls import read_kill_switch_state
 from ibkr_trader.orchestration.scheduling import (
     NextSessionExitStatus,
     build_instruction_runtime_schedule,
@@ -112,6 +120,10 @@ def serialize_runtime_cycle_result(result: RuntimeCycleResult) -> dict[str, Any]
     return _serialize_for_json(asdict(result))
 
 
+def _emit_runtime_cycle_result(result: RuntimeCycleResult) -> None:
+    print(json.dumps(serialize_runtime_cycle_result(result), indent=2))
+
+
 def _complete_cycle_timestamp(cycle_started_at: datetime) -> datetime:
     completed_at = utc_now()
     if completed_at < cycle_started_at:
@@ -152,6 +164,22 @@ def _append_issue(
     )
 
 
+def _persist_drained_broker_callbacks(
+    session_factory: sessionmaker[Session],
+    *,
+    broker_config: IbkrConnectionConfig,
+    callback_events: list[dict[str, Any]],
+) -> None:
+    if not callback_events:
+        return
+    persist_broker_callback_events(
+        session_factory,
+        callback_events,
+        broker_kind=BROKER_KIND_IBKR,
+        default_account_key=broker_config.account_id,
+    )
+
+
 def _instruction_payload(record: InstructionRecord) -> ExecutionInstruction:
     raw_instruction_payload = record.payload.get("instruction")
     if not isinstance(raw_instruction_payload, dict):
@@ -188,6 +216,181 @@ def _record_runtime_note(
                 note=note,
             )
         )
+
+
+def _build_runtime_cycle_result(
+    *,
+    cycle_started_at: datetime,
+    cycle_completed_at: datetime,
+    runtime_timezone: str,
+    submitted_entries: list[RuntimeCycleAction],
+    cancelled_entries: list[RuntimeCycleAction],
+    filled_entries: list[RuntimeCycleAction],
+    submitted_exits: list[RuntimeCycleAction],
+    completed_instructions: list[RuntimeCycleAction],
+    issues: list[RuntimeCycleIssue],
+) -> RuntimeCycleResult:
+    return RuntimeCycleResult(
+        cycle_started_at=cycle_started_at,
+        cycle_completed_at=cycle_completed_at,
+        runtime_timezone=runtime_timezone,
+        submitted_entries=tuple(submitted_entries),
+        cancelled_entries=tuple(cancelled_entries),
+        filled_entries=tuple(filled_entries),
+        submitted_exits=tuple(submitted_exits),
+        completed_instructions=tuple(completed_instructions),
+        issues=tuple(issues),
+    )
+
+
+def _persist_runtime_cycle_audit(
+    session_factory: sessionmaker[Session],
+    *,
+    run_kind: str,
+    broker_config: IbkrConnectionConfig,
+    runtime_timezone: str,
+    cycle_started_at: datetime,
+    cycle_completed_at: datetime,
+    submit_due_entries: bool,
+    due_instruction_count: int,
+    active_instruction_count: int,
+    snapshot: BrokerRuntimeSnapshot | None,
+    submitted_entries: list[RuntimeCycleAction],
+    cancelled_entries: list[RuntimeCycleAction],
+    filled_entries: list[RuntimeCycleAction],
+    submitted_exits: list[RuntimeCycleAction],
+    completed_instructions: list[RuntimeCycleAction],
+    issues: list[RuntimeCycleIssue],
+) -> None:
+    snapshot_counts = (
+        {
+            "account_count": len(snapshot.account_values),
+            "open_order_count": len(snapshot.open_orders),
+            "execution_count": len(snapshot.executions),
+            "position_count": len(snapshot.positions),
+            "portfolio_count": len(snapshot.portfolio),
+        }
+        if snapshot is not None
+        else None
+    )
+    action_payload = {
+        "submitted_entries": [_serialize_for_json(asdict(action)) for action in submitted_entries],
+        "cancelled_entries": [_serialize_for_json(asdict(action)) for action in cancelled_entries],
+        "filled_entries": [_serialize_for_json(asdict(action)) for action in filled_entries],
+        "submitted_exits": [_serialize_for_json(asdict(action)) for action in submitted_exits],
+        "completed_instructions": [
+            _serialize_for_json(asdict(action)) for action in completed_instructions
+        ],
+    }
+    action_count = sum(len(entries) for entries in action_payload.values())
+
+    with session_scope(session_factory) as session:
+        run_record = ReconciliationRunRecord(
+            run_kind=run_kind,
+            broker_kind=BROKER_KIND_IBKR,
+            account_key=broker_config.account_id,
+            runtime_timezone=runtime_timezone,
+            started_at=cycle_started_at,
+            completed_at=cycle_completed_at,
+            status="WARNINGS" if issues else "CLEAN",
+            issue_count=len(issues),
+            action_count=action_count,
+            metadata_json=_serialize_for_json(
+                {
+                    "submit_due_entries": submit_due_entries,
+                    "due_instruction_count": due_instruction_count,
+                    "active_instruction_count": active_instruction_count,
+                    "snapshot_counts": snapshot_counts,
+                    "actions": action_payload,
+                }
+            ),
+        )
+        session.add(run_record)
+        session.flush()
+
+        for issue in issues:
+            session.add(
+                ReconciliationIssueRecord(
+                    reconciliation_run_id=run_record.id,
+                    instruction_id=issue.instruction_id,
+                    stage=issue.stage,
+                    severity="ERROR",
+                    message=issue.message,
+                    observed_at=cycle_completed_at,
+                    payload={},
+                )
+            )
+
+
+def _finalize_runtime_cycle_result(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    *,
+    run_kind: str,
+    runtime_timezone: str,
+    cycle_started_at: datetime,
+    submit_due_entries: bool,
+    due_instruction_count: int,
+    active_instruction_count: int,
+    snapshot: BrokerRuntimeSnapshot | None,
+    submitted_entries: list[RuntimeCycleAction],
+    cancelled_entries: list[RuntimeCycleAction],
+    filled_entries: list[RuntimeCycleAction],
+    submitted_exits: list[RuntimeCycleAction],
+    completed_instructions: list[RuntimeCycleAction],
+    issues: list[RuntimeCycleIssue],
+) -> RuntimeCycleResult:
+    cycle_completed_at = _complete_cycle_timestamp(cycle_started_at)
+    result = _build_runtime_cycle_result(
+        cycle_started_at=cycle_started_at,
+        cycle_completed_at=cycle_completed_at,
+        runtime_timezone=runtime_timezone,
+        submitted_entries=submitted_entries,
+        cancelled_entries=cancelled_entries,
+        filled_entries=filled_entries,
+        submitted_exits=submitted_exits,
+        completed_instructions=completed_instructions,
+        issues=issues,
+    )
+    try:
+        _persist_runtime_cycle_audit(
+            session_factory,
+            run_kind=run_kind,
+            broker_config=broker_config,
+            runtime_timezone=runtime_timezone,
+            cycle_started_at=cycle_started_at,
+            cycle_completed_at=cycle_completed_at,
+            submit_due_entries=submit_due_entries,
+            due_instruction_count=due_instruction_count,
+            active_instruction_count=active_instruction_count,
+            snapshot=snapshot,
+            submitted_entries=submitted_entries,
+            cancelled_entries=cancelled_entries,
+            filled_entries=filled_entries,
+            submitted_exits=submitted_exits,
+            completed_instructions=completed_instructions,
+            issues=issues,
+        )
+    except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+        _append_issue(
+            issues,
+            instruction_id=None,
+            stage="runtime_cycle_audit",
+            message=str(exc),
+        )
+        cycle_completed_at = _complete_cycle_timestamp(cycle_started_at)
+        result = _build_runtime_cycle_result(
+            cycle_started_at=cycle_started_at,
+            cycle_completed_at=cycle_completed_at,
+            runtime_timezone=runtime_timezone,
+            submitted_entries=submitted_entries,
+            cancelled_entries=cancelled_entries,
+            filled_entries=filled_entries,
+            submitted_exits=submitted_exits,
+            completed_instructions=completed_instructions,
+            issues=issues,
+        )
+    return result
 
 
 def _fetch_instruction_ids(
@@ -537,6 +740,18 @@ def _record_entry_fill_and_optional_exit(
                 record.exit_order_status = str(broker_status["status"])
                 record.exit_submitted_quantity = str(entry_fill.quantity)
 
+            event_at = utc_now()
+            persist_broker_order_submission(
+                session,
+                broker_kind=BROKER_KIND_IBKR,
+                instruction_record=record,
+                broker_submission=broker_submission,
+                observed_at=event_at,
+                fallback_account_key=broker_config.account_id,
+                order_role="EXIT",
+                event_type=exit_spec["event_type"],
+                note=exit_spec["note"],
+            )
             state_before_exit = record.state
             record.state = ExecutionState.EXIT_PENDING.value
             session.add(
@@ -544,6 +759,7 @@ def _record_entry_fill_and_optional_exit(
                     instruction_id=record.id,
                     event_type=exit_spec["event_type"],
                     source="runtime_cycle",
+                    event_at=event_at,
                     state_before=state_before_exit,
                     state_after=record.state,
                     payload={"broker_submission": broker_submission},
@@ -582,6 +798,8 @@ def _mark_unfilled_entry_cancelled(
     instruction_id: str,
     *,
     note: str,
+    event_type: str = "entry_order_expired_without_fill",
+    action: str = "entry_cancelled_without_fill",
 ) -> RuntimeCycleAction:
     with session_scope(session_factory) as session:
         record = session.execute(
@@ -602,7 +820,7 @@ def _mark_unfilled_entry_cancelled(
         session.add(
             InstructionEventRecord(
                 instruction_id=record.id,
-                event_type="entry_order_expired_without_fill",
+                event_type=event_type,
                 source="runtime_cycle",
                 state_before=previous_state,
                 state_after=record.state,
@@ -612,7 +830,7 @@ def _mark_unfilled_entry_cancelled(
         )
         return RuntimeCycleAction(
             instruction_id=instruction_id,
-            action="entry_cancelled_without_fill",
+            action=action,
             state=record.state,
             detail={"note": note},
         )
@@ -651,11 +869,24 @@ def _submit_forced_exit(
         record.exit_order_status = str(broker_status["status"])
         record.exit_submitted_quantity = str(quantity)
         record.state = ExecutionState.EXIT_PENDING.value
+        event_at = utc_now()
+        persist_broker_order_submission(
+            session,
+            broker_kind=BROKER_KIND_IBKR,
+            instruction_record=record,
+            broker_submission=broker_submission,
+            observed_at=event_at,
+            fallback_account_key=broker_config.account_id,
+            order_role="EXIT",
+            event_type="forced_exit_submitted",
+            note="Submitted forced market exit at the next session open.",
+        )
         session.add(
             InstructionEventRecord(
                 instruction_id=record.id,
                 event_type="forced_exit_submitted",
                 source="runtime_cycle",
+                event_at=event_at,
                 state_before=previous_state,
                 state_after=record.state,
                 payload={"broker_submission": broker_submission},
@@ -755,15 +986,18 @@ def run_runtime_cycle(
     session_factory: sessionmaker[Session],
     broker_config: IbkrConnectionConfig,
     *,
+    run_kind: str = "runtime_cycle",
     runtime_timezone: str,
     session_calendar_path: Path,
     now: datetime | None = None,
     timeout: int = 10,
     instruction_ids: tuple[str, ...] | None = None,
+    submit_due_entries: bool = True,
     entry_submitter: Callable[..., Any] | None = None,
     entry_canceler: Callable[..., Any] | None = None,
     exit_submitter: Callable[..., dict[str, Any]] | None = None,
     broker_snapshot_fetcher: Callable[..., BrokerRuntimeSnapshot] | None = None,
+    broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -771,6 +1005,9 @@ def run_runtime_cycle(
     cycle_started_at = now.astimezone(timezone.utc) if now is not None else utc_now()
     runtime_snapshot_fetch = broker_snapshot_fetcher or fetch_broker_runtime_snapshot
     runtime_order_canceler = broker_order_canceler or cancel_broker_order
+    due_instruction_count = 0
+    active_instruction_count = 0
+    snapshot: BrokerRuntimeSnapshot | None = None
     submitted_entries: list[RuntimeCycleAction] = []
     cancelled_entries: list[RuntimeCycleAction] = []
     filled_entries: list[RuntimeCycleAction] = []
@@ -778,50 +1015,98 @@ def run_runtime_cycle(
     completed_instructions: list[RuntimeCycleAction] = []
     issues: list[RuntimeCycleIssue] = []
 
+    if broker_callback_fetcher is not None:
+        try:
+            _persist_drained_broker_callbacks(
+                session_factory,
+                broker_config=broker_config,
+                callback_events=broker_callback_fetcher(),
+            )
+        except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+            _append_issue(
+                issues,
+                instruction_id=None,
+                stage="broker_callbacks_pre_cycle",
+                message=str(exc),
+            )
+            return _finalize_runtime_cycle_result(
+                session_factory,
+                broker_config,
+                run_kind=run_kind,
+                runtime_timezone=runtime_timezone,
+                cycle_started_at=cycle_started_at,
+                submit_due_entries=submit_due_entries,
+                due_instruction_count=due_instruction_count,
+                active_instruction_count=active_instruction_count,
+                snapshot=snapshot,
+                submitted_entries=submitted_entries,
+                cancelled_entries=cancelled_entries,
+                filled_entries=filled_entries,
+                submitted_exits=submitted_exits,
+                completed_instructions=completed_instructions,
+                issues=issues,
+            )
+
+    kill_switch_state = read_kill_switch_state(session_factory)
+    kill_switch_enabled = kill_switch_state.enabled
     due_instruction_ids = _fetch_instruction_ids(
         session_factory,
         states=(ExecutionState.ENTRY_PENDING.value,),
         submit_before=cycle_started_at,
         instruction_ids=instruction_ids,
     )
-    for instruction_id in due_instruction_ids:
-        try:
-            submission = _run_with_broker_retries(
-                lambda: submit_persisted_instruction_entry(
-                    session_factory,
-                    broker_config,
-                    instruction_id,
-                    timeout=timeout,
-                    submitter=entry_submitter,
-                ),
-                retry_delays=broker_retry_delays,
-                sleep_fn=sleep_fn,
-            )
-            submitted_entries.append(
-                RuntimeCycleAction(
-                    instruction_id=instruction_id,
-                    action="entry_submitted",
-                    state=submission.state,
-                    detail={
-                        "broker_order_id": submission.broker_order_id,
-                        "broker_order_status": submission.broker_order_status,
-                    },
+    due_instruction_count = len(due_instruction_ids)
+    if submit_due_entries:
+        if kill_switch_enabled:
+            if due_instruction_ids:
+                _append_issue(
+                    issues,
+                    instruction_id=None,
+                    stage="kill_switch",
+                    message=(
+                        "Global kill switch is enabled; skipped submission of "
+                        f"{len(due_instruction_ids)} due entries."
+                    ),
                 )
-            )
-        except Exception as exc:  # pragma: no cover - broad by design for runtime safety
-            _append_issue(
-                issues,
-                instruction_id=instruction_id,
-                stage="entry_submit",
-                message=str(exc),
-            )
-            _record_runtime_note(
-                session_factory,
-                instruction_id=instruction_id,
-                event_type="runtime_entry_submit_failed",
-                note="Runtime cycle could not submit the due entry order.",
-                payload={"error": str(exc)},
-            )
+        else:
+            for instruction_id in due_instruction_ids:
+                try:
+                    submission = _run_with_broker_retries(
+                        lambda: submit_persisted_instruction_entry(
+                            session_factory,
+                            broker_config,
+                            instruction_id,
+                            timeout=timeout,
+                            submitter=entry_submitter,
+                        ),
+                        retry_delays=broker_retry_delays,
+                        sleep_fn=sleep_fn,
+                    )
+                    submitted_entries.append(
+                        RuntimeCycleAction(
+                            instruction_id=instruction_id,
+                            action="entry_submitted",
+                            state=submission.state,
+                            detail={
+                                "broker_order_id": submission.broker_order_id,
+                                "broker_order_status": submission.broker_order_status,
+                            },
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+                    _append_issue(
+                        issues,
+                        instruction_id=instruction_id,
+                        stage="entry_submit",
+                        message=str(exc),
+                    )
+                    _record_runtime_note(
+                        session_factory,
+                        instruction_id=instruction_id,
+                        event_type="runtime_entry_submit_failed",
+                        note="Runtime cycle could not submit the due entry order.",
+                        payload={"error": str(exc)},
+                    )
 
     active_instruction_ids = _fetch_instruction_ids(
         session_factory,
@@ -832,18 +1117,38 @@ def run_runtime_cycle(
         ),
         instruction_ids=instruction_ids,
     )
+    active_instruction_count = len(active_instruction_ids)
     if not active_instruction_ids:
-        cycle_completed_at = _complete_cycle_timestamp(cycle_started_at)
-        return RuntimeCycleResult(
-            cycle_started_at=cycle_started_at,
-            cycle_completed_at=cycle_completed_at,
+        if broker_callback_fetcher is not None:
+            try:
+                _persist_drained_broker_callbacks(
+                    session_factory,
+                    broker_config=broker_config,
+                    callback_events=broker_callback_fetcher(),
+                )
+            except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+                _append_issue(
+                    issues,
+                    instruction_id=None,
+                    stage="broker_callbacks_post_cycle",
+                    message=str(exc),
+                )
+        return _finalize_runtime_cycle_result(
+            session_factory,
+            broker_config,
+            run_kind=run_kind,
             runtime_timezone=runtime_timezone,
-            submitted_entries=tuple(submitted_entries),
-            cancelled_entries=tuple(cancelled_entries),
-            filled_entries=tuple(filled_entries),
-            submitted_exits=tuple(submitted_exits),
-            completed_instructions=tuple(completed_instructions),
-            issues=tuple(issues),
+            cycle_started_at=cycle_started_at,
+            submit_due_entries=submit_due_entries,
+            due_instruction_count=due_instruction_count,
+            active_instruction_count=active_instruction_count,
+            snapshot=snapshot,
+            submitted_entries=submitted_entries,
+            cancelled_entries=cancelled_entries,
+            filled_entries=filled_entries,
+            submitted_exits=submitted_exits,
+            completed_instructions=completed_instructions,
+            issues=issues,
         )
 
     try:
@@ -862,17 +1167,83 @@ def run_runtime_cycle(
             stage="broker_snapshot",
             message=str(exc),
         )
-        cycle_completed_at = _complete_cycle_timestamp(cycle_started_at)
-        return RuntimeCycleResult(
-            cycle_started_at=cycle_started_at,
-            cycle_completed_at=cycle_completed_at,
+        if broker_callback_fetcher is not None:
+            try:
+                _persist_drained_broker_callbacks(
+                    session_factory,
+                    broker_config=broker_config,
+                    callback_events=broker_callback_fetcher(),
+                )
+            except Exception as callback_exc:  # pragma: no cover - broad by design for runtime safety
+                _append_issue(
+                    issues,
+                    instruction_id=None,
+                    stage="broker_callbacks_post_cycle",
+                    message=str(callback_exc),
+                )
+        return _finalize_runtime_cycle_result(
+            session_factory,
+            broker_config,
+            run_kind=run_kind,
             runtime_timezone=runtime_timezone,
-            submitted_entries=tuple(submitted_entries),
-            cancelled_entries=tuple(cancelled_entries),
-            filled_entries=tuple(filled_entries),
-            submitted_exits=tuple(submitted_exits),
-            completed_instructions=tuple(completed_instructions),
-            issues=tuple(issues),
+            cycle_started_at=cycle_started_at,
+            submit_due_entries=submit_due_entries,
+            due_instruction_count=due_instruction_count,
+            active_instruction_count=active_instruction_count,
+            snapshot=snapshot,
+            submitted_entries=submitted_entries,
+            cancelled_entries=cancelled_entries,
+            filled_entries=filled_entries,
+            submitted_exits=submitted_exits,
+            completed_instructions=completed_instructions,
+            issues=issues,
+        )
+
+    try:
+        persist_broker_runtime_snapshot(
+            session_factory,
+            snapshot,
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=cycle_started_at,
+            default_account_key=broker_config.account_id,
+        )
+    except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+        _append_issue(
+            issues,
+            instruction_id=None,
+            stage="ledger_persist",
+            message=str(exc),
+        )
+        if broker_callback_fetcher is not None:
+            try:
+                _persist_drained_broker_callbacks(
+                    session_factory,
+                    broker_config=broker_config,
+                    callback_events=broker_callback_fetcher(),
+                )
+            except Exception as callback_exc:  # pragma: no cover - broad by design for runtime safety
+                _append_issue(
+                    issues,
+                    instruction_id=None,
+                    stage="broker_callbacks_post_cycle",
+                    message=str(callback_exc),
+                )
+        return _finalize_runtime_cycle_result(
+            session_factory,
+            broker_config,
+            run_kind=run_kind,
+            runtime_timezone=runtime_timezone,
+            cycle_started_at=cycle_started_at,
+            submit_due_entries=submit_due_entries,
+            due_instruction_count=due_instruction_count,
+            active_instruction_count=active_instruction_count,
+            snapshot=snapshot,
+            submitted_entries=submitted_entries,
+            cancelled_entries=cancelled_entries,
+            filled_entries=filled_entries,
+            submitted_exits=submitted_exits,
+            completed_instructions=completed_instructions,
+            issues=issues,
         )
 
     with session_scope(session_factory) as session:
@@ -915,6 +1286,73 @@ def run_runtime_cycle(
             expire_at = _ensure_utc(record.expire_at) or record.expire_at
 
             if record.state == ExecutionState.ENTRY_SUBMITTED.value:
+                if kill_switch_enabled:
+                    if entry_fill.has_fill:
+                        if entry_open:
+                            _run_with_broker_retries(
+                                lambda: runtime_order_canceler(
+                                    broker_config,
+                                    record.broker_order_id,
+                                    timeout=timeout,
+                                ),
+                                retry_delays=broker_retry_delays,
+                                sleep_fn=sleep_fn,
+                            )
+                        entry_action, exit_actions = _run_with_broker_retries(
+                            lambda: _record_entry_fill_and_optional_exit(
+                                session_factory,
+                                broker_config,
+                                instruction_id,
+                                entry_fill=entry_fill,
+                                timeout=timeout,
+                                exit_submitter=exit_submitter,
+                            ),
+                            retry_delays=broker_retry_delays,
+                            sleep_fn=sleep_fn,
+                        )
+                        filled_entries.append(entry_action)
+                        submitted_exits.extend(exit_actions)
+                        continue
+
+                    if entry_open:
+                        cancellation = _run_with_broker_retries(
+                            lambda: cancel_persisted_instruction_entry(
+                                session_factory,
+                                broker_config,
+                                instruction_id,
+                                timeout=timeout,
+                                canceler=entry_canceler,
+                            ),
+                            retry_delays=broker_retry_delays,
+                            sleep_fn=sleep_fn,
+                        )
+                        cancelled_entries.append(
+                            RuntimeCycleAction(
+                                instruction_id=instruction_id,
+                                action="entry_cancelled_by_kill_switch",
+                                state=cancellation.state,
+                                detail={
+                                    "broker_order_id": cancellation.broker_order_id,
+                                    "broker_order_status": cancellation.broker_order_status,
+                                    "reason": kill_switch_state.reason,
+                                },
+                            )
+                        )
+                    else:
+                        cancelled_entries.append(
+                            _mark_unfilled_entry_cancelled(
+                                session_factory,
+                                instruction_id,
+                                note=(
+                                    "Global kill switch was enabled and no open broker "
+                                    "entry order remained."
+                                ),
+                                event_type="entry_order_cancelled_by_kill_switch",
+                                action="entry_cancelled_by_kill_switch",
+                            )
+                        )
+                    continue
+
                 if entry_fill.has_fill:
                     if entry_open and cycle_started_at < expire_at:
                         continue
@@ -1065,17 +1503,73 @@ def run_runtime_cycle(
                 payload={"error": str(exc)},
             )
 
-    cycle_completed_at = _complete_cycle_timestamp(cycle_started_at)
-    return RuntimeCycleResult(
-        cycle_started_at=cycle_started_at,
-        cycle_completed_at=cycle_completed_at,
+    if broker_callback_fetcher is not None:
+        try:
+            _persist_drained_broker_callbacks(
+                session_factory,
+                broker_config=broker_config,
+                callback_events=broker_callback_fetcher(),
+            )
+        except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+            _append_issue(
+                issues,
+                instruction_id=None,
+                stage="broker_callbacks_post_cycle",
+                message=str(exc),
+            )
+    return _finalize_runtime_cycle_result(
+        session_factory,
+        broker_config,
+        run_kind=run_kind,
         runtime_timezone=runtime_timezone,
-        submitted_entries=tuple(submitted_entries),
-        cancelled_entries=tuple(cancelled_entries),
-        filled_entries=tuple(filled_entries),
-        submitted_exits=tuple(submitted_exits),
-        completed_instructions=tuple(completed_instructions),
-        issues=tuple(issues),
+        cycle_started_at=cycle_started_at,
+        submit_due_entries=submit_due_entries,
+        due_instruction_count=due_instruction_count,
+        active_instruction_count=active_instruction_count,
+        snapshot=snapshot,
+        submitted_entries=submitted_entries,
+        cancelled_entries=cancelled_entries,
+        filled_entries=filled_entries,
+        submitted_exits=submitted_exits,
+        completed_instructions=completed_instructions,
+        issues=issues,
+    )
+
+
+def run_startup_reconciliation(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    *,
+    runtime_timezone: str,
+    session_calendar_path: Path,
+    now: datetime | None = None,
+    timeout: int = 10,
+    instruction_ids: tuple[str, ...] | None = None,
+    exit_submitter: Callable[..., dict[str, Any]] | None = None,
+    broker_snapshot_fetcher: Callable[..., BrokerRuntimeSnapshot] | None = None,
+    broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
+    broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
+    broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> RuntimeCycleResult:
+    """Reconcile live broker state on startup without submitting new entry orders."""
+
+    return run_runtime_cycle(
+        session_factory,
+        broker_config,
+        run_kind="startup_reconciliation",
+        runtime_timezone=runtime_timezone,
+        session_calendar_path=session_calendar_path,
+        now=now,
+        timeout=timeout,
+        instruction_ids=instruction_ids,
+        submit_due_entries=False,
+        exit_submitter=exit_submitter,
+        broker_snapshot_fetcher=broker_snapshot_fetcher,
+        broker_callback_fetcher=broker_callback_fetcher,
+        broker_order_canceler=broker_order_canceler,
+        broker_retry_delays=broker_retry_delays,
+        sleep_fn=sleep_fn,
     )
 
 
@@ -1099,6 +1593,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Broker request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--skip-startup-reconciliation",
+        action="store_true",
+        help=(
+            "Skip the startup reconciliation pass. This is not recommended for the "
+            "persistent runtime."
+        ),
+    )
+    parser.add_argument(
+        "--allow-startup-issues",
+        action="store_true",
+        help=(
+            "Continue into the runtime loop even if startup reconciliation reports issues."
+        ),
     )
     return parser
 
@@ -1170,6 +1679,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
 
+    def drain_callbacks_with_primary() -> list[dict[str, Any]]:
+        return broker_sessions.primary.drain_broker_callback_events()
+
     def cancel_order_with_primary(
         broker_config: IbkrConnectionConfig,
         order_id: int,
@@ -1188,6 +1700,29 @@ def main(argv: list[str] | None = None) -> int:
 
     broker_sessions.warmup()
     try:
+        if not args.skip_startup_reconciliation:
+            startup_result = run_startup_reconciliation(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                runtime_timezone=app_config.timezone,
+                session_calendar_path=app_config.session_calendar_path,
+                timeout=args.timeout,
+                exit_submitter=submit_exit_with_primary,
+                broker_snapshot_fetcher=fetch_snapshot_with_primary,
+                broker_callback_fetcher=drain_callbacks_with_primary,
+                broker_order_canceler=cancel_order_with_primary,
+            )
+            _emit_runtime_cycle_result(startup_result)
+            if startup_result.issues and not args.allow_startup_issues:
+                print(
+                    (
+                        "Startup reconciliation reported issues; refusing to start the "
+                        "runtime loop. Re-run with --allow-startup-issues to override."
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
+
         while True:
             result = run_runtime_cycle(
                 session_factory,
@@ -1198,9 +1733,10 @@ def main(argv: list[str] | None = None) -> int:
                 entry_submitter=submit_entry_with_primary,
                 exit_submitter=submit_exit_with_primary,
                 broker_snapshot_fetcher=fetch_snapshot_with_primary,
+                broker_callback_fetcher=drain_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
             )
-            print(json.dumps(serialize_runtime_cycle_result(result), indent=2))
+            _emit_runtime_cycle_result(result)
             if args.once:
                 break
             time.sleep(args.interval_seconds)

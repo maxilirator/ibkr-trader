@@ -13,12 +13,15 @@ from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.orchestration.instruction_status import (
     InstructionStatusNotFoundError,
+    list_instruction_statuses,
     read_instruction_status,
     serialize_instruction_status,
 )
 
 
-def _persisted_instruction_payload() -> dict[str, object]:
+def _persisted_instruction_payload(
+    instruction_id: str = "status-aapl-1",
+) -> dict[str, object]:
     return {
         "schema_version": "2026-04-10",
         "source": {
@@ -27,7 +30,7 @@ def _persisted_instruction_payload() -> dict[str, object]:
             "generated_at": "2026-04-10T02:15:44Z",
         },
         "instruction": {
-            "instruction_id": "status-aapl-1",
+            "instruction_id": instruction_id,
             "account": {
                 "account_key": "GTW05",
                 "book_key": "long_risk_book",
@@ -75,11 +78,17 @@ class InstructionStatusTests(TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
 
-    def _insert_instruction(self) -> None:
+    def _insert_instruction(
+        self,
+        *,
+        instruction_id: str = "status-aapl-1",
+        state: str = "EXIT_PENDING",
+        updated_at: datetime | None = None,
+    ) -> None:
         session = self.session_factory()
         try:
             record = InstructionRecord(
-                instruction_id="status-aapl-1",
+                instruction_id=instruction_id,
                 schema_version="2026-04-10",
                 source_system="q-training",
                 batch_id="batch-1",
@@ -88,7 +97,7 @@ class InstructionStatusTests(TestCase):
                 symbol="AAPL",
                 exchange="SMART",
                 currency="USD",
-                state="EXIT_PENDING",
+                state=state,
                 submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
                 expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
                 order_type="LIMIT",
@@ -106,7 +115,8 @@ class InstructionStatusTests(TestCase):
                 exit_client_id=0,
                 exit_order_status="Submitted",
                 exit_submitted_quantity="1",
-                payload=_persisted_instruction_payload(),
+                payload=_persisted_instruction_payload(instruction_id),
+                updated_at=updated_at or datetime.now(timezone.utc),
             )
             session.add(record)
             session.flush()
@@ -165,3 +175,37 @@ class InstructionStatusTests(TestCase):
     def test_read_instruction_status_requires_existing_instruction(self) -> None:
         with self.assertRaisesRegex(InstructionStatusNotFoundError, "was not found"):
             read_instruction_status(self.session_factory, "missing-instruction")
+
+    def test_list_instruction_statuses_returns_recent_first(self) -> None:
+        self._insert_instruction(
+            instruction_id="status-aapl-1",
+            updated_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+        )
+        self._insert_instruction(
+            instruction_id="status-aapl-2",
+            updated_at=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
+        )
+
+        results = list_instruction_statuses(self.session_factory, limit=10)
+
+        self.assertEqual([item.instruction_id for item in results], ["status-aapl-2", "status-aapl-1"])
+        self.assertTrue(all(item.events == () for item in results))
+
+    def test_list_instruction_statuses_can_filter_by_state(self) -> None:
+        self._insert_instruction(
+            instruction_id="status-aapl-1",
+            state="ENTRY_PENDING",
+        )
+        self._insert_instruction(
+            instruction_id="status-aapl-2",
+            state="EXIT_PENDING",
+        )
+
+        results = list_instruction_statuses(
+            self.session_factory,
+            limit=10,
+            state="ENTRY_PENDING",
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].instruction_id, "status-aapl-1")
