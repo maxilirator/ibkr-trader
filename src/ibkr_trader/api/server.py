@@ -74,6 +74,12 @@ from ibkr_trader.orchestration.operator_controls import (
     serialize_kill_switch_status,
     set_kill_switch_state,
 )
+from ibkr_trader.orchestration.runtime_service_state import (
+    EXECUTION_RUNTIME_KEY,
+    read_runtime_service_status,
+    serialize_runtime_service_status,
+)
+from ibkr_trader.orchestration.runtime_worker import BackgroundExecutionRuntimeService
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
 from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_result
@@ -551,15 +557,23 @@ def create_app(config: AppConfig | None = None) -> Any:
         heartbeat_interval_seconds=app_config.broker_heartbeat_interval_seconds,
         snapshot_refresh_interval_seconds=app_config.broker_snapshot_refresh_interval_seconds,
     )
+    execution_runtime = BackgroundExecutionRuntimeService(
+        session_factory,
+        app_config,
+        broker_sessions,
+    )
 
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
         broker_sessions.warmup()
         if app_config.broker_monitor_enabled and app_config.environment != "test":
             broker_monitor.start()
+        if app_config.execution_runtime_enabled and app_config.environment != "test":
+            execution_runtime.start()
         try:
             yield
         finally:
+            execution_runtime.stop()
             broker_monitor.stop()
             broker_sessions.shutdown()
 
@@ -571,6 +585,7 @@ def create_app(config: AppConfig | None = None) -> Any:
     )
     app.state.broker_sessions = broker_sessions
     app.state.broker_monitor = broker_monitor
+    app.state.execution_runtime = execution_runtime
 
     @app.middleware("http")
     async def require_local_client(request: Request, call_next: Any) -> Any:
@@ -597,6 +612,15 @@ def create_app(config: AppConfig | None = None) -> Any:
             "broker_sessions": broker_sessions.status_snapshot(),
             "broker_operations": broker_sessions.activity_tracker.snapshot(recent_limit=10),
             "broker_monitor": serialize_broker_monitor_status(broker_monitor.status()),
+            "execution_runtime": (
+                execution_runtime.status()
+                or serialize_runtime_service_status(
+                    read_runtime_service_status(
+                        session_factory,
+                        runtime_key=EXECUTION_RUNTIME_KEY,
+                    )
+                )
+            ),
         }
 
     @app.get("/v1/ibkr/telemetry")

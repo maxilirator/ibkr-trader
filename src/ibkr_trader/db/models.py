@@ -532,3 +532,73 @@ class ReconciliationIssueRecord(Base):
     reconciliation_run: Mapped[ReconciliationRunRecord] = relationship(
         back_populates="issues"
     )
+
+
+class RuntimeServiceRecord(TimestampMixin, Base):
+    """Durable lifecycle row for long-lived local services such as execution runtime."""
+
+    __tablename__ = "runtime_service"
+    __table_args__ = (
+        UniqueConstraint("runtime_key", name="uq_runtime_service_runtime_key"),
+        Index("ix_runtime_service_status", "status"),
+        Index("ix_runtime_service_heartbeat_at", "heartbeat_at"),
+        Index("ix_runtime_service_lease_expires_at", "lease_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    service_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_token: Mapped[str | None] = mapped_column(String(64))
+    owner_label: Mapped[str | None] = mapped_column(String(256))
+    hostname: Mapped[str | None] = mapped_column(String(256))
+    pid: Mapped[int | None] = mapped_column(Integer)
+    runtime_timezone: Mapped[str | None] = mapped_column(String(64))
+    broker_kind: Mapped[str | None] = mapped_column(String(32))
+    broker_client_id: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_cycle_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_cycle_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_successful_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stop_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    events: Mapped[list["RuntimeServiceEventRecord"]] = relationship(
+        back_populates="runtime_service",
+        cascade="all, delete-orphan",
+    )
+
+
+class RuntimeServiceEventRecord(Base):
+    """Append-only event history for runtime-service lifecycle changes."""
+
+    __tablename__ = "runtime_service_event"
+    __table_args__ = (
+        Index("ix_runtime_service_event_runtime_service_id", "runtime_service_id"),
+        Index("ix_runtime_service_event_event_at", "event_at"),
+        Index("ix_runtime_service_event_event_type", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_service_id: Mapped[int] = mapped_column(
+        ForeignKey("runtime_service.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+    status_before: Mapped[str | None] = mapped_column(String(32))
+    status_after: Mapped[str | None] = mapped_column(String(32))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+
+    runtime_service: Mapped[RuntimeServiceRecord] = relationship(
+        back_populates="events"
+    )

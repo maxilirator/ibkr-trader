@@ -1,0 +1,17 @@
+[Unit]
+Description=IBKR Trader API Host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ibkr-trader
+Environment=PYTHONPATH=src
+ExecStartPre=%h/ibkr-trader/.venv/bin/python -m ibkr_trader.db.init_schema
+ExecStart=%h/ibkr-trader/.venv/bin/python -m ibkr_trader.api.server
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

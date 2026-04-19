@@ -55,6 +55,8 @@ Current repo template defaults:
 - `BROKER_MONITOR_ENABLED=true`
 - `BROKER_HEARTBEAT_INTERVAL_SECONDS=30`
 - `BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60`
+- `EXECUTION_RUNTIME_ENABLED=false`
+- `EXECUTION_RUNTIME_INTERVAL_SECONDS=5`
 
 The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo the canonical client-ID policy is:
 
@@ -86,8 +88,18 @@ Current important settings include:
 - local API bind host and port
 - IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, default account ID, and optional multi-account snapshot list
 - background broker heartbeat and ledger snapshot refresh intervals
+- long-lived execution runtime enablement, interval, timeout, startup-gate policy, and durable lease window
 
 For the background broker monitor, prefer `IBKR_ACCOUNT_IDS` when you want the dashboard and persisted runtime snapshots to refresh balances for more than one visible broker account. The monitor now uses per-account `reqAccountUpdates` for these accounts rather than `reqAccountSummary`, which avoids the IBKR summary-subscription limit during long-lived operation.
+
+The long-lived execution runtime can now run inside the API host process. When `EXECUTION_RUNTIME_ENABLED=true`, the API starts a background execution loop that:
+
+- acquires a durable runtime lease in Postgres
+- performs startup reconciliation before normal cycles
+- keeps renewing its runtime heartbeat and cycle timestamps
+- persists whether the runtime is `STARTING`, `RUNNING`, `DEGRADED`, `STARTUP_BLOCKED`, `STOPPED`, or `FAILED`
+
+That runtime status is exposed through `GET /healthz` and shown in the dashboard.
 
 ## Local API wrapper
 
@@ -118,6 +130,8 @@ The initial FastAPI wrapper includes:
 - `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
 - `POST /v1/runtime/run-once`
+
+For colocated deployment, the execution runtime now lives in the API host process by default, so one supervised API service is enough to keep the broker heartbeat, operator API, and execution loop alive together.
 
 See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instruction-contract.md](docs/instruction-contract.md) for the upstream payload contract.
 

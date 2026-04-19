@@ -2,12 +2,6 @@
 
 This file is the active implementation tracker for the production-grade trader plan.
 
-## In Progress
-
-- [ ] Long-lived execution runtime that owns one persistent broker session:
-  the canonical session plumbing and startup boot gate are in place, but the
-  always-on service still needs clearer supervision and runtime lifecycle semantics
-
 ## Next
 
 - [ ] Operator controls for reconciliation warnings and broker attention
@@ -16,6 +10,11 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Long-lived execution runtime that owns one persistent broker session:
+  the API host can now run the execution loop continuously, with a durable
+  runtime lease, startup reconciliation gate, persisted heartbeat/status,
+  and operator-visible lifecycle state for whether execution is running,
+  degraded, blocked, stopped, or failed
 - [x] Runtime snapshots no longer depend on IBKR account-summary subscriptions:
   the background broker monitor now uses per-account account updates for the
   configured accounts, and the sync wrapper always unsubscribes account-summary

@@ -58,6 +58,8 @@ IBKR_ACCOUNT_IDS=U25245595,U25245596
 BROKER_MONITOR_ENABLED=true
 BROKER_HEARTBEAT_INTERVAL_SECONDS=30
 BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60
+EXECUTION_RUNTIME_ENABLED=true
+EXECUTION_RUNTIME_INTERVAL_SECONDS=5
 ```
 
 Recommended repo usage:
@@ -67,6 +69,8 @@ Recommended repo usage:
 - reserve `IBKR_STREAMING_CLIENT_ID=9` for streaming and market-data sampling
 - set `IBKR_ACCOUNT_IDS` when the colocated runtime should refresh balances and portfolio data for multiple visible accounts without using the more fragile account-summary subscription path
 - do not work around ownership problems by generating fresh client IDs during normal operation
+
+When the API host is running with `EXECUTION_RUNTIME_ENABLED=true`, that same colocated process now hosts the long-lived execution loop. The runtime takes a durable Postgres lease before it starts cycling, and the dashboard can show whether the execution loop is running, degraded, blocked on startup reconciliation, or stopped.
 
 See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.
 

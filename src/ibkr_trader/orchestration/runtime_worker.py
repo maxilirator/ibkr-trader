@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import sys
 import time
+import uuid
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import date
@@ -13,6 +16,8 @@ from decimal import Decimal
 from decimal import InvalidOperation
 from enum import Enum
 from pathlib import Path
+from threading import Event
+from threading import Thread
 from typing import Any
 from typing import Callable
 
@@ -52,6 +57,18 @@ from ibkr_trader.orchestration.operator_controls import read_kill_switch_state
 from ibkr_trader.orchestration.scheduling import (
     NextSessionExitStatus,
     build_instruction_runtime_schedule,
+)
+from ibkr_trader.orchestration.runtime_service_state import (
+    EXECUTION_RUNTIME_KEY,
+    RuntimeServiceLeaseError,
+    acquire_runtime_service_lease,
+    mark_runtime_service_failed,
+    mark_runtime_service_startup_blocked,
+    mark_runtime_service_stopped,
+    read_runtime_service_status,
+    record_runtime_cycle_completed,
+    record_runtime_cycle_started,
+    serialize_runtime_service_status,
 )
 from ibkr_trader.orchestration.state_machine import ExecutionState
 
@@ -1573,52 +1590,18 @@ def run_startup_reconciliation(
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run the IBKR Trader MVP runtime loop."
-    )
-    parser.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=5.0,
-        help="Seconds to sleep between runtime cycles.",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run exactly one runtime cycle and exit.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=10,
-        help="Broker request timeout in seconds.",
-    )
-    parser.add_argument(
-        "--skip-startup-reconciliation",
-        action="store_true",
-        help=(
-            "Skip the startup reconciliation pass. This is not recommended for the "
-            "persistent runtime."
-        ),
-    )
-    parser.add_argument(
-        "--allow-startup-issues",
-        action="store_true",
-        help=(
-            "Continue into the runtime loop even if startup reconciliation reports issues."
-        ),
-    )
-    return parser
+@dataclass(slots=True)
+class RuntimeBrokerOperations:
+    submit_entry: Callable[..., dict[str, Any]]
+    submit_exit: Callable[..., dict[str, Any]]
+    fetch_snapshot: Callable[..., BrokerRuntimeSnapshot]
+    drain_callbacks: Callable[[], list[dict[str, Any]]]
+    cancel_order: Callable[..., dict[str, Any]]
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    app_config = AppConfig.from_env()
-    session_factory = create_session_factory(build_engine(app_config.database_url))
-    broker_sessions = CanonicalSyncSessions(app_config.ibkr)
-
+def _build_runtime_broker_operations(
+    broker_sessions: CanonicalSyncSessions,
+) -> RuntimeBrokerOperations:
     def submit_entry_with_primary(
         broker_config: IbkrConnectionConfig,
         instruction: ExecutionInstruction,
@@ -1698,22 +1681,100 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
 
+    return RuntimeBrokerOperations(
+        submit_entry=submit_entry_with_primary,
+        submit_exit=submit_exit_with_primary,
+        fetch_snapshot=fetch_snapshot_with_primary,
+        drain_callbacks=drain_callbacks_with_primary,
+        cancel_order=cancel_order_with_primary,
+    )
+
+
+def _runtime_owner_label() -> tuple[str, str, int]:
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    return f"{hostname}:{pid}", hostname, pid
+
+
+def run_persistent_execution_runtime(
+    session_factory: sessionmaker[Session],
+    app_config: AppConfig,
+    broker_sessions: CanonicalSyncSessions,
+    *,
+    interval_seconds: float,
+    timeout: int,
+    once: bool = False,
+    skip_startup_reconciliation: bool = False,
+    allow_startup_issues: bool = False,
+    runtime_key: str = EXECUTION_RUNTIME_KEY,
+    lease_seconds: float = 30.0,
+    stop_event: Event | None = None,
+    emit_results: bool = True,
+    shutdown_sessions_on_exit: bool = True,
+) -> int:
+    runtime_stop_event = stop_event or Event()
+    owner_token = uuid.uuid4().hex
+    owner_label, hostname, pid = _runtime_owner_label()
+    broker_config = app_config.ibkr.primary_session()
+    broker_ops = _build_runtime_broker_operations(broker_sessions)
+
+    acquire_runtime_service_lease(
+        session_factory,
+        runtime_key=runtime_key,
+        service_type="execution",
+        owner_token=owner_token,
+        owner_label=owner_label,
+        hostname=hostname,
+        pid=pid,
+        runtime_timezone=app_config.timezone,
+        broker_kind=BROKER_KIND_IBKR,
+        broker_client_id=broker_config.client_id,
+        lease_seconds=lease_seconds,
+        metadata_json={
+            "interval_seconds": interval_seconds,
+            "timeout_seconds": timeout,
+            "allow_startup_issues": allow_startup_issues,
+        },
+    )
+
     broker_sessions.warmup()
+    runtime_released = False
     try:
-        if not args.skip_startup_reconciliation:
+        if not skip_startup_reconciliation:
+            record_runtime_cycle_started(
+                session_factory,
+                runtime_key=runtime_key,
+                owner_token=owner_token,
+                lease_seconds=lease_seconds,
+            )
             startup_result = run_startup_reconciliation(
                 session_factory,
-                app_config.ibkr.primary_session(),
+                broker_config,
                 runtime_timezone=app_config.timezone,
                 session_calendar_path=app_config.session_calendar_path,
-                timeout=args.timeout,
-                exit_submitter=submit_exit_with_primary,
-                broker_snapshot_fetcher=fetch_snapshot_with_primary,
-                broker_callback_fetcher=drain_callbacks_with_primary,
-                broker_order_canceler=cancel_order_with_primary,
+                timeout=timeout,
+                exit_submitter=broker_ops.submit_exit,
+                broker_snapshot_fetcher=broker_ops.fetch_snapshot,
+                broker_callback_fetcher=broker_ops.drain_callbacks,
+                broker_order_canceler=broker_ops.cancel_order,
             )
-            _emit_runtime_cycle_result(startup_result)
-            if startup_result.issues and not args.allow_startup_issues:
+            record_runtime_cycle_completed(
+                session_factory,
+                runtime_key=runtime_key,
+                owner_token=owner_token,
+                lease_seconds=lease_seconds,
+                result=startup_result,
+            )
+            if emit_results:
+                _emit_runtime_cycle_result(startup_result)
+            if startup_result.issues and not allow_startup_issues:
+                mark_runtime_service_startup_blocked(
+                    session_factory,
+                    runtime_key=runtime_key,
+                    owner_token=owner_token,
+                    result=startup_result,
+                )
+                runtime_released = True
                 print(
                     (
                         "Startup reconciliation reported issues; refusing to start the "
@@ -1724,25 +1785,196 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
         while True:
+            if runtime_stop_event.is_set():
+                break
+
+            lease_snapshot = record_runtime_cycle_started(
+                session_factory,
+                runtime_key=runtime_key,
+                owner_token=owner_token,
+                lease_seconds=lease_seconds,
+            )
+            if lease_snapshot.stop_requested:
+                break
+
             result = run_runtime_cycle(
                 session_factory,
-                app_config.ibkr.primary_session(),
+                broker_config,
                 runtime_timezone=app_config.timezone,
                 session_calendar_path=app_config.session_calendar_path,
-                timeout=args.timeout,
-                entry_submitter=submit_entry_with_primary,
-                exit_submitter=submit_exit_with_primary,
-                broker_snapshot_fetcher=fetch_snapshot_with_primary,
-                broker_callback_fetcher=drain_callbacks_with_primary,
-                broker_order_canceler=cancel_order_with_primary,
+                timeout=timeout,
+                entry_submitter=broker_ops.submit_entry,
+                exit_submitter=broker_ops.submit_exit,
+                broker_snapshot_fetcher=broker_ops.fetch_snapshot,
+                broker_callback_fetcher=broker_ops.drain_callbacks,
+                broker_order_canceler=broker_ops.cancel_order,
             )
-            _emit_runtime_cycle_result(result)
-            if args.once:
+            record_runtime_cycle_completed(
+                session_factory,
+                runtime_key=runtime_key,
+                owner_token=owner_token,
+                lease_seconds=lease_seconds,
+                result=result,
+            )
+            if emit_results:
+                _emit_runtime_cycle_result(result)
+            if once:
                 break
-            time.sleep(args.interval_seconds)
+            if runtime_stop_event.wait(interval_seconds):
+                break
+
+        stop_note = (
+            "Completed the requested one-shot execution-runtime cycle."
+            if once
+            else "Execution runtime stopped cleanly."
+        )
+        mark_runtime_service_stopped(
+            session_factory,
+            runtime_key=runtime_key,
+            owner_token=owner_token,
+            note=stop_note,
+        )
+        runtime_released = True
+        return 0
+    except Exception as exc:
+        if not runtime_released:
+            try:
+                mark_runtime_service_failed(
+                    session_factory,
+                    runtime_key=runtime_key,
+                    owner_token=owner_token,
+                    error=str(exc),
+                )
+                runtime_released = True
+            except RuntimeServiceLeaseError:
+                pass
+        raise
     finally:
-        broker_sessions.shutdown()
-    return 0
+        if shutdown_sessions_on_exit:
+            broker_sessions.shutdown()
+
+
+class BackgroundExecutionRuntimeService:
+    """Run the execution runtime loop inside the long-lived API host process."""
+
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        app_config: AppConfig,
+        broker_sessions: CanonicalSyncSessions,
+    ) -> None:
+        self._session_factory = session_factory
+        self._app_config = app_config
+        self._broker_sessions = broker_sessions
+        self._stop_event = Event()
+        self._thread: Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        thread = Thread(
+            target=self._run,
+            name="execution-runtime-service",
+            daemon=True,
+        )
+        thread.start()
+        self._thread = thread
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=max(5.0, self._app_config.execution_runtime_interval_seconds + 5.0))
+        self._thread = None
+
+    def status(self) -> dict[str, Any] | None:
+        return serialize_runtime_service_status(
+            read_runtime_service_status(
+                self._session_factory,
+                runtime_key=EXECUTION_RUNTIME_KEY,
+            )
+        )
+
+    def _run(self) -> None:
+        try:
+            run_persistent_execution_runtime(
+                self._session_factory,
+                self._app_config,
+                self._broker_sessions,
+                interval_seconds=self._app_config.execution_runtime_interval_seconds,
+                timeout=self._app_config.execution_runtime_timeout_seconds,
+                allow_startup_issues=self._app_config.execution_runtime_allow_startup_issues,
+                lease_seconds=self._app_config.execution_runtime_lease_seconds,
+                stop_event=self._stop_event,
+                emit_results=False,
+                shutdown_sessions_on_exit=False,
+            )
+        except RuntimeServiceLeaseError:
+            return
+        except Exception:
+            return
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run the IBKR Trader MVP runtime loop."
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds to sleep between runtime cycles.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run exactly one runtime cycle and exit.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="Broker request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--skip-startup-reconciliation",
+        action="store_true",
+        help=(
+            "Skip the startup reconciliation pass. This is not recommended for the "
+            "persistent runtime."
+        ),
+    )
+    parser.add_argument(
+        "--allow-startup-issues",
+        action="store_true",
+        help=(
+            "Continue into the runtime loop even if startup reconciliation reports issues."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    app_config = AppConfig.from_env()
+    session_factory = create_session_factory(build_engine(app_config.database_url))
+    broker_sessions = CanonicalSyncSessions(app_config.ibkr)
+    try:
+        return run_persistent_execution_runtime(
+            session_factory,
+            app_config,
+            broker_sessions,
+            interval_seconds=args.interval_seconds,
+            timeout=args.timeout,
+            once=args.once,
+            skip_startup_reconciliation=args.skip_startup_reconciliation,
+            allow_startup_issues=args.allow_startup_issues,
+            lease_seconds=app_config.execution_runtime_lease_seconds,
+        )
+    except RuntimeServiceLeaseError as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

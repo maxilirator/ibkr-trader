@@ -27,6 +27,7 @@
       open_order_count: 0
     }
   };
+  const executionRuntime = data.health?.execution_runtime ?? null;
   const endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
   const warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count ?? 0) > 0);
   const killSwitchResult = form?.killSwitchResult ?? null;
@@ -72,6 +73,18 @@
     if (ok === true) return 'ok';
     if (ok === false) return 'bad';
     return 'warn';
+  }
+
+  function executionRuntimeLabel() {
+    return executionRuntime?.status ?? 'Unknown';
+  }
+
+  function executionRuntimeClass() {
+    if (!executionRuntime?.status) return 'warn';
+    if (executionRuntime.status === 'RUNNING') return 'ok';
+    if (executionRuntime.status === 'DEGRADED') return 'warn';
+    if (executionRuntime.status === 'STOPPED') return 'warn';
+    return 'bad';
   }
 
   function parseTimestamp(value) {
@@ -269,6 +282,16 @@
         {:else}
           {brokerMonitor.snapshot_refresh?.error ?? 'No snapshot refresh has completed yet.'}
         {/if}
+      </small>
+    </article>
+
+    <article class="stat-card">
+      <span>Execution Runtime</span>
+      <strong class={executionRuntimeClass()}>{executionRuntimeLabel()}</strong>
+      <small>
+        {executionRuntime?.last_successful_cycle_at ??
+          executionRuntime?.last_error ??
+          'No execution-runtime status has been persisted yet.'}
       </small>
     </article>
 

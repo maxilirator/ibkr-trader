@@ -25,6 +25,8 @@ from ibkr_trader.db.models import OperatorControlRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
+from ibkr_trader.db.models import RuntimeServiceEventRecord
+from ibkr_trader.db.models import RuntimeServiceRecord
 
 
 class DatabaseSchemaTests(unittest.TestCase):
@@ -61,6 +63,8 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "position_snapshot",
                 "reconciliation_issue",
                 "reconciliation_run",
+                "runtime_service",
+                "runtime_service_event",
             },
         )
         instruction_columns = {
@@ -338,6 +342,45 @@ class DatabaseSchemaTests(unittest.TestCase):
             ).scalar_one()
             self.assertEqual(cancellation.status, "COMPLETED")
             self.assertEqual(cancellation.cancelled_submitted_count, 1)
+        finally:
+            session.close()
+
+    def test_runtime_service_tables_round_trip(self) -> None:
+        session = self.session_factory()
+        try:
+            runtime_service = RuntimeServiceRecord(
+                runtime_key="EXECUTION_RUNTIME",
+                service_type="execution",
+                status="RUNNING",
+                owner_token="token-123",
+                owner_label="quant:1234",
+                hostname="quant",
+                pid=1234,
+                runtime_timezone="Europe/Stockholm",
+                broker_kind="IBKR",
+                broker_client_id=0,
+                stop_requested=False,
+                metadata_json={"interval_seconds": 5},
+            )
+            session.add(runtime_service)
+            session.flush()
+            session.add(
+                RuntimeServiceEventRecord(
+                    runtime_service_id=runtime_service.id,
+                    event_type="runtime_started",
+                    source="runtime_service",
+                    status_before="STOPPED",
+                    status_after="RUNNING",
+                    payload={"interval_seconds": 5},
+                    note="Started from test.",
+                )
+            )
+            session.commit()
+            session.refresh(runtime_service)
+
+            self.assertEqual(runtime_service.runtime_key, "EXECUTION_RUNTIME")
+            self.assertEqual(len(runtime_service.events), 1)
+            self.assertEqual(runtime_service.events[0].event_type, "runtime_started")
         finally:
             session.close()
 
