@@ -120,6 +120,11 @@ class AppConfig:
     stockholm_identity_path: Path
     api: ApiServerConfig
     ibkr: IbkrConnectionConfig
+    broker_monitor_enabled: bool = True
+    broker_heartbeat_interval_seconds: float = 30.0
+    broker_heartbeat_timeout_seconds: int = 5
+    broker_snapshot_refresh_interval_seconds: float = 60.0
+    broker_snapshot_refresh_timeout_seconds: int = 10
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -151,4 +156,21 @@ class AppConfig:
             ),
             api=ApiServerConfig.from_env(),
             ibkr=IbkrConnectionConfig.from_env(),
+            broker_monitor_enabled=getenv(
+                "BROKER_MONITOR_ENABLED",
+                "true",
+            ).lower()
+            not in {"0", "false", "no"},
+            broker_heartbeat_interval_seconds=float(
+                getenv("BROKER_HEARTBEAT_INTERVAL_SECONDS", "30")
+            ),
+            broker_heartbeat_timeout_seconds=int(
+                getenv("BROKER_HEARTBEAT_TIMEOUT_SECONDS", "5")
+            ),
+            broker_snapshot_refresh_interval_seconds=float(
+                getenv("BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS", "60")
+            ),
+            broker_snapshot_refresh_timeout_seconds=int(
+                getenv("BROKER_SNAPSHOT_REFRESH_TIMEOUT_SECONDS", "10")
+            ),
         )

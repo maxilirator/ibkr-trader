@@ -51,6 +51,9 @@ Current repo template defaults:
 - `IBKR_CLIENT_ID=0`
 - `IBKR_DIAGNOSTIC_CLIENT_ID=7`
 - `IBKR_STREAMING_CLIENT_ID=9`
+- `BROKER_MONITOR_ENABLED=true`
+- `BROKER_HEARTBEAT_INTERVAL_SECONDS=30`
+- `BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60`
 
 The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo the canonical client-ID policy is:
 
@@ -81,6 +84,7 @@ Current important settings include:
 - database URL
 - local API bind host and port
 - IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, and account ID
+- background broker heartbeat and ledger snapshot refresh intervals
 
 ## Local API wrapper
 

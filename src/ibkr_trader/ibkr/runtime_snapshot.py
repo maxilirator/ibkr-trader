@@ -18,6 +18,13 @@ class RuntimeSnapshotSyncWrapperProtocol(Protocol):
 
     def disconnect_and_stop(self) -> None: ...
 
+    def get_account_summary(
+        self,
+        tags: str,
+        group: str = "All",
+        timeout: int = 5,
+    ) -> dict[str, dict[str, dict[str, str]]]: ...
+
     def get_open_orders(self, timeout: int = 3) -> dict[int, Any]: ...
 
     def get_executions(self, exec_filter: Any | None = None, timeout: int = 10) -> list[Any]: ...
@@ -119,6 +126,17 @@ class BrokerRuntimeSnapshot:
     account_values: dict[str, dict[str, dict[str, str | None]]]
 
 
+ACCOUNT_SNAPSHOT_SUMMARY_TAGS: tuple[str, ...] = (
+    "NetLiquidation",
+    "TotalCashValue",
+    "BuyingPower",
+    "AvailableFunds",
+    "ExcessLiquidity",
+    "Cushion",
+    "Currency",
+)
+
+
 def _serialize_for_json(payload: Any) -> Any:
     if isinstance(payload, Decimal):
         return str(payload)
@@ -175,6 +193,45 @@ def _parse_ibkr_execution_time(value: Any) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def _merge_account_values(
+    base: dict[str, dict[str, dict[str, str | None]]],
+    overlay: dict[str, dict[str, dict[str, str | None]]],
+) -> dict[str, dict[str, dict[str, str | None]]]:
+    merged: dict[str, dict[str, dict[str, str | None]]] = {
+        account_key: {
+            tag: {
+                "value": payload.get("value"),
+                "currency": payload.get("currency"),
+            }
+            for tag, payload in values.items()
+            if isinstance(payload, dict)
+        }
+        for account_key, values in base.items()
+        if isinstance(values, dict)
+    }
+
+    for account_key, values in overlay.items():
+        if not isinstance(values, dict):
+            continue
+        account_payload = merged.setdefault(account_key, {})
+        for tag, payload in values.items():
+            if not isinstance(payload, dict):
+                continue
+            account_payload[tag] = {
+                "value": (
+                    str(payload.get("value"))
+                    if payload.get("value") not in (None, "")
+                    else None
+                ),
+                "currency": (
+                    str(payload.get("currency"))
+                    if payload.get("currency") not in (None, "")
+                    else None
+                ),
+            }
+    return merged
 
 
 def _serialize_open_order(raw_payload: Any) -> BrokerOpenOrder | None:
@@ -473,6 +530,11 @@ def fetch_broker_runtime_snapshot(
         try:
             raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
             raw_executions = runtime_app.get_executions(timeout=timeout)
+            raw_account_summary = runtime_app.get_account_summary(
+                tags=",".join(ACCOUNT_SNAPSHOT_SUMMARY_TAGS),
+                group="All",
+                timeout=timeout,
+            )
             raw_account_updates = runtime_app.get_account_updates(
                 account_code=config.account_id,
                 timeout=timeout,
@@ -491,11 +553,16 @@ def fetch_broker_runtime_snapshot(
 
     raw_portfolio = []
     raw_account_values: dict[str, dict[str, dict[str, str | None]]] = {}
+    if isinstance(raw_account_summary, dict):
+        raw_account_values = _merge_account_values(raw_account_values, raw_account_summary)
     if isinstance(raw_account_updates, dict):
         raw_portfolio = raw_account_updates.get("portfolio") or []
         account_values_payload = raw_account_updates.get("account_values")
         if isinstance(account_values_payload, dict):
-            raw_account_values = account_values_payload
+            raw_account_values = _merge_account_values(
+                raw_account_values,
+                account_values_payload,
+            )
 
     open_orders: dict[int, BrokerOpenOrder] = {}
     for raw_order in (raw_open_orders or {}).values():

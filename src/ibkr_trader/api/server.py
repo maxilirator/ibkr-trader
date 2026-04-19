@@ -10,6 +10,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping
 
+from ibkr_trader.api.broker_monitor import BrokerMonitorService
+from ibkr_trader.api.broker_monitor import serialize_broker_monitor_status
 from ibkr_trader.config import AppConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_session_factory
@@ -78,6 +80,7 @@ from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_res
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
+from ibkr_trader.ledger.persistence import persist_broker_runtime_snapshot
 from ibkr_trader.read_models import build_operator_dashboard_snapshot
 from ibkr_trader.read_models import build_ledger_dashboard_snapshot
 from ibkr_trader.read_models import serialize_ledger_dashboard_snapshot
@@ -431,22 +434,6 @@ def create_app(config: AppConfig | None = None) -> Any:
     FastAPI, HTTPException, Request, JSONResponse = _load_fastapi_runtime()
     broker_sessions = CanonicalSyncSessions(app_config.ibkr)
 
-    @asynccontextmanager
-    async def lifespan(_: Any) -> Any:
-        broker_sessions.warmup()
-        try:
-            yield
-        finally:
-            broker_sessions.shutdown()
-
-    app = FastAPI(
-        title="IBKR Trader Local API",
-        version="0.1.0",
-        summary="Local-only control plane for the IBKR Trader runtime.",
-        lifespan=lifespan,
-    )
-    app.state.broker_sessions = broker_sessions
-
     def with_primary_session(operation_name: str, operation: Any) -> Any:
         return broker_sessions.primary.execute(operation_name, operation)
 
@@ -532,6 +519,59 @@ def create_app(config: AppConfig | None = None) -> Any:
     def drain_broker_callbacks_with_primary() -> list[dict[str, Any]]:
         return broker_sessions.primary.drain_broker_callback_events()
 
+    def run_diagnostic_heartbeat_probe() -> Any:
+        return with_diagnostic_session(
+            "heartbeat_probe",
+            lambda broker_app: probe_gateway(
+                app_config.ibkr.diagnostic_session(),
+                timeout=app_config.broker_heartbeat_timeout_seconds,
+                app=broker_app,
+            ),
+        )
+
+    def fetch_background_runtime_snapshot() -> Any:
+        return fetch_runtime_snapshot_with_primary(
+            app_config.ibkr.primary_session(),
+            timeout=app_config.broker_snapshot_refresh_timeout_seconds,
+        )
+
+    def persist_background_runtime_snapshot(snapshot: Any, captured_at: datetime) -> None:
+        persist_broker_runtime_snapshot(
+            session_factory,
+            snapshot,
+            broker_kind="IBKR",
+            captured_at=captured_at,
+            default_account_key=app_config.ibkr.account_id or None,
+        )
+
+    broker_monitor = BrokerMonitorService(
+        heartbeat_probe=run_diagnostic_heartbeat_probe,
+        snapshot_fetcher=fetch_background_runtime_snapshot,
+        snapshot_persister=persist_background_runtime_snapshot,
+        heartbeat_interval_seconds=app_config.broker_heartbeat_interval_seconds,
+        snapshot_refresh_interval_seconds=app_config.broker_snapshot_refresh_interval_seconds,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: Any) -> Any:
+        broker_sessions.warmup()
+        if app_config.broker_monitor_enabled and app_config.environment != "test":
+            broker_monitor.start()
+        try:
+            yield
+        finally:
+            broker_monitor.stop()
+            broker_sessions.shutdown()
+
+    app = FastAPI(
+        title="IBKR Trader Local API",
+        version="0.1.0",
+        summary="Local-only control plane for the IBKR Trader runtime.",
+        lifespan=lifespan,
+    )
+    app.state.broker_sessions = broker_sessions
+    app.state.broker_monitor = broker_monitor
+
     @app.middleware("http")
     async def require_local_client(request: Request, call_next: Any) -> Any:
         client_host = request.client.host if request.client else None
@@ -556,6 +596,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             "session_calendar_path": str(app_config.session_calendar_path),
             "broker_sessions": broker_sessions.status_snapshot(),
             "broker_operations": broker_sessions.activity_tracker.snapshot(recent_limit=10),
+            "broker_monitor": serialize_broker_monitor_status(broker_monitor.status()),
         }
 
     @app.get("/v1/ibkr/telemetry")

@@ -16,6 +16,17 @@
   const brokerAttention = operatorSnapshot.recent_broker_attention ?? [];
   const reconciliationRuns = operatorSnapshot.recent_reconciliation_runs ?? [];
   const instructions = operatorSnapshot.instructions ?? [];
+  const brokerMonitor = data.health?.broker_monitor ?? {
+    heartbeat: { ok: null, last_success_at: null, error: null },
+    snapshot_refresh: {
+      ok: null,
+      last_success_at: null,
+      error: null,
+      account_count: 0,
+      position_count: 0,
+      open_order_count: 0
+    }
+  };
   const endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
   const warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count ?? 0) > 0);
   const killSwitchResult = form?.killSwitchResult ?? null;
@@ -49,6 +60,18 @@
 
   function killSwitchLabel() {
     return killSwitch.enabled ? 'Enabled' : 'Disabled';
+  }
+
+  function monitorLabel(ok) {
+    if (ok === true) return 'Healthy';
+    if (ok === false) return 'Failing';
+    return 'Unknown';
+  }
+
+  function monitorClass(ok) {
+    if (ok === true) return 'ok';
+    if (ok === false) return 'bad';
+    return 'warn';
   }
 
   function parseTimestamp(value) {
@@ -219,6 +242,34 @@
       <span>Diagnostic Session</span>
       <strong class={classForConnection('diagnostic')}>{connectionLabel('diagnostic')}</strong>
       <small>Client ID {data.health?.broker_sessions?.diagnostic?.client_id ?? 'n/a'}</small>
+    </article>
+
+    <article class="stat-card">
+      <span>Gateway Heartbeat</span>
+      <strong class={monitorClass(brokerMonitor.heartbeat?.ok)}>
+        {monitorLabel(brokerMonitor.heartbeat?.ok)}
+      </strong>
+      <small>
+        {brokerMonitor.heartbeat?.last_success_at ??
+          brokerMonitor.heartbeat?.error ??
+          'No heartbeat has completed yet.'}
+      </small>
+    </article>
+
+    <article class="stat-card">
+      <span>Snapshot Refresh</span>
+      <strong class={monitorClass(brokerMonitor.snapshot_refresh?.ok)}>
+        {monitorLabel(brokerMonitor.snapshot_refresh?.ok)}
+      </strong>
+      <small>
+        {#if brokerMonitor.snapshot_refresh?.ok === true}
+          {brokerMonitor.snapshot_refresh.account_count} accounts ·
+          {brokerMonitor.snapshot_refresh.position_count} positions ·
+          {brokerMonitor.snapshot_refresh.open_order_count} open orders
+        {:else}
+          {brokerMonitor.snapshot_refresh?.error ?? 'No snapshot refresh has completed yet.'}
+        {/if}
+      </small>
     </article>
 
     <article class="stat-card">

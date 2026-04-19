@@ -12,9 +12,13 @@ This file is the active implementation tracker for the production-grade trader p
 
 - [ ] Operator controls for reconciliation warnings and broker attention
 - [ ] Operator write actions for reconciliation issues and broker-attention items
+- [ ] Replace the temporary dashboard `vite preview` process with a clearer long-lived production service step
 
 ## Done
 
+- [x] Background broker heartbeat and snapshot refresh inside the API server:
+  keep a durable IB Gateway heartbeat running, persist fresh runtime snapshots
+  into the ledger, and expose monitor status through healthz for the UI
 - [x] Ledger dashboard page backed by the durable ledger:
   add a separate operator-facing page for append-only instruction events,
   broker order events, fills, control events, cancellation requests, and

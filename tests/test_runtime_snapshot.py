@@ -22,6 +22,34 @@ class _FakeRuntimeSnapshotSyncWrapper:
     def disconnect_and_stop(self) -> None:
         self.disconnected = True
 
+    def get_account_summary(
+        self,
+        tags: str,
+        group: str = "All",
+        timeout: int = 5,
+    ) -> dict[str, dict[str, dict[str, str]]]:
+        self.account_summary_args = (tags, group, timeout)
+        return {
+            "U25245596": {
+                "NetLiquidation": {"value": "100000.00", "currency": "USD"},
+                "TotalCashValue": {"value": "45000.00", "currency": "USD"},
+                "BuyingPower": {"value": "200000.00", "currency": "USD"},
+                "AvailableFunds": {"value": "150000.00", "currency": "USD"},
+                "ExcessLiquidity": {"value": "149000.00", "currency": "USD"},
+                "Cushion": {"value": "0.91", "currency": "USD"},
+                "Currency": {"value": "USD", "currency": "USD"},
+            },
+            "U11111111": {
+                "NetLiquidation": {"value": "50000.00", "currency": "SEK"},
+                "TotalCashValue": {"value": "21000.00", "currency": "SEK"},
+                "BuyingPower": {"value": "100000.00", "currency": "SEK"},
+                "AvailableFunds": {"value": "80000.00", "currency": "SEK"},
+                "ExcessLiquidity": {"value": "79000.00", "currency": "SEK"},
+                "Cushion": {"value": "0.88", "currency": "SEK"},
+                "Currency": {"value": "SEK", "currency": "SEK"},
+            },
+        }
+
     def get_open_orders(self, timeout: int = 3) -> dict[int, object]:
         return {
             17: {
@@ -165,4 +193,12 @@ class RuntimeSnapshotTests(TestCase):
         self.assertEqual(
             serialized["account_values"]["U25245596"]["NetLiquidation"]["value"],
             "100000.00",
+        )
+        self.assertEqual(
+            serialized["account_values"]["U25245596"]["TotalCashValue"]["value"],
+            "45000.00",
+        )
+        self.assertEqual(
+            serialized["account_values"]["U11111111"]["NetLiquidation"]["currency"],
+            "SEK",
         )
