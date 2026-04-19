@@ -9,10 +9,14 @@ from ibkr_trader.ibkr.runtime_snapshot import serialize_broker_runtime_snapshot
 
 
 class _FakeRuntimeSnapshotSyncWrapper:
+    last_instance: "_FakeRuntimeSnapshotSyncWrapper | None" = None
+
     def __init__(self, timeout: int) -> None:
         self.timeout = timeout
         self.connected = False
         self.disconnected = False
+        self.account_update_calls: list[tuple[str, int]] = []
+        _FakeRuntimeSnapshotSyncWrapper.last_instance = self
 
     def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
         self.connected = True
@@ -21,34 +25,6 @@ class _FakeRuntimeSnapshotSyncWrapper:
 
     def disconnect_and_stop(self) -> None:
         self.disconnected = True
-
-    def get_account_summary(
-        self,
-        tags: str,
-        group: str = "All",
-        timeout: int = 5,
-    ) -> dict[str, dict[str, dict[str, str]]]:
-        self.account_summary_args = (tags, group, timeout)
-        return {
-            "U25245596": {
-                "NetLiquidation": {"value": "100000.00", "currency": "USD"},
-                "TotalCashValue": {"value": "45000.00", "currency": "USD"},
-                "BuyingPower": {"value": "200000.00", "currency": "USD"},
-                "AvailableFunds": {"value": "150000.00", "currency": "USD"},
-                "ExcessLiquidity": {"value": "149000.00", "currency": "USD"},
-                "Cushion": {"value": "0.91", "currency": "USD"},
-                "Currency": {"value": "USD", "currency": "USD"},
-            },
-            "U11111111": {
-                "NetLiquidation": {"value": "50000.00", "currency": "SEK"},
-                "TotalCashValue": {"value": "21000.00", "currency": "SEK"},
-                "BuyingPower": {"value": "100000.00", "currency": "SEK"},
-                "AvailableFunds": {"value": "80000.00", "currency": "SEK"},
-                "ExcessLiquidity": {"value": "79000.00", "currency": "SEK"},
-                "Cushion": {"value": "0.88", "currency": "SEK"},
-                "Currency": {"value": "SEK", "currency": "SEK"},
-            },
-        }
 
     def get_open_orders(self, timeout: int = 3) -> dict[int, object]:
         return {
@@ -113,33 +89,56 @@ class _FakeRuntimeSnapshotSyncWrapper:
         ]
 
     def get_account_updates(self, account_code: str = "", timeout: int = 10) -> dict[str, object]:
-        return {
-            "portfolio": [
-                {
-                    "contract": SimpleNamespace(
-                        symbol="MSFT",
-                        localSymbol="MSFT",
-                        secType="STK",
-                        exchange="SMART",
-                        primaryExchange="NASDAQ",
-                        currency="USD",
-                    ),
-                    "accountName": "U25245596",
-                    "position": "2",
-                    "marketPrice": "410.50",
-                    "marketValue": "821.00",
-                    "averageCost": "401.25",
-                    "unrealizedPNL": "18.50",
-                    "realizedPNL": "0",
-                }
-            ],
-            "account_values": {
-                "U25245596": {
-                    "NetLiquidation": {"value": "100000.00", "currency": "USD"},
-                    "BuyingPower": {"value": "200000.00", "currency": "USD"},
-                }
-            },
-        }
+        self.account_update_calls.append((account_code, timeout))
+        if account_code == "U25245596":
+            return {
+                "portfolio": [
+                    {
+                        "contract": SimpleNamespace(
+                            symbol="MSFT",
+                            localSymbol="MSFT",
+                            secType="STK",
+                            exchange="SMART",
+                            primaryExchange="NASDAQ",
+                            currency="USD",
+                        ),
+                        "accountName": "U25245596",
+                        "position": "2",
+                        "marketPrice": "410.50",
+                        "marketValue": "821.00",
+                        "averageCost": "401.25",
+                        "unrealizedPNL": "18.50",
+                        "realizedPNL": "0",
+                    }
+                ],
+                "account_values": {
+                    "U25245596": {
+                        "NetLiquidation": {"value": "100000.00", "currency": "USD"},
+                        "TotalCashValue": {"value": "45000.00", "currency": "USD"},
+                        "BuyingPower": {"value": "200000.00", "currency": "USD"},
+                        "AvailableFunds": {"value": "150000.00", "currency": "USD"},
+                        "ExcessLiquidity": {"value": "149000.00", "currency": "USD"},
+                        "Cushion": {"value": "0.91", "currency": "USD"},
+                        "Currency": {"value": "USD", "currency": "USD"},
+                    }
+                },
+            }
+        if account_code == "U11111111":
+            return {
+                "portfolio": [],
+                "account_values": {
+                    "U11111111": {
+                        "NetLiquidation": {"value": "50000.00", "currency": "SEK"},
+                        "TotalCashValue": {"value": "21000.00", "currency": "SEK"},
+                        "BuyingPower": {"value": "100000.00", "currency": "SEK"},
+                        "AvailableFunds": {"value": "80000.00", "currency": "SEK"},
+                        "ExcessLiquidity": {"value": "79000.00", "currency": "SEK"},
+                        "Cushion": {"value": "0.88", "currency": "SEK"},
+                        "Currency": {"value": "SEK", "currency": "SEK"},
+                    }
+                },
+            }
+        return {"portfolio": [], "account_values": {}}
 
     def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
         return {
@@ -168,6 +167,7 @@ class RuntimeSnapshotTests(TestCase):
             client_id=0,
             diagnostic_client_id=7,
             account_id="U25245596",
+            account_ids=("U25245596", "U11111111"),
         )
 
         snapshot = fetch_broker_runtime_snapshot(
@@ -191,6 +191,10 @@ class RuntimeSnapshotTests(TestCase):
         self.assertEqual(len(serialized["positions"]), 1)
         self.assertEqual(serialized["positions"][0]["position"], "2")
         self.assertEqual(
+            snapshot.account_values["U25245596"]["Currency"]["value"],
+            "USD",
+        )
+        self.assertEqual(
             serialized["account_values"]["U25245596"]["NetLiquidation"]["value"],
             "100000.00",
         )
@@ -201,4 +205,8 @@ class RuntimeSnapshotTests(TestCase):
         self.assertEqual(
             serialized["account_values"]["U11111111"]["NetLiquidation"]["currency"],
             "SEK",
+        )
+        self.assertEqual(
+            _FakeRuntimeSnapshotSyncWrapper.last_instance.account_update_calls,
+            [("U25245596", 10), ("U11111111", 10)],
         )

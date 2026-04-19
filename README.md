@@ -51,6 +51,7 @@ Current repo template defaults:
 - `IBKR_CLIENT_ID=0`
 - `IBKR_DIAGNOSTIC_CLIENT_ID=7`
 - `IBKR_STREAMING_CLIENT_ID=9`
+- `IBKR_ACCOUNT_IDS=U25245595,U25245596`
 - `BROKER_MONITOR_ENABLED=true`
 - `BROKER_HEARTBEAT_INTERVAL_SECONDS=30`
 - `BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60`
@@ -83,8 +84,10 @@ Current important settings include:
 - Stockholm identity metadata path
 - database URL
 - local API bind host and port
-- IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, and account ID
+- IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, default account ID, and optional multi-account snapshot list
 - background broker heartbeat and ledger snapshot refresh intervals
+
+For the background broker monitor, prefer `IBKR_ACCOUNT_IDS` when you want the dashboard and persisted runtime snapshots to refresh balances for more than one visible broker account. The monitor now uses per-account `reqAccountUpdates` for these accounts rather than `reqAccountSummary`, which avoids the IBKR summary-subscription limit during long-lived operation.
 
 ## Local API wrapper
 

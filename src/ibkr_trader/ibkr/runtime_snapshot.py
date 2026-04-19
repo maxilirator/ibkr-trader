@@ -18,13 +18,6 @@ class RuntimeSnapshotSyncWrapperProtocol(Protocol):
 
     def disconnect_and_stop(self) -> None: ...
 
-    def get_account_summary(
-        self,
-        tags: str,
-        group: str = "All",
-        timeout: int = 5,
-    ) -> dict[str, dict[str, dict[str, str]]]: ...
-
     def get_open_orders(self, timeout: int = 3) -> dict[int, Any]: ...
 
     def get_executions(self, exec_filter: Any | None = None, timeout: int = 10) -> list[Any]: ...
@@ -126,17 +119,6 @@ class BrokerRuntimeSnapshot:
     account_values: dict[str, dict[str, dict[str, str | None]]]
 
 
-ACCOUNT_SNAPSHOT_SUMMARY_TAGS: tuple[str, ...] = (
-    "NetLiquidation",
-    "TotalCashValue",
-    "BuyingPower",
-    "AvailableFunds",
-    "ExcessLiquidity",
-    "Cushion",
-    "Currency",
-)
-
-
 def _serialize_for_json(payload: Any) -> Any:
     if isinstance(payload, Decimal):
         return str(payload)
@@ -232,6 +214,18 @@ def _merge_account_values(
                 ),
             }
     return merged
+
+
+def _configured_snapshot_account_ids(
+    config: IbkrConnectionConfig,
+) -> tuple[str, ...]:
+    ordered_accounts: list[str] = []
+    for raw_account_id in (*config.account_ids, config.account_id):
+        normalized = str(raw_account_id).strip() if raw_account_id is not None else ""
+        if not normalized or normalized in ordered_accounts:
+            continue
+        ordered_accounts.append(normalized)
+    return tuple(ordered_accounts)
 
 
 def _serialize_open_order(raw_payload: Any) -> BrokerOpenOrder | None:
@@ -530,15 +524,25 @@ def fetch_broker_runtime_snapshot(
         try:
             raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
             raw_executions = runtime_app.get_executions(timeout=timeout)
-            raw_account_summary = runtime_app.get_account_summary(
-                tags=",".join(ACCOUNT_SNAPSHOT_SUMMARY_TAGS),
-                group="All",
-                timeout=timeout,
-            )
-            raw_account_updates = runtime_app.get_account_updates(
-                account_code=config.account_id,
-                timeout=timeout,
-            )
+            configured_account_ids = _configured_snapshot_account_ids(config)
+            raw_account_updates_payloads: list[dict[str, Any]] = []
+            if configured_account_ids:
+                # Keep the long-lived monitor on reqAccountUpdates instead of
+                # reqAccountSummary so we do not burn summary subscriptions.
+                for account_id in configured_account_ids:
+                    raw_account_updates_payloads.append(
+                        runtime_app.get_account_updates(
+                            account_code=account_id,
+                            timeout=timeout,
+                        )
+                    )
+            else:
+                raw_account_updates_payloads.append(
+                    runtime_app.get_account_updates(
+                        account_code="",
+                        timeout=timeout,
+                    )
+                )
             raw_positions = runtime_app.get_positions(timeout=timeout)
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(runtime_app)
@@ -553,10 +557,10 @@ def fetch_broker_runtime_snapshot(
 
     raw_portfolio = []
     raw_account_values: dict[str, dict[str, dict[str, str | None]]] = {}
-    if isinstance(raw_account_summary, dict):
-        raw_account_values = _merge_account_values(raw_account_values, raw_account_summary)
-    if isinstance(raw_account_updates, dict):
-        raw_portfolio = raw_account_updates.get("portfolio") or []
+    for raw_account_updates in raw_account_updates_payloads:
+        if not isinstance(raw_account_updates, dict):
+            continue
+        raw_portfolio.extend(raw_account_updates.get("portfolio") or [])
         account_values_payload = raw_account_updates.get("account_values")
         if isinstance(account_values_payload, dict):
             raw_account_values = _merge_account_values(

@@ -352,9 +352,10 @@ def load_sync_wrapper_class() -> type[Any]:
             if req_id in self.account_summary:
                 del self.account_summary[req_id]
             self.reqAccountSummary(req_id, group, tags)
-            summary = self._wait_for_response(req_id, "account_summary", timeout)
-            self.cancelAccountSummary(req_id)
-            return summary
+            try:
+                return self._wait_for_response(req_id, "account_summary", timeout)
+            finally:
+                self.cancelAccountSummary(req_id)
 
         def get_open_orders(self, timeout: int = 3) -> dict[int, Any]:
             self.open_orders = {}
@@ -422,9 +423,11 @@ def load_sync_wrapper_class() -> type[Any]:
             self.portfolio = []
             self.account_values = {}
             self.reqAccountUpdates(True, account_code)
-            portfolio = self._wait_for_response(0, "portfolio", timeout)
-            account_values = deepcopy(self.account_values)
-            self.reqAccountUpdates(False, account_code)
+            try:
+                portfolio = self._wait_for_response(0, "portfolio", timeout)
+                account_values = deepcopy(self.account_values)
+            finally:
+                self.reqAccountUpdates(False, account_code)
             return {
                 "portfolio": portfolio,
                 "account_values": account_values,

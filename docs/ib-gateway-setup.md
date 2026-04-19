@@ -54,6 +54,7 @@ IBKR_PORT=4002
 IBKR_CLIENT_ID=0
 IBKR_DIAGNOSTIC_CLIENT_ID=7
 IBKR_STREAMING_CLIENT_ID=9
+IBKR_ACCOUNT_IDS=U25245595,U25245596
 BROKER_MONITOR_ENABLED=true
 BROKER_HEARTBEAT_INTERVAL_SECONDS=30
 BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60
@@ -64,6 +65,7 @@ Recommended repo usage:
 - reserve `IBKR_CLIENT_ID=0` for the main long-lived trading runtime
 - reserve `IBKR_DIAGNOSTIC_CLIENT_ID=7` for probe and contract-resolution calls
 - reserve `IBKR_STREAMING_CLIENT_ID=9` for streaming and market-data sampling
+- set `IBKR_ACCOUNT_IDS` when the colocated runtime should refresh balances and portfolio data for multiple visible accounts without using the more fragile account-summary subscription path
 - do not work around ownership problems by generating fresh client IDs during normal operation
 
 See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.

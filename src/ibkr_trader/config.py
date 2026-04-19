@@ -58,6 +58,14 @@ def _resolve_project_path(raw_path: str) -> Path:
     return (PROJECT_ROOT / path).resolve()
 
 
+def _parse_env_list(raw_value: str) -> tuple[str, ...]:
+    return tuple(
+        value.strip()
+        for value in raw_value.split(",")
+        if value.strip()
+    )
+
+
 @dataclass(slots=True)
 class IbkrConnectionConfig:
     host: str
@@ -66,6 +74,7 @@ class IbkrConnectionConfig:
     diagnostic_client_id: int
     streaming_client_id: int = STREAMING_CLIENT_ID
     account_id: str = ""
+    account_ids: tuple[str, ...] = ()
 
     def primary_session(self) -> "IbkrConnectionConfig":
         return replace(self, client_id=self.client_id)
@@ -78,6 +87,12 @@ class IbkrConnectionConfig:
 
     @classmethod
     def from_env(cls) -> "IbkrConnectionConfig":
+        configured_account_ids = _parse_env_list(getenv("IBKR_ACCOUNT_IDS", ""))
+        configured_account_id = getenv("IBKR_ACCOUNT_ID", "").strip()
+        if not configured_account_ids and configured_account_id:
+            configured_account_ids = (configured_account_id,)
+        if not configured_account_id and configured_account_ids:
+            configured_account_id = configured_account_ids[0]
         return cls(
             host=getenv("IBKR_HOST", "127.0.0.1"),
             port=int(getenv("IBKR_PORT", "7497")),
@@ -88,7 +103,8 @@ class IbkrConnectionConfig:
             streaming_client_id=int(
                 getenv("IBKR_STREAMING_CLIENT_ID", str(STREAMING_CLIENT_ID))
             ),
-            account_id=getenv("IBKR_ACCOUNT_ID", ""),
+            account_id=configured_account_id,
+            account_ids=configured_account_ids,
         )
 
 

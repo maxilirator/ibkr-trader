@@ -16,6 +16,10 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Runtime snapshots no longer depend on IBKR account-summary subscriptions:
+  the background broker monitor now uses per-account account updates for the
+  configured accounts, and the sync wrapper always unsubscribes account-summary
+  and account-update requests even when IBKR errors or times out
 - [x] Background broker heartbeat and snapshot refresh inside the API server:
   keep a durable IB Gateway heartbeat running, persist fresh runtime snapshots
   into the ledger, and expose monitor status through healthz for the UI

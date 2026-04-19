@@ -175,3 +175,44 @@ class SyncWrapperTests(TestCase):
             )
 
         self.assertEqual(app.drain_broker_callback_events(), [])
+
+    def test_get_account_summary_cancels_subscription_on_error(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        cancelled_request_ids: list[int] = []
+
+        app._next_local_request_id = lambda: 41  # type: ignore[method-assign]
+        app.reqAccountSummary = lambda req_id, group, tags: None  # type: ignore[method-assign]
+        app.cancelAccountSummary = cancelled_request_ids.append  # type: ignore[method-assign]
+
+        def fake_wait_for_response(req_id: int, response_name: str, timeout: int):
+            raise TimeoutError("timed out")
+
+        app._wait_for_response = fake_wait_for_response  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            app.get_account_summary("NetLiquidation", timeout=5)
+
+        self.assertEqual(cancelled_request_ids, [41])
+
+    def test_get_account_updates_unsubscribes_on_error(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        update_calls: list[tuple[bool, str]] = []
+
+        def fake_req_account_updates(subscribe: bool, account_code: str) -> None:
+            update_calls.append((subscribe, account_code))
+
+        def fake_wait_for_response(req_id: int, response_name: str, timeout: int):
+            raise TimeoutError("portfolio timed out")
+
+        app.reqAccountUpdates = fake_req_account_updates  # type: ignore[method-assign]
+        app._wait_for_response = fake_wait_for_response  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(TimeoutError, "portfolio timed out"):
+            app.get_account_updates("U25245596", timeout=5)
+
+        self.assertEqual(
+            update_calls,
+            [(True, "U25245596"), (False, "U25245596")],
+        )
