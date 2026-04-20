@@ -742,6 +742,7 @@
               <th>Side</th>
               <th>Quantity</th>
               <th>Price</th>
+              <th>Fee</th>
             </tr>
           </thead>
           <tbody>
@@ -753,6 +754,7 @@
                 <td>{fill.side ?? 'n/a'}</td>
                 <td>{fill.quantity}</td>
                 <td>{fill.price}</td>
+                <td>{fill.commission ?? 'n/a'} {fill.commission_currency ?? ''}</td>
               </tr>
             {/each}
           </tbody>

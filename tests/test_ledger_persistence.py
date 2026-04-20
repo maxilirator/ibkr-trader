@@ -176,6 +176,8 @@ class BrokerLedgerPersistenceTests(TestCase):
                     primary_exchange="NASDAQ",
                     currency="USD",
                     local_symbol="AAPL",
+                    commission=Decimal("1.25"),
+                    commission_currency="USD",
                 ),
             ),
             portfolio=(
@@ -297,6 +299,8 @@ class BrokerLedgerPersistenceTests(TestCase):
             self.assertEqual(len(execution_fills), 1)
             self.assertEqual(execution_fills[0].external_execution_id, "00014800.69ddd749.01.01")
             self.assertEqual(execution_fills[0].instruction_id, 1)
+            self.assertEqual(execution_fills[0].commission, "1.25")
+            self.assertEqual(execution_fills[0].commission_currency, "USD")
         finally:
             session.close()
 
@@ -385,6 +389,90 @@ class BrokerLedgerPersistenceTests(TestCase):
                 execution_fill.raw_payload["executed_at_inferred_from_snapshot_capture"],
                 True,
             )
+        finally:
+            session.close()
+
+    def test_persist_broker_runtime_snapshot_updates_existing_fill_when_commission_arrives_later(self) -> None:
+        self._insert_instruction()
+        captured_at = datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc)
+        snapshot_without_commission = BrokerRuntimeSnapshot(
+            open_orders={},
+            executions=(
+                BrokerExecution(
+                    exec_id="late-commission-exec",
+                    order_id=17,
+                    perm_id=9001,
+                    client_id=0,
+                    order_ref="persisted-aapl-1",
+                    side="BOT",
+                    shares=Decimal("1"),
+                    price=Decimal("200.00"),
+                    exchange="NASDAQ",
+                    executed_at=datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc),
+                    symbol="AAPL",
+                    account="DU1234567",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    currency="USD",
+                    local_symbol="AAPL",
+                ),
+            ),
+            portfolio=(),
+            positions=(),
+            account_values={},
+        )
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            snapshot_without_commission,
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=captured_at,
+            default_account_key="DU1234567",
+        )
+
+        snapshot_with_commission = BrokerRuntimeSnapshot(
+            open_orders={},
+            executions=(
+                BrokerExecution(
+                    exec_id="late-commission-exec",
+                    order_id=17,
+                    perm_id=9001,
+                    client_id=0,
+                    order_ref="persisted-aapl-1",
+                    side="BOT",
+                    shares=Decimal("1"),
+                    price=Decimal("200.00"),
+                    exchange="NASDAQ",
+                    executed_at=datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc),
+                    symbol="AAPL",
+                    account="DU1234567",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    currency="USD",
+                    local_symbol="AAPL",
+                    commission=Decimal("1.10"),
+                    commission_currency="USD",
+                ),
+            ),
+            portfolio=(),
+            positions=(),
+            account_values={},
+        )
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            snapshot_with_commission,
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=captured_at,
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            execution_fill = session.execute(select(ExecutionFillRecord)).scalar_one()
+            self.assertEqual(execution_fill.commission, "1.10")
+            self.assertEqual(execution_fill.commission_currency, "USD")
+            self.assertEqual(execution_fill.raw_payload["commission"], "1.10")
         finally:
             session.close()
 

@@ -1297,6 +1297,16 @@ def _persist_executions(
             )
         ).scalar_one_or_none()
         if existing_fill is not None:
+            if execution.commission is not None:
+                existing_fill.commission = _decimal_to_string(execution.commission)
+            if _normalize_text(execution.commission_currency) is not None:
+                existing_fill.commission_currency = _normalize_text(
+                    execution.commission_currency
+                )
+            existing_fill.raw_payload = {
+                **existing_fill.raw_payload,
+                **_serialize_for_json(asdict(execution)),
+            }
             continue
 
         external_order_id = (
@@ -1443,8 +1453,8 @@ def _persist_executions(
                     _decimal_to_string(execution.price),
                     context=f"Execution {exec_id} price",
                 ),
-                commission=None,
-                commission_currency=None,
+                commission=_decimal_to_string(execution.commission),
+                commission_currency=_normalize_text(execution.commission_currency),
                 executed_at=executed_at,
                 raw_payload=fill_raw_payload,
             )

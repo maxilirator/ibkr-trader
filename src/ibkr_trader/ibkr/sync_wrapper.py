@@ -47,6 +47,7 @@ def load_sync_wrapper_class() -> type[Any]:
             self._suppressed_callback_kinds: dict[str, int] = {}
             self._known_order_ids: set[int] = set()
             self.account_values: dict[str, dict[str, dict[str, str | None]]] = {}
+            self.execution_commissions: dict[str, Any] = {}
 
         def connect_and_start(self, host: str, port: int, client_id: int) -> bool:
             self.next_valid_id_value = None
@@ -312,6 +313,36 @@ def load_sync_wrapper_class() -> type[Any]:
                 },
             }
 
+        def _merge_execution_commissions(
+            self,
+            raw_executions: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            merged_executions: list[dict[str, Any]] = []
+            for execution_payload in raw_executions:
+                if not isinstance(execution_payload, dict):
+                    merged_executions.append(execution_payload)
+                    continue
+                execution = execution_payload.get("execution")
+                exec_id = (
+                    str(getattr(execution, "execId"))
+                    if getattr(execution, "execId", None) not in (None, "")
+                    else None
+                )
+                if exec_id is None:
+                    merged_executions.append(execution_payload)
+                    continue
+                commission_report = self.execution_commissions.get(exec_id)
+                if commission_report is None:
+                    merged_executions.append(execution_payload)
+                    continue
+                merged_executions.append(
+                    {
+                        **execution_payload,
+                        "commission_and_fees_report": commission_report,
+                    }
+                )
+            return merged_executions
+
         def placeOrder(self, orderId: int, contract: Any, order: Any) -> None:  # noqa: N802
             self._record_known_order_id(orderId)
             super().placeOrder(orderId, contract, order)
@@ -411,7 +442,8 @@ def load_sync_wrapper_class() -> type[Any]:
             if req_id in self.executions:
                 del self.executions[req_id]
             self.reqExecutions(req_id, exec_filter)
-            return self._wait_for_response(req_id, "executions", timeout)
+            raw_executions = self._wait_for_response(req_id, "executions", timeout)
+            return self._merge_execution_commissions(raw_executions)
 
         def updateAccountValue(
             self,
@@ -444,6 +476,19 @@ def load_sync_wrapper_class() -> type[Any]:
                 "portfolio": portfolio,
                 "account_values": account_values,
             }
+
+        def commissionAndFeesReport(  # noqa: N802
+            self,
+            commissionAndFeesReport: Any,
+        ) -> None:
+            exec_id = (
+                str(getattr(commissionAndFeesReport, "execId"))
+                if getattr(commissionAndFeesReport, "execId", None) not in (None, "")
+                else None
+            )
+            if exec_id is not None:
+                self.execution_commissions[exec_id] = deepcopy(commissionAndFeesReport)
+            super().commissionAndFeesReport(commissionAndFeesReport)
 
         def error(  # noqa: N802
             self,

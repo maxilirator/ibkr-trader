@@ -85,6 +85,12 @@ class _FakeRuntimeSnapshotSyncWrapper:
                     exchange="SFB",
                     time="20260414  14:47:29",
                 ),
+                "commission_and_fees_report": SimpleNamespace(
+                    execId="00014800.69ddd749.01.01",
+                    commissionAndFees="1.50",
+                    currency="SEK",
+                    realizedPNL="0.00",
+                ),
             }
         ]
 
@@ -186,6 +192,8 @@ class RuntimeSnapshotTests(TestCase):
         self.assertEqual(serialized["executions"][0]["order_ref"], "live-saab-buy-20260414-2")
         self.assertEqual(serialized["executions"][0]["price"], "615.5")
         self.assertEqual(serialized["executions"][0]["currency"], "SEK")
+        self.assertEqual(serialized["executions"][0]["commission"], "1.50")
+        self.assertEqual(serialized["executions"][0]["commission_currency"], "SEK")
         self.assertEqual(len(serialized["portfolio"]), 1)
         self.assertEqual(serialized["portfolio"][0]["market_value"], "821.00")
         self.assertEqual(len(serialized["positions"]), 1)

@@ -216,3 +216,50 @@ class SyncWrapperTests(TestCase):
             update_calls,
             [(True, "U25245596"), (False, "U25245596")],
         )
+
+    def test_commission_and_fees_report_is_merged_into_executions(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app._next_local_request_id = lambda: 41  # type: ignore[method-assign]
+        app.reqExecutions = lambda req_id, exec_filter: None  # type: ignore[method-assign]
+        app.execution_commissions["exec-001"] = SimpleNamespace(
+            execId="exec-001",
+            commissionAndFees="1.25",
+            currency="SEK",
+            realizedPNL="0.00",
+        )
+
+        def fake_wait_for_response(req_id: int, response_name: str, timeout: int):
+            return [
+                {
+                    "contract": SimpleNamespace(symbol="SIVE"),
+                    "execution": SimpleNamespace(execId="exec-001"),
+                }
+            ]
+
+        app._wait_for_response = fake_wait_for_response  # type: ignore[method-assign]
+
+        executions = app.get_executions(timeout=5)
+
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(
+            executions[0]["commission_and_fees_report"].commissionAndFees,
+            "1.25",
+        )
+
+    def test_commission_and_fees_report_caches_by_execution_id(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app.commissionAndFeesReport(
+            SimpleNamespace(
+                execId="exec-002",
+                commissionAndFees="0.95",
+                currency="USD",
+                realizedPNL="4.20",
+            )
+        )
+
+        self.assertEqual(app.execution_commissions["exec-002"].currency, "USD")
+        self.assertEqual(app.execution_commissions["exec-002"].commissionAndFees, "0.95")

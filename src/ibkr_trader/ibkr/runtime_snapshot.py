@@ -78,6 +78,8 @@ class BrokerExecution:
     primary_exchange: str | None = None
     currency: str | None = None
     local_symbol: str | None = None
+    commission: Decimal | None = None
+    commission_currency: str | None = None
 
 
 @dataclass(slots=True)
@@ -344,6 +346,7 @@ def _serialize_execution(raw_payload: Any) -> BrokerExecution | None:
         return None
     execution = raw_payload.get("execution")
     contract = raw_payload.get("contract")
+    commission_report = raw_payload.get("commission_and_fees_report")
     if execution is None:
         return None
     return BrokerExecution(
@@ -401,6 +404,16 @@ def _serialize_execution(raw_payload: Any) -> BrokerExecution | None:
         symbol=(
             str(getattr(contract, "symbol"))
             if getattr(contract, "symbol", None) not in (None, "")
+            else None
+        ),
+        commission=_to_decimal(
+            getattr(commission_report, "commissionAndFees", None)
+            if commission_report is not None
+            else None
+        ),
+        commission_currency=(
+            str(getattr(commission_report, "currency"))
+            if getattr(commission_report, "currency", None) not in (None, "")
             else None
         ),
     )

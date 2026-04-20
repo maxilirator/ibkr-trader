@@ -9,6 +9,10 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Broker fees now flow into the durable fill ledger:
+  IBKR commission-and-fees reports are cached on the live session, merged
+  onto executions by execId, persisted onto execution fills, and surfaced
+  in the operator dashboard recent-fills table
 - [x] Timed follow-up exits anchored to live market at activation time:
   instructions can now support "buy now, then at 10:30 place a sell limit
   5% above the market price observed at 10:30", and the live SIVE smoke
