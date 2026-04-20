@@ -1,0 +1,19 @@
+[Unit]
+Description=IBKR Trader Dashboard
+After=network-online.target ibkr-trader-api.service
+Wants=network-online.target ibkr-trader-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ibkr-trader/dashboard
+Environment=HOST=0.0.0.0
+Environment=PORT=4173
+Environment=ORIGIN=http://quant.geisler.se:4173
+Environment=IBKR_TRADER_API_BASE_URL=http://127.0.0.1:8000
+ExecStart=%h/.local/bin/node %h/ibkr-trader/dashboard/build
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

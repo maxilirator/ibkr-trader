@@ -6,7 +6,6 @@ This file is the active implementation tracker for the production-grade trader p
 
 - [ ] Operator controls for reconciliation warnings and broker attention
 - [ ] Operator write actions for reconciliation issues and broker-attention items
-- [ ] Replace the temporary dashboard `vite preview` process with a clearer long-lived production service step
 
 ## Done
 
@@ -38,6 +37,10 @@ This file is the active implementation tracker for the production-grade trader p
 - [x] Order prices are normalized against IBKR market rules before submit:
   live entry and exit order prices now snap to valid broker tick increments
   instead of sending raw model prices that IBKR rejects with error 110
+- [x] Dashboard now runs as a long-lived Node service instead of a temporary
+  `vite preview` process:
+  the SvelteKit build is started through a dedicated `systemd --user` unit on
+  the server so the site survives disconnects and reboot like the API host
 
 - [x] Phase 1 ledger foundation:
   add broker accounts, broker orders, broker order events, execution fills,

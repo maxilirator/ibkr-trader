@@ -16,8 +16,8 @@ Minimal SvelteKit dashboard for the LAN-visible IBKR Trader API.
 The dashboard reads the Python API server and expects these endpoints:
 
 - `GET /healthz`
-- `GET /v1/broker/runtime-snapshot`
-- `GET /v1/instructions?limit=100`
+- `GET /v1/read/operator-snapshot`
+- `GET /v1/read/ledger-snapshot`
 
 The API base URL is controlled by:
 
@@ -41,5 +41,5 @@ For a production-style Node build:
 cd dashboard
 npm install
 npm run build
-IBKR_TRADER_API_BASE_URL=http://quant.geisler.se:8000 node build
+IBKR_TRADER_API_BASE_URL=http://127.0.0.1:8000 HOST=0.0.0.0 PORT=4173 ORIGIN=http://quant.geisler.se:4173 npm run start
 ```
