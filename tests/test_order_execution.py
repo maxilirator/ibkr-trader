@@ -90,6 +90,7 @@ class _FakeOrderExecutionSyncWrapper:
                 marketName="NMS",
                 minTick=0.01,
                 validExchanges="SMART,NASDAQ",
+                marketRuleIds="26,26",
                 orderTypes="ACTIVETIM,ADJUST,ALERT,LMT,MKT",
                 timeZoneId="US/Eastern",
                 tradingHours="20260410:093000-160000",
@@ -102,6 +103,9 @@ class _FakeOrderExecutionSyncWrapper:
                 secIdList=[SimpleNamespace(tag="ISIN", value="US0378331005")],
             )
         ]
+
+    def get_market_rule(self, market_rule_id: int, timeout: int = 5) -> list[object]:
+        return [SimpleNamespace(lowEdge=0, increment=0.01)]
 
     def get_historical_data(
         self,
@@ -250,6 +254,27 @@ class OrderExecutionTests(TestCase):
         self.assertEqual(
             result["tws_submission"]["order_state"]["warning_text"],
             "Order held in TWS pending manual transmit.",
+        )
+
+    def test_submit_order_from_batch_normalizes_limit_price_to_market_rule(self) -> None:
+        payload = _base_payload()
+        payload["instructions"][0]["entry"]["limit_price"] = "23.5417"
+        batch = parse_execution_batch_payload(payload)
+
+        result = submit_order_from_batch(
+            self.config,
+            batch,
+            sync_wrapper_cls=_FakeOrderExecutionSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["order"]["limit_price"], "23.54")
+        self.assertEqual(result["order"]["price_increment"], "0.01")
+        self.assertIn(
+            "Entry limit price was normalized to the nearest valid IBKR tick increment.",
+            result["warnings"],
         )
 
     def test_submit_order_from_batch_rejects_fractional_stock_quantity(self) -> None:

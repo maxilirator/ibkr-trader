@@ -391,6 +391,18 @@ def load_sync_wrapper_class() -> type[Any]:
             )
             return self._wait_for_response(req_id, "historical_data", timeout)
 
+        def marketRule(self, marketRuleId: int, priceIncrements: list[Any]) -> None:  # noqa: N802
+            self._set_event(marketRuleId, "market_rule", list(priceIncrements or []))
+            super().marketRule(marketRuleId, priceIncrements)
+
+        def get_market_rule(
+            self,
+            market_rule_id: int,
+            timeout: int = 5,
+        ) -> list[Any]:
+            self.reqMarketRule(market_rule_id)
+            return self._wait_for_response(market_rule_id, "market_rule", timeout)
+
         def get_executions(self, exec_filter: Any | None = None, timeout: int = 10) -> list[Any]:
             if exec_filter is None:
                 exec_filter = ExecutionFilter()

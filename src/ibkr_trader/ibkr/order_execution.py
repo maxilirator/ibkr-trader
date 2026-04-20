@@ -21,6 +21,8 @@ from ibkr_trader.ibkr.order_preview import _load_response_timeout_class
 from ibkr_trader.ibkr.order_preview import _load_sync_wrapper_class
 from ibkr_trader.ibkr.order_preview import _resolve_sizing_preview
 from ibkr_trader.ibkr.order_preview import _select_broker_account_id
+from ibkr_trader.ibkr.price_rules import normalize_order_price
+from ibkr_trader.ibkr.price_rules import resolve_price_increment
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 
@@ -37,6 +39,12 @@ class OrderExecutionSyncWrapperProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def get_contract_details(self, contract: Any, timeout: int | None = None) -> list[Any]: ...
+
+    def get_market_rule(
+        self,
+        market_rule_id: int,
+        timeout: int = 5,
+    ) -> list[Any]: ...
 
     def get_historical_data(
         self,
@@ -355,7 +363,7 @@ def _resolve_instruction_contract_and_account(
     timeout: int,
     timeout_cls: type[Exception],
     contract_cls: type[Any] | None,
-) -> tuple[str, list[str], dict[str, Any], Any, dict[str, Any]]:
+) -> tuple[str, list[str], dict[str, Any], Any, dict[str, Any], Any]:
     runtime_contract_cls = contract_cls or _load_contract_class()
     normalized_summary = read_account_summary(
         config,
@@ -407,6 +415,7 @@ def _resolve_instruction_contract_and_account(
         normalized_summary,
         contract_matches[0].contract,
         resolved_contract,
+        contract_matches[0],
     )
 
 
@@ -419,6 +428,37 @@ def _serialize_resolved_contract(raw_detail: Any) -> dict[str, Any]:
     serialized["order_types"] = list(serialized["order_types"])
     serialized["sec_ids"] = dict(serialized["sec_ids"])
     return serialized
+
+
+def _normalize_price_for_order(
+    app: OrderExecutionSyncWrapperProtocol,
+    raw_detail: Any,
+    *,
+    exchange: str,
+    price: Decimal | None,
+    action: str,
+    order_type: str,
+    timeout: int,
+    timeout_cls: type[Exception],
+) -> tuple[Decimal | None, Decimal | None]:
+    if price is None:
+        return None, None
+
+    increment = resolve_price_increment(
+        app,
+        raw_detail,
+        exchange=exchange,
+        price=price,
+        timeout=timeout,
+        timeout_cls=timeout_cls,
+    )
+    normalized_price = normalize_order_price(
+        price=price,
+        increment=increment,
+        action=action,
+        order_type=order_type,
+    )
+    return normalized_price, increment
 
 
 def submit_order_from_batch(
@@ -484,6 +524,7 @@ def submit_order_from_instruction(
             normalized_summary,
             resolved_ibkr_contract,
             resolved_contract,
+            raw_contract_detail,
         ) = _resolve_instruction_contract_and_account(
             runtime_app,
             config,
@@ -510,18 +551,40 @@ def submit_order_from_instruction(
             sizing_preview["estimated_quantity"],
             allow_round_down=instruction.sizing.mode is not SizingMode.TARGET_QUANTITY,
         )
+        normalized_limit_price, limit_increment = _normalize_price_for_order(
+            runtime_app,
+            raw_contract_detail,
+            exchange=(
+                str(getattr(resolved_ibkr_contract, "exchange", ""))
+                or instruction.instrument.exchange
+            ),
+            price=instruction.entry.limit_price,
+            action=instruction.intent.side,
+            order_type="LMT",
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+        )
+        price_warnings: list[str] = []
+        if (
+            instruction.entry.limit_price is not None
+            and normalized_limit_price is not None
+            and normalized_limit_price != instruction.entry.limit_price
+        ):
+            price_warnings.append(
+                "Entry limit price was normalized to the nearest valid IBKR tick increment."
+            )
         order = _build_ibkr_order(
             action=instruction.intent.side,
             order_ref=instruction.instruction_id,
             ibkr_order_type=_resolve_ibkr_order_type(
                 instruction.entry.order_type,
-                limit_price=instruction.entry.limit_price,
+                limit_price=normalized_limit_price,
                 stop_price=None,
             ),
             broker_account_id=broker_account_id,
             quantity=normalized_quantity,
             time_in_force=instruction.entry.time_in_force.value,
-            limit_price=instruction.entry.limit_price,
+            limit_price=normalized_limit_price,
             order_cls=runtime_order_cls,
         )
 
@@ -547,7 +610,7 @@ def submit_order_from_instruction(
         {
             "instruction_id": instruction.instruction_id,
             "account": broker_account_id,
-            "warnings": [*list(account_warnings), *quantity_warnings],
+            "warnings": [*list(account_warnings), *quantity_warnings, *price_warnings],
             "resolved_contract": resolved_contract,
             "order": {
                 "order_ref": instruction.instruction_id,
@@ -555,10 +618,11 @@ def submit_order_from_instruction(
                 "order_type": order.orderType,
                 "time_in_force": order.tif,
                 "limit_price": (
-                    str(instruction.entry.limit_price)
-                    if instruction.entry.limit_price is not None
+                    str(normalized_limit_price)
+                    if normalized_limit_price is not None
                     else None
                 ),
+                "price_increment": str(limit_increment) if limit_increment is not None else None,
                 "total_quantity": str(normalized_quantity),
                 "outside_rth": order.outsideRth,
                 "transmit": order.transmit,
@@ -622,6 +686,7 @@ def submit_exit_order_from_instruction(
             _normalized_summary,
             resolved_ibkr_contract,
             resolved_contract,
+            raw_contract_detail,
         ) = _resolve_instruction_contract_and_account(
             runtime_app,
             config,
@@ -631,15 +696,52 @@ def submit_exit_order_from_instruction(
             contract_cls=runtime_contract_cls,
         )
 
+        action = _opposite_action(instruction.intent.side)
+        normalized_limit_price, limit_increment = _normalize_price_for_order(
+            runtime_app,
+            raw_contract_detail,
+            exchange=(
+                str(getattr(resolved_ibkr_contract, "exchange", ""))
+                or instruction.instrument.exchange
+            ),
+            price=limit_price,
+            action=action,
+            order_type=ibkr_order_type,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+        )
+        normalized_stop_price, stop_increment = _normalize_price_for_order(
+            runtime_app,
+            raw_contract_detail,
+            exchange=(
+                str(getattr(resolved_ibkr_contract, "exchange", ""))
+                or instruction.instrument.exchange
+            ),
+            price=stop_price,
+            action=action,
+            order_type=ibkr_order_type,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+        )
+        price_warnings: list[str] = []
+        if limit_price is not None and normalized_limit_price is not None and normalized_limit_price != limit_price:
+            price_warnings.append(
+                "Exit limit price was normalized to the nearest valid IBKR tick increment."
+            )
+        if stop_price is not None and normalized_stop_price is not None and normalized_stop_price != stop_price:
+            price_warnings.append(
+                "Exit stop price was normalized to the nearest valid IBKR tick increment."
+            )
+
         order = _build_ibkr_order(
-            action=_opposite_action(instruction.intent.side),
+            action=action,
             order_ref=order_ref,
             ibkr_order_type=ibkr_order_type,
             broker_account_id=broker_account_id,
             quantity=normalized_quantity,
             time_in_force=instruction.entry.time_in_force.value,
-            limit_price=limit_price,
-            stop_price=stop_price,
+            limit_price=normalized_limit_price,
+            stop_price=normalized_stop_price,
             oca_group=oca_group,
             oca_type=oca_type,
             order_cls=runtime_order_cls,
@@ -667,15 +769,21 @@ def submit_exit_order_from_instruction(
         {
             "instruction_id": instruction.instruction_id,
             "account": broker_account_id,
-            "warnings": [*list(account_warnings), *quantity_warnings],
+            "warnings": [*list(account_warnings), *quantity_warnings, *price_warnings],
             "resolved_contract": resolved_contract,
             "order": {
                 "order_ref": order_ref,
                 "action": order.action,
                 "order_type": order.orderType,
                 "time_in_force": order.tif,
-                "limit_price": str(limit_price) if limit_price is not None else None,
-                "stop_price": str(stop_price) if stop_price is not None else None,
+                "limit_price": str(normalized_limit_price) if normalized_limit_price is not None else None,
+                "stop_price": str(normalized_stop_price) if normalized_stop_price is not None else None,
+                "limit_price_increment": (
+                    str(limit_increment) if limit_increment is not None else None
+                ),
+                "stop_price_increment": (
+                    str(stop_increment) if stop_increment is not None else None
+                ),
                 "total_quantity": str(normalized_quantity),
                 "outside_rth": order.outsideRth,
                 "oca_group": oca_group,

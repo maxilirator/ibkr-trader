@@ -76,6 +76,7 @@ class _FakePreviewSyncWrapper:
                 marketName="NMS",
                 minTick=0.01,
                 validExchanges="SMART,NASDAQ",
+                marketRuleIds="26,26",
                 orderTypes="ACTIVETIM,ADJUST,ALERT,LMT,MKT",
                 timeZoneId="US/Eastern",
                 tradingHours="20260410:093000-160000",
@@ -88,6 +89,9 @@ class _FakePreviewSyncWrapper:
                 secIdList=[SimpleNamespace(tag="ISIN", value="US0378331005")],
             )
         ]
+
+    def get_market_rule(self, market_rule_id: int, timeout: int = 5) -> list[object]:
+        return [SimpleNamespace(lowEdge=0, increment=0.01)]
 
     def get_historical_data(
         self,
@@ -177,6 +181,76 @@ class OrderPreviewTests(TestCase):
         self.assertEqual(preview["order"]["order_type"], "LMT")
         self.assertEqual(preview["instrument"]["resolved"]["con_id"], 265598)
         self.assertEqual(preview["sizing"]["normalized_quantity"], "10")
+
+    def test_preview_normalizes_limit_price_to_market_rule(self) -> None:
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-1b",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-1b",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "AAPL",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "USD",
+                            "primary_exchange": "NASDAQ",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "target_quantity",
+                            "target_quantity": "10",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00-04:00",
+                            "expire_at": "2026-04-10T16:00:00-04:00",
+                            "limit_price": "23.5417",
+                        },
+                        "exit": {
+                            "take_profit_pct": "0.02",
+                        },
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_FakePreviewSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["order"]["limit_price"], "23.54")
+        self.assertEqual(preview["order"]["price_increment"], "0.01")
+        self.assertIn(
+            "Entry limit price was normalized to the nearest valid IBKR tick increment.",
+            preview["warnings"],
+        )
 
     def test_preview_uses_historical_fx_rate_for_fraction_sizing(self) -> None:
         class _EuroAccountPreviewSyncWrapper(_FakePreviewSyncWrapper):

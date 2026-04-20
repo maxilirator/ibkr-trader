@@ -23,6 +23,8 @@ from ibkr_trader.ibkr.contracts import (
     serialize_contract_details,
 )
 from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.price_rules import normalize_order_price
+from ibkr_trader.ibkr.price_rules import resolve_price_increment
 from ibkr_trader.ibkr.sync_wrapper import (
     load_response_timeout_class as _load_response_timeout_runtime_class,
 )
@@ -42,6 +44,12 @@ class PreviewSyncWrapperProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def get_contract_details(self, contract: Any, timeout: int | None = None) -> list[Any]: ...
+
+    def get_market_rule(
+        self,
+        market_rule_id: int,
+        timeout: int = 5,
+    ) -> list[Any]: ...
 
     def get_historical_data(
         self,
@@ -418,6 +426,8 @@ def _build_instruction_preview(
     contract_matches: list[Any] | None,
     contract_error: str | None,
     sizing_preview: dict[str, Any],
+    normalized_limit_price: Decimal | None = None,
+    limit_increment: Decimal | None = None,
 ) -> dict[str, Any]:
     issues = list(sizing_preview["issues"])
     warnings = list(sizing_preview["warnings"])
@@ -450,10 +460,11 @@ def _build_instruction_preview(
         "order_type": _map_order_type(instruction.entry.order_type),
         "tif": instruction.entry.time_in_force.value,
         "limit_price": (
-            str(instruction.entry.limit_price)
-            if instruction.entry.limit_price is not None
+            str(normalized_limit_price)
+            if normalized_limit_price is not None
             else None
         ),
+        "price_increment": str(limit_increment) if limit_increment is not None else None,
         "total_quantity": (
             str(normalized_quantity) if normalized_quantity is not None else None
         ),
@@ -572,6 +583,9 @@ def preview_execution_batch(
         for instruction in batch.instructions:
             contract_error = None
             contract_matches = None
+            normalized_limit_price = instruction.entry.limit_price
+            limit_increment: Decimal | None = None
+            price_warnings: list[str] = []
             try:
                 if hasattr(runtime_app, "contract_details"):
                     runtime_app.contract_details.clear()
@@ -590,6 +604,28 @@ def preview_execution_batch(
                     raw_contract,
                     timeout=timeout,
                 )
+                if len(contract_matches) == 1 and instruction.entry.limit_price is not None:
+                    limit_increment = resolve_price_increment(
+                        runtime_app,
+                        contract_matches[0],
+                        exchange=instruction.instrument.exchange,
+                        price=instruction.entry.limit_price,
+                        timeout=timeout,
+                        timeout_cls=timeout_cls,
+                    )
+                    normalized_limit_price = normalize_order_price(
+                        price=instruction.entry.limit_price,
+                        increment=limit_increment,
+                        action=instruction.intent.side,
+                        order_type="LMT",
+                    )
+                    if (
+                        normalized_limit_price is not None
+                        and normalized_limit_price != instruction.entry.limit_price
+                    ):
+                        price_warnings.append(
+                            "Entry limit price was normalized to the nearest valid IBKR tick increment."
+                        )
             except timeout_cls as exc:
                 broker_error = _extract_broker_error_message(runtime_app)
                 contract_error = (
@@ -613,8 +649,11 @@ def preview_execution_batch(
                 contract_matches=contract_matches,
                 contract_error=contract_error,
                 sizing_preview=sizing_preview,
+                normalized_limit_price=normalized_limit_price,
+                limit_increment=limit_increment,
             )
             preview["warnings"].extend(account_warnings)
+            preview["warnings"].extend(price_warnings)
             previews.append(preview)
     finally:
         if owns_connection:

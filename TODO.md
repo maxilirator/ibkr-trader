@@ -35,6 +35,9 @@ This file is the active implementation tracker for the production-grade trader p
   broker account selection and account-based sizing now use per-account
   account updates, and the operator dashboard no longer presents scheduled
   runtime entries as a manual submit workflow
+- [x] Order prices are normalized against IBKR market rules before submit:
+  live entry and exit order prices now snap to valid broker tick increments
+  instead of sending raw model prices that IBKR rejects with error 110
 
 - [x] Phase 1 ledger foundation:
   add broker accounts, broker orders, broker order events, execution fills,
