@@ -47,6 +47,8 @@ class _FakeOrderExecutionSyncWrapper:
         self.placed_orders: list[tuple[object, object, int | None]] = []
         self.cancelled_orders: list[tuple[int, int]] = []
         self.open_orders: dict[int, object] = {}
+        self.errors: dict[int, list[dict[str, object]]] = {}
+        self._next_order_id = 17
 
     def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
         self.connected = True
@@ -122,9 +124,11 @@ class _FakeOrderExecutionSyncWrapper:
 
     def place_order_sync(self, contract: object, order: object, timeout: int | None = None) -> dict[str, object]:
         self.placed_orders.append((contract, order, timeout))
-        order.orderId = 17
-        self.open_orders[17] = {
-            "orderId": 17,
+        order_id = self._next_order_id
+        self._next_order_id += 1
+        order.orderId = order_id
+        self.open_orders[order_id] = {
+            "orderId": order_id,
             "contract": contract,
             "order": order,
             "orderState": SimpleNamespace(
@@ -136,7 +140,7 @@ class _FakeOrderExecutionSyncWrapper:
             ),
         }
         return {
-            "orderId": 17,
+            "orderId": order_id,
             "status": "Submitted",
             "filled": "0",
             "remaining": str(order.totalQuantity),
@@ -274,6 +278,53 @@ class OrderExecutionTests(TestCase):
         self.assertEqual(result["order"]["price_increment"], "0.01")
         self.assertIn(
             "Entry limit price was normalized to the nearest valid IBKR tick increment.",
+            result["warnings"],
+        )
+
+    def test_submit_order_from_batch_reduces_quantity_after_insufficient_funds_reject(self) -> None:
+        class _InsufficientFundsWrapper(_FakeOrderExecutionSyncWrapper):
+            def place_order_sync(
+                self,
+                contract: object,
+                order: object,
+                timeout: int | None = None,
+            ) -> dict[str, object]:
+                result = super().place_order_sync(contract, order, timeout)
+                if int(order.totalQuantity) > 791:
+                    self.errors[int(result["orderId"])] = [
+                        {
+                            "errorCode": 201,
+                            "errorString": (
+                                "Order rejected - reason:We are unable to accept your order. "
+                                "Your Available Funds are in sufficient to cover the change in the "
+                                "account's margin requirements if this order executes. In order to "
+                                "obtain the desired position your Equity with Loan Value [19468.45 SEK] "
+                                "must exceed the new total Initial Margin of  [20319.14 SEK]."
+                            ),
+                        }
+                    ]
+                return result
+
+        payload = _base_payload()
+        payload["instructions"][0]["sizing"] = {
+            "mode": "fraction_of_account_nav",
+            "target_fraction_of_account": "1.0",
+        }
+        batch = parse_execution_batch_payload(payload)
+
+        result = submit_order_from_batch(
+            self.config,
+            batch,
+            sync_wrapper_cls=_InsufficientFundsWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["order"]["limit_price"], "120.00")
+        self.assertLessEqual(Decimal(result["order"]["total_quantity"]), Decimal("791"))
+        self.assertIn(
+            "Entry quantity was reduced after an IBKR insufficient-funds reject.",
             result["warnings"],
         )
 

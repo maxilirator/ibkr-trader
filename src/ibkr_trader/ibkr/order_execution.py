@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict
 from decimal import Decimal
 from decimal import ROUND_DOWN
+import re
+import time
 from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
@@ -278,6 +280,92 @@ def _normalize_quantity_for_stock(
             "Resolved stock quantity was rounded down to a whole share for execution."
         )
     return normalized, warnings
+
+
+_INSUFFICIENT_FUNDS_PATTERN = re.compile(
+    r"Loan Value \[([0-9.,]+)\s+[A-Z]{3}\].*Initial Margin of\s+\[([0-9.,]+)\s+[A-Z]{3}\]",
+    re.IGNORECASE,
+)
+
+
+def _extract_latest_order_error(
+    app: Any,
+    *,
+    order_id: int | None,
+) -> dict[str, Any] | None:
+    if order_id is None:
+        return None
+    raw_errors = getattr(app, "errors", None)
+    if not isinstance(raw_errors, dict):
+        return None
+    order_errors = raw_errors.get(order_id)
+    if not isinstance(order_errors, list) or not order_errors:
+        return None
+    latest_error = order_errors[-1]
+    if not isinstance(latest_error, dict):
+        return None
+    return latest_error
+
+
+def _wait_for_immediate_order_error(
+    app: Any,
+    *,
+    order_id: int | None,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    if order_id is None:
+        return None
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        latest_error = _extract_latest_order_error(app, order_id=order_id)
+        if latest_error is not None:
+            return latest_error
+        time.sleep(0.05)
+    return _extract_latest_order_error(app, order_id=order_id)
+
+
+def _parse_broker_decimal(raw_value: str) -> Decimal | None:
+    normalized = raw_value.strip().replace(",", "")
+    if not normalized:
+        return None
+    try:
+        return Decimal(normalized)
+    except Exception:
+        return None
+
+
+def _resize_for_insufficient_funds(
+    *,
+    quantity: Decimal,
+    error_payload: dict[str, Any],
+) -> Decimal | None:
+    if error_payload.get("errorCode") != 201:
+        return None
+
+    error_string = str(error_payload.get("errorString") or "")
+    match = _INSUFFICIENT_FUNDS_PATTERN.search(error_string)
+    if match is None:
+        return None
+
+    available_equity = _parse_broker_decimal(match.group(1))
+    required_margin = _parse_broker_decimal(match.group(2))
+    if (
+        available_equity is None
+        or required_margin is None
+        or available_equity <= 0
+        or required_margin <= 0
+    ):
+        return None
+
+    resized_quantity = (quantity * available_equity / required_margin).quantize(
+        Decimal("1"),
+        rounding=ROUND_DOWN,
+    )
+    if resized_quantity >= quantity:
+        resized_quantity = quantity - Decimal("1")
+    if resized_quantity <= 0:
+        return None
+    return resized_quantity
 
 
 def _build_ibkr_order(
@@ -573,35 +661,75 @@ def submit_order_from_instruction(
             price_warnings.append(
                 "Entry limit price was normalized to the nearest valid IBKR tick increment."
             )
-        order = _build_ibkr_order(
-            action=instruction.intent.side,
-            order_ref=instruction.instruction_id,
-            ibkr_order_type=_resolve_ibkr_order_type(
-                instruction.entry.order_type,
-                limit_price=normalized_limit_price,
-                stop_price=None,
-            ),
-            broker_account_id=broker_account_id,
-            quantity=normalized_quantity,
-            time_in_force=instruction.entry.time_in_force.value,
+        ibkr_order_type = _resolve_ibkr_order_type(
+            instruction.entry.order_type,
             limit_price=normalized_limit_price,
-            order_cls=runtime_order_cls,
+            stop_price=None,
         )
-
-        try:
-            order_status = runtime_app.place_order_sync(
-                resolved_ibkr_contract,
-                order,
-                timeout=timeout,
+        resize_warnings: list[str] = []
+        submitted_quantity = normalized_quantity
+        for _ in range(3):
+            order = _build_ibkr_order(
+                action=instruction.intent.side,
+                order_ref=instruction.instruction_id,
+                ibkr_order_type=ibkr_order_type,
+                broker_account_id=broker_account_id,
+                quantity=submitted_quantity,
+                time_in_force=instruction.entry.time_in_force.value,
+                limit_price=normalized_limit_price,
+                order_cls=runtime_order_cls,
             )
-        except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
-            if broker_error is not None:
+
+            try:
+                order_status = runtime_app.place_order_sync(
+                    resolved_ibkr_contract,
+                    order,
+                    timeout=timeout,
+                )
+            except timeout_cls as exc:
+                broker_error = _extract_broker_error_message(runtime_app)
+                if broker_error is not None:
+                    raise LookupError(
+                        f"IBKR rejected the order submission: {broker_error}"
+                    ) from exc
+                raise TimeoutError("Timed out while placing the IBKR order.") from exc
+
+            immediate_error = _wait_for_immediate_order_error(
+                runtime_app,
+                order_id=(
+                    int(order_status["orderId"])
+                    if order_status.get("orderId") not in (None, "")
+                    else None
+                ),
+                timeout_seconds=min(float(timeout), 1.0),
+            )
+            resized_quantity = (
+                _resize_for_insufficient_funds(
+                    quantity=submitted_quantity,
+                    error_payload=immediate_error,
+                )
+                if immediate_error is not None
+                else None
+            )
+            if resized_quantity is not None:
+                resize_warnings.append(
+                    "Entry quantity was reduced after an IBKR insufficient-funds reject."
+                )
+                submitted_quantity = resized_quantity
+                continue
+            if immediate_error is not None:
+                error_code = immediate_error.get("errorCode")
+                error_string = immediate_error.get("errorString") or "Unknown broker error."
                 raise LookupError(
-                    f"IBKR rejected the order submission: {broker_error}"
-                ) from exc
-            raise TimeoutError("Timed out while placing the IBKR order.") from exc
-        tws_submission = _extract_tws_submission(runtime_app, order_status)
+                    f"IBKR rejected the order submission: [{error_code}] {error_string}"
+                )
+
+            tws_submission = _extract_tws_submission(runtime_app, order_status)
+            break
+        else:
+            raise ValueError(
+                "IBKR rejected the order submission after repeated insufficient-funds quantity reductions."
+            )
     finally:
         if owns_connection:
             runtime_app.disconnect_and_stop()
@@ -610,7 +738,7 @@ def submit_order_from_instruction(
         {
             "instruction_id": instruction.instruction_id,
             "account": broker_account_id,
-            "warnings": [*list(account_warnings), *quantity_warnings, *price_warnings],
+            "warnings": [*list(account_warnings), *quantity_warnings, *price_warnings, *resize_warnings],
             "resolved_contract": resolved_contract,
             "order": {
                 "order_ref": instruction.instruction_id,
@@ -623,7 +751,7 @@ def submit_order_from_instruction(
                     else None
                 ),
                 "price_increment": str(limit_increment) if limit_increment is not None else None,
-                "total_quantity": str(normalized_quantity),
+                "total_quantity": str(submitted_quantity),
                 "outside_rth": order.outsideRth,
                 "transmit": order.transmit,
             },
