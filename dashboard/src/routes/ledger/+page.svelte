@@ -1,16 +1,42 @@
 <script>
+  import { invalidateAll } from '$app/navigation';
+  import { onMount } from 'svelte';
+
   export let data;
 
-  const ledgerSnapshot = data.ledgerSnapshot ?? {};
-  const summary = ledgerSnapshot.summary ?? {};
-  const focusInstruction = ledgerSnapshot.focus_instruction ?? null;
-  const instructionEvents = ledgerSnapshot.instruction_events ?? [];
-  const brokerOrderEvents = ledgerSnapshot.broker_order_events ?? [];
-  const recentFills = ledgerSnapshot.recent_fills ?? [];
-  const controlEvents = ledgerSnapshot.control_events ?? [];
-  const instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations ?? [];
-  const reconciliationIssues = ledgerSnapshot.reconciliation_issues ?? [];
-  const endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
+  const AUTO_REFRESH_INTERVAL_MS = 15000;
+
+  let ledgerSnapshot = {};
+  let summary = {};
+  let focusInstruction = null;
+  let instructionEvents = [];
+  let brokerOrderEvents = [];
+  let recentFills = [];
+  let controlEvents = [];
+  let instructionSetCancellations = [];
+  let reconciliationIssues = [];
+  let endpointErrors = [];
+
+  $: ledgerSnapshot = data.ledgerSnapshot ?? {};
+  $: summary = ledgerSnapshot.summary ?? {};
+  $: focusInstruction = ledgerSnapshot.focus_instruction ?? null;
+  $: instructionEvents = ledgerSnapshot.instruction_events ?? [];
+  $: brokerOrderEvents = ledgerSnapshot.broker_order_events ?? [];
+  $: recentFills = ledgerSnapshot.recent_fills ?? [];
+  $: controlEvents = ledgerSnapshot.control_events ?? [];
+  $: instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations ?? [];
+  $: reconciliationIssues = ledgerSnapshot.reconciliation_issues ?? [];
+  $: endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
+
+  onMount(() => {
+    const intervalId = window.setInterval(async () => {
+      await invalidateAll();
+    }, AUTO_REFRESH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  });
 
   function brokerConnected(role) {
     return data.health?.broker_sessions?.[role]?.connected === true;
@@ -27,7 +53,6 @@
 
 <svelte:head>
   <title>IBKR Trader Ledger Dashboard</title>
-  <meta http-equiv="refresh" content="15" />
 </svelte:head>
 
 <div class="page">
