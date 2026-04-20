@@ -175,6 +175,23 @@ class _FakeOrderExecutionSyncWrapper:
         }
 
 
+class _FakeMissingCancelOrderExecutionSyncWrapper(_FakeOrderExecutionSyncWrapper):
+    def cancel_order_sync(
+        self,
+        order_id: int,
+        orderCancel: object | None = None,
+        timeout: int = 3,
+    ) -> dict[str, object]:
+        self.cancelled_orders.append((order_id, timeout))
+        self.errors[order_id] = [
+            {
+                "errorCode": 10147,
+                "errorString": f"OrderId {order_id} that needs to be cancelled is not found.",
+            }
+        ]
+        raise TimeoutError()
+
+
 def _base_payload() -> dict[str, object]:
     return {
         "schema_version": "2026-04-10",
@@ -374,3 +391,15 @@ class OrderExecutionTests(TestCase):
 
         self.assertEqual(result["broker_order_status"]["orderId"], 17)
         self.assertEqual(result["broker_order_status"]["status"], "Cancelled")
+
+    def test_cancel_broker_order_treats_missing_broker_order_as_already_gone(self) -> None:
+        result = cancel_broker_order(
+            self.config,
+            33,
+            sync_wrapper_cls=_FakeMissingCancelOrderExecutionSyncWrapper,
+            response_timeout_cls=TimeoutError,
+        )
+
+        self.assertEqual(result["broker_order_status"]["orderId"], 33)
+        self.assertEqual(result["broker_order_status"]["status"], "NOT_FOUND_AT_BROKER")
+        self.assertIn("already absent", result["warning"])

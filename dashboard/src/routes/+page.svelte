@@ -16,6 +16,7 @@
   const brokerAttention = operatorSnapshot.recent_broker_attention ?? [];
   const reconciliationRuns = operatorSnapshot.recent_reconciliation_runs ?? [];
   const instructions = operatorSnapshot.instructions ?? [];
+  const marketTimeZone = data.health?.runtime_timezone ?? 'Europe/Stockholm';
   const brokerMonitor = data.health?.broker_monitor ?? {
     heartbeat: { ok: null, last_success_at: null, error: null },
     snapshot_refresh: {
@@ -36,6 +37,16 @@
   const orderRowActionResult = form?.orderRowActionResult ?? null;
   const referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
+  const timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: marketTimeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short'
+  });
 
   function brokerConnected(role) {
     return data.health?.broker_sessions?.[role]?.connected === true;
@@ -93,6 +104,22 @@
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
 
+  function formatTimestamp(value) {
+    const parsed = parseTimestamp(value);
+    if (!parsed) {
+      return value ?? 'n/a';
+    }
+    return timestampFormatter.format(parsed);
+  }
+
+  function formatTimestampOrNull(value) {
+    const parsed = parseTimestamp(value);
+    if (!parsed) {
+      return null;
+    }
+    return timestampFormatter.format(parsed);
+  }
+
   function instructionWindowState(instruction) {
     const submitAt = parseTimestamp(instruction.submit_at);
     const expireAt = parseTimestamp(instruction.expire_at);
@@ -112,7 +139,7 @@
       return {
         label: 'Scheduled',
         className: 'neutral',
-        detail: `Opens ${instruction.submit_at}`,
+        detail: `Opens ${formatTimestamp(instruction.submit_at)}`,
         isScheduled: true,
         isOpen: false,
         isExpired: false
@@ -123,7 +150,7 @@
       return {
         label: 'Expired',
         className: 'bad',
-        detail: `Expired ${instruction.expire_at}`,
+        detail: `Expired ${formatTimestamp(instruction.expire_at)}`,
         isScheduled: false,
         isOpen: false,
         isExpired: true
@@ -133,7 +160,7 @@
     return {
       label: 'Open',
       className: 'ok',
-      detail: `Closes ${instruction.expire_at}`,
+      detail: `Closes ${formatTimestamp(instruction.expire_at)}`,
       isScheduled: false,
       isOpen: true,
       isExpired: false
@@ -232,11 +259,15 @@
       </div>
       <div>
         <span>Page updated</span>
-        <strong>{data.generatedAt}</strong>
+        <strong>{formatTimestamp(data.generatedAt)}</strong>
       </div>
       <div>
         <span>Snapshot generated</span>
-        <strong>{operatorSnapshot.generated_at ?? 'n/a'}</strong>
+        <strong>{formatTimestamp(operatorSnapshot.generated_at)}</strong>
+      </div>
+      <div>
+        <span>Market timezone</span>
+        <strong>{marketTimeZone}</strong>
       </div>
     </div>
   </header>
@@ -260,7 +291,7 @@
         {monitorLabel(brokerMonitor.heartbeat?.ok)}
       </strong>
       <small>
-        {brokerMonitor.heartbeat?.last_success_at ??
+        {formatTimestampOrNull(brokerMonitor.heartbeat?.last_success_at) ??
           brokerMonitor.heartbeat?.error ??
           'No heartbeat has completed yet.'}
       </small>
@@ -286,7 +317,7 @@
       <span>Execution Runtime</span>
       <strong class={executionRuntimeClass()}>{executionRuntimeLabel()}</strong>
       <small>
-        {executionRuntime?.last_successful_cycle_at ??
+        {formatTimestampOrNull(executionRuntime?.last_successful_cycle_at) ??
           executionRuntime?.last_error ??
           'No execution-runtime status has been persisted yet.'}
       </small>
@@ -372,7 +403,7 @@
         </li>
         <li>
           <strong>Changed at</strong>
-          <span>{killSwitch.last_changed_at ?? 'n/a'}</span>
+          <span>{formatTimestamp(killSwitch.last_changed_at)}</span>
         </li>
       </ul>
     </section>
@@ -500,7 +531,7 @@
               <span class="pill neutral">{account.account_key}</span>
             </div>
             <dl>
-              <div><dt>Snapshot</dt><dd>{account.snapshot_at}</dd></div>
+              <div><dt>Snapshot</dt><dd>{formatTimestamp(account.snapshot_at)}</dd></div>
               <div><dt>Net liquidation</dt><dd>{account.net_liquidation ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
               <div><dt>Total cash</dt><dd>{account.total_cash_value ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
               <div><dt>Buying power</dt><dd>{account.buying_power ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
@@ -533,7 +564,7 @@
               </div>
               <p>{attention.message}</p>
               <small>
-                {attention.event_at}
+                {formatTimestamp(attention.event_at)}
                 {#if attention.order_ref}
                   · <span class="mono">{attention.order_ref}</span>
                 {/if}
@@ -558,7 +589,7 @@
               <div class="reconciliation-topline">
                 <div>
                   <h3>{run.run_kind}</h3>
-                  <p>{run.started_at} → {run.completed_at}</p>
+                  <p>{formatTimestamp(run.started_at)} → {formatTimestamp(run.completed_at)}</p>
                 </div>
                 <div class="run-pills">
                   <span class={`pill ${runStatusClass(run.status)}`}>{run.status}</span>
@@ -716,7 +747,7 @@
           <tbody>
             {#each recentFills as fill}
               <tr>
-                <td>{fill.executed_at}</td>
+                <td>{formatTimestamp(fill.executed_at)}</td>
                 <td>{fill.account_label ?? fill.account_key}</td>
                 <td>{fill.symbol}</td>
                 <td>{fill.side ?? 'n/a'}</td>
@@ -777,7 +808,7 @@
                 <td class="guidance-cell">{instructionGuidance(instruction)}</td>
                 <td>{instruction.broker_order_id ?? 'n/a'} / {instruction.broker_order_status ?? 'n/a'}</td>
                 <td>{instruction.exit_order_id ?? 'n/a'} / {instruction.exit_order_status ?? 'n/a'}</td>
-                <td>{instruction.updated_at}</td>
+                <td>{formatTimestamp(instruction.updated_at)}</td>
                 <td class="actions-cell">
                   {#if primaryAction && hasInstructionAction(instruction)}
                     <form method="POST" action="?/instructionRowAction" class="inline-action-form">

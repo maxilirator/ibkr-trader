@@ -27,6 +27,8 @@ from ibkr_trader.ibkr.price_rules import normalize_order_price
 from ibkr_trader.ibkr.price_rules import resolve_price_increment
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 
+_ORDER_CANCEL_NOT_FOUND_CODE = 10147
+
 
 @runtime_checkable
 class OrderExecutionSyncWrapperProtocol(Protocol):
@@ -955,6 +957,18 @@ def cancel_broker_order(
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
+                if f"[{_ORDER_CANCEL_NOT_FOUND_CODE}]" in broker_error:
+                    return _serialize_for_json(
+                        {
+                            "broker_order_status": {
+                                "orderId": order_id,
+                                "status": "NOT_FOUND_AT_BROKER",
+                            },
+                            "warning": (
+                                "IBKR reported that the order was already absent at cancel time."
+                            ),
+                        }
+                    )
                 raise LookupError(
                     f"IBKR rejected the order cancel request: {broker_error}"
                 ) from exc

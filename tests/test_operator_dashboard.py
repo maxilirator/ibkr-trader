@@ -176,7 +176,34 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
                 raw_payload={},
                 metadata_json={},
             )
-            session.add_all([open_order, closed_order])
+            errored_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="13",
+                external_perm_id="9003",
+                external_client_id="0",
+                order_ref="instr-saab-2",
+                symbol="SAAB",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SAAB-B",
+                side="BUY",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="ERROR",
+                total_quantity="1",
+                limit_price="99.00",
+                stop_price=None,
+                submitted_at=datetime(2026, 4, 19, 7, 26, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 19, 7, 26, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={"reject_reason": "Already absent at broker."},
+            )
+            session.add_all([open_order, closed_order, errored_order])
             session.flush()
 
             session.add(

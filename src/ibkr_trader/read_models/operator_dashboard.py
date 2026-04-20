@@ -29,8 +29,11 @@ from ibkr_trader.orchestration.operator_controls import KILL_SWITCH_CONTROL_KEY
 _CLOSED_ORDER_STATUSES = {
     "API_CANCELLED",
     "CANCELLED",
+    "ERROR",
     "FILLED",
     "INACTIVE",
+    "NOT_FOUND_AT_BROKER",
+    "REJECTED",
 }
 
 
