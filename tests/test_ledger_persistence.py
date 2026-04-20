@@ -336,6 +336,58 @@ class BrokerLedgerPersistenceTests(TestCase):
                 captured_at=datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc),
             )
 
+    def test_persist_broker_runtime_snapshot_uses_capture_time_when_execution_time_is_missing(self) -> None:
+        self._insert_instruction()
+        captured_at = datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc)
+        snapshot = BrokerRuntimeSnapshot(
+            open_orders={},
+            executions=(
+                BrokerExecution(
+                    exec_id="missing-time-exec",
+                    order_id=17,
+                    perm_id=9001,
+                    client_id=0,
+                    order_ref="persisted-aapl-1",
+                    side="BOT",
+                    shares=Decimal("1"),
+                    price=Decimal("200.00"),
+                    exchange="NASDAQ",
+                    executed_at=None,
+                    symbol="AAPL",
+                    account="DU1234567",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    currency="USD",
+                    local_symbol="AAPL",
+                ),
+            ),
+            portfolio=(),
+            positions=(),
+            account_values={},
+        )
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            snapshot,
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=captured_at,
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            execution_fill = session.execute(select(ExecutionFillRecord)).scalar_one()
+            self.assertEqual(
+                execution_fill.executed_at.replace(tzinfo=timezone.utc),
+                captured_at,
+            )
+            self.assertEqual(
+                execution_fill.raw_payload["executed_at_inferred_from_snapshot_capture"],
+                True,
+            )
+        finally:
+            session.close()
+
     def test_persist_broker_callback_events_updates_order_status_and_rejects(self) -> None:
         self._insert_broker_order()
 

@@ -1403,8 +1403,18 @@ def _persist_executions(
                 broker_order.instruction_id = instruction_record.id
 
         executed_at = execution.executed_at
+        fill_raw_payload = _serialize_for_json(asdict(execution))
         if executed_at is None:
-            raise ValueError(f"Execution {exec_id} did not include an execution timestamp.")
+            # IBKR occasionally omits execution.time on fills that are otherwise
+            # complete. Use the snapshot capture time so the runtime can keep
+            # reconciling, while retaining the raw broker payload that shows the
+            # missing execution timestamp.
+            executed_at = captured_at
+            fill_raw_payload = {
+                **fill_raw_payload,
+                "executed_at_inferred_from_snapshot_capture": True,
+                "snapshot_captured_at": captured_at.isoformat(),
+            }
 
         session.add(
             ExecutionFillRecord(
@@ -1436,7 +1446,7 @@ def _persist_executions(
                 commission=None,
                 commission_currency=None,
                 executed_at=executed_at,
-                raw_payload=_serialize_for_json(asdict(execution)),
+                raw_payload=fill_raw_payload,
             )
         )
 
