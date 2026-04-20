@@ -12,7 +12,7 @@ from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
 from ibkr_trader.domain.execution_contract import OrderType
 from ibkr_trader.domain.execution_contract import SizingMode
 from ibkr_trader.ibkr.account_summary import DEFAULT_ACCOUNT_SUMMARY_TAGS
-from ibkr_trader.ibkr.account_summary import normalize_account_summary_payload
+from ibkr_trader.ibkr.account_summary import read_account_summary
 from ibkr_trader.ibkr.contracts import _extract_broker_error_message
 from ibkr_trader.ibkr.contracts import build_ibkr_contract
 from ibkr_trader.ibkr.contracts import serialize_contract_details
@@ -30,12 +30,11 @@ class OrderExecutionSyncWrapperProtocol(Protocol):
 
     def disconnect_and_stop(self) -> None: ...
 
-    def get_account_summary(
+    def get_account_updates(
         self,
-        tags: str,
-        group: str = "All",
-        timeout: int = 5,
-    ) -> dict[str, dict[str, dict[str, str]]]: ...
+        account_code: str = "",
+        timeout: int = 10,
+    ) -> dict[str, Any]: ...
 
     def get_contract_details(self, contract: Any, timeout: int | None = None) -> list[Any]: ...
 
@@ -358,16 +357,14 @@ def _resolve_instruction_contract_and_account(
     contract_cls: type[Any] | None,
 ) -> tuple[str, list[str], dict[str, Any], Any, dict[str, Any]]:
     runtime_contract_cls = contract_cls or _load_contract_class()
-    raw_summary = app.get_account_summary(
-        tags=",".join(DEFAULT_ACCOUNT_SUMMARY_TAGS),
+    normalized_summary = read_account_summary(
+        config,
+        tags=DEFAULT_ACCOUNT_SUMMARY_TAGS,
         group="All",
-        timeout=timeout,
-    )
-    normalized_summary = normalize_account_summary_payload(
-        raw_summary,
-        requested_tags=DEFAULT_ACCOUNT_SUMMARY_TAGS,
         account_id=None,
-        group="All",
+        timeout=timeout,
+        response_timeout_cls=timeout_cls,
+        app=app,
     )
     broker_account_id, account_warnings = _select_broker_account_id(
         configured_account_id=config.account_id,
@@ -481,28 +478,20 @@ def submit_order_from_instruction(
             )
 
     try:
-        try:
-            (
-                broker_account_id,
-                account_warnings,
-                normalized_summary,
-                resolved_ibkr_contract,
-                resolved_contract,
-            ) = _resolve_instruction_contract_and_account(
-                runtime_app,
-                config,
-                instruction,
-                timeout=timeout,
-                timeout_cls=timeout_cls,
-                contract_cls=runtime_contract_cls,
-            )
-        except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
-            if broker_error is not None:
-                raise LookupError(
-                    f"IBKR rejected the account summary request: {broker_error}"
-                ) from exc
-            raise TimeoutError("Timed out while requesting IBKR account summary.") from exc
+        (
+            broker_account_id,
+            account_warnings,
+            normalized_summary,
+            resolved_ibkr_contract,
+            resolved_contract,
+        ) = _resolve_instruction_contract_and_account(
+            runtime_app,
+            config,
+            instruction,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+            contract_cls=runtime_contract_cls,
+        )
 
         sizing_preview = _resolve_sizing_preview(
             instruction,
@@ -627,28 +616,20 @@ def submit_exit_order_from_instruction(
             )
 
     try:
-        try:
-            (
-                broker_account_id,
-                account_warnings,
-                _normalized_summary,
-                resolved_ibkr_contract,
-                resolved_contract,
-            ) = _resolve_instruction_contract_and_account(
-                runtime_app,
-                config,
-                instruction,
-                timeout=timeout,
-                timeout_cls=timeout_cls,
-                contract_cls=runtime_contract_cls,
-            )
-        except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
-            if broker_error is not None:
-                raise LookupError(
-                    f"IBKR rejected the account summary request: {broker_error}"
-                ) from exc
-            raise TimeoutError("Timed out while requesting IBKR account summary.") from exc
+        (
+            broker_account_id,
+            account_warnings,
+            _normalized_summary,
+            resolved_ibkr_contract,
+            resolved_contract,
+        ) = _resolve_instruction_contract_and_account(
+            runtime_app,
+            config,
+            instruction,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+            contract_cls=runtime_contract_cls,
+        )
 
         order = _build_ibkr_order(
             action=_opposite_action(instruction.intent.side),

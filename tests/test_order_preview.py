@@ -39,23 +39,25 @@ class _FakePreviewSyncWrapper:
     def disconnect_and_stop(self) -> None:
         self.disconnected = True
 
-    def get_account_summary(
+    def get_account_updates(
         self,
-        tags: str,
-        group: str = "All",
-        timeout: int = 5,
-    ) -> dict[str, dict[str, dict[str, str]]]:
+        account_code: str = "",
+        timeout: int = 10,
+    ) -> dict[str, object]:
         return {
-            "DU1234567": {
-                "NetLiquidation": {
-                    "value": self.net_liquidation,
-                    "currency": self.account_currency,
-                },
-                "BuyingPower": {"value": "200000.00", "currency": self.account_currency},
-                "AvailableFunds": {"value": "90000.00", "currency": self.account_currency},
-                "ExcessLiquidity": {"value": "85000.00", "currency": self.account_currency},
-                "AccountType": {"value": "INDIVIDUAL", "currency": ""},
-            }
+            "portfolio": [],
+            "account_values": {
+                "DU1234567": {
+                    "NetLiquidation": {
+                        "value": self.net_liquidation,
+                        "currency": self.account_currency,
+                    },
+                    "BuyingPower": {"value": "200000.00", "currency": self.account_currency},
+                    "AvailableFunds": {"value": "90000.00", "currency": self.account_currency},
+                    "ExcessLiquidity": {"value": "85000.00", "currency": self.account_currency},
+                    "AccountType": {"value": "INDIVIDUAL", "currency": ""},
+                }
+            },
         }
 
     def get_contract_details(self, contract: _FakeContract, timeout: int | None = None) -> list[object]:

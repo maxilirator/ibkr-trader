@@ -30,6 +30,11 @@ This file is the active implementation tracker for the production-grade trader p
   stale instructions no longer show misleading submit buttons after expiry,
   and rows now explain whether they are scheduled, open, or expired with
   cancellation and ledger review paths when appropriate
+- [x] Order preview and live broker submission no longer depend on IBKR
+  account-summary subscriptions:
+  broker account selection and account-based sizing now use per-account
+  account updates, and the operator dashboard no longer presents scheduled
+  runtime entries as a manual submit workflow
 
 - [x] Phase 1 ledger foundation:
   add broker accounts, broker orders, broker order events, execution fills,

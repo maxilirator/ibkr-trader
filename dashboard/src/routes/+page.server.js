@@ -182,11 +182,6 @@ export const actions = {
     }
 
     const operationMap = {
-      submit_entry: {
-        execute: () =>
-          postWithoutBody(fetch, `${apiBaseUrl}/v1/instructions/${instructionId}/submit-entry`),
-        successMessage: `Submitted entry for instruction ${instructionId}.`
-      },
       cancel_entry: {
         execute: () =>
           postWithoutBody(fetch, `${apiBaseUrl}/v1/instructions/${instructionId}/cancel-entry`),

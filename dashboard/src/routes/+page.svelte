@@ -145,12 +145,12 @@
 
     if (instruction.state === 'ENTRY_PENDING') {
       if (windowState.isScheduled) {
-        return 'Waiting for the entry window to open. It should not be submitted yet.';
+        return 'Waiting for the scheduled entry window to open. Runtime will submit it automatically when due.';
       }
       if (windowState.isExpired) {
         return 'The entry window already passed. This row now needs cancellation or ledger review.';
       }
-      return 'The entry window is active. You can still submit it manually if that is intentional.';
+      return 'The entry window is active. Runtime should submit it automatically without operator intervention.';
     }
 
     if (instruction.state === 'ENTRY_SUBMITTED') {
@@ -187,9 +187,6 @@
     const windowState = instructionWindowState(instruction);
 
     if (instruction.state === 'ENTRY_PENDING') {
-      if (windowState.isOpen) {
-        return { operation: 'submit_entry', label: 'Submit Entry', className: 'inline-button' };
-      }
       return {
         operation: 'cancel_instruction',
         label: windowState.isExpired ? 'Cancel Stale' : 'Cancel Pending',

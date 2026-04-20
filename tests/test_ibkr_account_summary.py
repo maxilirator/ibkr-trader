@@ -15,8 +15,7 @@ class _FakeAccountSummarySyncWrapper:
         self.timeout = timeout
         self.connected = False
         self.disconnected = False
-        self.requested_tags: str | None = None
-        self.requested_group: str | None = None
+        self.requested_account_codes: list[str] = []
         self.connection_args: tuple[str, int, int] | None = None
 
     def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
@@ -27,15 +26,13 @@ class _FakeAccountSummarySyncWrapper:
     def disconnect_and_stop(self) -> None:
         self.disconnected = True
 
-    def get_account_summary(
+    def get_account_updates(
         self,
-        tags: str,
-        group: str = "All",
-        timeout: int = 5,
-    ) -> dict[str, dict[str, dict[str, str]]]:
-        self.requested_tags = tags
-        self.requested_group = group
-        return {
+        account_code: str = "",
+        timeout: int = 10,
+    ) -> dict[str, object]:
+        self.requested_account_codes.append(account_code)
+        payload = {
             "DU1234567": {
                 "NetLiquidation": {"value": "125000.45", "currency": "USD"},
                 "BuyingPower": {"value": "250000.90", "currency": "USD"},
@@ -45,6 +42,9 @@ class _FakeAccountSummarySyncWrapper:
                 "NetLiquidation": {"value": "5.00", "currency": "USD"},
             },
         }
+        if account_code:
+            payload = {account_code: payload[account_code]}
+        return {"portfolio": [], "account_values": payload}
 
 
 class AccountSummaryTests(TestCase):

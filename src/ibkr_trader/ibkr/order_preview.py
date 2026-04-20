@@ -15,7 +15,7 @@ from ibkr_trader.domain.execution_contract import (
 )
 from ibkr_trader.ibkr.account_summary import (
     DEFAULT_ACCOUNT_SUMMARY_TAGS,
-    normalize_account_summary_payload,
+    read_account_summary,
 )
 from ibkr_trader.ibkr.contracts import (
     _extract_broker_error_message,
@@ -35,12 +35,11 @@ class PreviewSyncWrapperProtocol(Protocol):
 
     def disconnect_and_stop(self) -> None: ...
 
-    def get_account_summary(
+    def get_account_updates(
         self,
-        tags: str,
-        group: str = "All",
-        timeout: int = 5,
-    ) -> dict[str, dict[str, dict[str, str]]]: ...
+        account_code: str = "",
+        timeout: int = 10,
+    ) -> dict[str, Any]: ...
 
     def get_contract_details(self, contract: Any, timeout: int | None = None) -> list[Any]: ...
 
@@ -551,25 +550,14 @@ def preview_execution_batch(
             )
 
     try:
-        try:
-            raw_summary = runtime_app.get_account_summary(
-                tags=",".join(DEFAULT_ACCOUNT_SUMMARY_TAGS),
-                group="All",
-                timeout=timeout,
-            )
-        except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
-            if broker_error is not None:
-                raise LookupError(
-                    f"IBKR rejected the account summary request: {broker_error}"
-                ) from exc
-            raise TimeoutError("Timed out while requesting IBKR account summary.") from exc
-
-        normalized_summary = normalize_account_summary_payload(
-            raw_summary,
-            requested_tags=DEFAULT_ACCOUNT_SUMMARY_TAGS,
-            account_id=None,
+        normalized_summary = read_account_summary(
+            config,
+            tags=DEFAULT_ACCOUNT_SUMMARY_TAGS,
             group="All",
+            account_id=None,
+            timeout=timeout,
+            response_timeout_cls=timeout_cls,
+            app=runtime_app,
         )
         broker_account_id, account_warnings = _select_broker_account_id(
             configured_account_id=config.account_id,
