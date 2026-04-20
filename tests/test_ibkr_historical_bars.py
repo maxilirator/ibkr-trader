@@ -182,4 +182,4 @@ class HistoricalBarsTests(TestCase):
             contract_cls=_FakeContract,
         )
 
-        self.assertEqual(wrapper.historical_args[1], "20260410-15:30:00 UTC")
+        self.assertEqual(wrapper.historical_args[1], "20260410-15:30:00")

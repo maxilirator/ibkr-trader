@@ -92,7 +92,8 @@ def _format_end_date_time(end_at: datetime | None) -> str:
     if end_at is None:
         return ""
 
-    return end_at.astimezone(timezone.utc).strftime("%Y%m%d-%H:%M:%S UTC")
+    # IBKR historical data accepts UTC timestamps as `YYYYMMDD-HH:MM:SS`.
+    return end_at.astimezone(timezone.utc).strftime("%Y%m%d-%H:%M:%S")
 
 
 def _serialize_bar_value(value: Any) -> str | None:
