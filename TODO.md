@@ -6,6 +6,10 @@ This file is the active implementation tracker for the production-grade trader p
 
 - [ ] Operator controls for reconciliation warnings and broker attention
 - [ ] Operator write actions for reconciliation issues and broker-attention items
+- [ ] Timed follow-up exits anchored to live market at activation time:
+  support instructions like "buy now, then at 10:30 place a sell limit
+  5% above the market price observed at 10:30" instead of only fill-based
+  take-profit and stop-loss exits
 
 ## Done
 

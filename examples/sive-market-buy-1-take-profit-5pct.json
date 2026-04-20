@@ -1,0 +1,60 @@
+{
+  "schema_version": "2026-04-10",
+  "source": {
+    "system": "manual-test",
+    "batch_id": "manual-test-2026-04-20-sive-market-1",
+    "generated_at": "2026-04-20T09:59:26+02:00",
+    "strategy_id": "manual-runtime-smoke"
+  },
+  "instructions": [
+    {
+      "instruction_id": "2026-04-20-U25245596-manual_test-SIVE-buy-01",
+      "account": {
+        "account_key": "U25245596",
+        "book_key": "manual_test",
+        "book_role": "test",
+        "book_side": "LONG"
+      },
+      "instrument": {
+        "symbol": "SIVE",
+        "security_type": "STK",
+        "exchange": "SMART",
+        "primary_exchange": "SFB",
+        "currency": "SEK",
+        "isin": "SE0003917798",
+        "aliases": [
+          "SIVE.ST"
+        ]
+      },
+      "intent": {
+        "side": "BUY",
+        "position_side": "LONG"
+      },
+      "sizing": {
+        "mode": "target_quantity",
+        "target_quantity": "1"
+      },
+      "entry": {
+        "order_type": "MARKET",
+        "submit_at": "2026-04-20T10:20:00+02:00",
+        "expire_at": "2026-04-20T10:30:00+02:00",
+        "time_in_force": "DAY",
+        "max_submit_count": 1,
+        "cancel_unfilled_at_expiry": true
+      },
+      "exit": {
+        "take_profit_pct": "0.05",
+        "force_exit_next_session_open": false
+      },
+      "trace": {
+        "reason_code": "manual_runtime_smoke_test",
+        "execution_policy": "market_entry_then_fill_based_take_profit",
+        "trade_date": "2026-04-20",
+        "company_name": "Sivers Semiconductors",
+        "metadata": {
+          "note": "Current runtime supports a take-profit derived from the entry fill price. A delayed 10:30 re-price from the then-current market is not implemented in the execution contract yet."
+        }
+      }
+    }
+  ]
+}
