@@ -1,4 +1,8 @@
 <script>
+  import { applyAction, enhance } from '$app/forms';
+  import { invalidateAll } from '$app/navigation';
+  import { onMount } from 'svelte';
+
   export let data;
   export let form;
 
@@ -40,6 +44,7 @@
   const reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
   const referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
+  const AUTO_REFRESH_INTERVAL_MS = 15000;
   const timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
     year: 'numeric',
@@ -180,6 +185,26 @@
     return `${referencePrefix}${order.price_spread}${pctSuffix}`;
   }
 
+  function enhanceDashboardAction() {
+    return async ({ result }) => {
+      await applyAction(result);
+
+      if (result.type === 'success') {
+        await invalidateAll();
+      }
+    };
+  }
+
+  onMount(() => {
+    const intervalId = window.setInterval(async () => {
+      await invalidateAll();
+    }, AUTO_REFRESH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  });
+
   function instructionWindowState(instruction) {
     const submitAt = parseTimestamp(instruction.submit_at);
     const expireAt = parseTimestamp(instruction.expire_at);
@@ -299,7 +324,6 @@
 
 <svelte:head>
   <title>IBKR Trader Operator Dashboard</title>
-  <meta http-equiv="refresh" content="15" />
 </svelte:head>
 
 <div class="page">
@@ -488,7 +512,12 @@
         </p>
       {/if}
 
-      <form method="POST" action="?/killSwitch" class="control-form">
+      <form
+        method="POST"
+        action="?/killSwitch"
+        class="control-form"
+        use:enhance={enhanceDashboardAction}
+      >
         <input
           type="hidden"
           name="enabled"
@@ -532,7 +561,12 @@
         </p>
       {/if}
 
-      <form method="POST" action="?/cancelInstructionSet" class="control-form">
+      <form
+        method="POST"
+        action="?/cancelInstructionSet"
+        class="control-form"
+        use:enhance={enhanceDashboardAction}
+      >
         <div class="form-grid">
           <label>
             <span>Batch ID</span>
@@ -592,7 +626,12 @@
       </p>
     {/if}
 
-    <form method="POST" action="?/startupReconcile" class="control-form">
+    <form
+      method="POST"
+      action="?/startupReconcile"
+      class="control-form"
+      use:enhance={enhanceDashboardAction}
+    >
       <div class="form-actions">
         <button class="action-button" type="submit">Run Startup Reconciliation</button>
       </div>
@@ -668,6 +707,7 @@
                     method="POST"
                     action="?/brokerAttentionAction"
                     class="inline-action-form"
+                    use:enhance={enhanceDashboardAction}
                   >
                     <input type="hidden" name="event_id" value={attention.event_id} />
                     <input type="hidden" name="operation" value={action.operation} />
@@ -730,6 +770,7 @@
                             method="POST"
                             action="?/reconciliationIssueAction"
                             class="inline-action-form"
+                            use:enhance={enhanceDashboardAction}
                           >
                             <input type="hidden" name="issue_id" value={issue.issue_id} />
                             <input type="hidden" name="operation" value={action.operation} />
@@ -858,7 +899,12 @@
                 <td>{order.reject_reason ?? order.warning_text ?? 'n/a'}</td>
                 <td>
                   {#if order.external_order_id}
-                    <form method="POST" action="?/orderRowAction" class="inline-action-form">
+                    <form
+                      method="POST"
+                      action="?/orderRowAction"
+                      class="inline-action-form"
+                      use:enhance={enhanceDashboardAction}
+                    >
                       <input type="hidden" name="external_order_id" value={order.external_order_id} />
                       <button class="inline-button danger" type="submit">Cancel Order</button>
                     </form>
@@ -963,7 +1009,12 @@
                 <td>{formatTimestamp(instruction.updated_at)}</td>
                 <td class="actions-cell">
                   {#if primaryAction && hasInstructionAction(instruction)}
-                    <form method="POST" action="?/instructionRowAction" class="inline-action-form">
+                    <form
+                      method="POST"
+                      action="?/instructionRowAction"
+                      class="inline-action-form"
+                      use:enhance={enhanceDashboardAction}
+                    >
                       <input type="hidden" name="instruction_id" value={instruction.instruction_id} />
                       <input type="hidden" name="operation" value={primaryAction.operation} />
                       <button class={primaryAction.className} type="submit">{primaryAction.label}</button>
