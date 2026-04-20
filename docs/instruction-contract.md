@@ -215,6 +215,35 @@ So the rule is:
 - `catastrophic_stop_loss_pct_from_fill` -> `exit.catastrophic_stop_loss_pct`
 - `fallback_exit_mode=next_open_fallback` -> `exit.force_exit_next_session_open=true`
 
+### Timed follow-up exits
+
+When the strategy needs a later follow-up order anchored to the market price at
+that later time, use `exit.delayed_limit`.
+
+Example:
+
+```json
+{
+  "exit": {
+    "delayed_limit": {
+      "submit_at": "2026-04-20T10:30:00+02:00",
+      "limit_offset_pct": "0.05",
+      "reference": "MARKET_AT_TRIGGER"
+    }
+  }
+}
+```
+
+Meaning:
+
+- wait until `exit.delayed_limit.submit_at`
+- observe the live market using the latest available IBKR market price at that time
+- place the exit limit order `5%` above that observed market for a long position
+- place the exit limit order `5%` below that observed market for a short position
+
+`exit.delayed_limit` is meant for timed market-anchored exits, so do not combine
+it with `exit.take_profit_pct`, which is a fill-anchored immediate protective exit.
+
 ## Strong opinion on sizing
 
 The execution contract should carry **one** sizing mechanism per instruction.

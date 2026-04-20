@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 from ibkr_trader.domain.execution_contract import (
     AccountRef,
+    DelayedExitReference,
+    DelayedLimitExitSpec,
     EntrySpec,
     ExecutionInstruction,
     ExecutionInstructionBatch,
@@ -97,6 +99,10 @@ def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> Execution
     trace_payload = payload.get("trace", {})
     if not isinstance(trace_payload, Mapping):
         raise ValueError("trace must be an object")
+
+    delayed_limit_payload = exit_payload.get("delayed_limit")
+    if delayed_limit_payload is not None and not isinstance(delayed_limit_payload, Mapping):
+        raise ValueError("exit.delayed_limit must be an object")
 
     instruction = ExecutionInstruction(
         instruction_id=str(payload["instruction_id"]),
@@ -194,6 +200,28 @@ def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> Execution
                     "exit.catastrophic_stop_loss_pct",
                 )
                 if exit_payload.get("catastrophic_stop_loss_pct") is not None
+                else None
+            ),
+            delayed_limit=(
+                DelayedLimitExitSpec(
+                    submit_at=parse_datetime(
+                        delayed_limit_payload["submit_at"],
+                        "exit.delayed_limit.submit_at",
+                    ),
+                    limit_offset_pct=parse_decimal(
+                        delayed_limit_payload["limit_offset_pct"],
+                        "exit.delayed_limit.limit_offset_pct",
+                    ),
+                    reference=DelayedExitReference(
+                        str(
+                            delayed_limit_payload.get(
+                                "reference",
+                                DelayedExitReference.MARKET_AT_TRIGGER.value,
+                            )
+                        ).upper()
+                    ),
+                )
+                if delayed_limit_payload is not None
                 else None
             ),
             force_exit_next_session_open=bool(

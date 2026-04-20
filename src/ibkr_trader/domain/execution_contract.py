@@ -32,6 +32,10 @@ class TimeInForce(StrEnum):
     GTC = "GTC"
 
 
+class DelayedExitReference(StrEnum):
+    MARKET_AT_TRIGGER = "MARKET_AT_TRIGGER"
+
+
 @dataclass(slots=True)
 class SourceContext:
     system: str
@@ -162,6 +166,7 @@ class ExitSpec:
     take_profit_pct: Decimal | None = None
     stop_loss_pct: Decimal | None = None
     catastrophic_stop_loss_pct: Decimal | None = None
+    delayed_limit: "DelayedLimitExitSpec | None" = None
     force_exit_next_session_open: bool = False
 
     def validate(self) -> None:
@@ -172,6 +177,25 @@ class ExitSpec:
         ):
             if value is not None and value <= 0:
                 raise ValueError(f"exit.{field_name} must be positive")
+        if self.delayed_limit is not None:
+            self.delayed_limit.validate()
+            if self.take_profit_pct is not None:
+                raise ValueError(
+                    "exit.delayed_limit cannot be combined with exit.take_profit_pct"
+                )
+
+
+@dataclass(slots=True)
+class DelayedLimitExitSpec:
+    submit_at: datetime
+    limit_offset_pct: Decimal
+    reference: DelayedExitReference = DelayedExitReference.MARKET_AT_TRIGGER
+
+    def validate(self) -> None:
+        if self.submit_at.tzinfo is None:
+            raise ValueError("exit.delayed_limit.submit_at must include timezone information")
+        if self.limit_offset_pct <= 0:
+            raise ValueError("exit.delayed_limit.limit_offset_pct must be positive")
 
 
 @dataclass(slots=True)

@@ -298,6 +298,26 @@ class OrderExecutionTests(TestCase):
             result["warnings"],
         )
 
+    def test_submit_order_from_batch_builds_market_order(self) -> None:
+        payload = _base_payload()
+        payload["instructions"][0]["entry"]["order_type"] = "MARKET"
+        del payload["instructions"][0]["entry"]["limit_price"]
+        batch = parse_execution_batch_payload(payload)
+
+        result = submit_order_from_batch(
+            self.config,
+            batch,
+            sync_wrapper_cls=_FakeOrderExecutionSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["order"]["order_type"], "MKT")
+        self.assertIsNone(result["order"]["limit_price"])
+        self.assertIsNone(result["order"]["price_increment"])
+        self.assertEqual(result["order"]["total_quantity"], "10")
+
     def test_submit_order_from_batch_reduces_quantity_after_insufficient_funds_reject(self) -> None:
         class _InsufficientFundsWrapper(_FakeOrderExecutionSyncWrapper):
             def place_order_sync(

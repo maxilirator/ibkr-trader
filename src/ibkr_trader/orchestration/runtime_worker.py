@@ -38,6 +38,7 @@ from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import OrderType
 from ibkr_trader.domain.execution_payloads import parse_execution_instruction_payload
+from ibkr_trader.ibkr.historical_bars import read_latest_trade_price
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
 from ibkr_trader.ibkr.order_execution import submit_exit_order_from_instruction
@@ -567,6 +568,42 @@ def _compute_stop_price(
     return _quantize_like(raw_price, reference_price)
 
 
+def _is_delayed_limit_exit_due(
+    instruction: ExecutionInstruction,
+    *,
+    cycle_at: datetime,
+) -> bool:
+    delayed_limit = instruction.exit.delayed_limit
+    if delayed_limit is None:
+        return False
+    return delayed_limit.submit_at.astimezone(timezone.utc) <= cycle_at.astimezone(timezone.utc)
+
+
+def _compute_delayed_limit_price(
+    instruction: ExecutionInstruction,
+    *,
+    market_price: Decimal,
+) -> Decimal:
+    delayed_limit = instruction.exit.delayed_limit
+    if delayed_limit is None:
+        raise ValueError("exit.delayed_limit is required to compute the delayed limit price.")
+    if market_price <= 0:
+        raise ValueError("Delayed-exit market anchor price must be positive.")
+
+    if instruction.intent.side == "BUY":
+        raw_price = market_price * (Decimal("1") + delayed_limit.limit_offset_pct)
+    elif instruction.intent.side == "SELL":
+        raw_price = market_price * (Decimal("1") - delayed_limit.limit_offset_pct)
+    else:
+        raise ValueError(f"Unsupported instruction side: {instruction.intent.side}")
+
+    if raw_price <= 0:
+        raise ValueError("Computed delayed exit limit price is not positive.")
+
+    reference_price = instruction.entry.limit_price or market_price
+    return _quantize_like(raw_price, reference_price)
+
+
 def _open_order_ids_with_ref_prefix(
     snapshot: BrokerRuntimeSnapshot,
     *,
@@ -853,6 +890,94 @@ def _mark_unfilled_entry_cancelled(
         )
 
 
+def _submit_delayed_limit_exit(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    instruction_id: str,
+    *,
+    quantity: Decimal,
+    market_reference: dict[str, Any],
+    timeout: int,
+    exit_submitter: Callable[..., dict[str, Any]] | None,
+) -> RuntimeCycleAction:
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one()
+        instruction = _instruction_payload(record)
+        market_price = _parse_decimal(str(market_reference.get("price")))
+        if market_price <= 0:
+            raise ValueError(
+                f"Instruction '{instruction_id}' did not receive a usable delayed-exit market price."
+            )
+        limit_price = _compute_delayed_limit_price(
+            instruction,
+            market_price=market_price,
+        )
+        runtime_exit_submitter = exit_submitter or submit_exit_order_from_instruction
+        broker_submission = runtime_exit_submitter(
+            broker_config,
+            instruction,
+            quantity=quantity,
+            order_type=OrderType.LIMIT,
+            order_ref=f"{instruction_id}:exit:delayed_limit",
+            timeout=timeout,
+            limit_price=limit_price,
+        )
+        broker_status = broker_submission["broker_order_status"]
+        previous_state = record.state
+        record.exit_order_id = int(broker_status["orderId"])
+        record.exit_perm_id = int(broker_status["permId"])
+        record.exit_client_id = int(broker_status["clientId"])
+        record.exit_order_status = str(broker_status["status"])
+        record.exit_submitted_quantity = str(quantity)
+        record.state = ExecutionState.EXIT_PENDING.value
+        event_at = utc_now()
+        persist_broker_order_submission(
+            session,
+            broker_kind=BROKER_KIND_IBKR,
+            instruction_record=record,
+            broker_submission=broker_submission,
+            observed_at=event_at,
+            fallback_account_key=broker_config.account_id,
+            order_role="EXIT",
+            event_type="delayed_limit_exit_submitted",
+            note="Submitted delayed limit exit anchored to live market at trigger time.",
+        )
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type="delayed_limit_exit_submitted",
+                source="runtime_cycle",
+                event_at=event_at,
+                state_before=previous_state,
+                state_after=record.state,
+                payload=_serialize_for_json(
+                    {
+                        "broker_submission": broker_submission,
+                        "market_reference": market_reference,
+                        "computed_limit_price": limit_price,
+                    }
+                ),
+                note="Submitted delayed limit exit anchored to live market at trigger time.",
+            )
+        )
+        return RuntimeCycleAction(
+            instruction_id=instruction_id,
+            action="delayed_limit_exit_submitted",
+            state=record.state,
+            detail={
+                "broker_order_id": record.exit_order_id,
+                "broker_order_status": record.exit_order_status,
+                "exit_submitted_quantity": record.exit_submitted_quantity,
+                "limit_price": str(limit_price),
+                "market_reference": _serialize_for_json(market_reference),
+            },
+        )
+
+
 def _submit_forced_exit(
     session_factory: sessionmaker[Session],
     broker_config: IbkrConnectionConfig,
@@ -1013,6 +1138,7 @@ def run_runtime_cycle(
     entry_submitter: Callable[..., Any] | None = None,
     entry_canceler: Callable[..., Any] | None = None,
     exit_submitter: Callable[..., dict[str, Any]] | None = None,
+    market_price_reader: Callable[..., dict[str, Any]] | None = None,
     broker_snapshot_fetcher: Callable[..., BrokerRuntimeSnapshot] | None = None,
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
@@ -1469,6 +1595,45 @@ def run_runtime_cycle(
                     )
                     continue
 
+                if (
+                    _is_delayed_limit_exit_due(
+                        instruction,
+                        cycle_at=cycle_started_at,
+                    )
+                    and remaining_quantity > 0
+                    and not exit_open
+                ):
+                    if market_price_reader is None:
+                        raise ValueError(
+                            "Delayed limit exits require a market_price_reader."
+                        )
+                    market_reference = _run_with_broker_retries(
+                        lambda: market_price_reader(
+                            broker_config,
+                            instruction,
+                            at=cycle_started_at,
+                            timeout=timeout,
+                        ),
+                        retry_delays=broker_retry_delays,
+                        sleep_fn=sleep_fn,
+                    )
+                    submitted_exits.append(
+                        _run_with_broker_retries(
+                            lambda: _submit_delayed_limit_exit(
+                                session_factory,
+                                broker_config,
+                                instruction_id,
+                                quantity=remaining_quantity,
+                                market_reference=market_reference,
+                                timeout=timeout,
+                                exit_submitter=exit_submitter,
+                            ),
+                            retry_delays=broker_retry_delays,
+                            sleep_fn=sleep_fn,
+                        )
+                    )
+                    continue
+
                 if not _is_next_session_exit_due(
                     instruction,
                     runtime_timezone=runtime_timezone,
@@ -1563,6 +1728,7 @@ def run_startup_reconciliation(
     timeout: int = 10,
     instruction_ids: tuple[str, ...] | None = None,
     exit_submitter: Callable[..., dict[str, Any]] | None = None,
+    market_price_reader: Callable[..., dict[str, Any]] | None = None,
     broker_snapshot_fetcher: Callable[..., BrokerRuntimeSnapshot] | None = None,
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
@@ -1582,6 +1748,7 @@ def run_startup_reconciliation(
         instruction_ids=instruction_ids,
         submit_due_entries=False,
         exit_submitter=exit_submitter,
+        market_price_reader=market_price_reader,
         broker_snapshot_fetcher=broker_snapshot_fetcher,
         broker_callback_fetcher=broker_callback_fetcher,
         broker_order_canceler=broker_order_canceler,
@@ -1594,6 +1761,7 @@ def run_startup_reconciliation(
 class RuntimeBrokerOperations:
     submit_entry: Callable[..., dict[str, Any]]
     submit_exit: Callable[..., dict[str, Any]]
+    read_market_price: Callable[..., dict[str, Any]]
     fetch_snapshot: Callable[..., BrokerRuntimeSnapshot]
     drain_callbacks: Callable[[], list[dict[str, Any]]]
     cancel_order: Callable[..., dict[str, Any]]
@@ -1648,6 +1816,29 @@ def _build_runtime_broker_operations(
             ),
         )
 
+    def read_market_price_with_primary(
+        broker_config: IbkrConnectionConfig,
+        instruction: ExecutionInstruction,
+        *,
+        at: datetime,
+        timeout: int = 10,
+    ) -> dict[str, Any]:
+        return broker_sessions.primary.execute(
+            "runtime_market_reference",
+            lambda broker_app: read_latest_trade_price(
+                broker_config,
+                symbol=instruction.instrument.symbol,
+                exchange=instruction.instrument.exchange,
+                currency=instruction.instrument.currency,
+                security_type=instruction.instrument.security_type.value,
+                primary_exchange=instruction.instrument.primary_exchange,
+                isin=instruction.instrument.isin,
+                end_at=at,
+                timeout=timeout,
+                app=broker_app,
+            ),
+        )
+
     def fetch_snapshot_with_primary(
         broker_config: IbkrConnectionConfig,
         *,
@@ -1684,6 +1875,7 @@ def _build_runtime_broker_operations(
     return RuntimeBrokerOperations(
         submit_entry=submit_entry_with_primary,
         submit_exit=submit_exit_with_primary,
+        read_market_price=read_market_price_with_primary,
         fetch_snapshot=fetch_snapshot_with_primary,
         drain_callbacks=drain_callbacks_with_primary,
         cancel_order=cancel_order_with_primary,
@@ -1754,6 +1946,7 @@ def run_persistent_execution_runtime(
                 session_calendar_path=app_config.session_calendar_path,
                 timeout=timeout,
                 exit_submitter=broker_ops.submit_exit,
+                market_price_reader=broker_ops.read_market_price,
                 broker_snapshot_fetcher=broker_ops.fetch_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
@@ -1805,6 +1998,7 @@ def run_persistent_execution_runtime(
                 timeout=timeout,
                 entry_submitter=broker_ops.submit_entry,
                 exit_submitter=broker_ops.submit_exit,
+                market_price_reader=broker_ops.read_market_price,
                 broker_snapshot_fetcher=broker_ops.fetch_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,

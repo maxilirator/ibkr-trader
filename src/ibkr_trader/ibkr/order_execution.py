@@ -586,9 +586,6 @@ def submit_order_from_instruction(
     order_cls: type[Any] | None = None,
     app: OrderExecutionSyncWrapperProtocol | None = None,
 ) -> dict[str, Any]:
-    if instruction.entry.order_type is not OrderType.LIMIT:
-        raise ValueError("Manual broker order submit currently supports LIMIT orders only.")
-
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
     runtime_contract_cls = contract_cls or _load_contract_class()
     runtime_order_cls = order_cls or _load_order_class()
@@ -641,19 +638,22 @@ def submit_order_from_instruction(
             sizing_preview["estimated_quantity"],
             allow_round_down=instruction.sizing.mode is not SizingMode.TARGET_QUANTITY,
         )
-        normalized_limit_price, limit_increment = _normalize_price_for_order(
-            runtime_app,
-            raw_contract_detail,
-            exchange=(
-                str(getattr(resolved_ibkr_contract, "exchange", ""))
-                or instruction.instrument.exchange
-            ),
-            price=instruction.entry.limit_price,
-            action=instruction.intent.side,
-            order_type="LMT",
-            timeout=timeout,
-            timeout_cls=timeout_cls,
-        )
+        normalized_limit_price = instruction.entry.limit_price
+        limit_increment = None
+        if instruction.entry.order_type is OrderType.LIMIT:
+            normalized_limit_price, limit_increment = _normalize_price_for_order(
+                runtime_app,
+                raw_contract_detail,
+                exchange=(
+                    str(getattr(resolved_ibkr_contract, "exchange", ""))
+                    or instruction.instrument.exchange
+                ),
+                price=instruction.entry.limit_price,
+                action=instruction.intent.side,
+                order_type="LMT",
+                timeout=timeout,
+                timeout_cls=timeout_cls,
+            )
         price_warnings: list[str] = []
         if (
             instruction.entry.limit_price is not None

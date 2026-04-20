@@ -235,3 +235,63 @@ def read_historical_bars(
             for raw_bar in raw_bars
         ],
     }
+
+
+def read_latest_trade_price(
+    config: IbkrConnectionConfig,
+    *,
+    symbol: str,
+    exchange: str,
+    currency: str,
+    security_type: str = "STK",
+    primary_exchange: str | None = None,
+    isin: str | None = None,
+    local_symbol: str | None = None,
+    end_at: datetime | None = None,
+    timeout: int = 20,
+    sync_wrapper_cls: type[HistoricalBarsSyncWrapperProtocol] | None = None,
+    response_timeout_cls: type[Exception] | None = None,
+    contract_cls: type[Any] | None = None,
+    app: HistoricalBarsSyncWrapperProtocol | None = None,
+) -> dict[str, Any]:
+    response = read_historical_bars(
+        config,
+        HistoricalBarsQuery(
+            symbol=symbol,
+            exchange=exchange,
+            currency=currency,
+            security_type=security_type,
+            primary_exchange=primary_exchange,
+            isin=isin,
+            local_symbol=local_symbol,
+            duration="1 D",
+            bar_size="1 min",
+            what_to_show="TRADES",
+            use_rth=True,
+            end_at=end_at,
+        ),
+        timeout=timeout,
+        sync_wrapper_cls=sync_wrapper_cls,
+        response_timeout_cls=response_timeout_cls,
+        contract_cls=contract_cls,
+        app=app,
+    )
+    raw_bars = response["bars"]
+    if not raw_bars:
+        raise LookupError(
+            f"IBKR returned no usable trade bars for {symbol} on {exchange}."
+        )
+    latest_bar = raw_bars[-1]
+    close_value = _to_decimal(latest_bar.get("close"))
+    if close_value is None or close_value <= 0:
+        raise LookupError(
+            f"IBKR returned no usable latest close for {symbol} on {exchange}."
+        )
+    return {
+        "price": str(close_value),
+        "observed_at": latest_bar.get("timestamp"),
+        "currency": response.get("currency"),
+        "source": "ibkr_historical_trades_1min_close",
+        "bar": latest_bar,
+        "resolved_contract": response.get("resolved_contract"),
+    }
