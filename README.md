@@ -107,9 +107,10 @@ The recommended service shape is:
 
 - keep the official IBKR Python API as the broker core
 - expose a small FastAPI control plane around it
-- bind the API only to loopback, not to public or LAN interfaces
+- keep IB Gateway loopback-only on the server itself
+- expose the trader API to the trusted LAN for agents and operator tools
 
-This gives the AI and orchestration layers a clean local HTTP interface without exposing the raw broker session to the network.
+This gives the AI and orchestration layers a clean HTTP interface without exposing the raw broker socket to the network.
 
 The initial FastAPI wrapper includes:
 
@@ -247,10 +248,10 @@ source .venv/bin/activate
 python3 -m ibkr_trader.api.server
 ```
 
-Expected local defaults:
+Expected colocated runtime defaults:
 
-- `API_HOST=127.0.0.1`
+- `API_HOST=0.0.0.0`
 - `API_PORT=8000`
-- `API_REQUIRE_LOOPBACK_ONLY=true`
+- `API_REQUIRE_LOOPBACK_ONLY=false`
 
-Even if the server is started incorrectly, the app refuses non-loopback bind targets when loopback-only mode is enabled.
+In the intended deployment on `quant.geisler.se`, IB Gateway stays on `127.0.0.1:4002` while the trader API is exposed on the LAN at `quant.geisler.se:8000`.

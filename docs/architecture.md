@@ -63,16 +63,17 @@ Responsibilities:
 - subscribe to order status, execution, account, and market-data callbacks
 - translate broker events into internal events
 
-### 3A. Local Control API
+### 3A. Trader Control API
 
-Thin local-only FastAPI service in front of the execution runtime.
+Thin FastAPI service in front of the execution runtime, exposed to the trusted LAN.
 
 Responsibilities:
 
 - accept validated local HTTP calls from internal services
+- accept validated LAN HTTP calls from agents and operator tools
 - keep the official IBKR Python API isolated in one process boundary
 - expose probe, validation, and later order-management endpoints
-- enforce loopback-only access by default
+- keep broker access isolated even when the trader API itself is LAN-visible
 
 ### 4. Risk and Controls
 

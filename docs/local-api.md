@@ -1,6 +1,6 @@
-# Local API
+# Trader API
 
-This repository now includes a small FastAPI control plane intended for **local-only** access.
+This repository now includes a small FastAPI control plane intended to be reachable on the **trusted LAN**, while IB Gateway itself remains local to the host.
 
 Current runtime scope:
 
@@ -14,7 +14,7 @@ For this system, using the official IBKR Python API directly inside a local serv
 
 - we keep IBKR session management in one process
 - AI and orchestration layers can call a simple HTTP API
-- we avoid exposing the broker API on the network
+- we avoid exposing the raw broker API on the network
 - we retain full control over validation, scheduling, and audit behavior
 
 This is especially useful once multiple internal components need to submit instructions, validate intents, or request broker state without each one opening its own IBKR connection.
@@ -27,15 +27,15 @@ If the configured parquet file cannot be read directly, the scheduler will use t
 
 ## Security posture
 
-The local API is designed to accept loopback traffic only:
+The intended deployment now is:
 
-- default bind host is `127.0.0.1`
-- startup rejects non-loopback bind targets when local-only mode is enabled
-- middleware rejects requests whose client address is not loopback
+- IB Gateway stays on `127.0.0.1`
+- the trader API is exposed on the trusted LAN
+- agents and operator tools call the trader API, not IB Gateway directly
 
 This is a strong starting point, but it is not the final security model for a production quant system. Later we should add:
 
-- process-level auth between local services
+- process-level auth between LAN clients and the trader API
 - OS firewall rules
 - separate live and paper environments
 - stricter instruction authorization and audit controls
