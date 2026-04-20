@@ -6,22 +6,22 @@
   export let data;
   export let form;
 
-  const operatorSnapshot = data.operatorSnapshot ?? {};
-  const killSwitch = operatorSnapshot.kill_switch ?? {
+  let operatorSnapshot = {};
+  let killSwitch = {
     enabled: false,
     reason: null,
     updated_by: null,
     last_changed_at: null
   };
-  const accounts = operatorSnapshot.accounts ?? [];
-  const positions = operatorSnapshot.positions ?? [];
-  const openOrders = operatorSnapshot.open_orders ?? [];
-  const recentFills = operatorSnapshot.recent_fills ?? [];
-  const brokerAttention = operatorSnapshot.recent_broker_attention ?? [];
-  const reconciliationRuns = operatorSnapshot.recent_reconciliation_runs ?? [];
-  const instructions = operatorSnapshot.instructions ?? [];
-  const marketTimeZone = data.health?.runtime_timezone ?? 'Europe/Stockholm';
-  const brokerMonitor = data.health?.broker_monitor ?? {
+  let accounts = [];
+  let positions = [];
+  let openOrders = [];
+  let recentFills = [];
+  let brokerAttention = [];
+  let reconciliationRuns = [];
+  let instructions = [];
+  let marketTimeZone = 'Europe/Stockholm';
+  let brokerMonitor = {
     heartbeat: { ok: null, last_success_at: null, error: null },
     snapshot_refresh: {
       ok: null,
@@ -32,20 +32,68 @@
       open_order_count: 0
     }
   };
-  const executionRuntime = data.health?.execution_runtime ?? null;
-  const endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
-  const warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count ?? 0) > 0);
-  const killSwitchResult = form?.killSwitchResult ?? null;
-  const startupReconcileResult = form?.startupReconcileResult ?? null;
-  const cancelSetResult = form?.cancelSetResult ?? null;
-  const instructionRowActionResult = form?.instructionRowActionResult ?? null;
-  const orderRowActionResult = form?.orderRowActionResult ?? null;
-  const brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
-  const reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
-  const referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
+  let executionRuntime = null;
+  let endpointErrors = [];
+  let warningRuns = [];
+  let killSwitchResult = null;
+  let startupReconcileResult = null;
+  let cancelSetResult = null;
+  let instructionRowActionResult = null;
+  let orderRowActionResult = null;
+  let brokerAttentionActionResult = null;
+  let reconciliationIssueActionResult = null;
+  let referenceNow = new Date();
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const AUTO_REFRESH_INTERVAL_MS = 15000;
-  const timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
+  let timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: marketTimeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short'
+  });
+
+  $: operatorSnapshot = data.operatorSnapshot ?? {};
+  $: killSwitch = operatorSnapshot.kill_switch ?? {
+    enabled: false,
+    reason: null,
+    updated_by: null,
+    last_changed_at: null
+  };
+  $: accounts = operatorSnapshot.accounts ?? [];
+  $: positions = operatorSnapshot.positions ?? [];
+  $: openOrders = operatorSnapshot.open_orders ?? [];
+  $: recentFills = operatorSnapshot.recent_fills ?? [];
+  $: brokerAttention = operatorSnapshot.recent_broker_attention ?? [];
+  $: reconciliationRuns = operatorSnapshot.recent_reconciliation_runs ?? [];
+  $: instructions = operatorSnapshot.instructions ?? [];
+  $: marketTimeZone = data.health?.runtime_timezone ?? 'Europe/Stockholm';
+  $: brokerMonitor = data.health?.broker_monitor ?? {
+    heartbeat: { ok: null, last_success_at: null, error: null },
+    snapshot_refresh: {
+      ok: null,
+      last_success_at: null,
+      error: null,
+      account_count: 0,
+      position_count: 0,
+      open_order_count: 0
+    }
+  };
+  $: executionRuntime = data.health?.execution_runtime ?? null;
+  $: endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
+  $: warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count ?? 0) > 0);
+  $: killSwitchResult = form?.killSwitchResult ?? null;
+  $: startupReconcileResult = form?.startupReconcileResult ?? null;
+  $: cancelSetResult = form?.cancelSetResult ?? null;
+  $: instructionRowActionResult = form?.instructionRowActionResult ?? null;
+  $: orderRowActionResult = form?.orderRowActionResult ?? null;
+  $: brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
+  $: reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
+  $: referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
+  $: timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
     year: 'numeric',
     month: '2-digit',
