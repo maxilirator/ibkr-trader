@@ -6,13 +6,13 @@ This file is the active implementation tracker for the production-grade trader p
 
 - [ ] Operator controls for reconciliation warnings and broker attention
 - [ ] Operator write actions for reconciliation issues and broker-attention items
-- [ ] Timed follow-up exits anchored to live market at activation time:
-  support instructions like "buy now, then at 10:30 place a sell limit
-  5% above the market price observed at 10:30" instead of only fill-based
-  take-profit and stop-loss exits
 
 ## Done
 
+- [x] Timed follow-up exits anchored to live market at activation time:
+  instructions can now support "buy now, then at 10:30 place a sell limit
+  5% above the market price observed at 10:30", and the live SIVE smoke
+  test on 2026-04-20 bought 1 share and submitted the delayed 5% exit
 - [x] Long-lived execution runtime that owns one persistent broker session:
   the API host can now run the execution loop continuously, with a durable
   runtime lease, startup reconciliation gate, persisted heartbeat/status,
