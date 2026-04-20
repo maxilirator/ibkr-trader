@@ -157,6 +157,29 @@
     return `${review.latest_action_type} by ${reviewedBy} at ${reviewedAt}`;
   }
 
+  function marketDirectionArrow(direction) {
+    if (direction === 'UP') return '↑';
+    if (direction === 'DOWN') return '↓';
+    if (direction === 'UNCHANGED') return '→';
+    return '';
+  }
+
+  function marketDirectionClass(direction) {
+    if (direction === 'UP') return 'ok';
+    if (direction === 'DOWN') return 'bad';
+    return 'subtle';
+  }
+
+  function orderSpreadLabel(order) {
+    if (!order.price_spread) {
+      return 'n/a';
+    }
+
+    const pctSuffix = order.price_spread_pct ? ` (${order.price_spread_pct}%)` : '';
+    const referencePrefix = order.spread_reference ? `${order.spread_reference} ` : '';
+    return `${referencePrefix}${order.price_spread}${pctSuffix}`;
+  }
+
   function instructionWindowState(instruction) {
     const submitAt = parseTimestamp(instruction.submit_at);
     const expireAt = parseTimestamp(instruction.expire_at);
@@ -795,6 +818,8 @@
               <th>Type</th>
               <th>Limit</th>
               <th>Stop</th>
+              <th>Market</th>
+              <th>Spread</th>
               <th>Status</th>
               <th>Warning</th>
               <th>Action</th>
@@ -811,6 +836,24 @@
                 <td>{order.order_type}</td>
                 <td>{order.limit_price ?? 'n/a'}</td>
                 <td>{order.stop_price ?? 'n/a'}</td>
+                <td>
+                  {#if order.reference_market_price}
+                    <div class="market-cell">
+                      <span>{order.reference_market_price}</span>
+                      {#if marketDirectionArrow(order.last_market_price_direction)}
+                        <span class={`market-arrow ${marketDirectionClass(order.last_market_price_direction)}`}>
+                          {marketDirectionArrow(order.last_market_price_direction)}
+                        </span>
+                      {/if}
+                    </div>
+                    {#if order.reference_market_price_at}
+                      <small class="row-detail">as of {formatTimestamp(order.reference_market_price_at)}</small>
+                    {/if}
+                  {:else}
+                    <span class="subtle">n/a</span>
+                  {/if}
+                </td>
+                <td>{orderSpreadLabel(order)}</td>
                 <td>{order.status}</td>
                 <td>{order.reject_reason ?? order.warning_text ?? 'n/a'}</td>
                 <td>
@@ -1319,6 +1362,17 @@
 
   .mono {
     font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  }
+
+  .market-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .market-arrow {
+    font-weight: 700;
+    font-size: 0.95rem;
   }
 
   .empty {

@@ -317,6 +317,11 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
         self.assertEqual(len(snapshot.open_orders), 1)
         self.assertEqual(snapshot.open_orders[0].external_order_id, "11")
         self.assertEqual(snapshot.open_orders[0].warning_text, "Held in TWS for review.")
+        self.assertEqual(snapshot.open_orders[0].reference_market_price, "102.00")
+        self.assertEqual(snapshot.open_orders[0].last_market_price_direction, "UP")
+        self.assertEqual(snapshot.open_orders[0].price_spread, "-2.00")
+        self.assertEqual(snapshot.open_orders[0].price_spread_pct, "-1.96")
+        self.assertEqual(snapshot.open_orders[0].spread_reference, "LIMIT")
 
         self.assertEqual(len(snapshot.recent_fills), 1)
         self.assertEqual(snapshot.recent_fills[0].external_execution_id, "exec-001")

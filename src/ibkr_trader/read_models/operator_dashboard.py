@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
+from decimal import InvalidOperation
 from enum import Enum
 from typing import Any
 
@@ -112,6 +113,12 @@ class OperatorOpenOrder:
     last_status_at: datetime | None
     warning_text: str | None
     reject_reason: str | None
+    reference_market_price: str | None
+    reference_market_price_at: datetime | None
+    last_market_price_direction: str | None
+    price_spread: str | None
+    price_spread_pct: str | None
+    spread_reference: str | None
 
 
 @dataclass(slots=True)
@@ -240,6 +247,137 @@ def _is_non_zero_quantity(value: str | None) -> bool:
     if value in (None, ""):
         return False
     return Decimal(str(value)) != Decimal("0")
+
+
+def _to_decimal(value: str | None) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _format_signed_decimal(value: Decimal | None, *, places: str) -> str | None:
+    if value is None:
+        return None
+    quantized = value.quantize(Decimal(places))
+    prefix = "+" if quantized > 0 else ""
+    return f"{prefix}{quantized}"
+
+
+def _position_snapshot_matches_order(
+    position_snapshot: PositionSnapshotRecord,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    if position_snapshot.broker_account_id != broker_order.broker_account_id:
+        return False
+    if position_snapshot.symbol != broker_order.symbol:
+        return False
+    if position_snapshot.currency != broker_order.currency:
+        return False
+    if position_snapshot.security_type != broker_order.security_type:
+        return False
+    if (
+        broker_order.local_symbol not in (None, "")
+        and position_snapshot.local_symbol not in (None, "")
+        and position_snapshot.local_symbol != broker_order.local_symbol
+    ):
+        return False
+    if (
+        broker_order.primary_exchange not in (None, "")
+        and position_snapshot.primary_exchange not in (None, "")
+        and position_snapshot.primary_exchange != broker_order.primary_exchange
+    ):
+        return False
+    return True
+
+
+def _open_order_market_context(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> tuple[str | None, datetime | None, str | None, str | None, str | None, str | None]:
+    matching_snapshots = []
+    rows = session.execute(
+        select(PositionSnapshotRecord)
+        .where(
+            PositionSnapshotRecord.broker_account_id == broker_order.broker_account_id,
+            PositionSnapshotRecord.symbol == broker_order.symbol,
+            PositionSnapshotRecord.currency == broker_order.currency,
+            PositionSnapshotRecord.security_type == broker_order.security_type,
+        )
+        .order_by(
+            PositionSnapshotRecord.snapshot_at.desc(),
+            PositionSnapshotRecord.id.desc(),
+        )
+    ).scalars()
+
+    for row in rows:
+        if not _position_snapshot_matches_order(row, broker_order=broker_order):
+            continue
+        if row.market_price in (None, ""):
+            continue
+        matching_snapshots.append(row)
+        if len(matching_snapshots) >= 2:
+            break
+
+    if not matching_snapshots:
+        return None, None, None, None, None, None
+
+    latest_snapshot = matching_snapshots[0]
+    previous_snapshot = matching_snapshots[1] if len(matching_snapshots) > 1 else None
+
+    latest_market_price = _to_decimal(latest_snapshot.market_price)
+    previous_market_price = _to_decimal(
+        previous_snapshot.market_price if previous_snapshot is not None else None
+    )
+
+    if latest_market_price is None:
+        return None, latest_snapshot.snapshot_at, None, None, None, None
+
+    direction: str | None = None
+    if previous_market_price is not None:
+        if latest_market_price > previous_market_price:
+            direction = "UP"
+        elif latest_market_price < previous_market_price:
+            direction = "DOWN"
+        else:
+            direction = "UNCHANGED"
+
+    spread_reference: str | None = None
+    working_price = _to_decimal(broker_order.limit_price)
+    if working_price is not None:
+        spread_reference = "LIMIT"
+    else:
+        working_price = _to_decimal(broker_order.stop_price)
+        if working_price is not None:
+            spread_reference = "STOP"
+
+    if working_price is None:
+        return (
+            latest_snapshot.market_price,
+            latest_snapshot.snapshot_at,
+            direction,
+            None,
+            None,
+            None,
+        )
+
+    spread = working_price - latest_market_price
+    spread_pct = None
+    if latest_market_price != 0:
+        spread_pct = (spread / latest_market_price) * Decimal("100")
+
+    return (
+        latest_snapshot.market_price,
+        latest_snapshot.snapshot_at,
+        direction,
+        _format_signed_decimal(spread, places="0.01"),
+        _format_signed_decimal(spread_pct, places="0.01") if spread_pct is not None else None,
+        spread_reference,
+    )
 
 
 def _build_account_snapshots(
@@ -408,6 +546,14 @@ def _build_open_orders(
         if _normalize_order_status(broker_order.status) in _CLOSED_ORDER_STATUSES:
             continue
         metadata_json = broker_order.metadata_json or {}
+        (
+            reference_market_price,
+            reference_market_price_at,
+            last_market_price_direction,
+            price_spread,
+            price_spread_pct,
+            spread_reference,
+        ) = _open_order_market_context(session, broker_order=broker_order)
         open_orders.append(
             OperatorOpenOrder(
                 broker_order_id=broker_order.id,
@@ -445,6 +591,12 @@ def _build_open_orders(
                     if metadata_json.get("reject_reason") not in (None, "")
                     else None
                 ),
+                reference_market_price=reference_market_price,
+                reference_market_price_at=reference_market_price_at,
+                last_market_price_direction=last_market_price_direction,
+                price_spread=price_spread,
+                price_spread_pct=price_spread_pct,
+                spread_reference=spread_reference,
             )
         )
         if len(open_orders) >= limit:
