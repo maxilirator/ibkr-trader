@@ -21,10 +21,18 @@ from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import OperatorControlEventRecord
 from ibkr_trader.db.models import OperatorControlRecord
+from ibkr_trader.db.models import OperatorReviewActionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.orchestration.operator_controls import KILL_SWITCH_CONTROL_KEY
+from ibkr_trader.orchestration.operator_reviews import (
+    BROKER_ATTENTION_TARGET_KIND,
+    RECONCILIATION_ISSUE_TARGET_KIND,
+    OperatorReviewStatus,
+    build_operator_review_status,
+    extract_broker_attention_message,
+)
 
 _CLOSED_ORDER_STATUSES = {
     "API_CANCELLED",
@@ -143,6 +151,7 @@ class OperatorBrokerAttention:
     event_at: datetime
     message: str
     note: str | None
+    operator_review: OperatorReviewStatus
 
 
 @dataclass(slots=True)
@@ -154,6 +163,7 @@ class OperatorReconciliationIssue:
     message: str
     observed_at: datetime
     payload: dict[str, Any]
+    operator_review: OperatorReviewStatus
 
 
 @dataclass(slots=True)
@@ -486,40 +496,35 @@ def _build_recent_fills(
     )
 
 
-def _extract_broker_attention_message(
-    broker_order_event: BrokerOrderEventRecord,
-    broker_order: BrokerOrderRecord,
-) -> str | None:
-    payload = broker_order_event.payload or {}
-    if not isinstance(payload, dict):
-        payload = {}
+def _build_review_status_map(
+    session: Session,
+    *,
+    target_kind: str,
+    target_ids: list[int],
+) -> dict[int, OperatorReviewStatus]:
+    if not target_ids:
+        return {}
 
-    if broker_order_event.event_type == "order_error_callback":
-        error_code = payload.get("errorCode")
-        error_message = payload.get("errorMsg") or payload.get("message")
-        if error_message in (None, ""):
-            return broker_order_event.note
-        if error_code in (None, ""):
-            return str(error_message)
-        return f"[{error_code}] {error_message}"
+    rows = session.execute(
+        select(OperatorReviewActionRecord)
+        .where(
+            OperatorReviewActionRecord.target_kind == target_kind,
+            OperatorReviewActionRecord.target_id.in_(target_ids),
+        )
+        .order_by(
+            OperatorReviewActionRecord.target_id.asc(),
+            OperatorReviewActionRecord.event_at.desc(),
+            OperatorReviewActionRecord.id.desc(),
+        )
+    ).scalars()
 
-    for key in ("reject_reason", "warning_text"):
-        raw_value = payload.get(key)
-        if raw_value not in (None, ""):
-            return str(raw_value)
+    review_status_by_target_id: dict[int, OperatorReviewStatus] = {}
+    for row in rows:
+        if row.target_id in review_status_by_target_id:
+            continue
+        review_status_by_target_id[row.target_id] = build_operator_review_status(row)
 
-    metadata_json = broker_order.metadata_json or {}
-    for key in ("reject_reason", "warning_text"):
-        raw_value = metadata_json.get(key)
-        if raw_value not in (None, ""):
-            return str(raw_value)
-
-    if broker_order_event.note not in (None, ""):
-        lowered_type = broker_order_event.event_type.lower()
-        lowered_note = broker_order_event.note.lower()
-        if "error" in lowered_type or "reject" in lowered_note or "warning" in lowered_note:
-            return broker_order_event.note
-    return None
+    return review_status_by_target_id
 
 
 def _build_recent_broker_attention(
@@ -546,7 +551,7 @@ def _build_recent_broker_attention(
 
     attention_rows: list[OperatorBrokerAttention] = []
     for broker_order_event, broker_order, broker_account in rows:
-        message = _extract_broker_attention_message(broker_order_event, broker_order)
+        message = extract_broker_attention_message(broker_order_event, broker_order)
         if message is None:
             continue
         attention_rows.append(
@@ -562,11 +567,37 @@ def _build_recent_broker_attention(
                 event_at=broker_order_event.event_at,
                 message=message,
                 note=broker_order_event.note,
+                operator_review=build_operator_review_status(None),
             )
         )
         if len(attention_rows) >= limit:
             break
-    return tuple(attention_rows)
+
+    review_status_by_target_id = _build_review_status_map(
+        session,
+        target_kind=BROKER_ATTENTION_TARGET_KIND,
+        target_ids=[row.event_id for row in attention_rows],
+    )
+    return tuple(
+        OperatorBrokerAttention(
+            event_id=row.event_id,
+            broker_order_id=row.broker_order_id,
+            account_key=row.account_key,
+            account_label=row.account_label,
+            symbol=row.symbol,
+            order_ref=row.order_ref,
+            event_type=row.event_type,
+            status_after=row.status_after,
+            event_at=row.event_at,
+            message=row.message,
+            note=row.note,
+            operator_review=review_status_by_target_id.get(
+                row.event_id,
+                build_operator_review_status(None),
+            ),
+        )
+        for row in attention_rows
+    )
 
 
 def _build_recent_reconciliation_runs(
@@ -602,6 +633,11 @@ def _build_recent_reconciliation_runs(
         ).scalars()
     )
     issues_by_run_id: dict[int, list[OperatorReconciliationIssue]] = {}
+    review_status_by_target_id = _build_review_status_map(
+        session,
+        target_kind=RECONCILIATION_ISSUE_TARGET_KIND,
+        target_ids=[issue.id for issue in issues],
+    )
     for issue in issues:
         issues_by_run_id.setdefault(issue.reconciliation_run_id, []).append(
             OperatorReconciliationIssue(
@@ -612,6 +648,10 @@ def _build_recent_reconciliation_runs(
                 message=issue.message,
                 observed_at=issue.observed_at,
                 payload=issue.payload,
+                operator_review=review_status_by_target_id.get(
+                    issue.id,
+                    build_operator_review_status(None),
+                ),
             )
         )
 

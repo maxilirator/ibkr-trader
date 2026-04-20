@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from datetime import datetime
+from datetime import timezone
+from unittest import TestCase
+
+from sqlalchemy.orm import Session
+
+from ibkr_trader.db.base import build_engine
+from ibkr_trader.db.base import create_schema
+from ibkr_trader.db.base import create_session_factory
+from ibkr_trader.db.models import BrokerAccountRecord
+from ibkr_trader.db.models import BrokerOrderEventRecord
+from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ReconciliationIssueRecord
+from ibkr_trader.db.models import ReconciliationRunRecord
+from ibkr_trader.orchestration.operator_reviews import (
+    ACKNOWLEDGED_REVIEW_STATUS,
+    OPEN_REVIEW_STATUS,
+    RESOLVED_REVIEW_STATUS,
+    OperatorReviewTargetNotFoundError,
+    record_broker_attention_review_action,
+    record_reconciliation_issue_review_action,
+)
+
+
+class OperatorReviewTests(TestCase):
+    def setUp(self) -> None:
+        self.engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(self.engine)
+        self.session_factory = create_session_factory(self.engine)
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+
+    def _seed_attention_and_issue(self) -> tuple[int, int]:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            broker_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="101",
+                external_perm_id="9001",
+                external_client_id="0",
+                order_ref="instr-saab-1",
+                symbol="SAAB",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SAAB-B",
+                side="BUY",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Submitted",
+                total_quantity="1",
+                limit_price="100.00",
+                submitted_at=datetime(2026, 4, 19, 7, 24, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 19, 7, 24, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.flush()
+
+            broker_event = BrokerOrderEventRecord(
+                broker_order_id=broker_order.id,
+                event_type="order_error_callback",
+                event_at=datetime(2026, 4, 19, 7, 24, 30, tzinfo=timezone.utc),
+                status_before="PreSubmitted",
+                status_after="Submitted",
+                payload={"errorCode": 201, "errorMsg": "Order held for review"},
+                note="Broker raised an order callback.",
+            )
+            session.add(broker_event)
+
+            reconciliation_run = ReconciliationRunRecord(
+                run_kind="runtime_cycle",
+                broker_kind="IBKR",
+                account_key="U25245596",
+                runtime_timezone="Europe/Stockholm",
+                started_at=datetime(2026, 4, 19, 7, 25, tzinfo=timezone.utc),
+                completed_at=datetime(2026, 4, 19, 7, 25, 3, tzinfo=timezone.utc),
+                status="WARNINGS",
+                issue_count=1,
+                action_count=2,
+                metadata_json={},
+            )
+            session.add(reconciliation_run)
+            session.flush()
+
+            reconciliation_issue = ReconciliationIssueRecord(
+                reconciliation_run_id=reconciliation_run.id,
+                instruction_id="instr-saab-1",
+                stage="reconcile_instruction",
+                severity="ERROR",
+                message="Order state drift detected.",
+                observed_at=datetime(2026, 4, 19, 7, 25, 3, tzinfo=timezone.utc),
+                payload={"order_id": 101},
+            )
+            session.add(reconciliation_issue)
+            session.commit()
+
+            return broker_event.id, reconciliation_issue.id
+        finally:
+            session.close()
+
+    def test_broker_attention_review_actions_progress_status(self) -> None:
+        event_id, _ = self._seed_attention_and_issue()
+
+        acknowledged = record_broker_attention_review_action(
+            self.session_factory,
+            event_id=event_id,
+            action_type="ACKNOWLEDGE",
+            updated_by="dashboard",
+        )
+        resolved = record_broker_attention_review_action(
+            self.session_factory,
+            event_id=event_id,
+            action_type="RESOLVE",
+            updated_by="dashboard",
+        )
+        reopened = record_broker_attention_review_action(
+            self.session_factory,
+            event_id=event_id,
+            action_type="REOPEN",
+            updated_by="dashboard",
+        )
+
+        self.assertEqual(acknowledged.status, ACKNOWLEDGED_REVIEW_STATUS)
+        self.assertEqual(resolved.status, RESOLVED_REVIEW_STATUS)
+        self.assertEqual(reopened.status, OPEN_REVIEW_STATUS)
+
+    def test_reconciliation_issue_review_actions_progress_status(self) -> None:
+        _, issue_id = self._seed_attention_and_issue()
+
+        acknowledged = record_reconciliation_issue_review_action(
+            self.session_factory,
+            issue_id=issue_id,
+            action_type="ACKNOWLEDGE",
+            updated_by="dashboard",
+        )
+        resolved = record_reconciliation_issue_review_action(
+            self.session_factory,
+            issue_id=issue_id,
+            action_type="RESOLVE",
+            updated_by="dashboard",
+        )
+
+        self.assertEqual(acknowledged.status, ACKNOWLEDGED_REVIEW_STATUS)
+        self.assertEqual(resolved.status, RESOLVED_REVIEW_STATUS)
+
+    def test_review_actions_reject_missing_targets(self) -> None:
+        with self.assertRaises(OperatorReviewTargetNotFoundError):
+            record_broker_attention_review_action(
+                self.session_factory,
+                event_id=999,
+                action_type="ACKNOWLEDGE",
+                updated_by="dashboard",
+            )
+
+        with self.assertRaises(OperatorReviewTargetNotFoundError):
+            record_reconciliation_issue_review_action(
+                self.session_factory,
+                issue_id=999,
+                action_type="ACKNOWLEDGE",
+                updated_by="dashboard",
+            )

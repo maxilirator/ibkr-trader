@@ -74,6 +74,12 @@ from ibkr_trader.orchestration.operator_controls import (
     serialize_kill_switch_status,
     set_kill_switch_state,
 )
+from ibkr_trader.orchestration.operator_reviews import (
+    OperatorReviewTargetNotFoundError,
+    record_broker_attention_review_action,
+    record_reconciliation_issue_review_action,
+    serialize_operator_review_status,
+)
 from ibkr_trader.orchestration.runtime_service_state import (
     EXECUTION_RUNTIME_KEY,
     read_runtime_service_status,
@@ -247,6 +253,29 @@ def parse_kill_switch_payload(payload: Mapping[str, Any]) -> tuple[bool, str | N
         raise ValueError("updated_by must be a non-empty string")
 
     return enabled, reason, updated_by
+
+
+def parse_operator_review_payload(
+    payload: Mapping[str, Any],
+) -> tuple[str, str, str | None]:
+    if "action" not in payload:
+        raise ValueError("action is required")
+
+    action = str(payload["action"]).strip()
+    if not action:
+        raise ValueError("action must be a non-empty string")
+
+    updated_by = str(payload.get("updated_by", "api")).strip()
+    if not updated_by:
+        raise ValueError("updated_by must be a non-empty string")
+
+    note = payload.get("note")
+    if note is not None:
+        note = str(note).strip()
+        if not note:
+            note = None
+
+    return action, updated_by, note
 
 
 def parse_instruction_set_cancellation_payload(
@@ -1127,6 +1156,54 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "kill_switch": serialize_kill_switch_status(result),
+        }
+
+    @app.post("/v1/broker-attention/{event_id}/review")
+    def review_broker_attention(
+        event_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            action, updated_by, note = parse_operator_review_payload(payload)
+            result = record_broker_attention_review_action(
+                session_factory,
+                event_id=event_id,
+                action_type=action,
+                updated_by=updated_by,
+                note=note,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OperatorReviewTargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "operator_review": serialize_operator_review_status(result),
+        }
+
+    @app.post("/v1/reconciliation-issues/{issue_id}/review")
+    def review_reconciliation_issue(
+        issue_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            action, updated_by, note = parse_operator_review_payload(payload)
+            result = record_reconciliation_issue_review_action(
+                session_factory,
+                issue_id=issue_id,
+                action_type=action,
+                updated_by=updated_by,
+                note=note,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OperatorReviewTargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "operator_review": serialize_operator_review_status(result),
         }
 
     @app.post("/v1/instructions/submit")

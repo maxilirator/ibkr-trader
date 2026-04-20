@@ -18,6 +18,10 @@ from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
+from ibkr_trader.orchestration.operator_reviews import (
+    record_broker_attention_review_action,
+    record_reconciliation_issue_review_action,
+)
 from ibkr_trader.read_models.operator_dashboard import build_operator_dashboard_snapshot
 
 
@@ -280,6 +284,18 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
 
     def test_build_operator_dashboard_snapshot_returns_latest_durable_views(self) -> None:
         self._seed_operator_data()
+        record_broker_attention_review_action(
+            self.session_factory,
+            event_id=1,
+            action_type="ACKNOWLEDGE",
+            updated_by="dashboard",
+        )
+        record_reconciliation_issue_review_action(
+            self.session_factory,
+            issue_id=1,
+            action_type="RESOLVE",
+            updated_by="dashboard",
+        )
 
         snapshot = build_operator_dashboard_snapshot(
             self.session_factory,
@@ -310,10 +326,18 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
             snapshot.recent_broker_attention[0].message,
             "[201] Order held for review",
         )
+        self.assertEqual(
+            snapshot.recent_broker_attention[0].operator_review.status,
+            "ACKNOWLEDGED",
+        )
 
         self.assertEqual(len(snapshot.recent_reconciliation_runs), 1)
         self.assertEqual(snapshot.recent_reconciliation_runs[0].status, "WARNINGS")
         self.assertEqual(len(snapshot.recent_reconciliation_runs[0].issues), 1)
+        self.assertEqual(
+            snapshot.recent_reconciliation_runs[0].issues[0].operator_review.status,
+            "RESOLVED",
+        )
 
 
 if __name__ == "__main__":

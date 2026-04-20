@@ -32,9 +32,12 @@
   const endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
   const warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count ?? 0) > 0);
   const killSwitchResult = form?.killSwitchResult ?? null;
+  const startupReconcileResult = form?.startupReconcileResult ?? null;
   const cancelSetResult = form?.cancelSetResult ?? null;
   const instructionRowActionResult = form?.instructionRowActionResult ?? null;
   const orderRowActionResult = form?.orderRowActionResult ?? null;
+  const brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
+  const reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
   const referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
@@ -118,6 +121,40 @@
       return null;
     }
     return timestampFormatter.format(parsed);
+  }
+
+  function operatorReviewClass(review) {
+    const status = review?.status ?? 'OPEN';
+    if (status === 'RESOLVED') return 'ok';
+    if (status === 'ACKNOWLEDGED') return 'neutral';
+    return 'warn';
+  }
+
+  function operatorReviewActions(review) {
+    const status = review?.status ?? 'OPEN';
+    if (status === 'RESOLVED') {
+      return [{ operation: 'REOPEN', label: 'Reopen', className: 'inline-button neutral' }];
+    }
+    if (status === 'ACKNOWLEDGED') {
+      return [
+        { operation: 'RESOLVE', label: 'Resolve', className: 'inline-button' },
+        { operation: 'REOPEN', label: 'Reopen', className: 'inline-button neutral' }
+      ];
+    }
+    return [
+      { operation: 'ACKNOWLEDGE', label: 'Acknowledge', className: 'inline-button neutral' },
+      { operation: 'RESOLVE', label: 'Resolve', className: 'inline-button' }
+    ];
+  }
+
+  function operatorReviewDetail(review) {
+    if (!review?.latest_action_type) {
+      return 'No operator action recorded yet.';
+    }
+
+    const reviewedAt = formatTimestampOrNull(review.latest_action_at) ?? 'unknown time';
+    const reviewedBy = review.latest_action_by ?? 'unknown operator';
+    return `${review.latest_action_type} by ${reviewedBy} at ${reviewedAt}`;
   }
 
   function instructionWindowState(instruction) {
@@ -515,6 +552,30 @@
     </section>
   </section>
 
+  <section class="panel control-panel">
+    <div class="panel-head">
+      <div>
+        <h2>Reconciliation Control</h2>
+        <p>
+          Run a fresh startup reconciliation pass against persisted state and the current broker
+          snapshot when warnings need a direct operator check.
+        </p>
+      </div>
+    </div>
+
+    {#if startupReconcileResult}
+      <p class={`action-feedback ${startupReconcileResult.ok ? 'ok' : 'bad'}`}>
+        {startupReconcileResult.message}
+      </p>
+    {/if}
+
+    <form method="POST" action="?/startupReconcile" class="control-form">
+      <div class="form-actions">
+        <button class="action-button" type="submit">Run Startup Reconciliation</button>
+      </div>
+    </form>
+  </section>
+
   <section class="panel" id="accounts">
     <div class="panel-head">
       <h2>Accounts</h2>
@@ -551,6 +612,11 @@
         <h2>Broker Attention</h2>
         <p>Recent broker-side warnings and rejects captured in the durable ledger.</p>
       </div>
+      {#if brokerAttentionActionResult}
+        <p class={`action-feedback ${brokerAttentionActionResult.ok ? 'ok' : 'bad'}`}>
+          {brokerAttentionActionResult.message}
+        </p>
+      {/if}
       {#if brokerAttention.length === 0}
         <p class="empty">No recent broker attention items were found.</p>
       {:else}
@@ -561,6 +627,9 @@
                 <span class="pill warn">{attention.event_type}</span>
                 <strong>{attention.symbol}</strong>
                 <span>{attention.account_label ?? attention.account_key}</span>
+                <span class={`pill ${operatorReviewClass(attention.operator_review)}`}>
+                  {attention.operator_review?.status ?? 'OPEN'}
+                </span>
               </div>
               <p>{attention.message}</p>
               <small>
@@ -569,6 +638,20 @@
                   · <span class="mono">{attention.order_ref}</span>
                 {/if}
               </small>
+              <small>{operatorReviewDetail(attention.operator_review)}</small>
+              <div class="inline-actions">
+                {#each operatorReviewActions(attention.operator_review) as action}
+                  <form
+                    method="POST"
+                    action="?/brokerAttentionAction"
+                    class="inline-action-form"
+                  >
+                    <input type="hidden" name="event_id" value={attention.event_id} />
+                    <input type="hidden" name="operation" value={action.operation} />
+                    <button class={action.className} type="submit">{action.label}</button>
+                  </form>
+                {/each}
+              </div>
             </li>
           {/each}
         </ul>
@@ -580,6 +663,11 @@
         <h2>Recent Reconciliation Runs</h2>
         <p>Durable audit rows from runtime and startup reconciliation passes.</p>
       </div>
+      {#if reconciliationIssueActionResult}
+        <p class={`action-feedback ${reconciliationIssueActionResult.ok ? 'ok' : 'bad'}`}>
+          {reconciliationIssueActionResult.message}
+        </p>
+      {/if}
       {#if reconciliationRuns.length === 0}
         <p class="empty">No reconciliation runs have been recorded yet.</p>
       {:else}
@@ -602,11 +690,30 @@
                 <ul class="issue-list">
                   {#each run.issues as issue}
                     <li>
-                      <strong>{issue.stage}</strong>
+                      <div class="issue-main">
+                        <strong>{issue.stage}</strong>
+                        <span class={`pill ${operatorReviewClass(issue.operator_review)}`}>
+                          {issue.operator_review?.status ?? 'OPEN'}
+                        </span>
+                      </div>
                       <span>{issue.message}</span>
                       {#if issue.instruction_id}
                         <small class="mono">{issue.instruction_id}</small>
                       {/if}
+                      <small>{operatorReviewDetail(issue.operator_review)}</small>
+                      <div class="inline-actions">
+                        {#each operatorReviewActions(issue.operator_review) as action}
+                          <form
+                            method="POST"
+                            action="?/reconciliationIssueAction"
+                            class="inline-action-form"
+                          >
+                            <input type="hidden" name="issue_id" value={issue.issue_id} />
+                            <input type="hidden" name="operation" value={action.operation} />
+                            <button class={action.className} type="submit">{action.label}</button>
+                          </form>
+                        {/each}
+                      </div>
                     </li>
                   {/each}
                 </ul>
@@ -1187,6 +1294,7 @@
   }
 
   .attention-main,
+  .issue-main,
   .run-pills {
     display: flex;
     gap: 0.5rem;
@@ -1289,6 +1397,13 @@
     margin: 0;
   }
 
+  .inline-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-top: 0.35rem;
+  }
+
   .actions-cell {
     display: flex;
     gap: 0.55rem;
@@ -1309,6 +1424,12 @@
 
   .inline-button.danger {
     background: linear-gradient(135deg, #8e2f2f 0%, #b43333 100%);
+  }
+
+  .inline-button.neutral {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--surface-strong);
   }
 
   .inline-button.subtle-link {

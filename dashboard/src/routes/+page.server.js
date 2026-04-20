@@ -114,6 +114,32 @@ export const actions = {
     };
   },
 
+  async startupReconcile({ fetch }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const result = await postJson(fetch, `${apiBaseUrl}/v1/runtime/startup-reconcile`, {
+      timeout: 15
+    });
+
+    if (!result.ok) {
+      return fail(result.status || 500, {
+        startupReconcileResult: {
+          ok: false,
+          message: result.error
+        }
+      });
+    }
+
+    const runtimeResult = result.body?.runtime_result;
+    return {
+      startupReconcileResult: {
+        ok: true,
+        message:
+          `Startup reconciliation completed with status ${runtimeResult?.status ?? 'unknown'}: ` +
+          `${runtimeResult?.issue_count ?? 0} issues, ${runtimeResult?.action_count ?? 0} actions.`
+      }
+    };
+  },
+
   async cancelInstructionSet({ fetch, request }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
     const formData = await request.formData();
@@ -268,6 +294,108 @@ export const actions = {
       orderRowActionResult: {
         ok: true,
         message: `Cancelled broker order ${normalizedOrderId}.`
+      }
+    };
+  },
+
+  async brokerAttentionAction({ fetch, request }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const formData = await request.formData();
+    const eventId = readOptionalField(formData, 'event_id');
+    const operation = readOptionalField(formData, 'operation');
+
+    const normalizedEventId = Number.parseInt(eventId ?? '', 10);
+    if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
+      return fail(400, {
+        brokerAttentionActionResult: {
+          ok: false,
+          message: 'Broker attention action is missing a valid event ID.'
+        }
+      });
+    }
+
+    if (!operation) {
+      return fail(400, {
+        brokerAttentionActionResult: {
+          ok: false,
+          message: 'Broker attention action type was invalid.'
+        }
+      });
+    }
+
+    const result = await postJson(
+      fetch,
+      `${apiBaseUrl}/v1/broker-attention/${normalizedEventId}/review`,
+      {
+        action: operation,
+        updated_by: 'dashboard'
+      }
+    );
+
+    if (!result.ok) {
+      return fail(result.status || 500, {
+        brokerAttentionActionResult: {
+          ok: false,
+          message: result.error
+        }
+      });
+    }
+
+    return {
+      brokerAttentionActionResult: {
+        ok: true,
+        message: `Broker attention item ${normalizedEventId} updated with ${operation}.`
+      }
+    };
+  },
+
+  async reconciliationIssueAction({ fetch, request }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const formData = await request.formData();
+    const issueId = readOptionalField(formData, 'issue_id');
+    const operation = readOptionalField(formData, 'operation');
+
+    const normalizedIssueId = Number.parseInt(issueId ?? '', 10);
+    if (!Number.isInteger(normalizedIssueId) || normalizedIssueId <= 0) {
+      return fail(400, {
+        reconciliationIssueActionResult: {
+          ok: false,
+          message: 'Reconciliation issue action is missing a valid issue ID.'
+        }
+      });
+    }
+
+    if (!operation) {
+      return fail(400, {
+        reconciliationIssueActionResult: {
+          ok: false,
+          message: 'Reconciliation issue action type was invalid.'
+        }
+      });
+    }
+
+    const result = await postJson(
+      fetch,
+      `${apiBaseUrl}/v1/reconciliation-issues/${normalizedIssueId}/review`,
+      {
+        action: operation,
+        updated_by: 'dashboard'
+      }
+    );
+
+    if (!result.ok) {
+      return fail(result.status || 500, {
+        reconciliationIssueActionResult: {
+          ok: false,
+          message: result.error
+        }
+      });
+    }
+
+    return {
+      reconciliationIssueActionResult: {
+        ok: true,
+        message: `Reconciliation issue ${normalizedIssueId} updated with ${operation}.`
       }
     };
   }

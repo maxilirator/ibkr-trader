@@ -204,6 +204,32 @@ class OperatorControlEventRecord(Base):
     operator_control: Mapped[OperatorControlRecord] = relationship(back_populates="events")
 
 
+class OperatorReviewActionRecord(Base):
+    """Append-only operator review actions for attention items and reconciliation issues."""
+
+    __tablename__ = "operator_review_action"
+    __table_args__ = (
+        Index("ix_operator_review_action_target_kind", "target_kind"),
+        Index("ix_operator_review_action_target_id", "target_id"),
+        Index("ix_operator_review_action_event_at", "event_at"),
+        Index("ix_operator_review_action_action_type", "action_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+    updated_by: Mapped[str | None] = mapped_column(String(64))
+    note: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
 class InstructionSetCancellationRecord(TimestampMixin, Base):
     """Durable audit row for operator-triggered instruction-set cancellation requests."""
 

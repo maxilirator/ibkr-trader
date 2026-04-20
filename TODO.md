@@ -4,8 +4,12 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Next
 
-- [ ] Operator controls for reconciliation warnings and broker attention
-- [ ] Operator write actions for reconciliation issues and broker-attention items
+- [x] Operator controls for reconciliation warnings and broker attention:
+  the dashboard can now trigger a durable startup reconciliation run and
+  shows operator review state on broker-attention and reconciliation items
+- [x] Operator write actions for reconciliation issues and broker-attention items:
+  operators can now acknowledge, resolve, and reopen those items through
+  durable API-backed review actions with append-only audit rows
 
 ## Done
 

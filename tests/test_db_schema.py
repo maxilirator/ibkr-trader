@@ -22,6 +22,7 @@ from ibkr_trader.db.models import InstructionSetCancellationRecord
 from ibkr_trader.db.models import InstrumentRecord
 from ibkr_trader.db.models import OperatorControlEventRecord
 from ibkr_trader.db.models import OperatorControlRecord
+from ibkr_trader.db.models import OperatorReviewActionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
@@ -60,6 +61,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "instrument",
                 "operator_control",
                 "operator_control_event",
+                "operator_review_action",
                 "position_snapshot",
                 "reconciliation_issue",
                 "reconciliation_run",
@@ -342,6 +344,29 @@ class DatabaseSchemaTests(unittest.TestCase):
             ).scalar_one()
             self.assertEqual(cancellation.status, "COMPLETED")
             self.assertEqual(cancellation.cancelled_submitted_count, 1)
+        finally:
+            session.close()
+
+    def test_operator_review_action_table_round_trips(self) -> None:
+        session = self.session_factory()
+        try:
+            record = OperatorReviewActionRecord(
+                target_kind="BROKER_ATTENTION",
+                target_id=17,
+                action_type="ACKNOWLEDGE",
+                source="dashboard",
+                updated_by="operator",
+                note="Looks understood.",
+                payload={"symbol": "SAAB"},
+            )
+            session.add(record)
+            session.commit()
+
+            stored = session.execute(select(OperatorReviewActionRecord)).scalar_one()
+            self.assertEqual(stored.target_kind, "BROKER_ATTENTION")
+            self.assertEqual(stored.target_id, 17)
+            self.assertEqual(stored.action_type, "ACKNOWLEDGE")
+            self.assertEqual(stored.updated_by, "operator")
         finally:
             session.close()
 

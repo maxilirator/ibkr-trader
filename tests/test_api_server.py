@@ -17,6 +17,7 @@ from ibkr_trader.api.server import (
     parse_execution_batch_payload,
     parse_historical_bars_payload,
     parse_kill_switch_payload,
+    parse_operator_review_payload,
     parse_positive_limit,
     parse_runtime_cycle_payload,
     parse_shortability_snapshot_payload,
@@ -634,6 +635,148 @@ class ApiServerTests(TestCase):
             self.assertEqual(after.status_code, 200)
             self.assertEqual(after.json()["kill_switch"]["reason"], "Freeze new entries.")
 
+    def test_operator_review_endpoints_round_trip(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "operator_review.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                broker_account = BrokerAccountRecord(
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    account_label="Live Sweden",
+                    base_currency="SEK",
+                )
+                session.add(broker_account)
+                session.flush()
+
+                broker_order = BrokerOrderRecord(
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    order_role="ENTRY",
+                    external_order_id="11",
+                    external_perm_id="9001",
+                    external_client_id="0",
+                    order_ref="instr-001",
+                    symbol="SAAB",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="SAAB-B",
+                    side="BUY",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Submitted",
+                    total_quantity="2",
+                    limit_price="100.00",
+                    stop_price=None,
+                    submitted_at=datetime(2026, 4, 19, 7, 21, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 19, 7, 22, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+                session.add(broker_order)
+                session.flush()
+
+                broker_event = BrokerOrderEventRecord(
+                    broker_order_id=broker_order.id,
+                    event_type="order_error_callback",
+                    event_at=datetime(2026, 4, 19, 7, 22, tzinfo=timezone.utc),
+                    status_before="PreSubmitted",
+                    status_after="Submitted",
+                    payload={"errorCode": 201, "errorMsg": "Order held for review"},
+                    note="Broker callback arrived.",
+                )
+                session.add(broker_event)
+
+                reconciliation_run = ReconciliationRunRecord(
+                    run_kind="runtime_cycle",
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    runtime_timezone="Europe/Stockholm",
+                    started_at=datetime(2026, 4, 19, 7, 25, tzinfo=timezone.utc),
+                    completed_at=datetime(2026, 4, 19, 7, 25, 3, tzinfo=timezone.utc),
+                    status="WARNINGS",
+                    issue_count=1,
+                    action_count=1,
+                    metadata_json={},
+                )
+                session.add(reconciliation_run)
+                session.flush()
+                issue = ReconciliationIssueRecord(
+                    reconciliation_run_id=reconciliation_run.id,
+                    instruction_id="instr-001",
+                    stage="reconcile_instruction",
+                    severity="ERROR",
+                    message="Order state drift detected.",
+                    observed_at=datetime(2026, 4, 19, 7, 25, 3, tzinfo=timezone.utc),
+                    payload={"broker_order_id": broker_order.id},
+                )
+                session.add(issue)
+                session.commit()
+            finally:
+                session.close()
+                engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="U25245596",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                attention_response = client.post(
+                    "/v1/broker-attention/1/review",
+                    json={"action": "ACKNOWLEDGE", "updated_by": "test-suite"},
+                )
+                issue_response = client.post(
+                    "/v1/reconciliation-issues/1/review",
+                    json={"action": "RESOLVE", "updated_by": "test-suite"},
+                )
+
+            self.assertEqual(attention_response.status_code, 200)
+            self.assertEqual(
+                attention_response.json()["operator_review"]["status"],
+                "ACKNOWLEDGED",
+            )
+            self.assertEqual(issue_response.status_code, 200)
+            self.assertEqual(
+                issue_response.json()["operator_review"]["status"],
+                "RESOLVED",
+            )
+
     def test_submit_endpoint_rejects_when_kill_switch_is_enabled(self) -> None:
         try:
             from fastapi.testclient import TestClient
@@ -835,6 +978,25 @@ class ApiServerTests(TestCase):
 
         with self.assertRaisesRegex(ValueError, "boolean"):
             parse_kill_switch_payload({"enabled": "yes"})
+
+    def test_parse_operator_review_payload_requires_valid_action_and_updated_by(self) -> None:
+        action, updated_by, note = parse_operator_review_payload(
+            {
+                "action": "ACKNOWLEDGE",
+                "updated_by": "dashboard",
+                "note": "Looks good.",
+            }
+        )
+
+        self.assertEqual(action, "ACKNOWLEDGE")
+        self.assertEqual(updated_by, "dashboard")
+        self.assertEqual(note, "Looks good.")
+
+        with self.assertRaisesRegex(ValueError, "required"):
+            parse_operator_review_payload({})
+
+        with self.assertRaisesRegex(ValueError, "updated_by"):
+            parse_operator_review_payload({"action": "ACKNOWLEDGE", "updated_by": "   "})
 
     def test_parse_execution_batch_payload_validates_contract(self) -> None:
         batch = parse_execution_batch_payload(
