@@ -476,6 +476,80 @@ class BrokerLedgerPersistenceTests(TestCase):
         finally:
             session.close()
 
+    def test_persist_broker_runtime_snapshot_merges_duplicate_portfolio_rows(self) -> None:
+        captured_at = datetime(2026, 4, 21, 14, 31, tzinfo=timezone.utc)
+        snapshot = BrokerRuntimeSnapshot(
+            open_orders={},
+            executions=(),
+            portfolio=(
+                BrokerPortfolioItem(
+                    account="DU1234567",
+                    symbol="SIVE",
+                    local_symbol="SIVE",
+                    security_type="STK",
+                    exchange="SFB",
+                    primary_exchange="SFB",
+                    currency="SEK",
+                    position=Decimal("1"),
+                    market_price=Decimal("29.70"),
+                    market_value=Decimal("29.70"),
+                    average_cost=Decimal("29.72"),
+                    unrealized_pnl=Decimal("-0.02"),
+                    realized_pnl=Decimal("0"),
+                ),
+                BrokerPortfolioItem(
+                    account="DU1234567",
+                    symbol="SIVE",
+                    local_symbol="SIVE",
+                    security_type="STK",
+                    exchange="SFB",
+                    primary_exchange="SFB",
+                    currency="SEK",
+                    position=Decimal("1"),
+                    market_price=Decimal("29.71"),
+                    market_value=Decimal("29.71"),
+                    average_cost=Decimal("29.72"),
+                    unrealized_pnl=Decimal("-0.01"),
+                    realized_pnl=Decimal("0"),
+                ),
+            ),
+            positions=(
+                BrokerPosition(
+                    account="DU1234567",
+                    symbol="SIVE",
+                    local_symbol="SIVE",
+                    security_type="STK",
+                    exchange="SFB",
+                    primary_exchange="SFB",
+                    currency="SEK",
+                    position=Decimal("1"),
+                    average_cost=Decimal("29.72"),
+                ),
+            ),
+            account_values={
+                "DU1234567": {
+                    "NetLiquidation": {"value": "19324.51", "currency": "SEK"},
+                }
+            },
+        )
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            snapshot,
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=captured_at,
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            position_snapshots = session.execute(select(PositionSnapshotRecord)).scalars().all()
+            self.assertEqual(len(position_snapshots), 1)
+            self.assertEqual(position_snapshots[0].symbol, "SIVE")
+            self.assertEqual(position_snapshots[0].market_price, "29.71")
+        finally:
+            session.close()
+
     def test_persist_broker_callback_events_updates_order_status_and_rejects(self) -> None:
         self._insert_broker_order()
 

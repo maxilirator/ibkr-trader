@@ -1121,6 +1121,74 @@ def _build_position_union(
         tuple[BrokerPosition | None, BrokerPortfolioItem | None],
     ] = {}
 
+    def merge_position(
+        existing: BrokerPosition,
+        incoming: BrokerPosition,
+    ) -> BrokerPosition:
+        return BrokerPosition(
+            account=incoming.account or existing.account,
+            symbol=incoming.symbol or existing.symbol,
+            local_symbol=incoming.local_symbol or existing.local_symbol,
+            security_type=incoming.security_type or existing.security_type,
+            exchange=incoming.exchange or existing.exchange,
+            primary_exchange=incoming.primary_exchange or existing.primary_exchange,
+            currency=incoming.currency or existing.currency,
+            position=(
+                incoming.position
+                if incoming.position is not None
+                else existing.position
+            ),
+            average_cost=(
+                incoming.average_cost
+                if incoming.average_cost is not None
+                else existing.average_cost
+            ),
+        )
+
+    def merge_portfolio_item(
+        existing: BrokerPortfolioItem,
+        incoming: BrokerPortfolioItem,
+    ) -> BrokerPortfolioItem:
+        return BrokerPortfolioItem(
+            account=incoming.account or existing.account,
+            symbol=incoming.symbol or existing.symbol,
+            local_symbol=incoming.local_symbol or existing.local_symbol,
+            security_type=incoming.security_type or existing.security_type,
+            exchange=incoming.exchange or existing.exchange,
+            primary_exchange=incoming.primary_exchange or existing.primary_exchange,
+            currency=incoming.currency or existing.currency,
+            position=(
+                incoming.position
+                if incoming.position is not None
+                else existing.position
+            ),
+            market_price=(
+                incoming.market_price
+                if incoming.market_price is not None
+                else existing.market_price
+            ),
+            market_value=(
+                incoming.market_value
+                if incoming.market_value is not None
+                else existing.market_value
+            ),
+            average_cost=(
+                incoming.average_cost
+                if incoming.average_cost is not None
+                else existing.average_cost
+            ),
+            unrealized_pnl=(
+                incoming.unrealized_pnl
+                if incoming.unrealized_pnl is not None
+                else existing.unrealized_pnl
+            ),
+            realized_pnl=(
+                incoming.realized_pnl
+                if incoming.realized_pnl is not None
+                else existing.realized_pnl
+            ),
+        )
+
     for position in snapshot.positions:
         account_key = _resolve_account_key(
             position.account,
@@ -1135,12 +1203,13 @@ def _build_position_union(
             _normalize_text(position.security_type),
             _normalize_text(position.local_symbol),
         )
-        if key in positions_by_key and positions_by_key[key][0] is not None:
-            raise ValueError(
-                f"Duplicate broker position snapshot for {account_key}:{key[1]}:{key[2]}."
-            )
-        previous_portfolio = positions_by_key.get(key, (None, None))[1]
-        positions_by_key[key] = (position, previous_portfolio)
+        previous_position, previous_portfolio = positions_by_key.get(key, (None, None))
+        positions_by_key[key] = (
+            merge_position(previous_position, position)
+            if previous_position is not None
+            else position,
+            previous_portfolio,
+        )
 
     for portfolio_item in snapshot.portfolio:
         account_key = _resolve_account_key(
@@ -1156,12 +1225,13 @@ def _build_position_union(
             _normalize_text(portfolio_item.security_type),
             _normalize_text(portfolio_item.local_symbol),
         )
-        if key in positions_by_key and positions_by_key[key][1] is not None:
-            raise ValueError(
-                f"Duplicate broker portfolio snapshot for {account_key}:{key[1]}:{key[2]}."
-            )
-        previous_position = positions_by_key.get(key, (None, None))[0]
-        positions_by_key[key] = (previous_position, portfolio_item)
+        previous_position, previous_portfolio = positions_by_key.get(key, (None, None))
+        positions_by_key[key] = (
+            previous_position,
+            merge_portfolio_item(previous_portfolio, portfolio_item)
+            if previous_portfolio is not None
+            else portfolio_item,
+        )
 
     return positions_by_key
 
