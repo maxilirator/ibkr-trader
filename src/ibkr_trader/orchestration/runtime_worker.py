@@ -31,6 +31,7 @@ from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
+from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
@@ -74,6 +75,15 @@ from ibkr_trader.orchestration.runtime_service_state import (
 from ibkr_trader.orchestration.state_machine import ExecutionState
 
 DEFAULT_BROKER_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
+_CLOSED_BROKER_ORDER_STATUSES = {
+    "API_CANCELLED",
+    "CANCELLED",
+    "ERROR",
+    "FILLED",
+    "INACTIVE",
+    "NOT_FOUND_AT_BROKER",
+    "REJECTED",
+}
 
 
 @dataclass(slots=True)
@@ -615,6 +625,64 @@ def _open_order_ids_with_ref_prefix(
         if open_order.order_ref is not None
         and open_order.order_ref.startswith(order_ref_prefix)
     )
+
+
+def _normalize_broker_order_status(status: str | None) -> str | None:
+    if status is None:
+        return None
+    normalized = status.strip()
+    if not normalized:
+        return None
+    return normalized.upper()
+
+
+def _persisted_open_exit_orders_by_instruction(
+    session_factory: sessionmaker[Session],
+    *,
+    records: list[InstructionRecord],
+) -> dict[str, tuple[int, ...]]:
+    if not records:
+        return {}
+
+    instruction_ids_by_record_id = {
+        record.id: record.instruction_id
+        for record in records
+    }
+
+    persisted_order_ids: dict[str, list[int]] = {
+        record.instruction_id: []
+        for record in records
+    }
+
+    with session_scope(session_factory) as session:
+        rows = session.execute(
+            select(
+                BrokerOrderRecord.instruction_id,
+                BrokerOrderRecord.external_order_id,
+                BrokerOrderRecord.status,
+            ).where(
+                BrokerOrderRecord.instruction_id.in_(tuple(instruction_ids_by_record_id.keys())),
+                BrokerOrderRecord.order_role == "EXIT",
+            )
+        ).all()
+
+    for instruction_record_id, external_order_id, status in rows:
+        public_instruction_id = instruction_ids_by_record_id.get(instruction_record_id)
+        if public_instruction_id is None:
+            continue
+        if _normalize_broker_order_status(status) in _CLOSED_BROKER_ORDER_STATUSES:
+            continue
+        if external_order_id in (None, ""):
+            continue
+        try:
+            persisted_order_ids[public_instruction_id].append(int(str(external_order_id)))
+        except ValueError:
+            continue
+
+    return {
+        instruction_id: tuple(sorted(set(order_ids)))
+        for instruction_id, order_ids in persisted_order_ids.items()
+    }
 
 
 def _remaining_position_quantity(
@@ -1399,6 +1467,10 @@ def run_runtime_cycle(
     records_by_instruction_id = {
         record.instruction_id: record for record in records
     }
+    persisted_open_exit_order_ids_by_instruction = _persisted_open_exit_orders_by_instruction(
+        session_factory,
+        records=records,
+    )
 
     for instruction_id in active_instruction_ids:
         record = records_by_instruction_id.get(instruction_id)
@@ -1425,7 +1497,14 @@ def run_runtime_cycle(
                 snapshot,
                 order_ref_prefix=f"{instruction.instruction_id}:exit:",
             )
-            exit_open = bool(exit_open_order_ids)
+            persisted_exit_open_order_ids = persisted_open_exit_order_ids_by_instruction.get(
+                instruction_id,
+                (),
+            )
+            combined_exit_open_order_ids = tuple(
+                sorted(set(exit_open_order_ids) | set(persisted_exit_open_order_ids))
+            )
+            exit_open = bool(combined_exit_open_order_ids)
             expire_at = _ensure_utc(record.expire_at) or record.expire_at
 
             if record.state == ExecutionState.ENTRY_SUBMITTED.value:
@@ -1645,7 +1724,7 @@ def run_runtime_cycle(
                 if remaining_quantity <= 0:
                     continue
 
-                for open_exit_order_id in exit_open_order_ids:
+                for open_exit_order_id in combined_exit_open_order_ids:
                     _run_with_broker_retries(
                         lambda order_id=open_exit_order_id: runtime_order_canceler(
                             broker_config,

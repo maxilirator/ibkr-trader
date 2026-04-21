@@ -1327,6 +1327,121 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.exit_order_id, 41)
         self.assertEqual(record.exit_submitted_quantity, "1")
 
+    def test_run_runtime_cycle_does_not_resubmit_delayed_exit_when_ledger_has_open_exit(self) -> None:
+        payload = _sive_payload()
+        payload["instruction"]["exit"] = {
+            "delayed_limit": {
+                "submit_at": "2026-04-10T10:30:00+02:00",
+                "limit_offset_pct": "0.05",
+            }
+        }
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="1",
+            exit_order_id=41,
+        )
+
+        session = self.session_factory()
+        try:
+            instruction_record = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-sive-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction_record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="EXIT",
+                    external_order_id="41",
+                    external_perm_id="9141",
+                    external_client_id="0",
+                    order_ref="runtime-sive-1:exit:delayed_limit",
+                    symbol="SIVE",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="SIVE",
+                    side="SELL",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Submitted",
+                    total_quantity="1",
+                    limit_price="21.00",
+                    stop_price=None,
+                    submitted_at=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        market_price_calls: list[dict[str, object]] = []
+        exit_submit_calls: list[dict[str, object]] = []
+
+        def fake_market_price_reader(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            at: datetime,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            market_price_calls.append({"at": at, "timeout": timeout})
+            return {
+                "price": "20.00",
+                "observed_at": "20260410 10:29:00",
+                "currency": "SEK",
+                "source": "test_latest_trade_price",
+            }
+
+        def fake_exit_submitter(**kwargs: object) -> dict[str, object]:
+            exit_submit_calls.append(kwargs)
+            raise AssertionError("Delayed exit should not be resubmitted when a persisted open exit exists.")
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+            exit_submitter=fake_exit_submitter,
+            market_price_reader=fake_market_price_reader,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(market_price_calls, [])
+        self.assertEqual(exit_submit_calls, [])
+        self.assertEqual(len(result.submitted_exits), 0)
+        record = self._read_record("runtime-sive-1")
+        self.assertEqual(record.exit_order_id, 41)
+        self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
+
     def test_run_runtime_cycle_submits_forced_exit_when_next_session_is_due(self) -> None:
         payload = _sive_payload()
         self._insert_instruction(
