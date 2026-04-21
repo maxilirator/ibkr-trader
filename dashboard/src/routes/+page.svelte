@@ -182,36 +182,31 @@
 
   function operatorReviewClass(review) {
     const status = review?.status ?? 'OPEN';
-    if (status === 'RESOLVED') return 'ok';
-    if (status === 'ACKNOWLEDGED') return 'neutral';
+    if (status !== 'OPEN') return 'neutral';
     return 'warn';
+  }
+
+  function operatorReviewLabel(review) {
+    const status = review?.status ?? 'OPEN';
+    return status === 'OPEN' ? 'OPEN' : 'CLEARED';
   }
 
   function operatorReviewActions(review) {
     const status = review?.status ?? 'OPEN';
-    if (status === 'RESOLVED') {
-      return [{ operation: 'REOPEN', label: 'Reopen', className: 'inline-button neutral' }];
+    if (status !== 'OPEN') {
+      return [];
     }
-    if (status === 'ACKNOWLEDGED') {
-      return [
-        { operation: 'RESOLVE', label: 'Resolve', className: 'inline-button' },
-        { operation: 'REOPEN', label: 'Reopen', className: 'inline-button neutral' }
-      ];
-    }
-    return [
-      { operation: 'ACKNOWLEDGE', label: 'Acknowledge', className: 'inline-button neutral' },
-      { operation: 'RESOLVE', label: 'Resolve', className: 'inline-button' }
-    ];
+    return [{ operation: 'ACKNOWLEDGE', label: 'Clear', className: 'inline-button neutral' }];
   }
 
   function operatorReviewDetail(review) {
     if (!review?.latest_action_type) {
-      return 'No operator action recorded yet.';
+      return 'Not cleared yet.';
     }
 
     const reviewedAt = formatTimestampOrNull(review.latest_action_at) ?? 'unknown time';
     const reviewedBy = review.latest_action_by ?? 'unknown operator';
-    return `${review.latest_action_type} by ${reviewedBy} at ${reviewedAt}`;
+    return `Cleared by ${reviewedBy} at ${reviewedAt}`;
   }
 
   function marketDirectionArrow(direction) {
@@ -829,7 +824,7 @@
           class="inline-action-form"
           use:enhance={enhanceDashboardAction}
         >
-          <button class="inline-button neutral" type="submit">Acknowledge All Visible</button>
+          <button class="inline-button neutral" type="submit">Clear All Visible</button>
         </form>
       </div>
       {#if acknowledgeAllLogsResult}
@@ -853,7 +848,7 @@
                 <strong>{attention.symbol}</strong>
                 <span>{attention.account_label ?? attention.account_key}</span>
                 <span class={`pill ${operatorReviewClass(attention.operator_review)}`}>
-                  {attention.operator_review?.status ?? 'OPEN'}
+                  {operatorReviewLabel(attention.operator_review)}
                 </span>
               </div>
               <p>{attention.message}</p>
@@ -896,7 +891,7 @@
           class="inline-action-form"
           use:enhance={enhanceDashboardAction}
         >
-          <button class="inline-button neutral" type="submit">Acknowledge Visible</button>
+          <button class="inline-button neutral" type="submit">Clear Visible</button>
         </form>
       </div>
       {#if reconciliationClearResult}
@@ -934,7 +929,7 @@
                       <div class="issue-main">
                         <strong>{issue.stage}</strong>
                         <span class={`pill ${operatorReviewClass(issue.operator_review)}`}>
-                          {issue.operator_review?.status ?? 'OPEN'}
+                          {operatorReviewLabel(issue.operator_review)}
                         </span>
                       </div>
                       <span>{issue.message}</span>

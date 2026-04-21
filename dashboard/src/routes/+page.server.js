@@ -132,7 +132,7 @@ export const actions = {
           reconciliationClearResult: {
             ok: false,
             message:
-              `Acknowledged ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+              `Cleared ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
               `${result.error}`
           }
         });
@@ -145,8 +145,8 @@ export const actions = {
         ok: true,
         message:
           acknowledgedReconciliationIssueCount === 0
-            ? 'No open reconciliation issues needed acknowledgement.'
-            : `Acknowledged ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
+            ? 'No open reconciliation issues needed clearing.'
+            : `Cleared ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
       }
     };
   },
@@ -189,7 +189,7 @@ export const actions = {
           acknowledgeAllLogsResult: {
             ok: false,
             message:
-              `Acknowledged ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
               `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
               `${result.error}`
           }
@@ -212,7 +212,7 @@ export const actions = {
           acknowledgeAllLogsResult: {
             ok: false,
             message:
-              `Acknowledged ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
               `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
               `${result.error}`
           }
@@ -228,8 +228,8 @@ export const actions = {
         ok: true,
         message:
           totalAcknowledged === 0
-            ? 'No open broker-attention or reconciliation-log items needed acknowledgement.'
-            : `Acknowledged ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+            ? 'No open broker-attention or reconciliation-log items needed clearing.'
+            : `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
               `${acknowledgedReconciliationIssueCount} reconciliation issues.`
       }
     };
@@ -506,7 +506,7 @@ export const actions = {
     return {
       brokerAttentionActionResult: {
         ok: true,
-        message: `Broker attention item ${normalizedEventId} updated with ${operation}.`
+        message: `Cleared broker attention item ${normalizedEventId}.`
       }
     };
   },
@@ -557,7 +557,7 @@ export const actions = {
     return {
       reconciliationIssueActionResult: {
         ok: true,
-        message: `Reconciliation issue ${normalizedIssueId} updated with ${operation}.`
+        message: `Cleared reconciliation issue ${normalizedIssueId}.`
       }
     };
   }
