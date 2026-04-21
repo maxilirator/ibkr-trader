@@ -25,6 +25,9 @@ This file is the active implementation tracker for the production-grade trader p
   unmatched exit status/error callbacks no longer fall through the entry-only
   reconstruction path, and they can rebuild the missing exit broker-order row
   from the persisted submit event before the callback is recorded
+- [x] Short-sale prechecks now fail closed on broker-position timeouts:
+  if IBKR stalls while returning positions for a SELL/SHORT validation, the
+  API now returns a clear validation issue instead of bubbling a server error
 - [x] Broker fees now flow into the durable fill ledger:
   IBKR commission-and-fees reports are cached on the live session, merged
   onto executions by execId, persisted onto execution fills, and surfaced

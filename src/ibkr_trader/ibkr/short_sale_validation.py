@@ -312,6 +312,13 @@ def _resolve_current_position_quantity(
     return matched_position
 
 
+def _requires_current_position_check(instruction: ExecutionInstruction) -> bool:
+    return (
+        instruction.intent.position_side is PositionSide.SHORT
+        or instruction.intent.side == "SELL"
+    )
+
+
 def _is_stockholm_equity_instruction(instruction: ExecutionInstruction) -> bool:
     if instruction.instrument.currency.upper() != "SEK":
         return False
@@ -429,26 +436,36 @@ def validate_short_sale_entry(
 ) -> ShortSaleValidationResult:
     issues: list[str] = []
     warnings: list[str] = []
-
-    current_position_quantity = _resolve_current_position_quantity(
-        app,
-        broker_account_id=broker_account_id,
-        instruction=instruction,
-        timeout=timeout,
-    )
+    current_position_quantity: Decimal | None = Decimal("0")
+    if _requires_current_position_check(instruction):
+        try:
+            current_position_quantity = _resolve_current_position_quantity(
+                app,
+                broker_account_id=broker_account_id,
+                instruction=instruction,
+                timeout=timeout,
+            )
+        except timeout_cls:
+            current_position_quantity = None
+            issues.append(
+                "IBKR positions lookup timed out, so the trader could not safely validate "
+                "whether this SELL/SHORT instruction would cross an existing position."
+            )
 
     is_short_sale = False
     if instruction.intent.position_side is PositionSide.SHORT:
         is_short_sale = True
         if instruction.intent.side != "SELL":
             issues.append("Short entries must use intent.side=SELL.")
-        if current_position_quantity > 0:
+        if current_position_quantity is not None and current_position_quantity > 0:
             issues.append(
                 "IBKR does not allow the account to hold a long and short position in the "
                 "same security at the same time. Flatten the existing long first."
             )
     elif instruction.intent.side == "SELL":
-        if current_position_quantity <= 0:
+        if current_position_quantity is None:
+            pass
+        elif current_position_quantity <= 0:
             issues.append(
                 "A SELL instruction without an existing long position would open a short "
                 "position. Use intent.position_side=SHORT so the trader can validate it."

@@ -261,6 +261,73 @@ class OrderPreviewTests(TestCase):
         self.assertEqual(preview["instrument"]["resolved"]["con_id"], 265598)
         self.assertEqual(preview["sizing"]["normalized_quantity"], "10")
 
+    def test_preview_returns_validation_issue_when_position_lookup_times_out_for_shorts(self) -> None:
+        class _TimedOutShortPreviewWrapper(_FakePreviewSyncWrapper):
+            def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
+                raise TimeoutError("positions timed out")
+
+        payload = {
+            "schema_version": "2026-04-10",
+            "source": {
+                "system": "q-training",
+                "batch_id": "batch-timeout",
+                "generated_at": "2026-04-10T02:15:44Z",
+            },
+            "instructions": [
+                {
+                    "instruction_id": "demo-short-timeout-1",
+                    "account": {
+                        "account_key": "GTW05",
+                        "book_key": "short_risk_book",
+                    },
+                    "instrument": {
+                        "symbol": "AAPL",
+                        "security_type": "STK",
+                        "exchange": "SMART",
+                        "currency": "USD",
+                        "primary_exchange": "NASDAQ",
+                    },
+                    "intent": {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                    },
+                    "sizing": {
+                        "mode": "target_quantity",
+                        "target_quantity": "1",
+                    },
+                    "entry": {
+                        "order_type": "MARKET",
+                        "submit_at": "2026-04-10T09:25:00-04:00",
+                        "expire_at": "2026-04-10T16:00:00-04:00",
+                    },
+                    "exit": {},
+                    "trace": {
+                        "reason_code": "preview-test",
+                    },
+                }
+            ],
+        }
+
+        batch = parse_execution_batch_payload(payload)
+        preview_payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_TimedOutShortPreviewWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = preview_payload["previews"][0]
+        self.assertEqual(preview["status"], "unresolved")
+        self.assertIn("positions lookup timed out", " ".join(preview["issues"]).lower())
+        self.assertEqual(preview["short_sale_validation"]["current_position_quantity"], None)
+
     def test_preview_normalizes_limit_price_to_market_rule(self) -> None:
         batch = parse_execution_batch_payload(
             {

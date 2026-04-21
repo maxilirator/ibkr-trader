@@ -446,6 +446,49 @@ class OrderExecutionTests(TestCase):
                 order_cls=_FakeOrder,
             )
 
+    def test_submit_order_from_batch_rejects_short_when_position_lookup_times_out(self) -> None:
+        class _TimedOutShortWrapper(_FakeOrderExecutionSyncWrapper):
+            def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
+                raise TimeoutError("positions timed out")
+
+            def get_historical_data(
+                self,
+                contract: _FakeContract,
+                end_date_time: str,
+                duration_str: str,
+                bar_size_setting: str,
+                what_to_show: str,
+                use_rth: bool = True,
+                format_date: int = 1,
+                timeout: int | None = None,
+            ) -> list[object]:
+                if (contract.symbol, contract.currency) == ("USD", "EUR"):
+                    raise TimeoutError("direct USD.EUR unavailable")
+                if (contract.symbol, contract.currency) == ("EUR", "USD"):
+                    return [SimpleNamespace(date="20260421", close="1.10")]
+                raise AssertionError(
+                    f"Unexpected FX request for {contract.symbol}.{contract.currency}"
+                )
+
+        payload = _base_payload()
+        payload["instructions"][0]["intent"] = {
+            "side": "SELL",
+            "position_side": "SHORT",
+        }
+        payload["instructions"][0]["entry"]["order_type"] = "MARKET"
+        del payload["instructions"][0]["entry"]["limit_price"]
+        batch = parse_execution_batch_payload(payload)
+
+        with self.assertRaisesRegex(ValueError, "positions lookup timed out"):
+            submit_order_from_batch(
+                self.config,
+                batch,
+                sync_wrapper_cls=_TimedOutShortWrapper,
+                response_timeout_cls=TimeoutError,
+                contract_cls=_FakeContract,
+                order_cls=_FakeOrder,
+            )
+
     def test_parse_execution_batch_payload_rejects_long_entry_with_sell_side(self) -> None:
         payload = _base_payload()
         payload["instructions"][0]["intent"] = {
