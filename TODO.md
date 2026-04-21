@@ -21,6 +21,10 @@ This file is the active implementation tracker for the production-grade trader p
 - [x] Clean reconciliation cycles are hidden from the operator dashboard:
   the operator read model now returns warning/error runs by default so the
   UI log stays focused on actionable broker and runtime problems
+- [x] Exit callbacks now reconstruct durable exit orders safely:
+  unmatched exit status/error callbacks no longer fall through the entry-only
+  reconstruction path, and they can rebuild the missing exit broker-order row
+  from the persisted submit event before the callback is recorded
 - [x] Broker fees now flow into the durable fill ledger:
   IBKR commission-and-fees reports are cached on the live session, merged
   onto executions by execId, persisted onto execution fills, and surfaced

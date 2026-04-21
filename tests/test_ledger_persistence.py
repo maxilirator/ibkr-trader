@@ -15,6 +15,7 @@ from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderEventRecord
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import ExecutionFillRecord
+from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.ibkr.runtime_snapshot import BrokerExecution
@@ -604,6 +605,154 @@ class BrokerLedgerPersistenceTests(TestCase):
             self.assertEqual(
                 broker_order.metadata_json["last_order_error_callback"]["errorCode"],
                 202,
+            )
+        finally:
+            session.close()
+
+    def test_persist_broker_callback_events_reconstructs_exit_order_from_instruction_event(self) -> None:
+        session = self.session_factory()
+        try:
+            instruction = InstructionRecord(
+                instruction_id="persisted-sive-exit-1",
+                schema_version="2026-04-10",
+                source_system="q-training",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="short_book",
+                symbol="SIVE",
+                exchange="SFB",
+                currency="SEK",
+                state=ExecutionState.EXIT_PENDING.value,
+                submit_at=datetime(2026, 4, 21, 7, 20, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 21, 15, 30, tzinfo=timezone.utc),
+                order_type="MKT",
+                side="BUY",
+                entry_submitted_quantity="1",
+                entry_filled_quantity="1",
+                entry_avg_fill_price="29.72",
+                entry_filled_at=datetime(2026, 4, 21, 8, 20, tzinfo=timezone.utc),
+                exit_order_id=95,
+                exit_order_status="Submitted",
+                exit_submitted_quantity="1",
+                payload={
+                    "instruction": {
+                        "instruction_id": "persisted-sive-exit-1",
+                        "account": {
+                            "account_key": "U25245596",
+                            "book_key": "short_book",
+                        },
+                        "instrument": {
+                            "symbol": "SIVE",
+                            "security_type": "STK",
+                            "exchange": "SFB",
+                            "primary_exchange": "SFB",
+                            "currency": "SEK",
+                            "local_symbol": "SIVE",
+                        },
+                        "entry": {
+                            "order_type": "MARKET",
+                            "submit_at": "2026-04-21T10:20:00+02:00",
+                            "expire_at": "2026-04-21T10:21:00+02:00",
+                            "time_in_force": "DAY",
+                        },
+                        "exit": {
+                            "delayed_limit": {
+                                "submit_at": "2026-04-21T10:21:00+02:00",
+                                "limit_offset_pct": "0.05",
+                                "reference": "MARKET_AT_TRIGGER",
+                            }
+                        },
+                    }
+                },
+            )
+            session.add(instruction)
+            session.flush()
+            session.add(
+                InstructionEventRecord(
+                    instruction_id=instruction.id,
+                    event_type="delayed_limit_exit_submitted",
+                    source="runtime_cycle",
+                    event_at=datetime(2026, 4, 21, 8, 21, tzinfo=timezone.utc),
+                    state_before=ExecutionState.POSITION_OPEN.value,
+                    state_after=ExecutionState.EXIT_PENDING.value,
+                    payload={
+                        "broker_submission": {
+                            "account": "U25245596",
+                            "order": {
+                                "action": "SELL",
+                                "order_type": "LIMIT",
+                                "total_quantity": "1",
+                                "limit_price": "31.20",
+                                "order_ref": "persisted-sive-exit-1:exit:delayed_limit",
+                            },
+                            "broker_order_status": {
+                                "orderId": 95,
+                                "permId": 91095,
+                                "clientId": 0,
+                                "status": "Submitted",
+                            },
+                            "resolved_contract": {
+                                "symbol": "SIVE",
+                                "exchange": "SFB",
+                                "primary_exchange": "SFB",
+                                "currency": "SEK",
+                                "security_type": "STK",
+                                "local_symbol": "SIVE",
+                            },
+                        }
+                    },
+                    note="Submitted delayed limit exit anchored to live market at trigger time.",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_callback_events(
+            self.session_factory,
+            [
+                {
+                    "event_type": "order_error",
+                    "event_at": datetime(2026, 4, 21, 8, 22, tzinfo=timezone.utc),
+                    "error": {
+                        "orderId": 95,
+                        "errorTime": 0,
+                        "errorCode": 201,
+                        "errorString": "Order rejected",
+                        "advancedOrderRejectJson": None,
+                    },
+                }
+            ],
+            broker_kind=BROKER_KIND_IBKR,
+            default_account_key="U25245596",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(
+                select(BrokerOrderRecord).where(BrokerOrderRecord.external_order_id == "95")
+            ).scalar_one()
+            broker_order_events = session.execute(
+                select(BrokerOrderEventRecord)
+                .where(BrokerOrderEventRecord.broker_order_id == broker_order.id)
+                .order_by(BrokerOrderEventRecord.id)
+            ).scalars().all()
+
+            self.assertEqual(broker_order.order_role, "EXIT")
+            self.assertEqual(broker_order.side, "SELL")
+            self.assertEqual(broker_order.order_type, "LIMIT")
+            self.assertEqual(broker_order.limit_price, "31.20")
+            self.assertEqual(broker_order.status, "Submitted")
+            self.assertTrue(
+                broker_order.raw_payload["reconstructed_from_instruction_event"]
+            )
+            self.assertEqual(
+                [event.event_type for event in broker_order_events],
+                ["order_error_callback"],
+            )
+            self.assertEqual(
+                broker_order.metadata_json["last_order_error_callback"]["errorCode"],
+                201,
             )
         finally:
             session.close()
