@@ -100,6 +100,57 @@ export async function load({ fetch }) {
 }
 
 export const actions = {
+  async acknowledgeVisibleReconciliation({ fetch }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const snapshotResult = await readOperatorSnapshot(fetch, apiBaseUrl);
+    if (!snapshotResult.ok) {
+      return fail(snapshotResult.status || 500, {
+        reconciliationClearResult: {
+          ok: false,
+          message: snapshotResult.error
+        }
+      });
+    }
+
+    const reconciliationRuns = snapshotResult.snapshot.recent_reconciliation_runs ?? [];
+    const openReconciliationIssues = reconciliationRuns.flatMap((run) =>
+      (run.issues ?? []).filter((issue) => (issue.operator_review?.status ?? 'OPEN') === 'OPEN')
+    );
+
+    let acknowledgedReconciliationIssueCount = 0;
+    for (const item of openReconciliationIssues) {
+      const result = await postJson(
+        fetch,
+        `${apiBaseUrl}/v1/reconciliation-issues/${item.issue_id}/review`,
+        {
+          action: 'ACKNOWLEDGE',
+          updated_by: 'dashboard'
+        }
+      );
+      if (!result.ok) {
+        return fail(result.status || 500, {
+          reconciliationClearResult: {
+            ok: false,
+            message:
+              `Acknowledged ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+              `${result.error}`
+          }
+        });
+      }
+      acknowledgedReconciliationIssueCount += 1;
+    }
+
+    return {
+      reconciliationClearResult: {
+        ok: true,
+        message:
+          acknowledgedReconciliationIssueCount === 0
+            ? 'No open reconciliation issues needed acknowledgement.'
+            : `Acknowledged ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
+      }
+    };
+  },
+
   async acknowledgeAllLogs({ fetch }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
     const snapshotResult = await readOperatorSnapshot(fetch, apiBaseUrl);

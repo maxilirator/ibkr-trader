@@ -9,6 +9,8 @@ from sqlalchemy import select
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
+from ibkr_trader.db.models import BrokerAccountRecord
+from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.orchestration.instruction_status import (
@@ -146,6 +148,91 @@ class InstructionStatusTests(TestCase):
         finally:
             session.close()
 
+    def _insert_broker_orders_for_instruction(
+        self,
+        *,
+        instruction_id: str,
+    ) -> None:
+        session = self.session_factory()
+        try:
+            record = session.execute(
+                select(InstructionRecord).where(InstructionRecord.instruction_id == instruction_id)
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key=record.account_key,
+                base_currency=record.currency,
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add_all(
+                [
+                    BrokerOrderRecord(
+                        instruction_id=record.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key=record.account_key,
+                        order_role="ENTRY",
+                        external_order_id="44",
+                        external_perm_id="844",
+                        external_client_id="0",
+                        order_ref=record.instruction_id,
+                        symbol=record.symbol,
+                        exchange=record.exchange,
+                        currency=record.currency,
+                        security_type="STK",
+                        side="BUY",
+                        order_type="LMT",
+                        status="Filled",
+                        submitted_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 10, 20, 1, tzinfo=timezone.utc),
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=record.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key=record.account_key,
+                        order_role="EXIT",
+                        external_order_id="55",
+                        external_perm_id="955",
+                        external_client_id="0",
+                        order_ref=f"{record.instruction_id}:exit:take_profit",
+                        symbol=record.symbol,
+                        exchange=record.exchange,
+                        currency=record.currency,
+                        security_type="STK",
+                        side="SELL",
+                        order_type="LMT",
+                        status="Submitted",
+                        submitted_at=datetime(2026, 4, 10, 20, 2, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 10, 20, 3, tzinfo=timezone.utc),
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=record.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key=record.account_key,
+                        order_role="EXIT",
+                        external_order_id="56",
+                        external_perm_id="956",
+                        external_client_id="0",
+                        order_ref=f"{record.instruction_id}:exit:catastrophic_stop",
+                        symbol=record.symbol,
+                        exchange=record.exchange,
+                        currency=record.currency,
+                        security_type="STK",
+                        side="SELL",
+                        order_type="STP",
+                        status="PreSubmitted",
+                        submitted_at=datetime(2026, 4, 10, 20, 2, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 10, 20, 4, tzinfo=timezone.utc),
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
     def test_read_instruction_status_returns_record_and_events(self) -> None:
         self._insert_instruction()
 
@@ -209,3 +296,20 @@ class InstructionStatusTests(TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].instruction_id, "status-aapl-1")
+
+    def test_instruction_status_prefers_current_broker_order_rows(self) -> None:
+        self._insert_instruction(
+            instruction_id="status-aapl-1",
+            updated_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+        )
+        self._insert_broker_orders_for_instruction(instruction_id="status-aapl-1")
+
+        result = read_instruction_status(self.session_factory, "status-aapl-1", include_events=False)
+
+        self.assertEqual(result.broker_order_id, 44)
+        self.assertEqual(result.broker_order_status, "Filled")
+        self.assertEqual(result.exit_order_id, 56)
+        self.assertEqual(result.exit_order_status, "PreSubmitted")
+        self.assertEqual(result.entry_order_display, "44 / Filled")
+        self.assertEqual(result.exit_order_display, "55, 56 / Submitted, PreSubmitted")
+        self.assertEqual(result.updated_at.isoformat(), "2026-04-10T20:04:00")

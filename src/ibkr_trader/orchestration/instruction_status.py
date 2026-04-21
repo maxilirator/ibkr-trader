@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
 
 from ibkr_trader.db.base import session_scope
+from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 
@@ -68,6 +69,9 @@ class InstructionStatus:
     exit_filled_quantity: str | None
     exit_avg_fill_price: str | None
     exit_filled_at: datetime | None
+    activity_at: datetime
+    entry_order_display: str | None
+    exit_order_display: str | None
     events: tuple[InstructionEventStatus, ...]
 
 
@@ -93,11 +97,119 @@ def serialize_instruction_status(payload: InstructionStatus) -> dict[str, Any]:
     return _serialize_for_json(asdict(payload))
 
 
+_TERMINAL_BROKER_ORDER_STATUSES = {
+    "API_CANCELLED",
+    "CANCELLED",
+    "ERROR",
+    "FILLED",
+    "INACTIVE",
+    "NOT_FOUND_AT_BROKER",
+    "REJECTED",
+}
+
+
+def _normalize_status(status: str | None) -> str | None:
+    if status is None:
+        return None
+    normalized = status.strip()
+    if not normalized:
+        return None
+    return normalized.upper()
+
+
+def _broker_order_activity_at(order: BrokerOrderRecord) -> datetime:
+    return (
+        order.last_status_at
+        or order.submitted_at
+        or order.updated_at
+        or order.created_at
+    )
+
+
+def _broker_order_sort_key(order: BrokerOrderRecord) -> tuple[datetime, int]:
+    return (_broker_order_activity_at(order), order.id)
+
+
+def _latest_matching_order(
+    broker_orders: tuple[BrokerOrderRecord, ...],
+    *,
+    order_role: str,
+) -> BrokerOrderRecord | None:
+    matching_orders = tuple(
+        order
+        for order in broker_orders
+        if (order.order_role or "").strip().upper() == order_role
+    )
+    if not matching_orders:
+        return None
+    return max(matching_orders, key=_broker_order_sort_key)
+
+
+def _display_for_orders(
+    broker_orders: tuple[BrokerOrderRecord, ...],
+    *,
+    order_role: str,
+) -> str | None:
+    matching_orders = tuple(
+        order
+        for order in broker_orders
+        if (order.order_role or "").strip().upper() == order_role
+    )
+    if not matching_orders:
+        return None
+
+    if order_role == "EXIT":
+        active_orders = tuple(
+            order
+            for order in matching_orders
+            if _normalize_status(order.status) not in _TERMINAL_BROKER_ORDER_STATUSES
+        )
+        if active_orders:
+            matching_orders = tuple(sorted(active_orders, key=_broker_order_sort_key))
+        else:
+            matching_orders = (
+                max(matching_orders, key=_broker_order_sort_key),
+            )
+    else:
+        matching_orders = (
+            max(matching_orders, key=_broker_order_sort_key),
+        )
+
+    if len(matching_orders) == 1:
+        order = matching_orders[0]
+        order_id = order.external_order_id or str(order.id)
+        return f"{order_id} / {order.status}"
+
+    order_ids = ", ".join(order.external_order_id or str(order.id) for order in matching_orders)
+    statuses = ", ".join(order.status for order in matching_orders)
+    return f"{order_ids} / {statuses}"
+
+
+def _activity_at(
+    record: InstructionRecord,
+    *,
+    events: tuple[InstructionEventStatus, ...],
+    broker_orders: tuple[BrokerOrderRecord, ...],
+) -> datetime:
+    candidates = [record.updated_at]
+    candidates.extend(event.event_at for event in events)
+    candidates.extend(_broker_order_activity_at(order) for order in broker_orders)
+    return max(candidates)
+
+
 def _build_instruction_status(
     record: InstructionRecord,
     *,
+    broker_orders: tuple[BrokerOrderRecord, ...] = (),
     events: tuple[InstructionEventStatus, ...] = (),
 ) -> InstructionStatus:
+    latest_entry_order = _latest_matching_order(broker_orders, order_role="ENTRY")
+    latest_exit_order = _latest_matching_order(broker_orders, order_role="EXIT")
+    activity_at = _activity_at(
+        record,
+        events=events,
+        broker_orders=broker_orders,
+    )
     return InstructionStatus(
         record_id=record.id,
         instruction_id=record.instruction_id,
@@ -115,23 +227,86 @@ def _build_instruction_status(
         order_type=record.order_type,
         side=record.side,
         created_at=record.created_at,
-        updated_at=record.updated_at,
-        broker_order_id=record.broker_order_id,
-        broker_perm_id=record.broker_perm_id,
-        broker_client_id=record.broker_client_id,
-        broker_order_status=record.broker_order_status,
+        updated_at=activity_at,
+        broker_order_id=(
+            int(latest_entry_order.external_order_id)
+            if latest_entry_order is not None
+            and latest_entry_order.external_order_id is not None
+            and latest_entry_order.external_order_id.isdigit()
+            else record.broker_order_id
+        ),
+        broker_perm_id=(
+            int(latest_entry_order.external_perm_id)
+            if latest_entry_order is not None
+            and latest_entry_order.external_perm_id is not None
+            and latest_entry_order.external_perm_id.isdigit()
+            else record.broker_perm_id
+        ),
+        broker_client_id=(
+            int(latest_entry_order.external_client_id)
+            if latest_entry_order is not None
+            and latest_entry_order.external_client_id is not None
+            and latest_entry_order.external_client_id.isdigit()
+            else record.broker_client_id
+        ),
+        broker_order_status=(
+            latest_entry_order.status
+            if latest_entry_order is not None
+            else record.broker_order_status
+        ),
         entry_submitted_quantity=record.entry_submitted_quantity,
         entry_filled_quantity=record.entry_filled_quantity,
         entry_avg_fill_price=record.entry_avg_fill_price,
         entry_filled_at=record.entry_filled_at,
-        exit_order_id=record.exit_order_id,
-        exit_perm_id=record.exit_perm_id,
-        exit_client_id=record.exit_client_id,
-        exit_order_status=record.exit_order_status,
+        exit_order_id=(
+            int(latest_exit_order.external_order_id)
+            if latest_exit_order is not None
+            and latest_exit_order.external_order_id is not None
+            and latest_exit_order.external_order_id.isdigit()
+            else record.exit_order_id
+        ),
+        exit_perm_id=(
+            int(latest_exit_order.external_perm_id)
+            if latest_exit_order is not None
+            and latest_exit_order.external_perm_id is not None
+            and latest_exit_order.external_perm_id.isdigit()
+            else record.exit_perm_id
+        ),
+        exit_client_id=(
+            int(latest_exit_order.external_client_id)
+            if latest_exit_order is not None
+            and latest_exit_order.external_client_id is not None
+            and latest_exit_order.external_client_id.isdigit()
+            else record.exit_client_id
+        ),
+        exit_order_status=(
+            latest_exit_order.status
+            if latest_exit_order is not None
+            else record.exit_order_status
+        ),
         exit_submitted_quantity=record.exit_submitted_quantity,
         exit_filled_quantity=record.exit_filled_quantity,
         exit_avg_fill_price=record.exit_avg_fill_price,
         exit_filled_at=record.exit_filled_at,
+        activity_at=activity_at,
+        entry_order_display=_display_for_orders(
+            broker_orders,
+            order_role="ENTRY",
+        )
+        or (
+            f"{record.broker_order_id} / {record.broker_order_status}"
+            if record.broker_order_id is not None or record.broker_order_status is not None
+            else None
+        ),
+        exit_order_display=_display_for_orders(
+            broker_orders,
+            order_role="EXIT",
+        )
+        or (
+            f"{record.exit_order_id} / {record.exit_order_status}"
+            if record.exit_order_id is not None or record.exit_order_status is not None
+            else None
+        ),
         events=events,
     )
 
@@ -146,13 +321,47 @@ def list_instruction_statuses(
     if state is not None:
         statement = statement.where(InstructionRecord.state == state)
     statement = statement.order_by(
-        InstructionRecord.updated_at.desc(),
         InstructionRecord.id.desc(),
-    ).limit(limit)
+    )
 
     with session_scope(session_factory) as session:
-        records = session.execute(statement).scalars()
-        return tuple(_build_instruction_status(record) for record in records)
+        records = tuple(session.execute(statement).scalars())
+        if not records:
+            return ()
+
+        broker_orders = tuple(
+            session.execute(
+                select(BrokerOrderRecord).where(
+                    BrokerOrderRecord.instruction_id.in_([record.id for record in records])
+                )
+            ).scalars()
+        )
+        broker_orders_by_instruction_id: dict[int, list[BrokerOrderRecord]] = {}
+        for broker_order in broker_orders:
+            if broker_order.instruction_id is None:
+                continue
+            broker_orders_by_instruction_id.setdefault(
+                broker_order.instruction_id,
+                [],
+            ).append(broker_order)
+
+        statuses = tuple(
+            _build_instruction_status(
+                record,
+                broker_orders=tuple(broker_orders_by_instruction_id.get(record.id, ())),
+            )
+            for record in records
+        )
+        return tuple(
+            sorted(
+                statuses,
+                key=lambda instruction: (
+                    instruction.activity_at,
+                    instruction.record_id,
+                ),
+                reverse=True,
+            )[:limit]
+        )
 
 
 def read_instruction_status(
@@ -193,4 +402,14 @@ def read_instruction_status(
                 for event in raw_events
             )
 
-        return _build_instruction_status(record, events=events)
+        broker_orders = tuple(
+            session.execute(
+                select(BrokerOrderRecord).where(BrokerOrderRecord.instruction_id == record.id)
+            ).scalars()
+        )
+
+        return _build_instruction_status(
+            record,
+            broker_orders=broker_orders,
+            events=events,
+        )

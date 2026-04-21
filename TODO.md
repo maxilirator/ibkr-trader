@@ -38,6 +38,11 @@ This file is the active implementation tracker for the production-grade trader p
   operators can acknowledge all visible broker-attention and reconciliation-log
   items in one action, and the expected account-data unsubscribe callback no
   longer pollutes the live API logs
+- [x] Recent-instruction rows now reconcile against the live broker-order
+  ledger, and reconciliation runs have their own visible clear control:
+  the operator dashboard no longer relies on stale `instruction` order fields,
+  recent-instruction ordering tracks latest broker activity, and the
+  reconciliation panel now has its own acknowledge-visible action
 - [x] Broker fees now flow into the durable fill ledger:
   IBKR commission-and-fees reports are cached on the live session, merged
   onto executions by execId, persisted onto execution fills, and surfaced

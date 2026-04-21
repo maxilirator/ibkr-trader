@@ -43,6 +43,7 @@
   let brokerAttentionActionResult = null;
   let reconciliationIssueActionResult = null;
   let acknowledgeAllLogsResult = null;
+  let reconciliationClearResult = null;
   let referenceNow = new Date();
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const AUTO_REFRESH_INTERVAL_MS = 15000;
@@ -94,6 +95,7 @@
   $: brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
   $: reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
   $: acknowledgeAllLogsResult = form?.acknowledgeAllLogsResult ?? null;
+  $: reconciliationClearResult = form?.reconciliationClearResult ?? null;
   $: referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
   $: timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
@@ -451,6 +453,20 @@
 
   function hasInstructionAction(instruction) {
     return !terminalInstructionStates.has(instruction.state);
+  }
+
+  function instructionOrderDisplay(instruction, kind) {
+    if (kind === 'entry') {
+      return (
+        instruction.entry_order_display ??
+        `${instruction.broker_order_id ?? 'n/a'} / ${instruction.broker_order_status ?? 'n/a'}`
+      );
+    }
+
+    return (
+      instruction.exit_order_display ??
+      `${instruction.exit_order_id ?? 'n/a'} / ${instruction.exit_order_status ?? 'n/a'}`
+    );
   }
 </script>
 
@@ -870,9 +886,24 @@
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Recent Reconciliation Runs</h2>
-        <p>Durable audit rows from runtime and startup reconciliation passes.</p>
+        <div>
+          <h2>Recent Reconciliation Runs</h2>
+          <p>Durable audit rows from runtime and startup reconciliation passes.</p>
+        </div>
+        <form
+          method="POST"
+          action="?/acknowledgeVisibleReconciliation"
+          class="inline-action-form"
+          use:enhance={enhanceDashboardAction}
+        >
+          <button class="inline-button neutral" type="submit">Acknowledge Visible</button>
+        </form>
       </div>
+      {#if reconciliationClearResult}
+        <p class={`action-feedback ${reconciliationClearResult.ok ? 'ok' : 'bad'}`}>
+          {reconciliationClearResult.message}
+        </p>
+      {/if}
       {#if reconciliationIssueActionResult}
         <p class={`action-feedback ${reconciliationIssueActionResult.ok ? 'ok' : 'bad'}`}>
           {reconciliationIssueActionResult.message}
@@ -1167,8 +1198,8 @@
                   <small class="row-detail">{windowState.detail}</small>
                 </td>
                 <td class="guidance-cell">{instructionGuidance(instruction)}</td>
-                <td>{instruction.broker_order_id ?? 'n/a'} / {instruction.broker_order_status ?? 'n/a'}</td>
-                <td>{instruction.exit_order_id ?? 'n/a'} / {instruction.exit_order_status ?? 'n/a'}</td>
+                <td>{instructionOrderDisplay(instruction, 'entry')}</td>
+                <td>{instructionOrderDisplay(instruction, 'exit')}</td>
                 <td>{formatTimestamp(instruction.updated_at)}</td>
                 <td class="actions-cell">
                   {#if primaryAction && hasInstructionAction(instruction)}
