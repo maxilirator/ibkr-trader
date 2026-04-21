@@ -582,6 +582,127 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
         self.assertEqual(catastrophic_stop.fill_price_spread_pct, "-14.98")
         self.assertEqual(catastrophic_stop.spread_reference, "STOP")
 
+    def test_build_operator_dashboard_snapshot_hides_auto_recovered_insufficient_funds_rejects(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="2026-04-21-U25245596-long_risk_book-VOLCAR B-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="long_risk_book",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                state="POSITION_OPEN",
+                submit_at=datetime(2026, 4, 21, 7, 20, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 21, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            session.add(instruction)
+            session.flush()
+
+            rejected_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="84",
+                external_perm_id="10084",
+                external_client_id="0",
+                order_ref=instruction.instruction_id,
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="BUY",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Inactive",
+                total_quantity="830",
+                limit_price="23.26",
+                submitted_at=datetime(2026, 4, 21, 7, 25, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 21, 7, 25, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            replacement_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="85",
+                external_perm_id="10085",
+                external_client_id="0",
+                order_ref=instruction.instruction_id,
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="BUY",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Filled",
+                total_quantity="827",
+                limit_price="23.26",
+                submitted_at=datetime(2026, 4, 21, 7, 25, 2, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 21, 7, 26, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add_all([rejected_order, replacement_order])
+            session.flush()
+
+            session.add(
+                BrokerOrderEventRecord(
+                    broker_order_id=rejected_order.id,
+                    event_type="order_error_callback",
+                    event_at=datetime(2026, 4, 21, 7, 25, 1, tzinfo=timezone.utc),
+                    status_before="Submitted",
+                    status_after="Inactive",
+                    payload={
+                        "errorCode": 201,
+                        "errorString": (
+                            "Order rejected - reason:We are unable to accept your order. "
+                            "Your Available Funds are insufficient to cover the change in the "
+                            "account's margin requirements."
+                        ),
+                    },
+                    note="Persisted broker order error callback directly from the live session.",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(tuple(snapshot.recent_broker_attention), ())
+
 
 if __name__ == "__main__":
     unittest.main()

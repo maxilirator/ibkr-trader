@@ -498,6 +498,8 @@ def load_sync_wrapper_class() -> type[Any]:
             errorString: str,
             advancedOrderRejectJson: str = "",
         ) -> None:
+            if errorCode == 2100 and "unsubscribed from account data" in errorString.lower():
+                return
             super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
             if self._is_callback_suppressed("order_error"):
                 return

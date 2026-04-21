@@ -19,6 +19,7 @@ from ibkr_trader.orchestration.operator_reviews import (
     OPEN_REVIEW_STATUS,
     RESOLVED_REVIEW_STATUS,
     OperatorReviewTargetNotFoundError,
+    extract_broker_attention_message,
     record_broker_attention_review_action,
     record_reconciliation_issue_review_action,
 )
@@ -177,3 +178,69 @@ class OperatorReviewTests(TestCase):
                 action_type="ACKNOWLEDGE",
                 updated_by="dashboard",
             )
+
+    def test_extract_broker_attention_message_uses_error_string_and_normalizes_html(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            broker_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="101",
+                external_perm_id="9001",
+                external_client_id="0",
+                order_ref="instr-volcar-1",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="BUY",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Inactive",
+                total_quantity="830",
+                limit_price="23.26",
+                submitted_at=datetime(2026, 4, 21, 7, 25, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 21, 7, 25, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.flush()
+
+            broker_event = BrokerOrderEventRecord(
+                broker_order_id=broker_order.id,
+                event_type="order_error_callback",
+                event_at=datetime(2026, 4, 21, 7, 25, 1, tzinfo=timezone.utc),
+                status_before="Submitted",
+                status_after="Inactive",
+                payload={
+                    "errorCode": 201,
+                    "errorString": (
+                        "Order rejected - reason:We are unable to accept your order.<br>"
+                        " Available Funds are insufficient."
+                    ),
+                },
+                note="Persisted broker order error callback directly from the live session.",
+            )
+            session.add(broker_event)
+            session.commit()
+
+            self.assertEqual(
+                extract_broker_attention_message(broker_event, broker_order),
+                "[201] Order rejected - reason:We are unable to accept your order. Available Funds are insufficient.",
+            )
+        finally:
+            session.close()

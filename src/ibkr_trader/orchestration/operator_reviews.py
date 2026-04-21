@@ -6,6 +6,7 @@ from datetime import date
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -66,6 +67,19 @@ def serialize_operator_review_status(payload: OperatorReviewStatus) -> dict[str,
     return _serialize_for_json(asdict(payload))
 
 
+def _normalize_broker_message_text(message: Any) -> str | None:
+    if message in (None, ""):
+        return None
+    normalized = str(message)
+    normalized = (
+        normalized.replace("<br />", " ")
+        .replace("<br/>", " ")
+        .replace("<br>", " ")
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized or None
+
+
 def normalize_operator_review_action_type(raw_value: str) -> str:
     normalized = raw_value.strip().upper()
     if normalized not in {ACKNOWLEDGE_ACTION, RESOLVE_ACTION, REOPEN_ACTION}:
@@ -116,7 +130,9 @@ def extract_broker_attention_message(
 
     if broker_order_event.event_type == "order_error_callback":
         error_code = payload.get("errorCode")
-        error_message = payload.get("errorMsg") or payload.get("message")
+        error_message = _normalize_broker_message_text(
+            payload.get("errorString") or payload.get("errorMsg") or payload.get("message")
+        )
         if error_message in (None, ""):
             return broker_order_event.note
         if error_code in (None, ""):
@@ -124,13 +140,13 @@ def extract_broker_attention_message(
         return f"[{error_code}] {error_message}"
 
     for key in ("reject_reason", "warning_text"):
-        raw_value = payload.get(key)
+        raw_value = _normalize_broker_message_text(payload.get(key))
         if raw_value not in (None, ""):
             return str(raw_value)
 
     metadata_json = broker_order.metadata_json or {}
     for key in ("reject_reason", "warning_text"):
-        raw_value = metadata_json.get(key)
+        raw_value = _normalize_broker_message_text(metadata_json.get(key))
         if raw_value not in (None, ""):
             return str(raw_value)
 

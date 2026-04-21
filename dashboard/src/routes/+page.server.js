@@ -30,19 +30,15 @@ function parseInstructionIds(rawValue) {
   return instructionIds.length > 0 ? instructionIds : null;
 }
 
-export async function load({ fetch }) {
-  const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
-  const operatorSnapshotUrl =
+function operatorSnapshotUrl(apiBaseUrl) {
+  return (
     `${apiBaseUrl}/v1/read/operator-snapshot` +
-    '?instruction_limit=50&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=12';
-  const healthUrl = `${apiBaseUrl}/healthz`;
+    '?instruction_limit=50&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=12'
+  );
+}
 
-  const [health, operatorSnapshot] = await Promise.all([
-    readJson(fetch, healthUrl),
-    readJson(fetch, operatorSnapshotUrl)
-  ]);
-
-  const operatorSnapshotBody = operatorSnapshot.body?.operator_snapshot ?? {
+function defaultOperatorSnapshot() {
+  return {
     generated_at: null,
     kill_switch: {
       enabled: false,
@@ -59,6 +55,37 @@ export async function load({ fetch }) {
     recent_reconciliation_runs: [],
     instructions: []
   };
+}
+
+async function readOperatorSnapshot(fetch, apiBaseUrl) {
+  const result = await readJson(fetch, operatorSnapshotUrl(apiBaseUrl));
+  if (!result.ok) {
+    return {
+      ok: false,
+      status: result.status,
+      error: result.error,
+      snapshot: defaultOperatorSnapshot()
+    };
+  }
+
+  return {
+    ok: true,
+    status: result.status,
+    error: null,
+    snapshot: result.body?.operator_snapshot ?? defaultOperatorSnapshot()
+  };
+}
+
+export async function load({ fetch }) {
+  const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+  const healthUrl = `${apiBaseUrl}/healthz`;
+
+  const [health, operatorSnapshot] = await Promise.all([
+    readJson(fetch, healthUrl),
+    readJson(fetch, operatorSnapshotUrl(apiBaseUrl))
+  ]);
+
+  const operatorSnapshotBody = operatorSnapshot.body?.operator_snapshot ?? defaultOperatorSnapshot();
 
   return {
     generatedAt: new Date().toISOString(),
@@ -73,6 +100,90 @@ export async function load({ fetch }) {
 }
 
 export const actions = {
+  async acknowledgeAllLogs({ fetch }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const snapshotResult = await readOperatorSnapshot(fetch, apiBaseUrl);
+    if (!snapshotResult.ok) {
+      return fail(snapshotResult.status || 500, {
+        acknowledgeAllLogsResult: {
+          ok: false,
+          message: snapshotResult.error
+        }
+      });
+    }
+
+    const brokerAttention = snapshotResult.snapshot.recent_broker_attention ?? [];
+    const reconciliationRuns = snapshotResult.snapshot.recent_reconciliation_runs ?? [];
+    const openBrokerAttention = brokerAttention.filter(
+      (item) => (item.operator_review?.status ?? 'OPEN') === 'OPEN'
+    );
+    const openReconciliationIssues = reconciliationRuns.flatMap((run) =>
+      (run.issues ?? []).filter((issue) => (issue.operator_review?.status ?? 'OPEN') === 'OPEN')
+    );
+
+    let acknowledgedBrokerAttentionCount = 0;
+    let acknowledgedReconciliationIssueCount = 0;
+
+    for (const item of openBrokerAttention) {
+      const result = await postJson(
+        fetch,
+        `${apiBaseUrl}/v1/broker-attention/${item.event_id}/review`,
+        {
+          action: 'ACKNOWLEDGE',
+          updated_by: 'dashboard'
+        }
+      );
+      if (!result.ok) {
+        return fail(result.status || 500, {
+          acknowledgeAllLogsResult: {
+            ok: false,
+            message:
+              `Acknowledged ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+              `${result.error}`
+          }
+        });
+      }
+      acknowledgedBrokerAttentionCount += 1;
+    }
+
+    for (const item of openReconciliationIssues) {
+      const result = await postJson(
+        fetch,
+        `${apiBaseUrl}/v1/reconciliation-issues/${item.issue_id}/review`,
+        {
+          action: 'ACKNOWLEDGE',
+          updated_by: 'dashboard'
+        }
+      );
+      if (!result.ok) {
+        return fail(result.status || 500, {
+          acknowledgeAllLogsResult: {
+            ok: false,
+            message:
+              `Acknowledged ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+              `${result.error}`
+          }
+        });
+      }
+      acknowledgedReconciliationIssueCount += 1;
+    }
+
+    const totalAcknowledged =
+      acknowledgedBrokerAttentionCount + acknowledgedReconciliationIssueCount;
+    return {
+      acknowledgeAllLogsResult: {
+        ok: true,
+        message:
+          totalAcknowledged === 0
+            ? 'No open broker-attention or reconciliation-log items needed acknowledgement.'
+            : `Acknowledged ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `${acknowledgedReconciliationIssueCount} reconciliation issues.`
+      }
+    };
+  },
+
   async killSwitch({ fetch, request }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
     const formData = await request.formData();

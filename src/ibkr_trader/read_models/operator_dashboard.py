@@ -7,6 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from decimal import InvalidOperation
 from enum import Enum
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -43,6 +44,14 @@ _CLOSED_ORDER_STATUSES = {
     "INACTIVE",
     "NOT_FOUND_AT_BROKER",
     "REJECTED",
+}
+
+_RECOVERED_RETRY_STATUSES = {
+    "PENDINGSUBMIT",
+    "PRESUBMITTED",
+    "SUBMITTED",
+    "PARTIALLYFILLED",
+    "FILLED",
 }
 
 
@@ -215,6 +224,78 @@ class OperatorDashboardSnapshot:
     recent_fills: tuple[OperatorExecutionFill, ...]
     recent_broker_attention: tuple[OperatorBrokerAttention, ...]
     recent_reconciliation_runs: tuple[OperatorReconciliationRun, ...]
+
+
+def _normalized_payload_error_message(payload: dict[str, Any]) -> str | None:
+    raw_message = payload.get("errorString") or payload.get("errorMsg") or payload.get("message")
+    if raw_message in (None, ""):
+        return None
+    normalized = str(raw_message)
+    normalized = (
+        normalized.replace("<br />", " ")
+        .replace("<br/>", " ")
+        .replace("<br>", " ")
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized or None
+
+
+def _is_insufficient_funds_order_error(payload: dict[str, Any]) -> bool:
+    error_code = str(payload.get("errorCode") or "").strip()
+    if error_code != "201":
+        return False
+    normalized_message = (_normalized_payload_error_message(payload) or "").lower()
+    return "available funds" in normalized_message and "margin" in normalized_message
+
+
+def _has_recovered_replacement_order(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+    event_at: datetime,
+) -> bool:
+    if broker_order.instruction_id is None:
+        return False
+
+    candidate_orders = session.execute(
+        select(BrokerOrderRecord).where(
+            BrokerOrderRecord.instruction_id == broker_order.instruction_id,
+            BrokerOrderRecord.order_role == broker_order.order_role,
+            BrokerOrderRecord.id != broker_order.id,
+        )
+    ).scalars()
+
+    for candidate_order in candidate_orders:
+        candidate_status = (candidate_order.status or "").upper()
+        if candidate_status not in _RECOVERED_RETRY_STATUSES:
+            continue
+        if (
+            candidate_order.last_status_at is not None
+            and candidate_order.last_status_at < event_at
+        ):
+            continue
+        return True
+    return False
+
+
+def _is_auto_recovered_entry_reject(
+    session: Session,
+    *,
+    broker_order_event: BrokerOrderEventRecord,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    if broker_order_event.event_type != "order_error_callback":
+        return False
+    if broker_order.order_role != "ENTRY":
+        return False
+    payload = broker_order_event.payload if isinstance(broker_order_event.payload, dict) else {}
+    if not _is_insufficient_funds_order_error(payload):
+        return False
+    return _has_recovered_replacement_order(
+        session,
+        broker_order=broker_order,
+        event_at=broker_order_event.event_at,
+    )
 
 
 def _serialize_for_json(payload: Any) -> Any:
@@ -840,6 +921,12 @@ def _build_recent_broker_attention(
     for broker_order_event, broker_order, broker_account in rows:
         message = extract_broker_attention_message(broker_order_event, broker_order)
         if message is None:
+            continue
+        if _is_auto_recovered_entry_reject(
+            session,
+            broker_order_event=broker_order_event,
+            broker_order=broker_order,
+        ):
             continue
         attention_rows.append(
             OperatorBrokerAttention(

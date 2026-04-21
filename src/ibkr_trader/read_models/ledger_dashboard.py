@@ -25,6 +25,7 @@ from ibkr_trader.db.models import OperatorControlEventRecord
 from ibkr_trader.db.models import OperatorControlRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
+from ibkr_trader.orchestration.operator_reviews import extract_broker_attention_message
 
 
 @dataclass(slots=True)
@@ -194,29 +195,7 @@ def _extract_broker_order_event_message(
     event: BrokerOrderEventRecord,
     order: BrokerOrderRecord,
 ) -> str | None:
-    payload = event.payload if isinstance(event.payload, dict) else {}
-    if event.event_type == "order_error_callback":
-        error_code = payload.get("errorCode")
-        error_message = payload.get("errorMsg") or payload.get("message")
-        if error_message not in (None, ""):
-            if error_code in (None, ""):
-                return str(error_message)
-            return f"[{error_code}] {error_message}"
-
-    for key in ("message", "warning_text", "reject_reason"):
-        value = payload.get(key)
-        if value not in (None, ""):
-            return str(value)
-
-    metadata_json = order.metadata_json if isinstance(order.metadata_json, dict) else {}
-    for key in ("warning_text", "reject_reason"):
-        value = metadata_json.get(key)
-        if value not in (None, ""):
-            return str(value)
-
-    if event.note not in (None, ""):
-        return event.note
-    return None
+    return extract_broker_attention_message(event, order)
 
 
 def _read_focus_instruction(

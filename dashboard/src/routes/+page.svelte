@@ -42,6 +42,7 @@
   let orderRowActionResult = null;
   let brokerAttentionActionResult = null;
   let reconciliationIssueActionResult = null;
+  let acknowledgeAllLogsResult = null;
   let referenceNow = new Date();
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const AUTO_REFRESH_INTERVAL_MS = 15000;
@@ -92,6 +93,7 @@
   $: orderRowActionResult = form?.orderRowActionResult ?? null;
   $: brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
   $: reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
+  $: acknowledgeAllLogsResult = form?.acknowledgeAllLogsResult ?? null;
   $: referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
   $: timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
@@ -741,9 +743,24 @@
   <section class="two-up" id="operations">
     <section class="panel">
       <div class="panel-head">
-        <h2>Broker Attention</h2>
-        <p>Recent broker-side warnings and rejects captured in the durable ledger.</p>
+        <div>
+          <h2>Broker Attention</h2>
+          <p>Recent broker-side warnings and rejects captured in the durable ledger.</p>
+        </div>
+        <form
+          method="POST"
+          action="?/acknowledgeAllLogs"
+          class="inline-action-form"
+          use:enhance={enhanceDashboardAction}
+        >
+          <button class="inline-button neutral" type="submit">Acknowledge All Visible</button>
+        </form>
       </div>
+      {#if acknowledgeAllLogsResult}
+        <p class={`action-feedback ${acknowledgeAllLogsResult.ok ? 'ok' : 'bad'}`}>
+          {acknowledgeAllLogsResult.message}
+        </p>
+      {/if}
       {#if brokerAttentionActionResult}
         <p class={`action-feedback ${brokerAttentionActionResult.ok ? 'ok' : 'bad'}`}>
           {brokerAttentionActionResult.message}

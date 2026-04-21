@@ -28,6 +28,16 @@ This file is the active implementation tracker for the production-grade trader p
 - [x] Short-sale prechecks now fail closed on broker-position timeouts:
   if IBKR stalls while returning positions for a SELL/SHORT validation, the
   API now returns a clear validation issue instead of bubbling a server error
+- [x] Operator attention now shows real broker error text and hides
+  auto-recovered insufficient-funds retries:
+  the dashboard/log view now surfaces IBKR `errorString` cleanly, while
+  insufficient-funds rejects that were automatically retried into a later
+  working order stay in the ledger but no longer appear as open operator noise
+- [x] Dashboard log now has an acknowledge-all control, and benign IBKR 2100
+  account-update unsubscribe chatter is suppressed:
+  operators can acknowledge all visible broker-attention and reconciliation-log
+  items in one action, and the expected account-data unsubscribe callback no
+  longer pollutes the live API logs
 - [x] Broker fees now flow into the durable fill ledger:
   IBKR commission-and-fees reports are cached on the live session, merged
   onto executions by execId, persisted onto execution fills, and surfaced
