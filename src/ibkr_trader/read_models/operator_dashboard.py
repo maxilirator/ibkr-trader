@@ -96,6 +96,7 @@ class OperatorOpenOrder:
     external_perm_id: str | None
     external_client_id: str | None
     order_ref: str | None
+    order_purpose: str | None
     symbol: str
     exchange: str
     currency: str
@@ -113,6 +114,12 @@ class OperatorOpenOrder:
     last_status_at: datetime | None
     warning_text: str | None
     reject_reason: str | None
+    working_price: str | None
+    working_price_reference: str | None
+    fill_basis_price: str | None
+    fill_basis_at: datetime | None
+    fill_price_spread: str | None
+    fill_price_spread_pct: str | None
     reference_market_price: str | None
     reference_market_price_at: datetime | None
     last_market_price_direction: str | None
@@ -258,12 +265,133 @@ def _to_decimal(value: str | None) -> Decimal | None:
         return None
 
 
+def _meaningful_decimal(value: str | None) -> Decimal | None:
+    decimal_value = _to_decimal(value)
+    if decimal_value is None or decimal_value == 0:
+        return None
+    return decimal_value
+
+
 def _format_signed_decimal(value: Decimal | None, *, places: str) -> str | None:
     if value is None:
         return None
     quantized = value.quantize(Decimal(places))
     prefix = "+" if quantized > 0 else ""
     return f"{prefix}{quantized}"
+
+
+def _format_decimal(value: Decimal | None, *, places: str) -> str | None:
+    if value is None:
+        return None
+    quantized = value.quantize(Decimal(places))
+    formatted = format(quantized, "f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    if formatted in {"-0", ""}:
+        return "0"
+    return formatted
+
+
+def _derive_order_purpose(broker_order: BrokerOrderRecord) -> str | None:
+    order_ref = (broker_order.order_ref or "").strip()
+    if ":exit:" in order_ref:
+        suffix = order_ref.rsplit(":exit:", 1)[1].strip()
+        if suffix == "take_profit":
+            return "Take Profit"
+        if suffix == "catastrophic_stop":
+            return "Catastrophic Stop"
+        if suffix == "delayed_limit":
+            return "Delayed Limit"
+        if suffix == "manual_flatten":
+            return "Manual Flatten"
+        if suffix == "force_exit_next_session_open":
+            return "Next Open Exit"
+        return suffix.replace("_", " ").title()
+
+    normalized_role = (broker_order.order_role or "").strip().upper()
+    if normalized_role == "ENTRY":
+        return "Entry"
+    if normalized_role == "EXIT":
+        return "Exit"
+    return broker_order.order_role
+
+
+def _resolve_working_price(
+    broker_order: BrokerOrderRecord,
+) -> tuple[Decimal | None, str | None]:
+    order_type = (broker_order.order_type or "").strip().upper()
+    limit_price = _meaningful_decimal(broker_order.limit_price)
+    stop_price = _meaningful_decimal(broker_order.stop_price)
+
+    if order_type.startswith("STP"):
+        if stop_price is not None:
+            return stop_price, "STOP"
+        if limit_price is not None:
+            return limit_price, "LIMIT"
+        return None, None
+
+    if limit_price is not None:
+        return limit_price, "LIMIT"
+    if stop_price is not None:
+        return stop_price, "STOP"
+    return None, None
+
+
+def _exit_fill_basis(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> tuple[str | None, datetime | None, str | None, str | None]:
+    if broker_order.instruction_id is None:
+        return None, None, None, None
+    if (broker_order.order_role or "").strip().upper() != "EXIT":
+        return None, None, None, None
+
+    rows = session.execute(
+        select(ExecutionFillRecord)
+        .where(ExecutionFillRecord.instruction_id == broker_order.instruction_id)
+        .order_by(
+            ExecutionFillRecord.executed_at.asc(),
+            ExecutionFillRecord.id.asc(),
+        )
+    ).scalars()
+
+    total_quantity = Decimal("0")
+    weighted_notional = Decimal("0")
+    latest_fill_at: datetime | None = None
+
+    for fill in rows:
+        order_ref = (fill.order_ref or "").strip()
+        if ":exit:" in order_ref:
+            continue
+
+        quantity = _meaningful_decimal(fill.quantity)
+        price = _meaningful_decimal(fill.price)
+        if quantity is None or price is None:
+            continue
+
+        total_quantity += quantity
+        weighted_notional += quantity * price
+        latest_fill_at = fill.executed_at
+
+    if total_quantity <= 0:
+        return None, None, None, None
+
+    basis_price = weighted_notional / total_quantity
+    working_price, _ = _resolve_working_price(broker_order)
+    if working_price is None:
+        return _format_decimal(basis_price, places="0.00000001"), latest_fill_at, None, None
+
+    fill_spread = working_price - basis_price
+    fill_spread_pct = (fill_spread / basis_price) * Decimal("100") if basis_price != 0 else None
+    return (
+        _format_decimal(basis_price, places="0.00000001"),
+        latest_fill_at,
+        _format_signed_decimal(fill_spread, places="0.01"),
+        _format_signed_decimal(fill_spread_pct, places="0.01")
+        if fill_spread_pct is not None
+        else None,
+    )
 
 
 def _position_snapshot_matches_order(
@@ -346,14 +474,7 @@ def _open_order_market_context(
         else:
             direction = "UNCHANGED"
 
-    spread_reference: str | None = None
-    working_price = _to_decimal(broker_order.limit_price)
-    if working_price is not None:
-        spread_reference = "LIMIT"
-    else:
-        working_price = _to_decimal(broker_order.stop_price)
-        if working_price is not None:
-            spread_reference = "STOP"
+    working_price, spread_reference = _resolve_working_price(broker_order)
 
     if working_price is None:
         return (
@@ -554,6 +675,13 @@ def _build_open_orders(
             price_spread_pct,
             spread_reference,
         ) = _open_order_market_context(session, broker_order=broker_order)
+        (
+            fill_basis_price,
+            fill_basis_at,
+            fill_price_spread,
+            fill_price_spread_pct,
+        ) = _exit_fill_basis(session, broker_order=broker_order)
+        working_price, working_price_reference = _resolve_working_price(broker_order)
         open_orders.append(
             OperatorOpenOrder(
                 broker_order_id=broker_order.id,
@@ -566,6 +694,7 @@ def _build_open_orders(
                 external_perm_id=broker_order.external_perm_id,
                 external_client_id=broker_order.external_client_id,
                 order_ref=broker_order.order_ref,
+                order_purpose=_derive_order_purpose(broker_order),
                 symbol=broker_order.symbol,
                 exchange=broker_order.exchange,
                 currency=broker_order.currency,
@@ -591,6 +720,12 @@ def _build_open_orders(
                     if metadata_json.get("reject_reason") not in (None, "")
                     else None
                 ),
+                working_price=_format_decimal(working_price, places="0.00000001"),
+                working_price_reference=working_price_reference,
+                fill_basis_price=fill_basis_price,
+                fill_basis_at=fill_basis_at,
+                fill_price_spread=fill_price_spread,
+                fill_price_spread_pct=fill_price_spread_pct,
                 reference_market_price=reference_market_price,
                 reference_market_price_at=reference_market_price_at,
                 last_market_price_direction=last_market_price_direction,

@@ -14,6 +14,7 @@ from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderEventRecord
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import ExecutionFillRecord
+from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
@@ -317,6 +318,9 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
         self.assertEqual(len(snapshot.open_orders), 1)
         self.assertEqual(snapshot.open_orders[0].external_order_id, "11")
         self.assertEqual(snapshot.open_orders[0].warning_text, "Held in TWS for review.")
+        self.assertEqual(snapshot.open_orders[0].order_purpose, "Entry")
+        self.assertEqual(snapshot.open_orders[0].working_price, "100")
+        self.assertEqual(snapshot.open_orders[0].working_price_reference, "LIMIT")
         self.assertEqual(snapshot.open_orders[0].reference_market_price, "102.00")
         self.assertEqual(snapshot.open_orders[0].last_market_price_direction, "UP")
         self.assertEqual(snapshot.open_orders[0].price_spread, "-2.00")
@@ -343,6 +347,226 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
             snapshot.recent_reconciliation_runs[0].issues[0].operator_review.status,
             "RESOLVED",
         )
+
+    def test_build_operator_dashboard_snapshot_reports_exit_orders_against_fill_basis(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="2026-04-21-U25245596-long_risk_book-VOLCAR B-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="long_risk_book",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                state="EXIT_PENDING",
+                submit_at=datetime(2026, 4, 21, 8, 0, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 21, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            session.add(instruction)
+            session.flush()
+
+            session.add_all(
+                [
+                    PositionSnapshotRecord(
+                        broker_account_id=broker_account.id,
+                        snapshot_at=datetime(2026, 4, 21, 12, 30, tzinfo=timezone.utc),
+                        source="runtime_snapshot",
+                        symbol="VOLCAR.B",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange="SFB",
+                        local_symbol="VOLCAR B",
+                        quantity="827",
+                        average_cost="23.3192503",
+                        market_price="23.30",
+                        market_value="19269.10",
+                        unrealized_pnl="-15.91",
+                        realized_pnl="0.00",
+                    ),
+                    PositionSnapshotRecord(
+                        broker_account_id=broker_account.id,
+                        snapshot_at=datetime(2026, 4, 21, 12, 31, tzinfo=timezone.utc),
+                        source="runtime_snapshot",
+                        symbol="VOLCAR.B",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange="SFB",
+                        local_symbol="VOLCAR B",
+                        quantity="827",
+                        average_cost="23.3192503",
+                        market_price="23.30674555",
+                        market_value="19274.68",
+                        unrealized_pnl="-10.34",
+                        realized_pnl="0.00",
+                    ),
+                ]
+            )
+
+            entry_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="85",
+                external_perm_id="1030141445",
+                external_client_id="0",
+                order_ref=instruction.instruction_id,
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="BUY",
+                order_type="MKT",
+                time_in_force="DAY",
+                status="Filled",
+                total_quantity="827",
+                limit_price=None,
+                stop_price=None,
+                submitted_at=datetime(2026, 4, 21, 8, 2, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 21, 8, 2, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            take_profit_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="87",
+                external_perm_id="1030141447",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:take_profit",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Submitted",
+                total_quantity="827",
+                limit_price="23.73",
+                stop_price="0.0",
+                submitted_at=datetime(2026, 4, 21, 8, 2, 1, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 21, 12, 31, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            catastrophic_stop_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="88",
+                external_perm_id="1030141448",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:catastrophic_stop",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="SELL",
+                order_type="STP",
+                time_in_force="DAY",
+                status="PreSubmitted",
+                total_quantity="827",
+                limit_price="0.0",
+                stop_price="19.775",
+                submitted_at=datetime(2026, 4, 21, 8, 2, 2, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 21, 12, 31, 1, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add_all([entry_order, take_profit_order, catastrophic_stop_order])
+            session.flush()
+
+            session.add(
+                ExecutionFillRecord(
+                    broker_order_id=entry_order.id,
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    external_execution_id="exec-volcar-entry",
+                    external_order_id="85",
+                    external_perm_id="1030141445",
+                    order_ref=instruction.instruction_id,
+                    symbol="VOLCAR.B",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    side="BOT",
+                    quantity="827",
+                    price="23.26",
+                    commission="49.00",
+                    commission_currency="SEK",
+                    executed_at=datetime(2026, 4, 21, 8, 2, 0, tzinfo=timezone.utc),
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        open_orders_by_ref = {row.order_ref: row for row in snapshot.open_orders}
+        take_profit = open_orders_by_ref[
+            "2026-04-21-U25245596-long_risk_book-VOLCAR B-long-01:exit:take_profit"
+        ]
+        catastrophic_stop = open_orders_by_ref[
+            "2026-04-21-U25245596-long_risk_book-VOLCAR B-long-01:exit:catastrophic_stop"
+        ]
+
+        self.assertEqual(take_profit.order_purpose, "Take Profit")
+        self.assertEqual(take_profit.working_price, "23.73")
+        self.assertEqual(take_profit.working_price_reference, "LIMIT")
+        self.assertEqual(take_profit.fill_basis_price, "23.26")
+        self.assertEqual(take_profit.fill_price_spread, "+0.47")
+        self.assertEqual(take_profit.fill_price_spread_pct, "+2.02")
+        self.assertEqual(take_profit.spread_reference, "LIMIT")
+        self.assertEqual(take_profit.price_spread, "+0.42")
+        self.assertEqual(take_profit.price_spread_pct, "+1.82")
+
+        self.assertEqual(catastrophic_stop.order_purpose, "Catastrophic Stop")
+        self.assertEqual(catastrophic_stop.working_price, "19.775")
+        self.assertEqual(catastrophic_stop.working_price_reference, "STOP")
+        self.assertEqual(catastrophic_stop.fill_basis_price, "23.26")
+        self.assertEqual(catastrophic_stop.fill_price_spread, "-3.48")
+        self.assertEqual(catastrophic_stop.fill_price_spread_pct, "-14.98")
+        self.assertEqual(catastrophic_stop.spread_reference, "STOP")
 
 
 if __name__ == "__main__":

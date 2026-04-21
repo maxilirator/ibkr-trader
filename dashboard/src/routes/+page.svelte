@@ -233,6 +233,28 @@
     return `${referencePrefix}${order.price_spread}${pctSuffix}`;
   }
 
+  function orderFillSpreadLabel(order) {
+    if (!order.fill_price_spread) {
+      return 'n/a';
+    }
+
+    const pctSuffix = order.fill_price_spread_pct ? ` (${order.fill_price_spread_pct}%)` : '';
+    return `${order.fill_price_spread}${pctSuffix}`;
+  }
+
+  function displayOrderPrice(value) {
+    if (value === null || value === undefined || value === '') {
+      return 'n/a';
+    }
+
+    const normalized = String(value).trim();
+    if (normalized === '0' || normalized === '0.0' || normalized === '0.00') {
+      return 'n/a';
+    }
+
+    return normalized;
+  }
+
   function enhanceDashboardAction() {
     return async ({ result }) => {
       await applyAction(result);
@@ -902,13 +924,15 @@
               <th>Account</th>
               <th>Symbol</th>
               <th>Role</th>
+              <th>Purpose</th>
               <th>Side</th>
               <th>Quantity</th>
               <th>Type</th>
               <th>Limit</th>
               <th>Stop</th>
+              <th>Vs Fill</th>
               <th>Market</th>
-              <th>Spread</th>
+              <th>Vs Mkt</th>
               <th>Status</th>
               <th>Warning</th>
               <th>Action</th>
@@ -920,11 +944,25 @@
                 <td>{order.account_label ?? order.account_key}</td>
                 <td>{order.local_symbol ?? order.symbol}</td>
                 <td>{order.order_role}</td>
+                <td>{order.order_purpose ?? 'n/a'}</td>
                 <td>{order.side}</td>
                 <td>{order.total_quantity ?? 'n/a'}</td>
                 <td>{order.order_type}</td>
-                <td>{order.limit_price ?? 'n/a'}</td>
-                <td>{order.stop_price ?? 'n/a'}</td>
+                <td>{displayOrderPrice(order.limit_price)}</td>
+                <td>{displayOrderPrice(order.stop_price)}</td>
+                <td>
+                  {#if order.fill_basis_price}
+                    <div>{orderFillSpreadLabel(order)}</div>
+                    <small class="row-detail">
+                      from {order.fill_basis_price}
+                      {#if order.fill_basis_at}
+                        at {formatTimestamp(order.fill_basis_at)}
+                      {/if}
+                    </small>
+                  {:else}
+                    <span class="subtle">n/a</span>
+                  {/if}
+                </td>
                 <td>
                   {#if order.reference_market_price}
                     <div class="market-cell">
