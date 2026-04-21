@@ -280,6 +280,66 @@
   function instructionWindowState(instruction) {
     const submitAt = parseTimestamp(instruction.submit_at);
     const expireAt = parseTimestamp(instruction.expire_at);
+    const state = instruction.state ?? 'UNKNOWN';
+
+    if (state === 'EXIT_PENDING') {
+      return {
+        label: 'Exit Active',
+        className: 'ok',
+        detail: expireAt
+          ? `Entry window closed ${formatTimestamp(instruction.expire_at)}; exit workflow is still active.`
+          : 'Exit workflow is still active.',
+        isScheduled: false,
+        isOpen: true,
+        isExpired: false
+      };
+    }
+
+    if (state === 'POSITION_OPEN') {
+      return {
+        label: 'Position Open',
+        className: 'ok',
+        detail: expireAt
+          ? `Entry window closed ${formatTimestamp(instruction.expire_at)}; runtime still owns the position.`
+          : 'Runtime still owns the position.',
+        isScheduled: false,
+        isOpen: true,
+        isExpired: false
+      };
+    }
+
+    if (state === 'COMPLETED') {
+      return {
+        label: 'Completed',
+        className: 'neutral',
+        detail: 'Instruction lifecycle completed.',
+        isScheduled: false,
+        isOpen: false,
+        isExpired: false
+      };
+    }
+
+    if (state === 'ENTRY_CANCELLED') {
+      return {
+        label: 'Cancelled',
+        className: 'neutral',
+        detail: 'Entry path cancelled and no longer active.',
+        isScheduled: false,
+        isOpen: false,
+        isExpired: false
+      };
+    }
+
+    if (state === 'FAILED') {
+      return {
+        label: 'Failed',
+        className: 'bad',
+        detail: 'Instruction requires ledger review.',
+        isScheduled: false,
+        isOpen: false,
+        isExpired: false
+      };
+    }
 
     if (!submitAt || !expireAt) {
       return {
@@ -1082,7 +1142,7 @@
               <th>Instruction</th>
               <th>Symbol</th>
               <th>State</th>
-              <th>Window</th>
+              <th>Lifecycle</th>
               <th>Guidance</th>
               <th>Entry Order</th>
               <th>Exit Order</th>
