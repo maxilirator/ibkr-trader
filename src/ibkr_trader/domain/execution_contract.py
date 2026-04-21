@@ -91,6 +91,10 @@ class IntentSpec:
     def validate(self) -> None:
         if self.side not in {"BUY", "SELL"}:
             raise ValueError("intent.side must be BUY or SELL")
+        if self.position_side is PositionSide.LONG and self.side != "BUY":
+            raise ValueError("LONG entries must use intent.side=BUY")
+        if self.position_side is PositionSide.SHORT and self.side != "SELL":
+            raise ValueError("SHORT entries must use intent.side=SELL")
 
 
 @dataclass(slots=True)

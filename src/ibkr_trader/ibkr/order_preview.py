@@ -25,6 +25,7 @@ from ibkr_trader.ibkr.contracts import (
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.price_rules import normalize_order_price
 from ibkr_trader.ibkr.price_rules import resolve_price_increment
+from ibkr_trader.ibkr.short_sale_validation import validate_short_sale_entry
 from ibkr_trader.ibkr.sync_wrapper import (
     load_response_timeout_class as _load_response_timeout_runtime_class,
 )
@@ -50,6 +51,8 @@ class PreviewSyncWrapperProtocol(Protocol):
         market_rule_id: int,
         timeout: int = 5,
     ) -> list[Any]: ...
+
+    def get_positions(self, timeout: int = 10) -> dict[str, list[Any]]: ...
 
     def get_historical_data(
         self,
@@ -652,6 +655,55 @@ def preview_execution_batch(
                 normalized_limit_price=normalized_limit_price,
                 limit_increment=limit_increment,
             )
+            short_sale_validation = validate_short_sale_entry(
+                app=runtime_app,
+                instruction=instruction,
+                broker_account_id=broker_account_id or "",
+                normalized_summary=normalized_summary,
+                requested_quantity=sizing_preview["normalized_quantity"],
+                timeout=timeout,
+                timeout_cls=timeout_cls,
+                contract_cls=runtime_contract_cls,
+            )
+            preview["issues"].extend(short_sale_validation.issues)
+            preview["warnings"].extend(short_sale_validation.warnings)
+            preview["status"] = "ready" if not preview["issues"] else "unresolved"
+            preview["short_sale_validation"] = {
+                "is_short_sale": short_sale_validation.is_short_sale,
+                "current_position_quantity": (
+                    str(short_sale_validation.current_position_quantity)
+                    if short_sale_validation.current_position_quantity is not None
+                    else None
+                ),
+                "requested_quantity": (
+                    str(short_sale_validation.requested_quantity)
+                    if short_sale_validation.requested_quantity is not None
+                    else None
+                ),
+                "account_type": short_sale_validation.account_type,
+                "leverage": (
+                    str(short_sale_validation.leverage)
+                    if short_sale_validation.leverage is not None
+                    else None
+                ),
+                "net_liquidation": (
+                    str(short_sale_validation.net_liquidation)
+                    if short_sale_validation.net_liquidation is not None
+                    else None
+                ),
+                "net_liquidation_currency": short_sale_validation.net_liquidation_currency,
+                "net_liquidation_eur": (
+                    str(short_sale_validation.net_liquidation_eur)
+                    if short_sale_validation.net_liquidation_eur is not None
+                    else None
+                ),
+                "stockholm_shortability_status": (
+                    short_sale_validation.stockholm_shortability_status
+                ),
+                "stockholm_shortability_as_of_date": (
+                    short_sale_validation.stockholm_shortability_as_of_date
+                ),
+            }
             preview["warnings"].extend(account_warnings)
             preview["warnings"].extend(price_warnings)
             previews.append(preview)

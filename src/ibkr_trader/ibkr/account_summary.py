@@ -13,6 +13,9 @@ from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_
 
 DEFAULT_ACCOUNT_SUMMARY_TAGS: tuple[str, ...] = (
     "AccountType",
+    "AccountReady",
+    "Leverage-S",
+    "TradingType-S",
     "NetLiquidation",
     "BuyingPower",
     "AvailableFunds",

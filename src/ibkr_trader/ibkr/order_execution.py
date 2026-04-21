@@ -25,6 +25,8 @@ from ibkr_trader.ibkr.order_preview import _resolve_sizing_preview
 from ibkr_trader.ibkr.order_preview import _select_broker_account_id
 from ibkr_trader.ibkr.price_rules import normalize_order_price
 from ibkr_trader.ibkr.price_rules import resolve_price_increment
+from ibkr_trader.ibkr.short_sale_validation import ShortSaleValidationError
+from ibkr_trader.ibkr.short_sale_validation import validate_short_sale_entry
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 _ORDER_CANCEL_NOT_FOUND_CODE = 10147
@@ -49,6 +51,8 @@ class OrderExecutionSyncWrapperProtocol(Protocol):
         market_rule_id: int,
         timeout: int = 5,
     ) -> list[Any]: ...
+
+    def get_positions(self, timeout: int = 10) -> dict[str, list[Any]]: ...
 
     def get_historical_data(
         self,
@@ -638,6 +642,18 @@ def submit_order_from_instruction(
             sizing_preview["estimated_quantity"],
             allow_round_down=instruction.sizing.mode is not SizingMode.TARGET_QUANTITY,
         )
+        short_sale_validation = validate_short_sale_entry(
+            app=runtime_app,
+            instruction=instruction,
+            broker_account_id=broker_account_id,
+            normalized_summary=normalized_summary,
+            requested_quantity=normalized_quantity,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+            contract_cls=runtime_contract_cls,
+        )
+        if short_sale_validation.issues:
+            raise ShortSaleValidationError("; ".join(short_sale_validation.issues))
         normalized_limit_price = instruction.entry.limit_price
         limit_increment = None
         if instruction.entry.order_type is OrderType.LIMIT:
@@ -740,7 +756,25 @@ def submit_order_from_instruction(
         {
             "instruction_id": instruction.instruction_id,
             "account": broker_account_id,
-            "warnings": [*list(account_warnings), *quantity_warnings, *price_warnings, *resize_warnings],
+            "warnings": [
+                *list(account_warnings),
+                *quantity_warnings,
+                *list(short_sale_validation.warnings),
+                *price_warnings,
+                *resize_warnings,
+            ],
+            "short_sale_validation": {
+                "is_short_sale": short_sale_validation.is_short_sale,
+                "current_position_quantity": short_sale_validation.current_position_quantity,
+                "requested_quantity": short_sale_validation.requested_quantity,
+                "account_type": short_sale_validation.account_type,
+                "leverage": short_sale_validation.leverage,
+                "net_liquidation": short_sale_validation.net_liquidation,
+                "net_liquidation_currency": short_sale_validation.net_liquidation_currency,
+                "net_liquidation_eur": short_sale_validation.net_liquidation_eur,
+                "stockholm_shortability_status": short_sale_validation.stockholm_shortability_status,
+                "stockholm_shortability_as_of_date": short_sale_validation.stockholm_shortability_as_of_date,
+            },
             "resolved_contract": resolved_contract,
             "order": {
                 "order_ref": instruction.instruction_id,

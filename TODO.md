@@ -13,6 +13,14 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Short-sale prechecks now block invalid shorts before broker submit:
+  the preview and submit paths now require explicit SHORT intent, reject
+  sell-through-long instructions, reject non-short-enabled account types,
+  enforce IBKR's EUR 2000-equivalent minimum equity check, and validate
+  Stockholm shorts against the persisted official IBKR Sweden shortable list
+- [x] Clean reconciliation cycles are hidden from the operator dashboard:
+  the operator read model now returns warning/error runs by default so the
+  UI log stays focused on actionable broker and runtime problems
 - [x] Broker fees now flow into the durable fill ledger:
   IBKR commission-and-fees reports are cached on the live session, merged
   onto executions by execId, persisted onto execution fills, and surfaced

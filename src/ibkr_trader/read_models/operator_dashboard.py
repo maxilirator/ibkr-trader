@@ -891,15 +891,18 @@ def _build_recent_reconciliation_runs(
     session: Session,
     *,
     limit: int,
+    include_clean_runs: bool,
 ) -> tuple[OperatorReconciliationRun, ...]:
+    query = select(ReconciliationRunRecord)
+    if not include_clean_runs:
+        query = query.where(ReconciliationRunRecord.issue_count > 0)
+
     reconciliation_runs = list(
         session.execute(
-            select(ReconciliationRunRecord)
-            .order_by(
+            query.order_by(
                 ReconciliationRunRecord.started_at.desc(),
                 ReconciliationRunRecord.id.desc(),
-            )
-            .limit(limit)
+            ).limit(limit)
         ).scalars()
     )
     if not reconciliation_runs:
@@ -969,6 +972,7 @@ def build_operator_dashboard_snapshot(
     fill_limit: int = 50,
     attention_limit: int = 25,
     reconciliation_run_limit: int = 20,
+    include_clean_reconciliation_runs: bool = False,
 ) -> OperatorDashboardSnapshot:
     """Return a durable operator-facing snapshot built only from persisted ledger rows."""
 
@@ -990,5 +994,6 @@ def build_operator_dashboard_snapshot(
             recent_reconciliation_runs=_build_recent_reconciliation_runs(
                 session,
                 limit=reconciliation_run_limit,
+                include_clean_runs=include_clean_reconciliation_runs,
             ),
         )

@@ -122,6 +122,9 @@ class _FakeOrderExecutionSyncWrapper:
     ) -> list[object]:
         raise AssertionError("FX data should not be requested for target_quantity sizing.")
 
+    def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
+        return {"DU1234567": []}
+
     def place_order_sync(self, contract: object, order: object, timeout: int | None = None) -> dict[str, object]:
         self.placed_orders.append((contract, order, timeout))
         order_id = self._next_order_id
@@ -379,6 +382,79 @@ class OrderExecutionTests(TestCase):
                 contract_cls=_FakeContract,
                 order_cls=_FakeOrder,
             )
+
+    def test_submit_order_from_batch_rejects_explicit_short_on_non_shortable_stockholm_account(self) -> None:
+        class _SwedenShortWrapper(_FakeOrderExecutionSyncWrapper):
+            def get_account_updates(
+                self,
+                account_code: str = "",
+                timeout: int = 10,
+            ) -> dict[str, object]:
+                return {
+                    "portfolio": [],
+                    "account_values": {
+                        "DU1234567": {
+                            "NetLiquidation": {"value": "25000.00", "currency": "SEK"},
+                            "BuyingPower": {"value": "200000.00", "currency": "SEK"},
+                            "AvailableFunds": {"value": "100000.00", "currency": "SEK"},
+                            "ExcessLiquidity": {"value": "100000.00", "currency": "SEK"},
+                            "AccountType": {"value": "INDIVIDUAL", "currency": ""},
+                            "Leverage-S": {"value": "1.00", "currency": ""},
+                            "Currency": {"value": "SEK", "currency": "SEK"},
+                        }
+                    },
+                }
+
+            def get_historical_data(
+                self,
+                contract: _FakeContract,
+                end_date_time: str,
+                duration_str: str,
+                bar_size_setting: str,
+                what_to_show: str,
+                use_rth: bool = True,
+                format_date: int = 1,
+                timeout: int | None = None,
+            ) -> list[object]:
+                if (contract.symbol, contract.currency) == ("EUR", "SEK"):
+                    return [SimpleNamespace(date="20260421", close="10.00")]
+                if (contract.symbol, contract.currency) == ("SEK", "EUR"):
+                    return [SimpleNamespace(date="20260421", close="0.10")]
+                raise AssertionError(f"Unexpected FX request for {contract.symbol}.{contract.currency}")
+
+        payload = _base_payload()
+        payload["instructions"][0]["instrument"] = {
+            "symbol": "ACUVI",
+            "security_type": "STK",
+            "exchange": "XSTO",
+            "currency": "SEK",
+            "primary_exchange": "XSTO",
+        }
+        payload["instructions"][0]["intent"] = {
+            "side": "SELL",
+            "position_side": "SHORT",
+        }
+        batch = parse_execution_batch_payload(payload)
+
+        with self.assertRaisesRegex(ValueError, "not present on the persisted official IBKR Sweden shortable list"):
+            submit_order_from_batch(
+                self.config,
+                batch,
+                sync_wrapper_cls=_SwedenShortWrapper,
+                response_timeout_cls=TimeoutError,
+                contract_cls=_FakeContract,
+                order_cls=_FakeOrder,
+            )
+
+    def test_parse_execution_batch_payload_rejects_long_entry_with_sell_side(self) -> None:
+        payload = _base_payload()
+        payload["instructions"][0]["intent"] = {
+            "side": "SELL",
+            "position_side": "LONG",
+        }
+
+        with self.assertRaisesRegex(ValueError, "LONG entries must use intent.side=BUY"):
+            parse_execution_batch_payload(payload)
 
     def test_submit_order_from_batch_rounds_down_fraction_of_nav_quantity(self) -> None:
         payload = _base_payload()

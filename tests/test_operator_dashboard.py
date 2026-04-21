@@ -272,6 +272,20 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
                     payload={"order_id": 11},
                 )
             )
+            session.add(
+                ReconciliationRunRecord(
+                    run_kind="runtime_cycle",
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    runtime_timezone="Europe/Stockholm",
+                    started_at=datetime(2026, 4, 19, 7, 26, tzinfo=timezone.utc),
+                    completed_at=datetime(2026, 4, 19, 7, 26, 3, tzinfo=timezone.utc),
+                    status="CLEAN",
+                    issue_count=0,
+                    action_count=1,
+                    metadata_json={"snapshot_counts": {"open_order_count": 1}},
+                )
+            )
 
             session.commit()
         finally:

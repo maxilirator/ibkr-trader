@@ -109,7 +109,12 @@ class _FakePreviewSyncWrapper:
             return [SimpleNamespace(date="20260410", close="1.20")]
         if pair == ("EUR", "SEK"):
             return [SimpleNamespace(date="20260410", close="10.00")]
+        if pair == ("SEK", "EUR"):
+            return [SimpleNamespace(date="20260410", close="0.10")]
         raise TimeoutError(f"Unsupported FX pair {contract.symbol}.{contract.currency}")
+
+    def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
+        return {"DU1234567": []}
 
 
 class OrderPreviewTests(TestCase):
@@ -178,6 +183,80 @@ class OrderPreviewTests(TestCase):
         preview = payload["previews"][0]
         self.assertEqual(preview["status"], "ready")
         self.assertEqual(preview["order"]["total_quantity"], "10")
+
+    def test_preview_flags_invalid_stockholm_short_before_submit(self) -> None:
+        class _StockholmShortPreviewWrapper(_FakePreviewSyncWrapper):
+            account_currency = "SEK"
+            net_liquidation = "25000.00"
+
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-1",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-short-1",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "short_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "ACUVI",
+                            "security_type": "STK",
+                            "exchange": "XSTO",
+                            "currency": "SEK",
+                            "primary_exchange": "XSTO",
+                        },
+                        "intent": {
+                            "side": "SELL",
+                            "position_side": "SHORT",
+                        },
+                        "sizing": {
+                            "mode": "target_quantity",
+                            "target_quantity": "10",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00+02:00",
+                            "expire_at": "2026-04-10T16:00:00+02:00",
+                            "limit_price": "100.00",
+                        },
+                        "exit": {
+                            "take_profit_pct": "0.02",
+                        },
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_StockholmShortPreviewWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "unresolved")
+        self.assertEqual(preview["short_sale_validation"]["is_short_sale"], True)
+        self.assertIn(
+            "not present on the persisted official IBKR Sweden shortable list",
+            " ".join(preview["issues"]),
+        )
         self.assertEqual(preview["order"]["order_type"], "LMT")
         self.assertEqual(preview["instrument"]["resolved"]["con_id"], 265598)
         self.assertEqual(preview["sizing"]["normalized_quantity"], "10")
