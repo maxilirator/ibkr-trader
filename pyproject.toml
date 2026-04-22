@@ -27,6 +27,7 @@ server = [
   "uvicorn",
   "pandas",
   "pyarrow",
+  "duckdb",
 ]
 
 [tool.setuptools]

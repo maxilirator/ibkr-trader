@@ -70,8 +70,10 @@ def _load_rows_from_csv(path: Path) -> tuple[SessionCalendarRow, ...]:
 def _load_rows_from_parquet(path: Path) -> tuple[SessionCalendarRow, ...]:
     try:
         import duckdb
-    except ModuleNotFoundError:
-        return ()
+    except ModuleNotFoundError as exc:
+        raise ValueError(
+            f"duckdb is required to read parquet session calendars at {path}"
+        ) from exc
 
     query = """
         SELECT session_date, timezone, open_time, close_time, session_kind
