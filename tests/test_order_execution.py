@@ -40,6 +40,8 @@ class _FakeOrder:
 
 
 class _FakeOrderExecutionSyncWrapper:
+    total_cash_value = "100000.00"
+
     def __init__(self, timeout: int) -> None:
         self.timeout = timeout
         self.connected = False
@@ -68,6 +70,7 @@ class _FakeOrderExecutionSyncWrapper:
             "account_values": {
                 "DU1234567": {
                     "NetLiquidation": {"value": "100000.00", "currency": "USD"},
+                    "TotalCashValue": {"value": self.total_cash_value, "currency": "USD"},
                     "BuyingPower": {"value": "200000.00", "currency": "USD"},
                     "AvailableFunds": {"value": "100000.00", "currency": "USD"},
                     "ExcessLiquidity": {"value": "100000.00", "currency": "USD"},
@@ -401,6 +404,35 @@ class OrderExecutionTests(TestCase):
 
         self.assertEqual(result["broker_order_status"]["status"], "Submitted")
         self.assertIn("IBKR order warning [399]", " ".join(result["warnings"]))
+
+    def test_submit_order_from_batch_blocks_long_fraction_sizing_without_cash(self) -> None:
+        class _NoCashWrapper(_FakeOrderExecutionSyncWrapper):
+            total_cash_value = "0.00"
+
+            def place_order_sync(
+                self,
+                contract: object,
+                order: object,
+                timeout: int | None = None,
+            ) -> dict[str, object]:
+                raise AssertionError("cash-backed long sizing without cash must not place an order")
+
+        payload = _base_payload()
+        payload["instructions"][0]["sizing"] = {
+            "mode": "fraction_of_account_nav",
+            "target_fraction_of_account": "1.0",
+        }
+        batch = parse_execution_batch_payload(payload)
+
+        with self.assertRaisesRegex(ValueError, "no positive cash balance available"):
+            submit_order_from_batch(
+                self.config,
+                batch,
+                sync_wrapper_cls=_NoCashWrapper,
+                response_timeout_cls=TimeoutError,
+                contract_cls=_FakeContract,
+                order_cls=_FakeOrder,
+            )
 
     def test_submit_order_from_batch_rejects_fractional_stock_quantity(self) -> None:
         payload = _base_payload()

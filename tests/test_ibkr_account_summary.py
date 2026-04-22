@@ -98,5 +98,6 @@ class AccountSummaryTests(TestCase):
 
     def test_default_tags_include_nav_fields(self) -> None:
         self.assertIn("NetLiquidation", DEFAULT_ACCOUNT_SUMMARY_TAGS)
+        self.assertIn("TotalCashValue", DEFAULT_ACCOUNT_SUMMARY_TAGS)
         self.assertIn("BuyingPower", DEFAULT_ACCOUNT_SUMMARY_TAGS)
         self.assertIn("AvailableFunds", DEFAULT_ACCOUNT_SUMMARY_TAGS)

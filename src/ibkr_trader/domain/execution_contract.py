@@ -22,6 +22,11 @@ class SizingMode(StrEnum):
     TARGET_QUANTITY = "target_quantity"
 
 
+class FundingBasis(StrEnum):
+    CASH = "cash"
+    ACCOUNT_NAV = "account_nav"
+
+
 class OrderType(StrEnum):
     LIMIT = "LIMIT"
     MARKET = "MARKET"
@@ -103,6 +108,8 @@ class SizingSpec:
     target_fraction_of_account: Decimal | None = None
     target_notional: Decimal | None = None
     target_quantity: Decimal | None = None
+    funding_basis: FundingBasis | None = None
+    allow_leverage: bool = False
 
     def validate(self) -> None:
         populated_targets = [

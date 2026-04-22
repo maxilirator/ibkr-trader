@@ -13,6 +13,11 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Long account-based sizing now defaults to real cash, not NAV:
+  when a long BUY instruction uses `fraction_of_account_nav`, the trader now
+  sizes from `TotalCashValue`/settled cash by default and refuses the order if
+  no positive cash is available; using NAV for a long now requires explicit
+  `funding_basis = account_nav` together with `allow_leverage = true`
 - [x] Runtime now prioritizes urgent carry-over exits before fresh entries,
   uses lighter broker snapshots during execution cycles, and fails closed on
   stale or terminal pending-entry submits:

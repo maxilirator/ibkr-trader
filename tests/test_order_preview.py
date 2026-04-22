@@ -25,6 +25,7 @@ class _FakeContract:
 class _FakePreviewSyncWrapper:
     account_currency = "USD"
     net_liquidation = "100000.00"
+    total_cash_value = "100000.00"
 
     def __init__(self, timeout: int) -> None:
         self.timeout = timeout
@@ -50,6 +51,10 @@ class _FakePreviewSyncWrapper:
                 "DU1234567": {
                     "NetLiquidation": {
                         "value": self.net_liquidation,
+                        "currency": self.account_currency,
+                    },
+                    "TotalCashValue": {
+                        "value": self.total_cash_value,
                         "currency": self.account_currency,
                     },
                     "BuyingPower": {"value": "200000.00", "currency": self.account_currency},
@@ -473,6 +478,219 @@ class OrderPreviewTests(TestCase):
             preview["sizing"]["fx_conversion"]["lookup_contract"]["symbol"],
             "EUR",
         )
+
+    def test_preview_defaults_long_fraction_sizing_to_cash_balance(self) -> None:
+        class _CashLimitedPreviewSyncWrapper(_FakePreviewSyncWrapper):
+            total_cash_value = "10000.00"
+
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-cash-1",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-cash-1",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "AAPL",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "USD",
+                            "primary_exchange": "NASDAQ",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "1.0",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00-04:00",
+                            "expire_at": "2026-04-10T16:00:00-04:00",
+                            "limit_price": "100.00",
+                        },
+                        "exit": {},
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_CashLimitedPreviewSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(preview["sizing"]["funding_basis"], "cash")
+        self.assertFalse(preview["sizing"]["allow_leverage"])
+        self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("10000.00"))
+        self.assertEqual(preview["order"]["total_quantity"], "100")
+
+    def test_preview_requires_explicit_leverage_for_long_nav_sizing(self) -> None:
+        class _CashLimitedPreviewSyncWrapper(_FakePreviewSyncWrapper):
+            total_cash_value = "10000.00"
+
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-nav-1",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-nav-1",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "AAPL",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "USD",
+                            "primary_exchange": "NASDAQ",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "0.50",
+                            "funding_basis": "account_nav",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00-04:00",
+                            "expire_at": "2026-04-10T16:00:00-04:00",
+                            "limit_price": "100.00",
+                        },
+                        "exit": {},
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_CashLimitedPreviewSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "unresolved")
+        self.assertIn(
+            "allow_leverage=true",
+            " ".join(preview["issues"]),
+        )
+
+    def test_preview_allows_explicit_leveraged_long_nav_sizing(self) -> None:
+        class _CashLimitedPreviewSyncWrapper(_FakePreviewSyncWrapper):
+            total_cash_value = "10000.00"
+
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-nav-2",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "demo-nav-2",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "AAPL",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "USD",
+                            "primary_exchange": "NASDAQ",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "fraction_of_account_nav",
+                            "target_fraction_of_account": "0.50",
+                            "funding_basis": "account_nav",
+                            "allow_leverage": True,
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-04-10T09:25:00-04:00",
+                            "expire_at": "2026-04-10T16:00:00-04:00",
+                            "limit_price": "100.00",
+                        },
+                        "exit": {},
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_CashLimitedPreviewSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(preview["sizing"]["funding_basis"], "account_nav")
+        self.assertTrue(preview["sizing"]["allow_leverage"])
+        self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("50000.00"))
+        self.assertEqual(preview["order"]["total_quantity"], "500")
 
     def test_preview_inverts_fx_pair_when_only_inverse_exists(self) -> None:
         batch = parse_execution_batch_payload(

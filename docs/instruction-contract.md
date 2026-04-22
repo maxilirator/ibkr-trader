@@ -146,7 +146,9 @@ So the rule is:
       },
       "sizing": {
         "mode": "fraction_of_account_nav",
-        "target_fraction_of_account": "1.0"
+        "target_fraction_of_account": "1.0",
+        "funding_basis": "cash",
+        "allow_leverage": false
       },
       "entry": {
         "order_type": "LIMIT",
@@ -254,6 +256,17 @@ Allowed:
 - target notional
 - target quantity
 
+For long `BUY` instructions, account-based sizing is cash-backed by default.
+That means the execution service uses account cash, not margin, unless the
+instruction explicitly opts into leveraged sizing:
+
+- `sizing.funding_basis = "cash"`:
+  use cash balance for account-based sizing
+- `sizing.funding_basis = "account_nav"` plus `sizing.allow_leverage = true`:
+  allow NAV/margin-backed sizing for a long entry
+
+Short entries may still size off account NAV without this extra flag.
+
 Not allowed:
 
 - multiple sizing targets in the same instruction
@@ -273,4 +286,7 @@ Examples:
 - `SIVE` on Stockholm should use `SEK` bars, `SEK` limit prices, `SEK` fills, and `SEK` direct notionals
 - `AAPL` on NASDAQ should use `USD` bars, `USD` limit prices, `USD` fills, and `USD` direct notionals
 
-If an instruction uses `fraction_of_account_nav`, the execution service may convert account currency into `instrument.currency` for sizing. After that conversion, the downstream order preview and execution remain in `instrument.currency`.
+If an instruction uses account-based sizing, the execution service may convert
+the chosen account funding value into `instrument.currency` for sizing. After
+that conversion, the downstream order preview and execution remain in
+`instrument.currency`.

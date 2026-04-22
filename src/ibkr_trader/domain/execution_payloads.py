@@ -12,6 +12,7 @@ from ibkr_trader.domain.execution_contract import (
     ExecutionInstruction,
     ExecutionInstructionBatch,
     ExitSpec,
+    FundingBasis,
     InstrumentRef,
     IntentSpec,
     OrderType,
@@ -165,6 +166,12 @@ def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> Execution
                 if sizing_payload.get("target_quantity") is not None
                 else None
             ),
+            funding_basis=(
+                FundingBasis(str(sizing_payload["funding_basis"]).lower())
+                if sizing_payload.get("funding_basis") is not None
+                else None
+            ),
+            allow_leverage=bool(sizing_payload.get("allow_leverage", False)),
         ),
         entry=EntrySpec(
             order_type=OrderType(str(entry_payload["order_type"]).upper()),

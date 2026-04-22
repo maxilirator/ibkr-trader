@@ -10,6 +10,7 @@ from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import (
     ExecutionInstruction,
     ExecutionInstructionBatch,
+    FundingBasis,
     OrderType,
     SizingMode,
 )
@@ -149,6 +150,26 @@ def _get_account_value(
     tag: str,
 ) -> dict[str, str | None] | None:
     return normalized_summary["accounts"].get(account_id, {}).get(tag)
+
+
+def _get_first_account_value(
+    normalized_summary: dict[str, Any],
+    account_id: str,
+    tags: tuple[str, ...],
+) -> dict[str, str | None] | None:
+    for tag in tags:
+        value = _get_account_value(normalized_summary, account_id, tag)
+        if value is not None:
+            return value
+    return None
+
+
+def _effective_funding_basis(instruction: ExecutionInstruction) -> FundingBasis:
+    if instruction.sizing.funding_basis is not None:
+        return instruction.sizing.funding_basis
+    if instruction.intent.side == "BUY" and instruction.intent.position_side.value == "LONG":
+        return FundingBasis.CASH
+    return FundingBasis.ACCOUNT_NAV
 
 
 def _map_order_type(order_type: OrderType) -> str:
@@ -342,6 +363,8 @@ def _resolve_sizing_preview(
     warnings: list[str] = []
     account_net_liquidation = None
     account_currency = None
+    account_cash_balance = None
+    cash_currency = None
 
     if broker_account_id is not None:
         account_net_liquidation = _get_account_value(
@@ -351,12 +374,20 @@ def _resolve_sizing_preview(
         )
         if account_net_liquidation is not None:
             account_currency = account_net_liquidation.get("currency")
+        account_cash_balance = _get_first_account_value(
+            normalized_summary,
+            broker_account_id,
+            ("TotalCashValue", "SettledCash", "CashBalance"),
+        )
+        if account_cash_balance is not None:
+            cash_currency = account_cash_balance.get("currency") or account_currency
 
     target_notional = None
     estimated_quantity = None
     normalized_quantity = None
     fx_conversion = None
     sizing_mode = instruction.sizing.mode
+    funding_basis = _effective_funding_basis(instruction)
 
     if sizing_mode is SizingMode.TARGET_QUANTITY:
         estimated_quantity = instruction.sizing.target_quantity
@@ -369,22 +400,48 @@ def _resolve_sizing_preview(
             )
             issues.extend(sizing_issues)
     elif sizing_mode is SizingMode.FRACTION_OF_ACCOUNT_NAV:
-        if account_net_liquidation is None:
-            issues.append("NetLiquidation is unavailable for account-based sizing.")
+        source_value_payload = None
+        source_currency = None
+        if funding_basis is FundingBasis.CASH:
+            source_value_payload = account_cash_balance
+            source_currency = cash_currency
+            if source_value_payload is None:
+                issues.append(
+                    "Cash-backed account sizing requires TotalCashValue, SettledCash, or CashBalance."
+                )
         else:
-            net_liquidation_value = _to_decimal(account_net_liquidation.get("value"))
-            if net_liquidation_value is None:
-                issues.append("NetLiquidation could not be parsed as a decimal.")
-            elif account_currency is None:
-                issues.append("NetLiquidation did not include an account currency.")
+            if (
+                instruction.intent.side == "BUY"
+                and instruction.intent.position_side.value == "LONG"
+                and not instruction.sizing.allow_leverage
+            ):
+                issues.append(
+                    "Long account-based sizing may use account_nav only when sizing.allow_leverage=true."
+                )
+            source_value_payload = account_net_liquidation
+            source_currency = account_currency
+            if source_value_payload is None:
+                issues.append("NetLiquidation is unavailable for account-based sizing.")
+
+        if source_value_payload is not None:
+            source_value = _to_decimal(source_value_payload.get("value"))
+            if source_value is None:
+                issues.append(f"{funding_basis.value} sizing value could not be parsed as a decimal.")
+            elif source_value <= 0:
+                if funding_basis is FundingBasis.CASH:
+                    issues.append("Cash-backed account sizing has no positive cash balance available.")
+                else:
+                    issues.append("Account-based sizing requires a positive NetLiquidation value.")
+            elif source_currency is None:
+                issues.append(f"{funding_basis.value} sizing value did not include an account currency.")
             else:
                 fraction_value = instruction.sizing.target_fraction_of_account
                 if fraction_value is not None:
-                    target_notional = net_liquidation_value * fraction_value
-                    if account_currency != instruction.instrument.currency:
+                    target_notional = source_value * fraction_value
+                    if source_currency != instruction.instrument.currency:
                         fx_conversion, fx_issues = _resolve_fx_conversion(
                             app=app,
-                            source_currency=account_currency,
+                            source_currency=source_currency,
                             target_currency=instruction.instrument.currency,
                             timeout=timeout,
                             timeout_cls=timeout_cls,
@@ -415,10 +472,13 @@ def _resolve_sizing_preview(
         "warnings": warnings,
         "account_net_liquidation": account_net_liquidation,
         "account_currency": account_currency,
+        "account_cash_balance": account_cash_balance,
+        "cash_currency": cash_currency,
         "target_notional": target_notional,
         "estimated_quantity": estimated_quantity,
         "normalized_quantity": normalized_quantity,
         "fx_conversion": fx_conversion,
+        "funding_basis": funding_basis,
     }
 
 
@@ -454,8 +514,10 @@ def _build_instruction_preview(
     estimated_quantity = sizing_preview["estimated_quantity"]
     normalized_quantity = sizing_preview["normalized_quantity"]
     account_net_liquidation = sizing_preview["account_net_liquidation"]
+    account_cash_balance = sizing_preview["account_cash_balance"]
     account_currency = sizing_preview["account_currency"]
     sizing_mode = instruction.sizing.mode
+    funding_basis = sizing_preview["funding_basis"]
 
     order_preview = {
         "account": broker_account_id,
@@ -486,6 +548,7 @@ def _build_instruction_preview(
         "account": {
             "broker_account_id": broker_account_id,
             "net_liquidation": account_net_liquidation,
+            "cash_balance": account_cash_balance,
         },
         "instrument": {
             "requested": {
@@ -513,6 +576,8 @@ def _build_instruction_preview(
         },
         "sizing": {
             "mode": sizing_mode.value,
+            "funding_basis": funding_basis.value if funding_basis is not None else None,
+            "allow_leverage": instruction.sizing.allow_leverage,
             "target_fraction_of_account": (
                 str(instruction.sizing.target_fraction_of_account)
                 if instruction.sizing.target_fraction_of_account is not None
