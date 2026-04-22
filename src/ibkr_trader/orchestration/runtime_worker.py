@@ -509,6 +509,110 @@ def _fetch_due_entry_instruction_ids(
     ]
 
 
+def _is_pending_entry_expired(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    cycle_at: datetime,
+) -> bool:
+    with session_scope(session_factory) as session:
+        expire_at = session.execute(
+            select(InstructionRecord.expire_at).where(
+                InstructionRecord.instruction_id == instruction_id
+            )
+        ).scalar_one_or_none()
+    normalized_expire_at = _ensure_utc(expire_at)
+    if normalized_expire_at is None:
+        return False
+    return normalized_expire_at <= cycle_at
+
+
+def _mark_pending_entry_cancelled(
+    session_factory: sessionmaker[Session],
+    instruction_id: str,
+    *,
+    note: str,
+    event_type: str = "entry_expired_before_submit",
+    action: str = "entry_cancelled_before_submit",
+) -> RuntimeCycleAction:
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one()
+        if record.state != ExecutionState.ENTRY_PENDING.value:
+            return RuntimeCycleAction(
+                instruction_id=instruction_id,
+                action="entry_cancel_skip",
+                state=record.state,
+                detail={},
+            )
+
+        previous_state = record.state
+        record.state = ExecutionState.ENTRY_CANCELLED.value
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type=event_type,
+                source="runtime_cycle",
+                state_before=previous_state,
+                state_after=record.state,
+                payload={},
+                note=note,
+            )
+        )
+        return RuntimeCycleAction(
+            instruction_id=instruction_id,
+            action=action,
+            state=record.state,
+            detail={"note": note},
+        )
+
+
+def _mark_pending_entry_failed(
+    session_factory: sessionmaker[Session],
+    instruction_id: str,
+    *,
+    note: str,
+    payload: dict[str, Any],
+    event_type: str = "entry_submit_failed",
+) -> RuntimeCycleAction:
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one()
+        if record.state != ExecutionState.ENTRY_PENDING.value:
+            return RuntimeCycleAction(
+                instruction_id=instruction_id,
+                action="entry_fail_skip",
+                state=record.state,
+                detail={},
+            )
+
+        previous_state = record.state
+        record.state = ExecutionState.FAILED.value
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type=event_type,
+                source="runtime_cycle",
+                state_before=previous_state,
+                state_after=record.state,
+                payload=_serialize_for_json(payload),
+                note=note,
+            )
+        )
+        return RuntimeCycleAction(
+            instruction_id=instruction_id,
+            action="entry_failed",
+            state=record.state,
+            detail=_serialize_for_json(payload),
+        )
+
+
 def _is_retryable_broker_error(exc: Exception) -> bool:
     if isinstance(exc, ConnectionError):
         return True
@@ -1268,6 +1372,105 @@ def _is_next_session_exit_due(
     return due_at <= cycle_at.astimezone(timezone.utc)
 
 
+def _submit_due_pending_entries(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    *,
+    due_instruction_ids: list[str],
+    cycle_started_at: datetime,
+    timeout: int,
+    kill_switch_enabled: bool,
+    entry_submitter: Callable[..., Any] | None,
+    broker_retry_delays: tuple[float, ...],
+    sleep_fn: Callable[[float], None],
+    submitted_entries: list[RuntimeCycleAction],
+    cancelled_entries: list[RuntimeCycleAction],
+    issues: list[RuntimeCycleIssue],
+) -> None:
+    if not due_instruction_ids:
+        return
+
+    if kill_switch_enabled:
+        _append_issue(
+            issues,
+            instruction_id=None,
+            stage="kill_switch",
+            message=(
+                "Global kill switch is enabled; skipped submission of "
+                f"{len(due_instruction_ids)} due entries."
+            ),
+        )
+        return
+
+    for instruction_id in due_instruction_ids:
+        if _is_pending_entry_expired(
+            session_factory,
+            instruction_id=instruction_id,
+            cycle_at=cycle_started_at,
+        ):
+            cancelled_entries.append(
+                _mark_pending_entry_cancelled(
+                    session_factory,
+                    instruction_id,
+                    note=(
+                        "Entry window expired before the runtime could submit the order "
+                        "to IBKR."
+                    ),
+                )
+            )
+            continue
+
+        try:
+            submission = _run_with_broker_retries(
+                lambda: submit_persisted_instruction_entry(
+                    session_factory,
+                    broker_config,
+                    instruction_id,
+                    timeout=timeout,
+                    submitter=entry_submitter,
+                ),
+                retry_delays=broker_retry_delays,
+                sleep_fn=sleep_fn,
+            )
+            submitted_entries.append(
+                RuntimeCycleAction(
+                    instruction_id=instruction_id,
+                    action="entry_submitted",
+                    state=submission.state,
+                    detail={
+                        "broker_order_id": submission.broker_order_id,
+                        "broker_order_status": submission.broker_order_status,
+                    },
+                )
+            )
+        except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+            _append_issue(
+                issues,
+                instruction_id=instruction_id,
+                stage="entry_submit",
+                message=str(exc),
+            )
+            if _is_retryable_broker_error(exc):
+                _record_runtime_note(
+                    session_factory,
+                    instruction_id=instruction_id,
+                    event_type="runtime_entry_submit_failed",
+                    note="Runtime cycle could not submit the due entry order.",
+                    payload={"error": str(exc)},
+                )
+                continue
+
+            _mark_pending_entry_failed(
+                session_factory,
+                instruction_id,
+                note=(
+                    "Runtime cycle marked the due entry as failed after a terminal "
+                    "broker submission error."
+                ),
+                payload={"error": str(exc)},
+            )
+
+
 def run_runtime_cycle(
     session_factory: sessionmaker[Session],
     broker_config: IbkrConnectionConfig,
@@ -1345,57 +1548,6 @@ def run_runtime_cycle(
         instruction_ids=instruction_ids,
     )
     due_instruction_count = len(due_instruction_ids)
-    if submit_due_entries:
-        if kill_switch_enabled:
-            if due_instruction_ids:
-                _append_issue(
-                    issues,
-                    instruction_id=None,
-                    stage="kill_switch",
-                    message=(
-                        "Global kill switch is enabled; skipped submission of "
-                        f"{len(due_instruction_ids)} due entries."
-                    ),
-                )
-        else:
-            for instruction_id in due_instruction_ids:
-                try:
-                    submission = _run_with_broker_retries(
-                        lambda: submit_persisted_instruction_entry(
-                            session_factory,
-                            broker_config,
-                            instruction_id,
-                            timeout=timeout,
-                            submitter=entry_submitter,
-                        ),
-                        retry_delays=broker_retry_delays,
-                        sleep_fn=sleep_fn,
-                    )
-                    submitted_entries.append(
-                        RuntimeCycleAction(
-                            instruction_id=instruction_id,
-                            action="entry_submitted",
-                            state=submission.state,
-                            detail={
-                                "broker_order_id": submission.broker_order_id,
-                                "broker_order_status": submission.broker_order_status,
-                            },
-                        )
-                    )
-                except Exception as exc:  # pragma: no cover - broad by design for runtime safety
-                    _append_issue(
-                        issues,
-                        instruction_id=instruction_id,
-                        stage="entry_submit",
-                        message=str(exc),
-                    )
-                    _record_runtime_note(
-                        session_factory,
-                        instruction_id=instruction_id,
-                        event_type="runtime_entry_submit_failed",
-                        note="Runtime cycle could not submit the due entry order.",
-                        payload={"error": str(exc)},
-                    )
 
     active_instruction_ids = _fetch_instruction_ids(
         session_factory,
@@ -1408,6 +1560,21 @@ def run_runtime_cycle(
     )
     active_instruction_count = len(active_instruction_ids)
     if not active_instruction_ids:
+        if submit_due_entries:
+            _submit_due_pending_entries(
+                session_factory,
+                broker_config,
+                due_instruction_ids=due_instruction_ids,
+                cycle_started_at=cycle_started_at,
+                timeout=timeout,
+                kill_switch_enabled=kill_switch_enabled,
+                entry_submitter=entry_submitter,
+                broker_retry_delays=broker_retry_delays,
+                sleep_fn=sleep_fn,
+                submitted_entries=submitted_entries,
+                cancelled_entries=cancelled_entries,
+                issues=issues,
+            )
         if broker_callback_fetcher is not None:
             try:
                 _persist_drained_broker_callbacks(
@@ -1549,6 +1716,7 @@ def run_runtime_cycle(
         session_factory,
         records=records,
     )
+    blocking_due_exit_instruction_ids: list[str] = []
 
     for instruction_id in active_instruction_ids:
         record = records_by_instruction_id.get(instruction_id)
@@ -1805,6 +1973,7 @@ def run_runtime_cycle(
                 if remaining_quantity <= 0:
                     continue
 
+                blocking_due_exit_instruction_ids.append(instruction_id)
                 for open_exit_order_id in combined_exit_open_order_ids:
                     _run_with_broker_retries(
                         lambda order_id=open_exit_order_id: runtime_order_canceler(
@@ -1843,6 +2012,36 @@ def run_runtime_cycle(
                 event_type="runtime_reconcile_failed",
                 note="Runtime cycle could not reconcile the instruction cleanly.",
                 payload={"error": str(exc)},
+            )
+
+    if submit_due_entries:
+        # Active exit workflows take priority over fresh entries so we do not
+        # size or submit new risk before urgent carry-over positions are handled.
+        if blocking_due_exit_instruction_ids and due_instruction_ids:
+            _append_issue(
+                issues,
+                instruction_id=None,
+                stage="entry_submit_blocked",
+                message=(
+                    "Skipped due entry submissions while urgent next-session exits were "
+                    "still active for: "
+                    f"{', '.join(sorted(set(blocking_due_exit_instruction_ids)))}"
+                ),
+            )
+        else:
+            _submit_due_pending_entries(
+                session_factory,
+                broker_config,
+                due_instruction_ids=due_instruction_ids,
+                cycle_started_at=cycle_started_at,
+                timeout=timeout,
+                kill_switch_enabled=kill_switch_enabled,
+                entry_submitter=entry_submitter,
+                broker_retry_delays=broker_retry_delays,
+                sleep_fn=sleep_fn,
+                submitted_entries=submitted_entries,
+                cancelled_entries=cancelled_entries,
+                issues=issues,
             )
 
     if broker_callback_fetcher is not None:
@@ -2011,6 +2210,7 @@ def _build_runtime_broker_operations(
             lambda broker_app: fetch_broker_runtime_snapshot(
                 broker_config,
                 timeout=timeout,
+                include_account_updates=False,
                 app=broker_app,
             ),
         )

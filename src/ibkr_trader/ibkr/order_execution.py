@@ -30,6 +30,7 @@ from ibkr_trader.ibkr.short_sale_validation import validate_short_sale_entry
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 _ORDER_CANCEL_NOT_FOUND_CODE = 10147
+_NON_FATAL_ORDER_WARNING_CODES = {399}
 
 
 @runtime_checkable
@@ -685,6 +686,7 @@ def submit_order_from_instruction(
             stop_price=None,
         )
         resize_warnings: list[str] = []
+        broker_warnings: list[str] = []
         submitted_quantity = normalized_quantity
         for _ in range(3):
             order = _build_ibkr_order(
@@ -738,6 +740,12 @@ def submit_order_from_instruction(
             if immediate_error is not None:
                 error_code = immediate_error.get("errorCode")
                 error_string = immediate_error.get("errorString") or "Unknown broker error."
+                if error_code in _NON_FATAL_ORDER_WARNING_CODES:
+                    broker_warnings.append(
+                        f"IBKR order warning [{error_code}]: {error_string}"
+                    )
+                    tws_submission = _extract_tws_submission(runtime_app, order_status)
+                    break
                 raise LookupError(
                     f"IBKR rejected the order submission: [{error_code}] {error_string}"
                 )
@@ -762,6 +770,7 @@ def submit_order_from_instruction(
                 *list(short_sale_validation.warnings),
                 *price_warnings,
                 *resize_warnings,
+                *broker_warnings,
             ],
             "short_sale_validation": {
                 "is_short_sale": short_sale_validation.is_short_sale,

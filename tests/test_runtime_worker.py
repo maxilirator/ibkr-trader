@@ -333,6 +333,82 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.broker_order_id, 11)
         self.assertEqual(record.entry_submitted_quantity, "1")
 
+    def test_run_runtime_cycle_cancels_expired_pending_entry_before_submit(self) -> None:
+        payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+            payload=payload,
+        )
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 5, tzinfo=timezone.utc),
+            entry_submitter=lambda *args, **kwargs: self.fail(
+                "expired pending entries must not be submitted"
+            ),
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(result.submitted_entries, ())
+        self.assertEqual(len(result.cancelled_entries), 1)
+        self.assertEqual(
+            self._read_record("runtime-aapl-1").state,
+            ExecutionState.ENTRY_CANCELLED.value,
+        )
+
+    def test_run_runtime_cycle_marks_terminal_due_entry_submit_failure(self) -> None:
+        payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+            payload=payload,
+        )
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
+            entry_submitter=lambda *args, **kwargs: (_ for _ in ()).throw(
+                ValueError("insufficient funds")
+            ),
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(len(result.issues), 1)
+        self.assertEqual(result.issues[0].stage, "entry_submit")
+        self.assertEqual(
+            self._read_record("runtime-aapl-1").state,
+            ExecutionState.FAILED.value,
+        )
+
     def test_run_runtime_cycle_submits_stockholm_open_entry_one_minute_early(self) -> None:
         payload = _sive_payload()
         payload["instruction"]["entry"]["submit_at"] = "2026-04-10T09:00:00+02:00"
@@ -869,7 +945,7 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(runs[0].issue_count, 0)
         self.assertEqual(runs[0].action_count, 1)
         self.assertEqual(runs[0].metadata_json["due_instruction_count"], 1)
-        self.assertEqual(runs[0].metadata_json["active_instruction_count"], 1)
+        self.assertEqual(runs[0].metadata_json["active_instruction_count"], 0)
 
     def test_run_runtime_cycle_persists_reconciliation_issues_on_early_return(self) -> None:
         payload = _aapl_payload()
@@ -1711,6 +1787,128 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
         self.assertEqual(record.exit_order_id, 31)
         self.assertEqual(record.exit_submitted_quantity, "100")
+
+    def test_run_runtime_cycle_blocks_due_entries_while_next_session_exit_is_active(self) -> None:
+        exit_payload = _sive_payload()
+        entry_payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.POSITION_OPEN.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=exit_payload,
+            entry_filled_quantity="100",
+        )
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 13, 13, 0, tzinfo=timezone.utc),
+            payload=entry_payload,
+        )
+
+        entry_submit_calls: list[str] = []
+
+        def fake_entry_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            entry_submit_calls.append(instruction.instruction_id)
+            raise AssertionError("due entries should be blocked while urgent exits remain active")
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            self.assertEqual(order_ref, "runtime-sive-1:exit:forced")
+            return {
+                "instruction_id": "runtime-sive-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 489000, "symbol": "SIVE"},
+                "order": {
+                    "order_ref": order_ref,
+                    "action": "SELL",
+                    "order_type": "MKT",
+                    "time_in_force": "DAY",
+                    "limit_price": None,
+                    "total_quantity": "100",
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 31,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": "100",
+                    "avgFillPrice": 0.0,
+                    "permId": 9101,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                entry_submitter=fake_entry_submitter,
+                exit_submitter=fake_exit_submitter,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={},
+                    executions=(),
+                    portfolio=(),
+                    positions=(),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(entry_submit_calls, [])
+        self.assertEqual(len(result.submitted_exits), 1)
+        self.assertEqual(
+            [issue.stage for issue in result.issues],
+            ["entry_submit_blocked"],
+        )
+        self.assertEqual(
+            self._read_record("runtime-aapl-1").state,
+            ExecutionState.ENTRY_PENDING.value,
+        )
 
     def test_run_runtime_cycle_cancels_all_open_exit_orders_before_forced_exit(self) -> None:
         payload = _sive_payload()

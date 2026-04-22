@@ -513,6 +513,7 @@ def fetch_broker_runtime_snapshot(
     config: IbkrConnectionConfig,
     *,
     timeout: int = 10,
+    include_account_updates: bool = True,
     sync_wrapper_cls: type[RuntimeSnapshotSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
     app: RuntimeSnapshotSyncWrapperProtocol | None = None,
@@ -537,25 +538,26 @@ def fetch_broker_runtime_snapshot(
         try:
             raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
             raw_executions = runtime_app.get_executions(timeout=timeout)
-            configured_account_ids = _configured_snapshot_account_ids(config)
             raw_account_updates_payloads: list[dict[str, Any]] = []
-            if configured_account_ids:
-                # Keep the long-lived monitor on reqAccountUpdates instead of
-                # reqAccountSummary so we do not burn summary subscriptions.
-                for account_id in configured_account_ids:
+            if include_account_updates:
+                configured_account_ids = _configured_snapshot_account_ids(config)
+                if configured_account_ids:
+                    # Keep the long-lived monitor on reqAccountUpdates instead of
+                    # reqAccountSummary so we do not burn summary subscriptions.
+                    for account_id in configured_account_ids:
+                        raw_account_updates_payloads.append(
+                            runtime_app.get_account_updates(
+                                account_code=account_id,
+                                timeout=timeout,
+                            )
+                        )
+                else:
                     raw_account_updates_payloads.append(
                         runtime_app.get_account_updates(
-                            account_code=account_id,
+                            account_code="",
                             timeout=timeout,
                         )
                     )
-            else:
-                raw_account_updates_payloads.append(
-                    runtime_app.get_account_updates(
-                        account_code="",
-                        timeout=timeout,
-                    )
-                )
             raw_positions = runtime_app.get_positions(timeout=timeout)
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(runtime_app)

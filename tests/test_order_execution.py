@@ -368,6 +368,40 @@ class OrderExecutionTests(TestCase):
             result["warnings"],
         )
 
+    def test_submit_order_from_batch_keeps_non_fatal_ibkr_warning(self) -> None:
+        class _WarningWrapper(_FakeOrderExecutionSyncWrapper):
+            def place_order_sync(
+                self,
+                contract: object,
+                order: object,
+                timeout: int | None = None,
+            ) -> dict[str, object]:
+                result = super().place_order_sync(contract, order, timeout)
+                self.errors[int(result["orderId"])] = [
+                    {
+                        "errorCode": 399,
+                        "errorString": (
+                            "Order Message: BUY 10 AAPL Warning: Your order will not be placed "
+                            "at the exchange until 2026-04-11 09:30:00 US/Eastern."
+                        ),
+                    }
+                ]
+                return result
+
+        batch = parse_execution_batch_payload(_base_payload())
+
+        result = submit_order_from_batch(
+            self.config,
+            batch,
+            sync_wrapper_cls=_WarningWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["broker_order_status"]["status"], "Submitted")
+        self.assertIn("IBKR order warning [399]", " ".join(result["warnings"]))
+
     def test_submit_order_from_batch_rejects_fractional_stock_quantity(self) -> None:
         payload = _base_payload()
         payload["instructions"][0]["sizing"]["target_quantity"] = "10.5"

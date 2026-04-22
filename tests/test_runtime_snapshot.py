@@ -218,3 +218,27 @@ class RuntimeSnapshotTests(TestCase):
             _FakeRuntimeSnapshotSyncWrapper.last_instance.account_update_calls,
             [("U25245596", 10), ("U11111111", 10)],
         )
+
+    def test_fetch_broker_runtime_snapshot_can_skip_account_updates(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=7496,
+            client_id=0,
+            diagnostic_client_id=7,
+            account_id="U25245596",
+            account_ids=("U25245596",),
+        )
+
+        snapshot = fetch_broker_runtime_snapshot(
+            config,
+            sync_wrapper_cls=_FakeRuntimeSnapshotSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            include_account_updates=False,
+        )
+
+        self.assertEqual(snapshot.account_values, {})
+        self.assertEqual(snapshot.portfolio, ())
+        self.assertEqual(
+            _FakeRuntimeSnapshotSyncWrapper.last_instance.account_update_calls,
+            [],
+        )

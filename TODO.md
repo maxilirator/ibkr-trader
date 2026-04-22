@@ -13,6 +13,13 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Runtime now prioritizes urgent carry-over exits before fresh entries,
+  uses lighter broker snapshots during execution cycles, and fails closed on
+  stale or terminal pending-entry submits:
+  forced next-session exits can no longer be starved behind new entry submits,
+  the runtime cycle no longer pulls account-update payloads it does not use,
+  expired pending entries are cancelled before any broker call, and terminal
+  submit errors now move pending entries to `FAILED` instead of looping forever
 - [x] Session-bound open/close orders now pre-submit before the boundary:
   the runtime now sends exact Stockholm open/close scheduled orders and
   forced next-session-open exits one minute early by default so IBKR
