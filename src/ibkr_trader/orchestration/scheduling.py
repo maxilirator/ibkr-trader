@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -9,7 +9,11 @@ from zoneinfo import ZoneInfoNotFoundError
 
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
+from ibkr_trader.orchestration.session_calendar import find_matching_session_boundary
 from ibkr_trader.orchestration.session_calendar import find_next_session_open
+
+
+_STOCKHOLM_EXCHANGE_CODES = {"XSTO", "SFB"}
 
 
 class NextSessionExitStatus(StrEnum):
@@ -71,11 +75,7 @@ def _build_next_session_exit_preview(
             status=NextSessionExitStatus.NOT_REQUESTED,
         )
 
-    stockholm_codes = {"XSTO", "SFB"}
-    uses_stockholm_calendar = (
-        instruction.instrument.exchange in stockholm_codes
-        or instruction.instrument.primary_exchange in stockholm_codes
-    )
+    uses_stockholm_calendar = uses_stockholm_session_calendar(instruction)
     if uses_stockholm_calendar and session_calendar_path is not None:
         try:
             resolution = find_next_session_open(
@@ -114,6 +114,40 @@ def _build_next_session_exit_preview(
             "only anchors the request after the entry expiry window."
         ),
     )
+
+
+def uses_stockholm_session_calendar(instruction: ExecutionInstruction) -> bool:
+    return (
+        instruction.instrument.exchange in _STOCKHOLM_EXCHANGE_CODES
+        or instruction.instrument.primary_exchange in _STOCKHOLM_EXCHANGE_CODES
+    )
+
+
+def resolve_scheduled_submission_due_at(
+    instruction: ExecutionInstruction,
+    *,
+    scheduled_at: datetime,
+    session_calendar_path: Path | None,
+    submission_lead_time: timedelta,
+) -> datetime:
+    scheduled_at_utc = scheduled_at.astimezone(timezone.utc)
+    if submission_lead_time <= timedelta(0):
+        return scheduled_at_utc
+    if session_calendar_path is None or not uses_stockholm_session_calendar(instruction):
+        return scheduled_at_utc
+
+    try:
+        resolution = find_matching_session_boundary(
+            scheduled_at,
+            session_calendar_path=session_calendar_path,
+        )
+    except (FileNotFoundError, ValueError):
+        return scheduled_at_utc
+    if resolution is None:
+        return scheduled_at_utc
+
+    due_at = resolution.boundary_at.astimezone(timezone.utc) - submission_lead_time
+    return due_at if due_at < scheduled_at_utc else scheduled_at_utc
 
 
 def build_instruction_runtime_schedule(

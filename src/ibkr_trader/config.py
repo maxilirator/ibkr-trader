@@ -144,6 +144,7 @@ class AppConfig:
     execution_runtime_enabled: bool = False
     execution_runtime_interval_seconds: float = 5.0
     execution_runtime_timeout_seconds: int = 10
+    execution_runtime_submission_lead_seconds: float = 60.0
     execution_runtime_allow_startup_issues: bool = False
     execution_runtime_lease_seconds: float = 30.0
 
@@ -204,6 +205,9 @@ class AppConfig:
             ),
             execution_runtime_timeout_seconds=int(
                 getenv("EXECUTION_RUNTIME_TIMEOUT_SECONDS", "10")
+            ),
+            execution_runtime_submission_lead_seconds=float(
+                getenv("EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS", "60")
             ),
             execution_runtime_allow_startup_issues=getenv(
                 "EXECUTION_RUNTIME_ALLOW_STARTUP_ISSUES",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
 from pathlib import Path
@@ -331,6 +332,178 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.state, ExecutionState.ENTRY_SUBMITTED.value)
         self.assertEqual(record.broker_order_id, 11)
         self.assertEqual(record.entry_submitted_quantity, "1")
+
+    def test_run_runtime_cycle_submits_stockholm_open_entry_one_minute_early(self) -> None:
+        payload = _sive_payload()
+        payload["instruction"]["entry"]["submit_at"] = "2026-04-10T09:00:00+02:00"
+        payload["instruction"]["entry"]["expire_at"] = "2026-04-10T10:00:00+02:00"
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 0, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 8, 0, tzinfo=timezone.utc),
+            payload=payload,
+        )
+
+        submit_calls: list[str] = []
+
+        def fake_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            submit_calls.append(instruction.instruction_id)
+            return {
+                "instruction_id": "runtime-sive-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 489000, "symbol": "SIVE"},
+                "order": {
+                    "order_ref": "runtime-sive-1",
+                    "action": "BUY",
+                    "order_type": "LMT",
+                    "time_in_force": "DAY",
+                    "limit_price": "11.3131",
+                    "total_quantity": "100",
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 11,
+                    "status": "PreSubmitted",
+                    "filled": "0",
+                    "remaining": "100",
+                    "avgFillPrice": 0.0,
+                    "permId": 8001,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 10, 6, 59, tzinfo=timezone.utc),
+                entry_submitter=fake_submitter,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={},
+                    executions=(),
+                    portfolio=(),
+                    positions=(),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(submit_calls, ["runtime-sive-1"])
+        self.assertEqual(len(result.submitted_entries), 1)
+
+    def test_run_runtime_cycle_submits_stockholm_close_entry_one_minute_early(self) -> None:
+        payload = _sive_payload()
+        payload["instruction"]["entry"]["submit_at"] = "2026-04-10T17:30:00+02:00"
+        payload["instruction"]["entry"]["expire_at"] = "2026-04-10T17:31:00+02:00"
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 31, tzinfo=timezone.utc),
+            payload=payload,
+        )
+
+        submit_calls: list[str] = []
+
+        def fake_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            submit_calls.append(instruction.instruction_id)
+            return {
+                "instruction_id": "runtime-sive-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 489000, "symbol": "SIVE"},
+                "order": {
+                    "order_ref": "runtime-sive-1",
+                    "action": "BUY",
+                    "order_type": "LMT",
+                    "time_in_force": "DAY",
+                    "limit_price": "11.3131",
+                    "total_quantity": "100",
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 11,
+                    "status": "PreSubmitted",
+                    "filled": "0",
+                    "remaining": "100",
+                    "avgFillPrice": 0.0,
+                    "permId": 8001,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 10, 15, 29, tzinfo=timezone.utc),
+                entry_submitter=fake_submitter,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={},
+                    executions=(),
+                    portfolio=(),
+                    positions=(),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(submit_calls, ["runtime-sive-1"])
+        self.assertEqual(len(result.submitted_entries), 1)
 
     def test_run_runtime_cycle_skips_due_entry_when_kill_switch_is_enabled(self) -> None:
         payload = _aapl_payload()
@@ -1521,8 +1694,9 @@ class RuntimeWorkerTests(TestCase):
                 self.config,
                 runtime_timezone="Europe/Stockholm",
                 session_calendar_path=schedule_path,
-                now=datetime(2026, 4, 13, 7, 1, tzinfo=timezone.utc),
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
                 exit_submitter=fake_exit_submitter,
+                submission_lead_time=timedelta(minutes=1),
                 broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                     open_orders={},
                     executions=(),
@@ -1628,9 +1802,10 @@ class RuntimeWorkerTests(TestCase):
                 self.config,
                 runtime_timezone="Europe/Stockholm",
                 session_calendar_path=schedule_path,
-                now=datetime(2026, 4, 13, 7, 1, tzinfo=timezone.utc),
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
                 exit_submitter=fake_exit_submitter,
                 broker_order_canceler=fake_canceler,
+                submission_lead_time=timedelta(minutes=1),
                 broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                     open_orders={
                         21: BrokerOpenOrder(

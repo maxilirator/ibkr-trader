@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from dataclasses import asdict
 from datetime import date, datetime
 from decimal import Decimal
@@ -1384,6 +1385,9 @@ def create_app(config: AppConfig | None = None) -> Any:
                 broker_snapshot_fetcher=fetch_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
+                submission_lead_time=timedelta(
+                    seconds=app_config.execution_runtime_submission_lead_seconds
+                ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1420,6 +1424,9 @@ def create_app(config: AppConfig | None = None) -> Any:
                 broker_snapshot_fetcher=fetch_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
+                submission_lead_time=timedelta(
+                    seconds=app_config.execution_runtime_submission_lead_seconds
+                ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

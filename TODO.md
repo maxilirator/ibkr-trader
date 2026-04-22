@@ -13,6 +13,10 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Session-bound open/close orders now pre-submit before the boundary:
+  the runtime now sends exact Stockholm open/close scheduled orders and
+  forced next-session-open exits one minute early by default so IBKR
+  already has them before the auction begins
 - [x] Short-sale prechecks now block invalid shorts before broker submit:
   the preview and submit paths now require explicit SHORT intent, reject
   sell-through-long instructions, reject non-short-enabled account types,

@@ -11,6 +11,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
 from decimal import InvalidOperation
@@ -59,6 +60,7 @@ from ibkr_trader.orchestration.operator_controls import read_kill_switch_state
 from ibkr_trader.orchestration.scheduling import (
     NextSessionExitStatus,
     build_instruction_runtime_schedule,
+    resolve_scheduled_submission_due_at,
 )
 from ibkr_trader.orchestration.runtime_service_state import (
     EXECUTION_RUNTIME_KEY,
@@ -75,6 +77,7 @@ from ibkr_trader.orchestration.runtime_service_state import (
 from ibkr_trader.orchestration.state_machine import ExecutionState
 
 DEFAULT_BROKER_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
+DEFAULT_SUBMISSION_LEAD_TIME = timedelta(seconds=60)
 _CLOSED_BROKER_ORDER_STATUSES = {
     "API_CANCELLED",
     "CANCELLED",
@@ -443,6 +446,69 @@ def _fetch_instruction_ids(
         )
 
 
+def _is_entry_submission_due(
+    record: InstructionRecord,
+    *,
+    cycle_at: datetime,
+    session_calendar_path: Path,
+    submission_lead_time: timedelta,
+) -> bool:
+    submit_at = _ensure_utc(record.submit_at)
+    if submit_at is None:
+        return False
+    if submit_at <= cycle_at:
+        return True
+    if submit_at > cycle_at + submission_lead_time:
+        return False
+
+    try:
+        instruction = _instruction_payload(record)
+    except Exception:
+        return False
+
+    due_at = resolve_scheduled_submission_due_at(
+        instruction,
+        scheduled_at=instruction.entry.submit_at,
+        session_calendar_path=session_calendar_path,
+        submission_lead_time=submission_lead_time,
+    )
+    return due_at <= cycle_at
+
+
+def _fetch_due_entry_instruction_ids(
+    session_factory: sessionmaker[Session],
+    *,
+    cycle_at: datetime,
+    session_calendar_path: Path,
+    submission_lead_time: timedelta,
+    instruction_ids: tuple[str, ...] | None = None,
+) -> list[str]:
+    candidate_cutoff = cycle_at + submission_lead_time
+    with session_scope(session_factory) as session:
+        query = select(InstructionRecord).where(
+            InstructionRecord.state == ExecutionState.ENTRY_PENDING.value,
+            InstructionRecord.submit_at <= candidate_cutoff,
+        )
+        if instruction_ids:
+            query = query.where(InstructionRecord.instruction_id.in_(instruction_ids))
+        records = list(
+            session.execute(
+                query.order_by(InstructionRecord.submit_at, InstructionRecord.id)
+            ).scalars()
+        )
+
+    return [
+        record.instruction_id
+        for record in records
+        if _is_entry_submission_due(
+            record,
+            cycle_at=cycle_at,
+            session_calendar_path=session_calendar_path,
+            submission_lead_time=submission_lead_time,
+        )
+    ]
+
+
 def _is_retryable_broker_error(exc: Exception) -> bool:
     if isinstance(exc, ConnectionError):
         return True
@@ -582,11 +648,19 @@ def _is_delayed_limit_exit_due(
     instruction: ExecutionInstruction,
     *,
     cycle_at: datetime,
+    session_calendar_path: Path,
+    submission_lead_time: timedelta,
 ) -> bool:
     delayed_limit = instruction.exit.delayed_limit
     if delayed_limit is None:
         return False
-    return delayed_limit.submit_at.astimezone(timezone.utc) <= cycle_at.astimezone(timezone.utc)
+    due_at = resolve_scheduled_submission_due_at(
+        instruction,
+        scheduled_at=delayed_limit.submit_at,
+        session_calendar_path=session_calendar_path,
+        submission_lead_time=submission_lead_time,
+    )
+    return due_at <= cycle_at.astimezone(timezone.utc)
 
 
 def _compute_delayed_limit_price(
@@ -1176,6 +1250,7 @@ def _is_next_session_exit_due(
     runtime_timezone: str,
     session_calendar_path: Path,
     cycle_at: datetime,
+    submission_lead_time: timedelta,
 ) -> bool:
     schedule = build_instruction_runtime_schedule(
         instruction,
@@ -1189,7 +1264,8 @@ def _is_next_session_exit_due(
         or preview.next_session_open_utc is None
     ):
         return False
-    return preview.next_session_open_utc <= cycle_at.astimezone(timezone.utc)
+    due_at = preview.next_session_open_utc - submission_lead_time
+    return due_at <= cycle_at.astimezone(timezone.utc)
 
 
 def run_runtime_cycle(
@@ -1211,6 +1287,7 @@ def run_runtime_cycle(
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
+    submission_lead_time: timedelta = DEFAULT_SUBMISSION_LEAD_TIME,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> RuntimeCycleResult:
     cycle_started_at = now.astimezone(timezone.utc) if now is not None else utc_now()
@@ -1260,10 +1337,11 @@ def run_runtime_cycle(
 
     kill_switch_state = read_kill_switch_state(session_factory)
     kill_switch_enabled = kill_switch_state.enabled
-    due_instruction_ids = _fetch_instruction_ids(
+    due_instruction_ids = _fetch_due_entry_instruction_ids(
         session_factory,
-        states=(ExecutionState.ENTRY_PENDING.value,),
-        submit_before=cycle_started_at,
+        cycle_at=cycle_started_at,
+        session_calendar_path=session_calendar_path,
+        submission_lead_time=submission_lead_time,
         instruction_ids=instruction_ids,
     )
     due_instruction_count = len(due_instruction_ids)
@@ -1678,6 +1756,8 @@ def run_runtime_cycle(
                     _is_delayed_limit_exit_due(
                         instruction,
                         cycle_at=cycle_started_at,
+                        session_calendar_path=session_calendar_path,
+                        submission_lead_time=submission_lead_time,
                     )
                     and remaining_quantity > 0
                     and not exit_open
@@ -1718,6 +1798,7 @@ def run_runtime_cycle(
                     runtime_timezone=runtime_timezone,
                     session_calendar_path=session_calendar_path,
                     cycle_at=cycle_started_at,
+                    submission_lead_time=submission_lead_time,
                 ):
                     continue
 
@@ -1812,6 +1893,7 @@ def run_startup_reconciliation(
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
+    submission_lead_time: timedelta = DEFAULT_SUBMISSION_LEAD_TIME,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> RuntimeCycleResult:
     """Reconcile live broker state on startup without submitting new entry orders."""
@@ -1832,6 +1914,7 @@ def run_startup_reconciliation(
         broker_callback_fetcher=broker_callback_fetcher,
         broker_order_canceler=broker_order_canceler,
         broker_retry_delays=broker_retry_delays,
+        submission_lead_time=submission_lead_time,
         sleep_fn=sleep_fn,
     )
 
@@ -1988,6 +2071,9 @@ def run_persistent_execution_runtime(
     owner_label, hostname, pid = _runtime_owner_label()
     broker_config = app_config.ibkr.primary_session()
     broker_ops = _build_runtime_broker_operations(broker_sessions)
+    submission_lead_time = timedelta(
+        seconds=app_config.execution_runtime_submission_lead_seconds
+    )
 
     acquire_runtime_service_lease(
         session_factory,
@@ -2004,6 +2090,7 @@ def run_persistent_execution_runtime(
         metadata_json={
             "interval_seconds": interval_seconds,
             "timeout_seconds": timeout,
+            "submission_lead_seconds": app_config.execution_runtime_submission_lead_seconds,
             "allow_startup_issues": allow_startup_issues,
         },
     )
@@ -2029,6 +2116,7 @@ def run_persistent_execution_runtime(
                 broker_snapshot_fetcher=broker_ops.fetch_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
+                submission_lead_time=submission_lead_time,
             )
             record_runtime_cycle_completed(
                 session_factory,
@@ -2081,6 +2169,7 @@ def run_persistent_execution_runtime(
                 broker_snapshot_fetcher=broker_ops.fetch_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
+                submission_lead_time=submission_lead_time,
             )
             record_runtime_cycle_completed(
                 session_factory,

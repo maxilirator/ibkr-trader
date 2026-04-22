@@ -60,6 +60,7 @@ BROKER_HEARTBEAT_INTERVAL_SECONDS=30
 BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60
 EXECUTION_RUNTIME_ENABLED=true
 EXECUTION_RUNTIME_INTERVAL_SECONDS=5
+EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60
 ```
 
 Recommended repo usage:
@@ -71,6 +72,8 @@ Recommended repo usage:
 - do not work around ownership problems by generating fresh client IDs during normal operation
 
 When the API host is running with `EXECUTION_RUNTIME_ENABLED=true`, that same colocated process now hosts the long-lived execution loop. The runtime takes a durable Postgres lease before it starts cycling, and the dashboard can show whether the execution loop is running, degraded, blocked on startup reconciliation, or stopped.
+
+For Stockholm session-bound orders, the execution runtime now pre-submits exact open/close instructions ahead of the boundary. With the default `EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60`, next-session-open forced exits and exact open/close scheduled orders are sent one minute early so the broker already has them before the auction starts.
 
 See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.
 

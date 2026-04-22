@@ -57,6 +57,7 @@ Current repo template defaults:
 - `BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60`
 - `EXECUTION_RUNTIME_ENABLED=false`
 - `EXECUTION_RUNTIME_INTERVAL_SECONDS=5`
+- `EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60`
 
 The `0` client ID is intentional. IBKR's current TWS API docs recommend connecting with `client_id=0` for optimal order-management functionality. In this repo the canonical client-ID policy is:
 
@@ -89,6 +90,7 @@ Current important settings include:
 - IBKR host, port, primary client ID, diagnostic client ID, streaming client ID, default account ID, and optional multi-account snapshot list
 - background broker heartbeat and ledger snapshot refresh intervals
 - long-lived execution runtime enablement, interval, timeout, startup-gate policy, and durable lease window
+- session-bound submission lead time for open/close auction protection
 
 For the background broker monitor, prefer `IBKR_ACCOUNT_IDS` when you want the dashboard and persisted runtime snapshots to refresh balances for more than one visible broker account. The monitor now uses per-account `reqAccountUpdates` for these accounts rather than `reqAccountSummary`, which avoids the IBKR summary-subscription limit during long-lived operation.
 
@@ -100,6 +102,11 @@ The long-lived execution runtime can now run inside the API host process. When `
 - persists whether the runtime is `STARTING`, `RUNNING`, `DEGRADED`, `STARTUP_BLOCKED`, `STOPPED`, or `FAILED`
 
 That runtime status is exposed through `GET /healthz` and shown in the dashboard.
+
+For Stockholm session-bound orders, the runtime now submits exact open/close instructions slightly ahead of the boundary. By default `EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60`, so:
+
+- a forced next-session-open market exit is sent one minute before the open
+- an instruction explicitly scheduled for the exchange open or close is also sent one minute early
 
 ## Local API wrapper
 

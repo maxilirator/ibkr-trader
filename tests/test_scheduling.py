@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import timedelta
 from unittest import TestCase
 
 from ibkr_trader.api.server import parse_execution_batch_payload
 from ibkr_trader.orchestration.scheduling import NextSessionExitStatus
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
+from ibkr_trader.orchestration.scheduling import resolve_scheduled_submission_due_at
 from ibkr_trader.orchestration.scheduling import resolve_runtime_timezone
 
 
@@ -133,6 +135,61 @@ class SchedulingTests(TestCase):
     def test_resolve_runtime_timezone_rejects_unknown_name(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown runtime timezone"):
             resolve_runtime_timezone("Europe/NotARealPlace")
+
+    def test_resolve_scheduled_submission_due_at_uses_one_minute_lead_for_stockholm_open(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            parquet_path = Path(temp_dir) / "day_sessions.parquet"
+            parquet_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            batch_payload = _sample_batch()
+            batch_payload["instructions"][0]["entry"]["submit_at"] = "2026-04-10T09:00:00+02:00"
+            batch = parse_execution_batch_payload(batch_payload)
+            instruction = batch.instructions[0]
+
+            due_at = resolve_scheduled_submission_due_at(
+                instruction,
+                scheduled_at=instruction.entry.submit_at,
+                session_calendar_path=parquet_path,
+                submission_lead_time=timedelta(minutes=1),
+            )
+
+        self.assertEqual(due_at.isoformat(), "2026-04-10T06:59:00+00:00")
+
+    def test_resolve_scheduled_submission_due_at_uses_one_minute_lead_for_stockholm_close(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            parquet_path = Path(temp_dir) / "day_sessions.parquet"
+            parquet_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            batch_payload = _sample_batch()
+            batch_payload["instructions"][0]["entry"]["submit_at"] = "2026-04-10T17:30:00+02:00"
+            batch_payload["instructions"][0]["entry"]["expire_at"] = "2026-04-10T17:31:00+02:00"
+            batch = parse_execution_batch_payload(batch_payload)
+            instruction = batch.instructions[0]
+
+            due_at = resolve_scheduled_submission_due_at(
+                instruction,
+                scheduled_at=instruction.entry.submit_at,
+                session_calendar_path=parquet_path,
+                submission_lead_time=timedelta(minutes=1),
+            )
+
+        self.assertEqual(due_at.isoformat(), "2026-04-10T15:29:00+00:00")
 
 
 if __name__ == "__main__":

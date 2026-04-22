@@ -41,6 +41,15 @@ class SessionOpenResolution:
     source_path: str
 
 
+@dataclass(frozen=True, slots=True)
+class SessionBoundaryResolution:
+    boundary_at: datetime
+    boundary_kind: str
+    session_kind: str
+    timezone_name: str
+    source_path: str
+
+
 def _parse_session_row(row: dict[str, str], *, source_path: Path) -> SessionCalendarRow:
     return SessionCalendarRow(
         session_date=date.fromisoformat(row["session_date"]),
@@ -130,5 +139,38 @@ def find_next_session_open(
             timezone_name=row.timezone_name,
             source_path=row.source_path,
         )
+
+    return None
+
+
+def find_matching_session_boundary(
+    target_at: datetime,
+    *,
+    session_calendar_path: Path,
+) -> SessionBoundaryResolution | None:
+    if target_at.tzinfo is None:
+        raise ValueError("target_at must include timezone information")
+
+    target_at_utc = target_at.astimezone(timezone.utc)
+    for row in load_session_calendar(session_calendar_path):
+        open_at = row.open_at()
+        if open_at.astimezone(timezone.utc) == target_at_utc:
+            return SessionBoundaryResolution(
+                boundary_at=open_at,
+                boundary_kind="open",
+                session_kind=row.session_kind,
+                timezone_name=row.timezone_name,
+                source_path=row.source_path,
+            )
+
+        close_at = row.close_at()
+        if close_at.astimezone(timezone.utc) == target_at_utc:
+            return SessionBoundaryResolution(
+                boundary_at=close_at,
+                boundary_kind="close",
+                session_kind=row.session_kind,
+                timezone_name=row.timezone_name,
+                source_path=row.source_path,
+            )
 
     return None
