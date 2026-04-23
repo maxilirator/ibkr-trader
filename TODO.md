@@ -13,6 +13,10 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Repo now includes a session-bound IB Gateway IBC service scaffold:
+  the repo ships a user-level `systemd` unit, a session-env capture helper,
+  and an explicit IBC launcher wrapper so Gateway startup can be managed
+  deliberately instead of depending on accidental lingering desktop state
 - [x] Long account-based sizing now defaults to real cash, not NAV:
   when a long BUY instruction uses `fraction_of_account_nav`, the trader now
   sizes from `TotalCashValue`/settled cash by default and refuses the order if

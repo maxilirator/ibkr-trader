@@ -77,6 +77,88 @@ For Stockholm session-bound orders, the execution runtime now pre-submits exact 
 
 See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.
 
+## Session-bound Gateway service
+
+For the current `quant.geisler.se` operating model, the safest first service
+shape is a **session-bound** IB Gateway service:
+
+- `ibgateway` logs in once via RDP
+- XRDP keeps that desktop session alive across disconnects
+- a `systemd --user` service starts IBC and IB Gateway on that same display
+- reconnecting via RDP returns to the same visible Gateway screen
+
+This is intentionally different from a headless `Xvfb` service. A headless
+service is useful later, but it does not satisfy the operator requirement of
+"disconnect and reconnect to the same Gateway screen."
+
+The repo now includes:
+
+- [ibgateway-ibc.service](/home/mattias/dev/ibkr-trader/ops/systemd/ibgateway-ibc.service)
+- [run_ibgateway_ibc.sh](/home/mattias/dev/ibkr-trader/ops/scripts/run_ibgateway_ibc.sh)
+- [write_ibgateway_session_env.sh](/home/mattias/dev/ibkr-trader/ops/scripts/write_ibgateway_session_env.sh)
+- [ibgateway-ibc.env.example](/home/mattias/dev/ibkr-trader/ops/examples/ibgateway-ibc.env.example)
+
+### Install flow for `ibgateway`
+
+Run these steps as the `ibgateway` user on the server after the XRDP desktop is
+stable and reconnecting properly.
+
+1. Create the persistent Gateway config directory:
+
+```bash
+mkdir -p ~/.config/ibgateway ~/.config/systemd/user
+```
+
+2. Copy the repo templates into the user config location:
+
+```bash
+cp ~/ibkr-trader/ops/systemd/ibgateway-ibc.service ~/.config/systemd/user/
+cp ~/ibkr-trader/ops/examples/ibgateway-ibc.env.example ~/.config/ibgateway/ibgateway.env
+```
+
+3. Edit `~/.config/ibgateway/ibgateway.env` so the paths match the actual IBC
+   and Gateway installation for `ibgateway`.
+
+4. Capture the active desktop session. If you are doing this from an XRDP
+   terminal inside the live desktop, the current `DISPLAY` is normally enough:
+
+```bash
+~/ibkr-trader/ops/scripts/write_ibgateway_session_env.sh
+```
+
+If you are doing it from SSH, specify the live display explicitly:
+
+```bash
+~/ibkr-trader/ops/scripts/write_ibgateway_session_env.sh \
+  --display :11 \
+  --xauthority /home/ibgateway/.Xauthority
+```
+
+5. Reload and start the user service:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ibgateway-ibc.service
+```
+
+6. Verify status and logs:
+
+```bash
+systemctl --user status ibgateway-ibc.service
+journalctl --user -u ibgateway-ibc.service -n 200 --no-pager
+```
+
+### Operational notes
+
+- If the XRDP display number changes later, rerun
+  `write_ibgateway_session_env.sh` and restart the service.
+- This service will fail closed if `DISPLAY`, `XAUTHORITY`, IBC, or the Gateway
+  config path are missing.
+- This service does not solve second-factor authentication by itself. It only
+  makes the launch path durable and explicit.
+- For XRDP reconnect behavior, the server should use `KillDisconnected=false`
+  and a reconnect policy such as `Policy=UBI` in `/etc/xrdp/sesman.ini`.
+
 ## First live validation
 
 Once the remote IB Gateway is running and the official Python API client is installed:

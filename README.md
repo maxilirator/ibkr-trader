@@ -108,6 +108,22 @@ For Stockholm session-bound orders, the runtime now submits exact open/close ins
 - a forced next-session-open market exit is sent one minute before the open
 - an instruction explicitly scheduled for the exchange open or close is also sent one minute early
 
+## IB Gateway service
+
+The repo now includes a first production-style IB Gateway service model for the
+`ibgateway` operator account:
+
+- [ibgateway-ibc.service](ops/systemd/ibgateway-ibc.service)
+- [run_ibgateway_ibc.sh](ops/scripts/run_ibgateway_ibc.sh)
+- [write_ibgateway_session_env.sh](ops/scripts/write_ibgateway_session_env.sh)
+- [ibgateway-ibc.env.example](ops/examples/ibgateway-ibc.env.example)
+
+This first version is deliberately **session-bound** rather than headless. It
+attaches IBC and IB Gateway to the user's persistent XRDP desktop so an
+operator can disconnect and reconnect to the same live Gateway screen. See
+[docs/ib-gateway-setup.md](docs/ib-gateway-setup.md) for the exact install
+steps.
+
 ## Local API wrapper
 
 The recommended service shape is:
