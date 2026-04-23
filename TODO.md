@@ -13,6 +13,13 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Operator dashboard now groups repeated broker/reconciliation noise,
+  persists per-column filters, and gives buttons visible click/work/done
+  feedback:
+  broker attention and reconciliation warnings are aggregated into grouped
+  rows with count badges and group clear actions, dashboard filters persist
+  in the browser until cleared, and API-backed buttons now show clear
+  in-flight and completion states instead of feeling blind
 - [x] Recovery now heals stale fills and instruction state after broker trouble:
   background diagnostic snapshots automatically pull executions while there
   are active instructions or unsettled broker orders, execution persistence

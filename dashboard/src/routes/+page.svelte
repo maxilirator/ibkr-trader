@@ -1,4 +1,5 @@
 <script>
+  import { browser } from '$app/environment';
   import { applyAction, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -46,8 +47,25 @@
   let reconciliationClearResult = null;
   let referenceNow = new Date();
   let refreshInFlight = false;
+  let dashboardFilters = defaultDashboardFilters();
+  let filtersLoaded = false;
+  let buttonStates = {};
+  let filteredPositions = [];
+  let filteredOpenOrders = [];
+  let filteredRecentFills = [];
+  let filteredInstructions = [];
+  let aggregatedBrokerAttention = [];
+  let filteredBrokerAttention = [];
+  let aggregatedReconciliation = [];
+  let filteredReconciliation = [];
+  let visibleBrokerAttentionEventIds = [];
+  let visibleReconciliationIssueIds = [];
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const AUTO_REFRESH_INTERVAL_MS = 15000;
+  const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v2';
+  const BUTTON_CLICK_TO_WORK_MS = 140;
+  const BUTTON_SUCCESS_RESET_MS = 1600;
+  const BUTTON_ERROR_RESET_MS = 2200;
   let timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
     year: 'numeric',
@@ -58,6 +76,140 @@
     second: '2-digit',
     timeZoneName: 'short'
   });
+
+  function defaultDashboardFilters() {
+    return {
+      positions: {
+        account: '',
+        symbol: '',
+        exchange: '',
+        currency: '',
+        quantity: '',
+        averageCost: '',
+        marketPrice: '',
+        marketValue: '',
+        unrealizedPnl: ''
+      },
+      openOrders: {
+        account: '',
+        symbol: '',
+        role: '',
+        purpose: '',
+        side: '',
+        quantity: '',
+        type: '',
+        limit: '',
+        stop: '',
+        vsFill: '',
+        market: '',
+        vsMkt: '',
+        status: '',
+        warning: ''
+      },
+      recentFills: {
+        time: '',
+        account: '',
+        symbol: '',
+        side: '',
+        quantity: '',
+        price: '',
+        fee: ''
+      },
+      instructions: {
+        instruction: '',
+        symbol: '',
+        state: '',
+        lifecycle: '',
+        guidance: '',
+        entryOrder: '',
+        exitOrder: '',
+        updated: ''
+      },
+      brokerAttention: {
+        account: '',
+        symbol: '',
+        eventType: '',
+        message: '',
+        count: '',
+        latestAt: ''
+      },
+      reconciliation: {
+        runKind: '',
+        stage: '',
+        severity: '',
+        message: '',
+        instruction: '',
+        count: '',
+        latestAt: ''
+      }
+    };
+  }
+
+  function parseStoredFilters(rawValue) {
+    const defaults = defaultDashboardFilters();
+    if (!rawValue) {
+      return defaults;
+    }
+
+    try {
+      const parsed = JSON.parse(rawValue);
+      for (const [sectionName, sectionDefaults] of Object.entries(defaults)) {
+        const parsedSection =
+          parsed && typeof parsed === 'object' && parsed[sectionName] && typeof parsed[sectionName] === 'object'
+            ? parsed[sectionName]
+            : {};
+        defaults[sectionName] = Object.fromEntries(
+          Object.keys(sectionDefaults).map((key) => [key, String(parsedSection[key] ?? '')])
+        );
+      }
+      return defaults;
+    } catch {
+      return defaults;
+    }
+  }
+
+  function resetFilterSection(sectionName) {
+    const defaults = defaultDashboardFilters();
+    dashboardFilters = {
+      ...dashboardFilters,
+      [sectionName]: defaults[sectionName]
+    };
+  }
+
+  function sectionHasActiveFilters(sectionName) {
+    return Object.values(dashboardFilters[sectionName] ?? {}).some(
+      (value) => String(value ?? '').trim() !== ''
+    );
+  }
+
+  function normalizeSearchText(value) {
+    if (value === null || value === undefined) return '';
+    if (Array.isArray(value)) return value.map((item) => normalizeSearchText(item)).join(' ');
+    return String(value).toLowerCase();
+  }
+
+  function matchesFilterValue(value, filterValue) {
+    const normalizedFilter = String(filterValue ?? '').trim().toLowerCase();
+    if (!normalizedFilter) {
+      return true;
+    }
+    return normalizeSearchText(value).includes(normalizedFilter);
+  }
+
+  function uniqueIds(values) {
+    return [...new Set(values.filter((value) => Number.isInteger(value) && value > 0))];
+  }
+
+  function summarizeRefs(values) {
+    const uniqueValues = [...new Set(values.filter(Boolean))];
+    if (uniqueValues.length === 0) {
+      return null;
+    }
+    if (uniqueValues.length <= 2) {
+      return uniqueValues.join(', ');
+    }
+    return `${uniqueValues.slice(0, 2).join(', ')} +${uniqueValues.length - 2} more`;
+  }
 
   $: operatorSnapshot = data.operatorSnapshot ?? {};
   $: killSwitch = operatorSnapshot.kill_switch ?? {
@@ -255,16 +407,6 @@
     return normalized;
   }
 
-  function enhanceDashboardAction() {
-    return async ({ result }) => {
-      await applyAction(result);
-
-      if (result.type === 'success') {
-        await refreshDashboard();
-      }
-    };
-  }
-
   async function refreshDashboard() {
     if (refreshInFlight) {
       return;
@@ -281,6 +423,11 @@
   }
 
   onMount(() => {
+    if (browser) {
+      dashboardFilters = parseStoredFilters(window.localStorage.getItem(FILTER_STORAGE_KEY));
+      filtersLoaded = true;
+    }
+
     const intervalId = window.setInterval(() => {
       void refreshDashboard();
     }, AUTO_REFRESH_INTERVAL_MS);
@@ -289,6 +436,10 @@
       window.clearInterval(intervalId);
     };
   });
+
+  $: if (browser && filtersLoaded) {
+    window.localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(dashboardFilters));
+  }
 
   function instructionWindowState(instruction) {
     const submitAt = parseTimestamp(instruction.submit_at);
@@ -479,6 +630,281 @@
       `${instruction.exit_order_id ?? 'n/a'} / ${instruction.exit_order_status ?? 'n/a'}`
     );
   }
+
+  function isOpenReview(review) {
+    return (review?.status ?? 'OPEN') === 'OPEN';
+  }
+
+  function groupBrokerAttentionRows(rows) {
+    const groupedRows = new Map();
+
+    for (const row of rows) {
+      if (!isOpenReview(row.operator_review)) {
+        continue;
+      }
+
+      const groupKey = [
+        row.account_key,
+        row.symbol,
+        row.event_type,
+        row.message
+      ].join('|');
+      const currentGroup = groupedRows.get(groupKey) ?? {
+        key: groupKey,
+        accountKey: row.account_key,
+        accountLabel: row.account_label,
+        symbol: row.symbol,
+        eventType: row.event_type,
+        message: row.message,
+        latestAt: row.event_at,
+        latestStatusAfter: row.status_after,
+        eventIds: [],
+        orderRefs: [],
+        notes: [],
+        count: 0
+      };
+
+      currentGroup.count += 1;
+      currentGroup.eventIds.push(Number(row.event_id));
+      if (row.order_ref) currentGroup.orderRefs.push(row.order_ref);
+      if (row.note) currentGroup.notes.push(row.note);
+
+      if (parseTimestamp(row.event_at)?.getTime() >= (parseTimestamp(currentGroup.latestAt)?.getTime() ?? 0)) {
+        currentGroup.latestAt = row.event_at;
+        currentGroup.latestStatusAfter = row.status_after;
+        currentGroup.accountLabel = row.account_label ?? currentGroup.accountLabel;
+      }
+
+      groupedRows.set(groupKey, currentGroup);
+    }
+
+    return [...groupedRows.values()]
+      .map((group) => ({
+        ...group,
+        eventIds: uniqueIds(group.eventIds),
+        eventIdsCsv: uniqueIds(group.eventIds).join(','),
+        orderRefSummary: summarizeRefs(group.orderRefs),
+        noteSummary: summarizeRefs(group.notes)
+      }))
+      .sort((left, right) => {
+        const leftAt = parseTimestamp(left.latestAt)?.getTime() ?? 0;
+        const rightAt = parseTimestamp(right.latestAt)?.getTime() ?? 0;
+        return rightAt - leftAt;
+      });
+  }
+
+  function groupReconciliationRuns(runs) {
+    const groupedRows = new Map();
+
+    for (const run of runs) {
+      for (const issue of run.issues ?? []) {
+        if (!isOpenReview(issue.operator_review)) {
+          continue;
+        }
+
+        const groupKey = [
+          run.run_kind,
+          issue.stage,
+          issue.severity,
+          issue.instruction_id ?? '',
+          issue.message
+        ].join('|');
+
+        const currentGroup = groupedRows.get(groupKey) ?? {
+          key: groupKey,
+          runKind: run.run_kind,
+          stage: issue.stage,
+          severity: issue.severity,
+          instructionId: issue.instruction_id,
+          message: issue.message,
+          latestAt: issue.observed_at,
+          issueIds: [],
+          runIds: [],
+          runStatuses: [],
+          runCompletedAts: [],
+          count: 0
+        };
+
+        currentGroup.count += 1;
+        currentGroup.issueIds.push(Number(issue.issue_id));
+        currentGroup.runIds.push(Number(run.run_id));
+        currentGroup.runStatuses.push(run.status);
+        currentGroup.runCompletedAts.push(run.completed_at);
+
+        if (parseTimestamp(issue.observed_at)?.getTime() >= (parseTimestamp(currentGroup.latestAt)?.getTime() ?? 0)) {
+          currentGroup.latestAt = issue.observed_at;
+        }
+
+        groupedRows.set(groupKey, currentGroup);
+      }
+    }
+
+    return [...groupedRows.values()]
+      .map((group) => ({
+        ...group,
+        issueIds: uniqueIds(group.issueIds),
+        issueIdsCsv: uniqueIds(group.issueIds).join(','),
+        runCount: uniqueIds(group.runIds).length,
+        latestCompletedAt: group.runCompletedAts
+          .map((value) => parseTimestamp(value))
+          .filter(Boolean)
+          .sort((left, right) => right.getTime() - left.getTime())[0]
+          ?.toISOString() ?? null
+      }))
+      .sort((left, right) => {
+        const leftAt = parseTimestamp(left.latestAt)?.getTime() ?? 0;
+        const rightAt = parseTimestamp(right.latestAt)?.getTime() ?? 0;
+        return rightAt - leftAt;
+      });
+  }
+
+  function setButtonState(actionKey, nextState) {
+    buttonStates = {
+      ...buttonStates,
+      [actionKey]: nextState
+    };
+  }
+
+  function clearButtonState(actionKey) {
+    const nextStates = { ...buttonStates };
+    delete nextStates[actionKey];
+    buttonStates = nextStates;
+  }
+
+  function buttonState(actionKey) {
+    return buttonStates[actionKey] ?? 'idle';
+  }
+
+  function buttonIsBusy(actionKey) {
+    const currentState = buttonState(actionKey);
+    return currentState === 'clicking' || currentState === 'working';
+  }
+
+  function buttonStateClass(actionKey) {
+    const currentState = buttonState(actionKey);
+    if (currentState === 'clicking') return 'is-clicking';
+    if (currentState === 'working') return 'is-working';
+    if (currentState === 'success') return 'is-success';
+    if (currentState === 'error') return 'is-error';
+    return '';
+  }
+
+  function buttonLabel(actionKey, baseLabel) {
+    const currentState = buttonState(actionKey);
+    if (currentState === 'clicking') return 'Clicking…';
+    if (currentState === 'working') return 'Working…';
+    if (currentState === 'success') return 'Done';
+    if (currentState === 'error') return 'Retry';
+    return baseLabel;
+  }
+
+  function enhanceDashboardAction(defaultActionKey = 'dashboard-action') {
+    return ({ submitter }) => {
+      const actionKey = submitter?.dataset?.actionKey ?? defaultActionKey;
+      setButtonState(actionKey, 'clicking');
+
+      const transitionTimer = window.setTimeout(() => {
+        if (buttonState(actionKey) === 'clicking') {
+          setButtonState(actionKey, 'working');
+        }
+      }, BUTTON_CLICK_TO_WORK_MS);
+
+      return async ({ result }) => {
+        window.clearTimeout(transitionTimer);
+        await applyAction(result);
+
+        if (result.type === 'success') {
+          setButtonState(actionKey, 'success');
+          await refreshDashboard();
+          window.setTimeout(() => clearButtonState(actionKey), BUTTON_SUCCESS_RESET_MS);
+          return;
+        }
+
+        setButtonState(actionKey, 'error');
+        window.setTimeout(() => clearButtonState(actionKey), BUTTON_ERROR_RESET_MS);
+      };
+    };
+  }
+
+  $: filteredPositions = positions.filter((position) =>
+    matchesFilterValue(position.account_label ?? position.account_key, dashboardFilters.positions.account) &&
+    matchesFilterValue(position.local_symbol ?? position.symbol, dashboardFilters.positions.symbol) &&
+    matchesFilterValue(position.primary_exchange ?? position.exchange, dashboardFilters.positions.exchange) &&
+    matchesFilterValue(position.currency, dashboardFilters.positions.currency) &&
+    matchesFilterValue(position.quantity, dashboardFilters.positions.quantity) &&
+    matchesFilterValue(position.average_cost ?? 'n/a', dashboardFilters.positions.averageCost) &&
+    matchesFilterValue(position.market_price ?? 'n/a', dashboardFilters.positions.marketPrice) &&
+    matchesFilterValue(position.market_value ?? 'n/a', dashboardFilters.positions.marketValue) &&
+    matchesFilterValue(position.unrealized_pnl ?? 'n/a', dashboardFilters.positions.unrealizedPnl)
+  );
+
+  $: filteredOpenOrders = openOrders.filter((order) =>
+    matchesFilterValue(order.account_label ?? order.account_key, dashboardFilters.openOrders.account) &&
+    matchesFilterValue(order.local_symbol ?? order.symbol, dashboardFilters.openOrders.symbol) &&
+    matchesFilterValue(order.order_role, dashboardFilters.openOrders.role) &&
+    matchesFilterValue(order.order_purpose ?? 'n/a', dashboardFilters.openOrders.purpose) &&
+    matchesFilterValue(order.side, dashboardFilters.openOrders.side) &&
+    matchesFilterValue(order.total_quantity ?? 'n/a', dashboardFilters.openOrders.quantity) &&
+    matchesFilterValue(order.order_type, dashboardFilters.openOrders.type) &&
+    matchesFilterValue(displayOrderPrice(order.limit_price), dashboardFilters.openOrders.limit) &&
+    matchesFilterValue(displayOrderPrice(order.stop_price), dashboardFilters.openOrders.stop) &&
+    matchesFilterValue(orderFillSpreadLabel(order), dashboardFilters.openOrders.vsFill) &&
+    matchesFilterValue(order.reference_market_price ?? 'n/a', dashboardFilters.openOrders.market) &&
+    matchesFilterValue(orderSpreadLabel(order), dashboardFilters.openOrders.vsMkt) &&
+    matchesFilterValue(order.status, dashboardFilters.openOrders.status) &&
+    matchesFilterValue(order.reject_reason ?? order.warning_text ?? 'n/a', dashboardFilters.openOrders.warning)
+  );
+
+  $: filteredRecentFills = recentFills.filter((fill) =>
+    matchesFilterValue(formatTimestamp(fill.executed_at), dashboardFilters.recentFills.time) &&
+    matchesFilterValue(fill.account_label ?? fill.account_key, dashboardFilters.recentFills.account) &&
+    matchesFilterValue(fill.symbol, dashboardFilters.recentFills.symbol) &&
+    matchesFilterValue(fill.side ?? 'n/a', dashboardFilters.recentFills.side) &&
+    matchesFilterValue(fill.quantity, dashboardFilters.recentFills.quantity) &&
+    matchesFilterValue(fill.price, dashboardFilters.recentFills.price) &&
+    matchesFilterValue(`${fill.commission ?? 'n/a'} ${fill.commission_currency ?? ''}`, dashboardFilters.recentFills.fee)
+  );
+
+  $: filteredInstructions = instructions.filter((instruction) => {
+    const lifecycle = instructionWindowState(instruction);
+    return (
+      matchesFilterValue(instruction.instruction_id, dashboardFilters.instructions.instruction) &&
+      matchesFilterValue(instruction.symbol, dashboardFilters.instructions.symbol) &&
+      matchesFilterValue(instruction.state, dashboardFilters.instructions.state) &&
+      matchesFilterValue(lifecycle.label, dashboardFilters.instructions.lifecycle) &&
+      matchesFilterValue(instructionGuidance(instruction), dashboardFilters.instructions.guidance) &&
+      matchesFilterValue(instructionOrderDisplay(instruction, 'entry'), dashboardFilters.instructions.entryOrder) &&
+      matchesFilterValue(instructionOrderDisplay(instruction, 'exit'), dashboardFilters.instructions.exitOrder) &&
+      matchesFilterValue(formatTimestamp(instruction.updated_at), dashboardFilters.instructions.updated)
+    );
+  });
+
+  $: aggregatedBrokerAttention = groupBrokerAttentionRows(brokerAttention);
+  $: filteredBrokerAttention = aggregatedBrokerAttention.filter((group) =>
+    matchesFilterValue(group.accountLabel ?? group.accountKey, dashboardFilters.brokerAttention.account) &&
+    matchesFilterValue(group.symbol, dashboardFilters.brokerAttention.symbol) &&
+    matchesFilterValue(group.eventType, dashboardFilters.brokerAttention.eventType) &&
+    matchesFilterValue(group.message, dashboardFilters.brokerAttention.message) &&
+    matchesFilterValue(`${group.count}x`, dashboardFilters.brokerAttention.count) &&
+    matchesFilterValue(formatTimestamp(group.latestAt), dashboardFilters.brokerAttention.latestAt)
+  );
+  $: visibleBrokerAttentionEventIds = uniqueIds(
+    filteredBrokerAttention.flatMap((group) => group.eventIds)
+  );
+
+  $: aggregatedReconciliation = groupReconciliationRuns(reconciliationRuns);
+  $: filteredReconciliation = aggregatedReconciliation.filter((group) =>
+    matchesFilterValue(group.runKind, dashboardFilters.reconciliation.runKind) &&
+    matchesFilterValue(group.stage, dashboardFilters.reconciliation.stage) &&
+    matchesFilterValue(group.severity, dashboardFilters.reconciliation.severity) &&
+    matchesFilterValue(group.message, dashboardFilters.reconciliation.message) &&
+    matchesFilterValue(group.instructionId ?? 'n/a', dashboardFilters.reconciliation.instruction) &&
+    matchesFilterValue(`${group.count}x`, dashboardFilters.reconciliation.count) &&
+    matchesFilterValue(formatTimestamp(group.latestAt), dashboardFilters.reconciliation.latestAt)
+  );
+  $: visibleReconciliationIssueIds = uniqueIds(
+    filteredReconciliation.flatMap((group) => group.issueIds)
+  );
 </script>
 
 <svelte:head>
@@ -675,7 +1101,7 @@
         method="POST"
         action="?/killSwitch"
         class="control-form"
-        use:enhance={enhanceDashboardAction}
+        use:enhance={enhanceDashboardAction('kill-switch-toggle')}
       >
         <input
           type="hidden"
@@ -696,8 +1122,16 @@
         </label>
 
         <div class="form-actions">
-          <button class={`action-button ${killSwitch.enabled ? 'neutral' : 'danger'}`} type="submit">
-            {killSwitch.enabled ? 'Disable Kill Switch' : 'Enable Kill Switch'}
+          <button
+            class={`action-button ${killSwitch.enabled ? 'neutral' : 'danger'} ${buttonStateClass('kill-switch-toggle')}`}
+            type="submit"
+            data-action-key="kill-switch-toggle"
+            disabled={buttonIsBusy('kill-switch-toggle')}
+          >
+            {buttonLabel(
+              'kill-switch-toggle',
+              killSwitch.enabled ? 'Disable Kill Switch' : 'Enable Kill Switch'
+            )}
           </button>
         </div>
       </form>
@@ -724,7 +1158,7 @@
         method="POST"
         action="?/cancelInstructionSet"
         class="control-form"
-        use:enhance={enhanceDashboardAction}
+        use:enhance={enhanceDashboardAction('cancel-instruction-set')}
       >
         <div class="form-grid">
           <label>
@@ -762,7 +1196,14 @@
         </div>
 
         <div class="form-actions">
-          <button class="action-button" type="submit">Cancel Matching Entries</button>
+          <button
+            class={`action-button ${buttonStateClass('cancel-instruction-set')}`}
+            type="submit"
+            data-action-key="cancel-instruction-set"
+            disabled={buttonIsBusy('cancel-instruction-set')}
+          >
+            {buttonLabel('cancel-instruction-set', 'Cancel Matching Entries')}
+          </button>
         </div>
       </form>
     </section>
@@ -789,10 +1230,17 @@
       method="POST"
       action="?/startupReconcile"
       class="control-form"
-      use:enhance={enhanceDashboardAction}
+      use:enhance={enhanceDashboardAction('startup-reconcile')}
     >
       <div class="form-actions">
-        <button class="action-button" type="submit">Run Startup Reconciliation</button>
+        <button
+          class={`action-button ${buttonStateClass('startup-reconcile')}`}
+          type="submit"
+          data-action-key="startup-reconcile"
+          disabled={buttonIsBusy('startup-reconcile')}
+        >
+          {buttonLabel('startup-reconcile', 'Run Startup Reconciliation')}
+        </button>
       </div>
     </form>
   </section>
@@ -832,16 +1280,36 @@
       <div class="panel-head">
         <div>
           <h2>Broker Attention</h2>
-          <p>Recent broker-side warnings and rejects captured in the durable ledger.</p>
+          <p>Active broker-side warnings and rejects, grouped so repeated noise collapses into one row.</p>
         </div>
-        <form
-          method="POST"
-          action="?/acknowledgeAllLogs"
-          class="inline-action-form"
-          use:enhance={enhanceDashboardAction}
-        >
-          <button class="inline-button neutral" type="submit">Clear All Visible</button>
-        </form>
+        <div class="panel-tools">
+          <span class="subtle">{filteredBrokerAttention.length} groups visible</span>
+          <button
+            class="inline-button neutral"
+            type="button"
+            on:click={() => resetFilterSection('brokerAttention')}
+            disabled={!sectionHasActiveFilters('brokerAttention')}
+          >
+            Clear Filters
+          </button>
+          <form
+            method="POST"
+            action="?/acknowledgeAllLogs"
+            class="inline-action-form"
+            use:enhance={enhanceDashboardAction('clear-all-visible-logs')}
+          >
+            <input type="hidden" name="event_ids" value={visibleBrokerAttentionEventIds.join(',')} />
+            <input type="hidden" name="issue_ids" value={visibleReconciliationIssueIds.join(',')} />
+            <button
+              class={`inline-button neutral ${buttonStateClass('clear-all-visible-logs')}`}
+              type="submit"
+              data-action-key="clear-all-visible-logs"
+              disabled={buttonIsBusy('clear-all-visible-logs') || (visibleBrokerAttentionEventIds.length === 0 && visibleReconciliationIssueIds.length === 0)}
+            >
+              {buttonLabel('clear-all-visible-logs', 'Clear All Visible')}
+            </button>
+          </form>
+        </div>
       </div>
       {#if acknowledgeAllLogsResult}
         <p class={`action-feedback ${acknowledgeAllLogsResult.ok ? 'ok' : 'bad'}`}>
@@ -853,41 +1321,57 @@
           {brokerAttentionActionResult.message}
         </p>
       {/if}
-      {#if brokerAttention.length === 0}
-        <p class="empty">No recent broker attention items were found.</p>
+      <div class="list-filter-grid">
+        <label><span>Account</span><input bind:value={dashboardFilters.brokerAttention.account} placeholder="Filter" /></label>
+        <label><span>Symbol</span><input bind:value={dashboardFilters.brokerAttention.symbol} placeholder="Filter" /></label>
+        <label><span>Event</span><input bind:value={dashboardFilters.brokerAttention.eventType} placeholder="Filter" /></label>
+        <label><span>Message</span><input bind:value={dashboardFilters.brokerAttention.message} placeholder="Filter" /></label>
+        <label><span>Count</span><input bind:value={dashboardFilters.brokerAttention.count} placeholder="e.g. 10x" /></label>
+        <label><span>Latest</span><input bind:value={dashboardFilters.brokerAttention.latestAt} placeholder="Filter" /></label>
+      </div>
+      {#if filteredBrokerAttention.length === 0}
+        <p class="empty">No active broker attention items are visible.</p>
       {:else}
         <ul class="attention-list">
-          {#each brokerAttention as attention}
+          {#each filteredBrokerAttention as attention}
             <li>
               <div class="attention-main">
-                <span class="pill warn">{attention.event_type}</span>
+                <span class="pill warn">{attention.eventType}</span>
                 <strong>{attention.symbol}</strong>
-                <span>{attention.account_label ?? attention.account_key}</span>
-                <span class={`pill ${operatorReviewClass(attention.operator_review)}`}>
-                  {operatorReviewLabel(attention.operator_review)}
-                </span>
+                <span>{attention.accountLabel ?? attention.accountKey}</span>
+                <span class="pill neutral">{attention.count}x</span>
               </div>
               <p>{attention.message}</p>
               <small>
-                {formatTimestamp(attention.event_at)}
-                {#if attention.order_ref}
-                  · <span class="mono">{attention.order_ref}</span>
+                {formatTimestamp(attention.latestAt)}
+                {#if attention.orderRefSummary}
+                  · <span class="mono">{attention.orderRefSummary}</span>
                 {/if}
               </small>
-              <small>{operatorReviewDetail(attention.operator_review)}</small>
+              {#if attention.latestStatusAfter}
+                <small>Status after: {attention.latestStatusAfter}</small>
+              {/if}
+              {#if attention.noteSummary}
+                <small>{attention.noteSummary}</small>
+              {/if}
               <div class="inline-actions">
-                {#each operatorReviewActions(attention.operator_review) as action}
-                  <form
-                    method="POST"
-                    action="?/brokerAttentionAction"
-                    class="inline-action-form"
-                    use:enhance={enhanceDashboardAction}
+                <form
+                  method="POST"
+                  action="?/brokerAttentionAction"
+                  class="inline-action-form"
+                  use:enhance={enhanceDashboardAction(`broker-attention-${attention.key}`)}
+                >
+                  <input type="hidden" name="event_ids" value={attention.eventIdsCsv} />
+                  <input type="hidden" name="operation" value="ACKNOWLEDGE" />
+                  <button
+                    class={`inline-button neutral ${buttonStateClass(`broker-attention-${attention.key}`)}`}
+                    type="submit"
+                    data-action-key={`broker-attention-${attention.key}`}
+                    disabled={buttonIsBusy(`broker-attention-${attention.key}`)}
                   >
-                    <input type="hidden" name="event_id" value={attention.event_id} />
-                    <input type="hidden" name="operation" value={action.operation} />
-                    <button class={action.className} type="submit">{action.label}</button>
-                  </form>
-                {/each}
+                    {buttonLabel(`broker-attention-${attention.key}`, 'Clear')}
+                  </button>
+                </form>
               </div>
             </li>
           {/each}
@@ -899,16 +1383,35 @@
       <div class="panel-head">
         <div>
           <h2>Recent Reconciliation Runs</h2>
-          <p>Durable audit rows from runtime and startup reconciliation passes.</p>
+          <p>Active reconciliation warnings grouped across recent runs so repeated issues collapse cleanly.</p>
         </div>
-        <form
-          method="POST"
-          action="?/acknowledgeVisibleReconciliation"
-          class="inline-action-form"
-          use:enhance={enhanceDashboardAction}
-        >
-          <button class="inline-button neutral" type="submit">Clear Visible</button>
-        </form>
+        <div class="panel-tools">
+          <span class="subtle">{filteredReconciliation.length} groups visible</span>
+          <button
+            class="inline-button neutral"
+            type="button"
+            on:click={() => resetFilterSection('reconciliation')}
+            disabled={!sectionHasActiveFilters('reconciliation')}
+          >
+            Clear Filters
+          </button>
+          <form
+            method="POST"
+            action="?/acknowledgeVisibleReconciliation"
+            class="inline-action-form"
+            use:enhance={enhanceDashboardAction('clear-visible-reconciliation')}
+          >
+            <input type="hidden" name="issue_ids" value={visibleReconciliationIssueIds.join(',')} />
+            <button
+              class={`inline-button neutral ${buttonStateClass('clear-visible-reconciliation')}`}
+              type="submit"
+              data-action-key="clear-visible-reconciliation"
+              disabled={buttonIsBusy('clear-visible-reconciliation') || visibleReconciliationIssueIds.length === 0}
+            >
+              {buttonLabel('clear-visible-reconciliation', 'Clear Visible')}
+            </button>
+          </form>
+        </div>
       </div>
       {#if reconciliationClearResult}
         <p class={`action-feedback ${reconciliationClearResult.ok ? 'ok' : 'bad'}`}>
@@ -920,59 +1423,66 @@
           {reconciliationIssueActionResult.message}
         </p>
       {/if}
-      {#if reconciliationRuns.length === 0}
-        <p class="empty">No reconciliation runs have been recorded yet.</p>
+      <div class="list-filter-grid">
+        <label><span>Run Kind</span><input bind:value={dashboardFilters.reconciliation.runKind} placeholder="Filter" /></label>
+        <label><span>Stage</span><input bind:value={dashboardFilters.reconciliation.stage} placeholder="Filter" /></label>
+        <label><span>Severity</span><input bind:value={dashboardFilters.reconciliation.severity} placeholder="Filter" /></label>
+        <label><span>Message</span><input bind:value={dashboardFilters.reconciliation.message} placeholder="Filter" /></label>
+        <label><span>Instruction</span><input bind:value={dashboardFilters.reconciliation.instruction} placeholder="Filter" /></label>
+        <label><span>Count</span><input bind:value={dashboardFilters.reconciliation.count} placeholder="e.g. 10x" /></label>
+        <label><span>Latest</span><input bind:value={dashboardFilters.reconciliation.latestAt} placeholder="Filter" /></label>
+      </div>
+      {#if filteredReconciliation.length === 0}
+        <p class="empty">No active reconciliation warnings are visible.</p>
       {:else}
         <div class="reconciliation-list">
-          {#each reconciliationRuns as run}
+          {#each filteredReconciliation as run}
             <article class="reconciliation-card">
               <div class="reconciliation-topline">
                 <div>
-                  <h3>{run.run_kind}</h3>
-                  <p>{formatTimestamp(run.started_at)} → {formatTimestamp(run.completed_at)}</p>
+                  <h3>{run.runKind}</h3>
+                  <p>{formatTimestamp(run.latestAt)}</p>
                 </div>
                 <div class="run-pills">
-                  <span class={`pill ${runStatusClass(run.status)}`}>{run.status}</span>
-                  <span class="pill neutral">{run.action_count} actions</span>
-                  <span class="pill neutral">{run.issue_count} issues</span>
+                  <span class={`pill ${run.severity === 'ERROR' ? 'bad' : 'warn'}`}>{run.severity}</span>
+                  <span class="pill neutral">{run.count}x</span>
+                  <span class="pill neutral">{run.runCount} runs</span>
                 </div>
               </div>
-
-              {#if (run.issues ?? []).length > 0}
-                <ul class="issue-list">
-                  {#each run.issues as issue}
-                    <li>
-                      <div class="issue-main">
-                        <strong>{issue.stage}</strong>
-                        <span class={`pill ${operatorReviewClass(issue.operator_review)}`}>
-                          {operatorReviewLabel(issue.operator_review)}
-                        </span>
-                      </div>
-                      <span>{issue.message}</span>
-                      {#if issue.instruction_id}
-                        <small class="mono">{issue.instruction_id}</small>
-                      {/if}
-                      <small>{operatorReviewDetail(issue.operator_review)}</small>
-                      <div class="inline-actions">
-                        {#each operatorReviewActions(issue.operator_review) as action}
-                          <form
-                            method="POST"
-                            action="?/reconciliationIssueAction"
-                            class="inline-action-form"
-                            use:enhance={enhanceDashboardAction}
-                          >
-                            <input type="hidden" name="issue_id" value={issue.issue_id} />
-                            <input type="hidden" name="operation" value={action.operation} />
-                            <button class={action.className} type="submit">{action.label}</button>
-                          </form>
-                        {/each}
-                      </div>
-                    </li>
-                  {/each}
-                </ul>
-              {:else}
-                <p class="empty subtle">No issues were recorded for this run.</p>
-              {/if}
+              <ul class="issue-list">
+                <li>
+                  <div class="issue-main">
+                    <strong>{run.stage}</strong>
+                    <span class="pill neutral">{run.count}x</span>
+                  </div>
+                  <span>{run.message}</span>
+                  {#if run.instructionId}
+                    <small class="mono">{run.instructionId}</small>
+                  {/if}
+                  {#if run.latestCompletedAt}
+                    <small>Latest run completed at {formatTimestamp(run.latestCompletedAt)}</small>
+                  {/if}
+                  <div class="inline-actions">
+                    <form
+                      method="POST"
+                      action="?/reconciliationIssueAction"
+                      class="inline-action-form"
+                      use:enhance={enhanceDashboardAction(`reconciliation-${run.key}`)}
+                    >
+                      <input type="hidden" name="issue_ids" value={run.issueIdsCsv} />
+                      <input type="hidden" name="operation" value="ACKNOWLEDGE" />
+                      <button
+                        class={`inline-button neutral ${buttonStateClass(`reconciliation-${run.key}`)}`}
+                        type="submit"
+                        data-action-key={`reconciliation-${run.key}`}
+                        disabled={buttonIsBusy(`reconciliation-${run.key}`)}
+                      >
+                        {buttonLabel(`reconciliation-${run.key}`, 'Clear')}
+                      </button>
+                    </form>
+                  </div>
+                </li>
+              </ul>
             </article>
           {/each}
         </div>
@@ -982,8 +1492,21 @@
 
   <section class="panel" id="positions">
     <div class="panel-head">
-      <h2>Current Holdings</h2>
-      <p>Latest non-zero position snapshots persisted in the ledger.</p>
+      <div>
+        <h2>Current Holdings</h2>
+        <p>Latest non-zero position snapshots persisted in the ledger.</p>
+      </div>
+      <div class="panel-tools">
+        <span class="subtle">{filteredPositions.length} of {positions.length} visible</span>
+        <button
+          class="inline-button neutral"
+          type="button"
+          on:click={() => resetFilterSection('positions')}
+          disabled={!sectionHasActiveFilters('positions')}
+        >
+          Clear Filters
+        </button>
+      </div>
     </div>
     {#if positions.length === 0}
       <p class="empty">No durable open positions are available yet.</p>
@@ -1002,9 +1525,20 @@
               <th>Market Value</th>
               <th>Unrealized PnL</th>
             </tr>
+            <tr class="filter-row">
+              <th><input bind:value={dashboardFilters.positions.account} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.symbol} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.exchange} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.currency} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.quantity} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.averageCost} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.marketPrice} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.marketValue} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.unrealizedPnl} placeholder="Filter" /></th>
+            </tr>
           </thead>
           <tbody>
-            {#each positions as position}
+            {#each filteredPositions as position}
               <tr>
                 <td>{position.account_label ?? position.account_key}</td>
                 <td>{position.local_symbol ?? position.symbol}</td>
@@ -1025,8 +1559,21 @@
 
   <section class="panel" id="orders">
     <div class="panel-head">
-      <h2>Open Orders</h2>
-      <p>Durable broker-order rows that are still operationally open.</p>
+      <div>
+        <h2>Open Orders</h2>
+        <p>Durable broker-order rows that are still operationally open.</p>
+      </div>
+      <div class="panel-tools">
+        <span class="subtle">{filteredOpenOrders.length} of {openOrders.length} visible</span>
+        <button
+          class="inline-button neutral"
+          type="button"
+          on:click={() => resetFilterSection('openOrders')}
+          disabled={!sectionHasActiveFilters('openOrders')}
+        >
+          Clear Filters
+        </button>
+      </div>
     </div>
     {#if orderRowActionResult}
       <p class={`action-feedback ${orderRowActionResult.ok ? 'ok' : 'bad'}`}>
@@ -1056,9 +1603,26 @@
               <th>Warning</th>
               <th>Action</th>
             </tr>
+            <tr class="filter-row">
+              <th><input bind:value={dashboardFilters.openOrders.account} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.symbol} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.role} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.purpose} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.side} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.quantity} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.type} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.limit} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.stop} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.vsFill} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.market} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.vsMkt} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.status} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.openOrders.warning} placeholder="Filter" /></th>
+              <th></th>
+            </tr>
           </thead>
           <tbody>
-            {#each openOrders as order}
+            {#each filteredOpenOrders as order}
               <tr>
                 <td>{order.account_label ?? order.account_key}</td>
                 <td>{order.local_symbol ?? order.symbol}</td>
@@ -1108,10 +1672,17 @@
                       method="POST"
                       action="?/orderRowAction"
                       class="inline-action-form"
-                      use:enhance={enhanceDashboardAction}
+                      use:enhance={enhanceDashboardAction(`cancel-order-${order.external_order_id}`)}
                     >
                       <input type="hidden" name="external_order_id" value={order.external_order_id} />
-                      <button class="inline-button danger" type="submit">Cancel Order</button>
+                      <button
+                        class={`inline-button danger ${buttonStateClass(`cancel-order-${order.external_order_id}`)}`}
+                        type="submit"
+                        data-action-key={`cancel-order-${order.external_order_id}`}
+                        disabled={buttonIsBusy(`cancel-order-${order.external_order_id}`)}
+                      >
+                        {buttonLabel(`cancel-order-${order.external_order_id}`, 'Cancel Order')}
+                      </button>
                     </form>
                   {:else}
                     <span class="subtle">No action</span>
@@ -1127,8 +1698,21 @@
 
   <section class="panel" id="fills">
     <div class="panel-head">
-      <h2>Recent Fills</h2>
-      <p>Latest persisted execution fills.</p>
+      <div>
+        <h2>Recent Fills</h2>
+        <p>Latest persisted execution fills.</p>
+      </div>
+      <div class="panel-tools">
+        <span class="subtle">{filteredRecentFills.length} of {recentFills.length} visible</span>
+        <button
+          class="inline-button neutral"
+          type="button"
+          on:click={() => resetFilterSection('recentFills')}
+          disabled={!sectionHasActiveFilters('recentFills')}
+        >
+          Clear Filters
+        </button>
+      </div>
     </div>
     {#if recentFills.length === 0}
       <p class="empty">No execution fills have been recorded yet.</p>
@@ -1145,9 +1729,18 @@
               <th>Price</th>
               <th>Fee</th>
             </tr>
+            <tr class="filter-row">
+              <th><input bind:value={dashboardFilters.recentFills.time} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.account} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.symbol} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.side} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.quantity} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.price} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.fee} placeholder="Filter" /></th>
+            </tr>
           </thead>
           <tbody>
-            {#each recentFills as fill}
+            {#each filteredRecentFills as fill}
               <tr>
                 <td>{formatTimestamp(fill.executed_at)}</td>
                 <td>{fill.account_label ?? fill.account_key}</td>
@@ -1166,8 +1759,21 @@
 
   <section class="panel" id="instructions">
     <div class="panel-head">
-      <h2>Recent Instructions</h2>
-      <p>Most recently updated persisted instructions from the control plane.</p>
+      <div>
+        <h2>Recent Instructions</h2>
+        <p>Most recently updated persisted instructions from the control plane.</p>
+      </div>
+      <div class="panel-tools">
+        <span class="subtle">{filteredInstructions.length} of {instructions.length} visible</span>
+        <button
+          class="inline-button neutral"
+          type="button"
+          on:click={() => resetFilterSection('instructions')}
+          disabled={!sectionHasActiveFilters('instructions')}
+        >
+          Clear Filters
+        </button>
+      </div>
     </div>
     {#if instructionRowActionResult}
       <p class={`action-feedback ${instructionRowActionResult.ok ? 'ok' : 'bad'}`}>
@@ -1191,9 +1797,20 @@
               <th>Updated</th>
               <th>Actions</th>
             </tr>
+            <tr class="filter-row">
+              <th><input bind:value={dashboardFilters.instructions.instruction} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.symbol} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.state} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.lifecycle} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.guidance} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.entryOrder} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.exitOrder} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.instructions.updated} placeholder="Filter" /></th>
+              <th></th>
+            </tr>
           </thead>
           <tbody>
-            {#each instructions as instruction}
+            {#each filteredInstructions as instruction}
               {@const windowState = instructionWindowState(instruction)}
               {@const primaryAction = instructionPrimaryAction(instruction)}
               <tr>
@@ -1218,11 +1835,21 @@
                       method="POST"
                       action="?/instructionRowAction"
                       class="inline-action-form"
-                      use:enhance={enhanceDashboardAction}
+                      use:enhance={enhanceDashboardAction(`instruction-${instruction.instruction_id}-${primaryAction.operation}`)}
                     >
                       <input type="hidden" name="instruction_id" value={instruction.instruction_id} />
                       <input type="hidden" name="operation" value={primaryAction.operation} />
-                      <button class={primaryAction.className} type="submit">{primaryAction.label}</button>
+                      <button
+                        class={`${primaryAction.className} ${buttonStateClass(`instruction-${instruction.instruction_id}-${primaryAction.operation}`)}`}
+                        type="submit"
+                        data-action-key={`instruction-${instruction.instruction_id}-${primaryAction.operation}`}
+                        disabled={buttonIsBusy(`instruction-${instruction.instruction_id}-${primaryAction.operation}`)}
+                      >
+                        {buttonLabel(
+                          `instruction-${instruction.instruction_id}-${primaryAction.operation}`,
+                          primaryAction.label
+                        )}
+                      </button>
                     </form>
                   {:else}
                     <span class="subtle">No write action</span>
@@ -1459,6 +2086,14 @@
     margin-bottom: 0.95rem;
   }
 
+  .panel-tools {
+    display: flex;
+    gap: 0.65rem;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+
   .panel-head h2,
   .account-card h3,
   .reconciliation-card h3 {
@@ -1524,6 +2159,26 @@
 
   .table-wrap {
     overflow-x: auto;
+  }
+
+  .filter-row th {
+    padding-top: 0.35rem;
+    padding-bottom: 0.6rem;
+    background: transparent;
+    border-top: none;
+  }
+
+  .filter-row input {
+    width: 100%;
+    min-width: 5.5rem;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 0.7rem;
+    padding: 0.45rem 0.55rem;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--text-primary);
+    background: var(--surface-strong);
   }
 
   table {
@@ -1608,6 +2263,36 @@
 
   .reconciliation-card {
     padding: 1rem;
+  }
+
+  .list-filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 0.95rem;
+  }
+
+  .list-filter-grid label {
+    display: grid;
+    gap: 0.35rem;
+  }
+
+  .list-filter-grid span {
+    font-size: 0.76rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+
+  .list-filter-grid input {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    padding: 0.62rem 0.72rem;
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--surface-strong);
   }
 
   .issue-list {
@@ -1699,6 +2384,12 @@
     cursor: pointer;
   }
 
+  .action-button:disabled,
+  .inline-button:disabled {
+    cursor: wait;
+    opacity: 0.8;
+  }
+
   .action-button.danger {
     background: linear-gradient(135deg, #8e2f2f 0%, #b43333 100%);
   }
@@ -1748,6 +2439,27 @@
     background: var(--surface-strong);
   }
 
+  .action-button.is-clicking,
+  .inline-button.is-clicking {
+    transform: scale(0.98);
+    filter: saturate(1.08);
+  }
+
+  .action-button.is-working,
+  .inline-button.is-working {
+    animation: dashboard-pulse 1s ease-in-out infinite;
+  }
+
+  .action-button.is-success,
+  .inline-button.is-success {
+    animation: dashboard-success 0.8s ease;
+  }
+
+  .action-button.is-error,
+  .inline-button.is-error {
+    animation: dashboard-error 0.8s ease;
+  }
+
   .guidance-cell {
     min-width: 15rem;
     max-width: 24rem;
@@ -1772,6 +2484,42 @@
     border-radius: 0.85rem;
     background: var(--surface-strong);
     font-weight: 600;
+  }
+
+  @keyframes dashboard-pulse {
+    0%,
+    100% {
+      transform: translateY(0);
+      box-shadow: 0 0 0 0 rgba(25, 157, 97, 0.15);
+    }
+    50% {
+      transform: translateY(-1px);
+      box-shadow: 0 0 0 0.4rem rgba(25, 157, 97, 0.08);
+    }
+  }
+
+  @keyframes dashboard-success {
+    0% {
+      box-shadow: 0 0 0 0 rgba(14, 122, 73, 0.3);
+    }
+    60% {
+      box-shadow: 0 0 0 0.45rem rgba(14, 122, 73, 0.12);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(14, 122, 73, 0);
+    }
+  }
+
+  @keyframes dashboard-error {
+    0% {
+      box-shadow: 0 0 0 0 rgba(180, 51, 51, 0.3);
+    }
+    60% {
+      box-shadow: 0 0 0 0.45rem rgba(180, 51, 51, 0.12);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(180, 51, 51, 0);
+    }
   }
 
   @media (max-width: 900px) {

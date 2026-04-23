@@ -30,6 +30,23 @@ function parseInstructionIds(rawValue) {
   return instructionIds.length > 0 ? instructionIds : null;
 }
 
+function parsePositiveIntegerIds(rawValue) {
+  if (!rawValue) {
+    return [];
+  }
+
+  const values = String(rawValue)
+    .split(/[\s,]+/)
+    .map((value) => Number.parseInt(value.trim(), 10))
+    .filter((value) => Number.isInteger(value) && value > 0);
+
+  return [...new Set(values)];
+}
+
+function parsePositiveIntegerIdsFromForm(formData, fieldName) {
+  return parsePositiveIntegerIds(readOptionalField(formData, fieldName));
+}
+
 function operatorSnapshotUrl(apiBaseUrl) {
   return (
     `${apiBaseUrl}/v1/read/operator-snapshot` +
@@ -100,8 +117,46 @@ export async function load({ fetch }) {
 }
 
 export const actions = {
-  async acknowledgeVisibleReconciliation({ fetch }) {
+  async acknowledgeVisibleReconciliation({ fetch, request }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const formData = await request.formData();
+    const requestedIssueIds = parsePositiveIntegerIdsFromForm(formData, 'issue_ids');
+
+    if (requestedIssueIds.length > 0) {
+      let acknowledgedReconciliationIssueCount = 0;
+      for (const issueId of requestedIssueIds) {
+        const result = await postJson(
+          fetch,
+          `${apiBaseUrl}/v1/reconciliation-issues/${issueId}/review`,
+          {
+            action: 'ACKNOWLEDGE',
+            updated_by: 'dashboard'
+          }
+        );
+        if (!result.ok) {
+          return fail(result.status || 500, {
+            reconciliationClearResult: {
+              ok: false,
+              message:
+                `Cleared ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+                `${result.error}`
+            }
+          });
+        }
+        acknowledgedReconciliationIssueCount += 1;
+      }
+
+      return {
+        reconciliationClearResult: {
+          ok: true,
+          message:
+            acknowledgedReconciliationIssueCount === 0
+              ? 'No visible reconciliation issues needed clearing.'
+              : `Cleared ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
+        }
+      };
+    }
+
     const snapshotResult = await readOperatorSnapshot(fetch, apiBaseUrl);
     if (!snapshotResult.ok) {
       return fail(snapshotResult.status || 500, {
@@ -151,8 +206,76 @@ export const actions = {
     };
   },
 
-  async acknowledgeAllLogs({ fetch }) {
+  async acknowledgeAllLogs({ fetch, request }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const formData = await request.formData();
+    const requestedEventIds = parsePositiveIntegerIdsFromForm(formData, 'event_ids');
+    const requestedIssueIds = parsePositiveIntegerIdsFromForm(formData, 'issue_ids');
+
+    if (requestedEventIds.length > 0 || requestedIssueIds.length > 0) {
+      let acknowledgedBrokerAttentionCount = 0;
+      let acknowledgedReconciliationIssueCount = 0;
+
+      for (const eventId of requestedEventIds) {
+        const result = await postJson(
+          fetch,
+          `${apiBaseUrl}/v1/broker-attention/${eventId}/review`,
+          {
+            action: 'ACKNOWLEDGE',
+            updated_by: 'dashboard'
+          }
+        );
+        if (!result.ok) {
+          return fail(result.status || 500, {
+            acknowledgeAllLogsResult: {
+              ok: false,
+              message:
+                `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+                `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+                `${result.error}`
+            }
+          });
+        }
+        acknowledgedBrokerAttentionCount += 1;
+      }
+
+      for (const issueId of requestedIssueIds) {
+        const result = await postJson(
+          fetch,
+          `${apiBaseUrl}/v1/reconciliation-issues/${issueId}/review`,
+          {
+            action: 'ACKNOWLEDGE',
+            updated_by: 'dashboard'
+          }
+        );
+        if (!result.ok) {
+          return fail(result.status || 500, {
+            acknowledgeAllLogsResult: {
+              ok: false,
+              message:
+                `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+                `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+                `${result.error}`
+            }
+          });
+        }
+        acknowledgedReconciliationIssueCount += 1;
+      }
+
+      const totalAcknowledged =
+        acknowledgedBrokerAttentionCount + acknowledgedReconciliationIssueCount;
+      return {
+        acknowledgeAllLogsResult: {
+          ok: true,
+          message:
+            totalAcknowledged === 0
+              ? 'No visible broker-attention or reconciliation-log items needed clearing.'
+              : `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+                `${acknowledgedReconciliationIssueCount} reconciliation issues.`
+        }
+      };
+    }
+
     const snapshotResult = await readOperatorSnapshot(fetch, apiBaseUrl);
     if (!snapshotResult.ok) {
       return fail(snapshotResult.status || 500, {
@@ -464,14 +587,18 @@ export const actions = {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
     const formData = await request.formData();
     const eventId = readOptionalField(formData, 'event_id');
+    const eventIds = parsePositiveIntegerIdsFromForm(formData, 'event_ids');
     const operation = readOptionalField(formData, 'operation');
 
-    const normalizedEventId = Number.parseInt(eventId ?? '', 10);
-    if (!Number.isInteger(normalizedEventId) || normalizedEventId <= 0) {
+    const normalizedEventIds =
+      eventIds.length > 0
+        ? eventIds
+        : parsePositiveIntegerIds(eventId ?? '');
+    if (normalizedEventIds.length === 0) {
       return fail(400, {
         brokerAttentionActionResult: {
           ok: false,
-          message: 'Broker attention action is missing a valid event ID.'
+          message: 'Broker attention action is missing a valid event ID list.'
         }
       });
     }
@@ -485,28 +612,36 @@ export const actions = {
       });
     }
 
-    const result = await postJson(
-      fetch,
-      `${apiBaseUrl}/v1/broker-attention/${normalizedEventId}/review`,
-      {
-        action: operation,
-        updated_by: 'dashboard'
-      }
-    );
-
-    if (!result.ok) {
-      return fail(result.status || 500, {
-        brokerAttentionActionResult: {
-          ok: false,
-          message: result.error
+    let processedCount = 0;
+    for (const normalizedEventId of normalizedEventIds) {
+      const result = await postJson(
+        fetch,
+        `${apiBaseUrl}/v1/broker-attention/${normalizedEventId}/review`,
+        {
+          action: operation,
+          updated_by: 'dashboard'
         }
-      });
+      );
+
+      if (!result.ok) {
+        return fail(result.status || 500, {
+          brokerAttentionActionResult: {
+            ok: false,
+            message:
+              `Cleared ${processedCount} broker attention items before failing: ${result.error}`
+          }
+        });
+      }
+      processedCount += 1;
     }
 
     return {
       brokerAttentionActionResult: {
         ok: true,
-        message: `Cleared broker attention item ${normalizedEventId}.`
+        message:
+          processedCount === 1
+            ? `Cleared broker attention item ${normalizedEventIds[0]}.`
+            : `Cleared ${processedCount} broker attention items.`
       }
     };
   },
@@ -515,14 +650,18 @@ export const actions = {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
     const formData = await request.formData();
     const issueId = readOptionalField(formData, 'issue_id');
+    const issueIds = parsePositiveIntegerIdsFromForm(formData, 'issue_ids');
     const operation = readOptionalField(formData, 'operation');
 
-    const normalizedIssueId = Number.parseInt(issueId ?? '', 10);
-    if (!Number.isInteger(normalizedIssueId) || normalizedIssueId <= 0) {
+    const normalizedIssueIds =
+      issueIds.length > 0
+        ? issueIds
+        : parsePositiveIntegerIds(issueId ?? '');
+    if (normalizedIssueIds.length === 0) {
       return fail(400, {
         reconciliationIssueActionResult: {
           ok: false,
-          message: 'Reconciliation issue action is missing a valid issue ID.'
+          message: 'Reconciliation issue action is missing a valid issue ID list.'
         }
       });
     }
@@ -536,28 +675,36 @@ export const actions = {
       });
     }
 
-    const result = await postJson(
-      fetch,
-      `${apiBaseUrl}/v1/reconciliation-issues/${normalizedIssueId}/review`,
-      {
-        action: operation,
-        updated_by: 'dashboard'
-      }
-    );
-
-    if (!result.ok) {
-      return fail(result.status || 500, {
-        reconciliationIssueActionResult: {
-          ok: false,
-          message: result.error
+    let processedCount = 0;
+    for (const normalizedIssueId of normalizedIssueIds) {
+      const result = await postJson(
+        fetch,
+        `${apiBaseUrl}/v1/reconciliation-issues/${normalizedIssueId}/review`,
+        {
+          action: operation,
+          updated_by: 'dashboard'
         }
-      });
+      );
+
+      if (!result.ok) {
+        return fail(result.status || 500, {
+          reconciliationIssueActionResult: {
+            ok: false,
+            message:
+              `Cleared ${processedCount} reconciliation issues before failing: ${result.error}`
+          }
+        });
+      }
+      processedCount += 1;
     }
 
     return {
       reconciliationIssueActionResult: {
         ok: true,
-        message: `Cleared reconciliation issue ${normalizedIssueId}.`
+        message:
+          processedCount === 1
+            ? `Cleared reconciliation issue ${normalizedIssueIds[0]}.`
+            : `Cleared ${processedCount} reconciliation issues.`
       }
     };
   }
