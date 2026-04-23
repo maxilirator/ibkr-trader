@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 
@@ -130,6 +131,21 @@ def _broker_order_sort_key(order: BrokerOrderRecord) -> tuple[datetime, int]:
     return (_broker_order_activity_at(order), order.id)
 
 
+def _execution_fill_sort_key(fill: ExecutionFillRecord) -> tuple[datetime, int]:
+    return (fill.executed_at, fill.id)
+
+
+def _int_or_none(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    normalized = value.strip()
+    if not normalized or not normalized.isdigit():
+        return None
+    return int(normalized)
+
+
 def _latest_matching_order(
     broker_orders: tuple[BrokerOrderRecord, ...],
     *,
@@ -170,6 +186,63 @@ def _dedupe_order_lineages(
         deduped.append(order)
         seen_lineages.add(lineage_key)
     return tuple(deduped)
+
+
+def _matching_fills_for_role(
+    record: InstructionRecord,
+    *,
+    execution_fills: tuple[ExecutionFillRecord, ...],
+    broker_orders: tuple[BrokerOrderRecord, ...],
+    order_role: str,
+) -> tuple[ExecutionFillRecord, ...]:
+    if not execution_fills:
+        return ()
+
+    order_role = order_role.strip().upper()
+    matching_order_ids = {
+        order.id
+        for order in broker_orders
+        if (order.order_role or "").strip().upper() == order_role
+    }
+    matching_order_refs = {
+        str(order.order_ref).strip()
+        for order in broker_orders
+        if (order.order_role or "").strip().upper() == order_role
+        and order.order_ref is not None
+        and str(order.order_ref).strip()
+    }
+    fill_order_ref_prefix = f"{record.instruction_id}:{order_role.lower()}:"
+
+    matching_fills: list[ExecutionFillRecord] = []
+    for fill in execution_fills:
+        fill_order_ref = str(fill.order_ref or "").strip()
+        if fill.broker_order_id is not None and fill.broker_order_id in matching_order_ids:
+            matching_fills.append(fill)
+            continue
+        if fill_order_ref and fill_order_ref in matching_order_refs:
+            matching_fills.append(fill)
+            continue
+        if fill_order_ref.startswith(fill_order_ref_prefix):
+            matching_fills.append(fill)
+    return tuple(matching_fills)
+
+
+def _latest_matching_fill(
+    record: InstructionRecord,
+    *,
+    execution_fills: tuple[ExecutionFillRecord, ...],
+    broker_orders: tuple[BrokerOrderRecord, ...],
+    order_role: str,
+) -> ExecutionFillRecord | None:
+    matching_fills = _matching_fills_for_role(
+        record,
+        execution_fills=execution_fills,
+        broker_orders=broker_orders,
+        order_role=order_role,
+    )
+    if not matching_fills:
+        return None
+    return max(matching_fills, key=_execution_fill_sort_key)
 
 
 def _display_for_orders(
@@ -218,10 +291,12 @@ def _activity_at(
     *,
     events: tuple[InstructionEventStatus, ...],
     broker_orders: tuple[BrokerOrderRecord, ...],
+    execution_fills: tuple[ExecutionFillRecord, ...],
 ) -> datetime:
     candidates = [record.updated_at]
     candidates.extend(event.event_at for event in events)
     candidates.extend(_broker_order_activity_at(order) for order in broker_orders)
+    candidates.extend(fill.executed_at for fill in execution_fills)
     return max(candidates)
 
 
@@ -229,14 +304,70 @@ def _build_instruction_status(
     record: InstructionRecord,
     *,
     broker_orders: tuple[BrokerOrderRecord, ...] = (),
+    execution_fills: tuple[ExecutionFillRecord, ...] = (),
     events: tuple[InstructionEventStatus, ...] = (),
 ) -> InstructionStatus:
     latest_entry_order = _latest_matching_order(broker_orders, order_role="ENTRY")
     latest_exit_order = _latest_matching_order(broker_orders, order_role="EXIT")
+    latest_entry_fill = _latest_matching_fill(
+        record,
+        execution_fills=execution_fills,
+        broker_orders=broker_orders,
+        order_role="ENTRY",
+    )
+    latest_exit_fill = _latest_matching_fill(
+        record,
+        execution_fills=execution_fills,
+        broker_orders=broker_orders,
+        order_role="EXIT",
+    )
     activity_at = _activity_at(
         record,
         events=events,
         broker_orders=broker_orders,
+        execution_fills=execution_fills,
+    )
+    entry_fill_completed = record.entry_filled_quantity not in (None, "", "0")
+    exit_fill_completed = record.exit_filled_quantity not in (None, "", "0")
+    derived_entry_order_status = (
+        "Filled"
+        if entry_fill_completed and latest_entry_fill is not None
+        else (
+            latest_entry_order.status
+            if latest_entry_order is not None
+            else record.broker_order_status
+        )
+    )
+    derived_exit_order_status = (
+        "Filled"
+        if exit_fill_completed and latest_exit_fill is not None
+        else (
+            latest_exit_order.status
+            if latest_exit_order is not None
+            else record.exit_order_status
+        )
+    )
+    derived_entry_order_display = (
+        f"{latest_entry_fill.external_order_id} / Filled"
+        if latest_entry_fill is not None and latest_entry_fill.external_order_id is not None
+        else None
+    )
+    derived_exit_order_display = (
+        f"{latest_exit_fill.external_order_id} / Filled"
+        if latest_exit_fill is not None and latest_exit_fill.external_order_id is not None
+        else None
+    )
+    resolved_exit_order_display = (
+        derived_exit_order_display
+        or _display_for_orders(
+            broker_orders,
+            order_role="EXIT",
+        )
+        or (
+            f"{record.exit_order_id} / {derived_exit_order_status}"
+            if record.exit_order_id is not None or derived_exit_order_status is not None
+            else None
+        )
     )
     return InstructionStatus(
         record_id=record.id,
@@ -257,17 +388,21 @@ def _build_instruction_status(
         created_at=record.created_at,
         updated_at=activity_at,
         broker_order_id=(
-            int(latest_entry_order.external_order_id)
+            _int_or_none(latest_entry_fill.external_order_id)
+            if latest_entry_fill is not None
+            and _int_or_none(latest_entry_fill.external_order_id) is not None
+            else _int_or_none(latest_entry_order.external_order_id)
             if latest_entry_order is not None
-            and latest_entry_order.external_order_id is not None
-            and latest_entry_order.external_order_id.isdigit()
+            and _int_or_none(latest_entry_order.external_order_id) is not None
             else record.broker_order_id
         ),
         broker_perm_id=(
-            int(latest_entry_order.external_perm_id)
+            _int_or_none(latest_entry_fill.external_perm_id)
+            if latest_entry_fill is not None
+            and _int_or_none(latest_entry_fill.external_perm_id) is not None
+            else _int_or_none(latest_entry_order.external_perm_id)
             if latest_entry_order is not None
-            and latest_entry_order.external_perm_id is not None
-            and latest_entry_order.external_perm_id.isdigit()
+            and _int_or_none(latest_entry_order.external_perm_id) is not None
             else record.broker_perm_id
         ),
         broker_client_id=(
@@ -277,27 +412,27 @@ def _build_instruction_status(
             and latest_entry_order.external_client_id.isdigit()
             else record.broker_client_id
         ),
-        broker_order_status=(
-            latest_entry_order.status
-            if latest_entry_order is not None
-            else record.broker_order_status
-        ),
+        broker_order_status=derived_entry_order_status,
         entry_submitted_quantity=record.entry_submitted_quantity,
         entry_filled_quantity=record.entry_filled_quantity,
         entry_avg_fill_price=record.entry_avg_fill_price,
         entry_filled_at=record.entry_filled_at,
         exit_order_id=(
-            int(latest_exit_order.external_order_id)
+            _int_or_none(latest_exit_fill.external_order_id)
+            if latest_exit_fill is not None
+            and _int_or_none(latest_exit_fill.external_order_id) is not None
+            else _int_or_none(latest_exit_order.external_order_id)
             if latest_exit_order is not None
-            and latest_exit_order.external_order_id is not None
-            and latest_exit_order.external_order_id.isdigit()
+            and _int_or_none(latest_exit_order.external_order_id) is not None
             else record.exit_order_id
         ),
         exit_perm_id=(
-            int(latest_exit_order.external_perm_id)
+            _int_or_none(latest_exit_fill.external_perm_id)
+            if latest_exit_fill is not None
+            and _int_or_none(latest_exit_fill.external_perm_id) is not None
+            else _int_or_none(latest_exit_order.external_perm_id)
             if latest_exit_order is not None
-            and latest_exit_order.external_perm_id is not None
-            and latest_exit_order.external_perm_id.isdigit()
+            and _int_or_none(latest_exit_order.external_perm_id) is not None
             else record.exit_perm_id
         ),
         exit_client_id=(
@@ -308,33 +443,24 @@ def _build_instruction_status(
             else record.exit_client_id
         ),
         exit_order_status=(
-            latest_exit_order.status
-            if latest_exit_order is not None
-            else record.exit_order_status
+            derived_exit_order_status
         ),
         exit_submitted_quantity=record.exit_submitted_quantity,
         exit_filled_quantity=record.exit_filled_quantity,
         exit_avg_fill_price=record.exit_avg_fill_price,
         exit_filled_at=record.exit_filled_at,
         activity_at=activity_at,
-        entry_order_display=_display_for_orders(
+        entry_order_display=derived_entry_order_display
+        or _display_for_orders(
             broker_orders,
             order_role="ENTRY",
         )
         or (
-            f"{record.broker_order_id} / {record.broker_order_status}"
-            if record.broker_order_id is not None or record.broker_order_status is not None
+            f"{record.broker_order_id} / {derived_entry_order_status}"
+            if record.broker_order_id is not None or derived_entry_order_status is not None
             else None
         ),
-        exit_order_display=_display_for_orders(
-            broker_orders,
-            order_role="EXIT",
-        )
-        or (
-            f"{record.exit_order_id} / {record.exit_order_status}"
-            if record.exit_order_id is not None or record.exit_order_status is not None
-            else None
-        ),
+        exit_order_display=resolved_exit_order_display,
         events=events,
     )
 
@@ -364,6 +490,13 @@ def list_instruction_statuses(
                 )
             ).scalars()
         )
+        execution_fills = tuple(
+            session.execute(
+                select(ExecutionFillRecord).where(
+                    ExecutionFillRecord.instruction_id.in_([record.id for record in records])
+                )
+            ).scalars()
+        )
         broker_orders_by_instruction_id: dict[int, list[BrokerOrderRecord]] = {}
         for broker_order in broker_orders:
             if broker_order.instruction_id is None:
@@ -372,11 +505,20 @@ def list_instruction_statuses(
                 broker_order.instruction_id,
                 [],
             ).append(broker_order)
+        execution_fills_by_instruction_id: dict[int, list[ExecutionFillRecord]] = {}
+        for execution_fill in execution_fills:
+            if execution_fill.instruction_id is None:
+                continue
+            execution_fills_by_instruction_id.setdefault(
+                execution_fill.instruction_id,
+                [],
+            ).append(execution_fill)
 
         statuses = tuple(
             _build_instruction_status(
                 record,
                 broker_orders=tuple(broker_orders_by_instruction_id.get(record.id, ())),
+                execution_fills=tuple(execution_fills_by_instruction_id.get(record.id, ())),
             )
             for record in records
         )
@@ -435,9 +577,15 @@ def read_instruction_status(
                 select(BrokerOrderRecord).where(BrokerOrderRecord.instruction_id == record.id)
             ).scalars()
         )
+        execution_fills = tuple(
+            session.execute(
+                select(ExecutionFillRecord).where(ExecutionFillRecord.instruction_id == record.id)
+            ).scalars()
+        )
 
         return _build_instruction_status(
             record,
             broker_orders=broker_orders,
+            execution_fills=execution_fills,
             events=events,
         )

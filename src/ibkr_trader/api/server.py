@@ -12,12 +12,18 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping
 
+from sqlalchemy import or_
+from sqlalchemy import select
+
 from ibkr_trader.api.broker_monitor import BrokerMonitorService
 from ibkr_trader.api.broker_monitor import serialize_broker_monitor_status
 from ibkr_trader.config import AppConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_session_factory
+from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
+from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import (
     ExecutionInstructionBatch,
@@ -93,6 +99,7 @@ from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
 from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_result
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
+from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
@@ -106,6 +113,22 @@ from ibkr_trader.read_models import serialize_operator_dashboard_snapshot
 
 class ApiDependencyError(RuntimeError):
     """Raised when optional API server dependencies are unavailable."""
+
+
+_BACKGROUND_RECOVERY_INSTRUCTION_STATES = {
+    ExecutionState.ENTRY_SUBMITTED.value,
+    ExecutionState.POSITION_OPEN.value,
+    ExecutionState.EXIT_PENDING.value,
+}
+_BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES = {
+    "API_CANCELLED",
+    "CANCELLED",
+    "ERROR",
+    "FILLED",
+    "INACTIVE",
+    "NOT_FOUND_AT_BROKER",
+    "REJECTED",
+}
 
 
 def is_loopback_host(host: str | None) -> bool:
@@ -161,6 +184,37 @@ def parse_contract_resolve_payload(payload: Mapping[str, Any]) -> ContractResolv
     )
     query.validate()
     return query
+
+
+def should_include_background_execution_recovery(
+    session_factory: Any,
+) -> bool:
+    with session_scope(session_factory) as session:
+        active_instruction = session.execute(
+            select(InstructionRecord.id)
+            .where(
+                InstructionRecord.state.in_(
+                    tuple(_BACKGROUND_RECOVERY_INSTRUCTION_STATES)
+                )
+            )
+            .limit(1)
+        ).first()
+        if active_instruction is not None:
+            return True
+
+        unsettled_order = session.execute(
+            select(BrokerOrderRecord.id)
+            .where(
+                or_(
+                    BrokerOrderRecord.status.is_(None),
+                    BrokerOrderRecord.status.not_in(
+                        tuple(_BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES)
+                    ),
+                )
+            )
+            .limit(1)
+        ).first()
+        return unsettled_order is not None
 
 
 def parse_account_summary_payload(payload: Mapping[str, Any]) -> tuple[tuple[str, ...], str, str | None]:
@@ -622,11 +676,14 @@ def create_app(config: AppConfig | None = None) -> Any:
                 account_id=account_id,
                 account_ids=(account_id,),
             )
+        include_execution_recovery = should_include_background_execution_recovery(
+            session_factory
+        )
         return fetch_runtime_snapshot_with_diagnostic(
             diagnostic_config,
             timeout=app_config.broker_snapshot_refresh_timeout_seconds,
             include_open_orders=False,
-            include_executions=False,
+            include_executions=include_execution_recovery,
             include_positions=False,
         )
 

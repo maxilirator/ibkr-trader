@@ -22,6 +22,8 @@ from threading import Thread
 from typing import Any
 from typing import Callable
 
+from sqlalchemy import and_
+from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
@@ -33,6 +35,7 @@ from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
@@ -779,6 +782,80 @@ def _aggregate_broker_order_status_fill(
     )
 
 
+def _aggregate_persisted_execution_fill(
+    session_factory: sessionmaker[Session],
+    *,
+    record: InstructionRecord,
+    order_role: str,
+    external_order_id: int | None = None,
+) -> ExecutionAggregate:
+    with session_scope(session_factory) as session:
+        statement = select(ExecutionFillRecord).where(
+            ExecutionFillRecord.instruction_id == record.id,
+        )
+        if external_order_id is not None:
+            statement = statement.where(
+                ExecutionFillRecord.external_order_id == str(external_order_id)
+            )
+        elif order_role == "ENTRY":
+            entry_predicates = [
+                ExecutionFillRecord.order_ref == record.instruction_id,
+            ]
+            if record.broker_order_id is not None:
+                entry_predicates.append(
+                    ExecutionFillRecord.external_order_id == str(record.broker_order_id)
+                )
+            statement = statement.where(or_(*entry_predicates))
+        else:
+            exit_predicates = [
+                ExecutionFillRecord.order_ref.like(f"{record.instruction_id}:exit:%"),
+            ]
+            if record.exit_order_id is not None:
+                exit_predicates.append(
+                    ExecutionFillRecord.external_order_id == str(record.exit_order_id)
+                )
+            statement = statement.where(or_(*exit_predicates))
+
+        fills = session.execute(statement).scalars().all()
+
+    seen_execution_ids: set[str] = set()
+    total_quantity = Decimal("0")
+    weighted_notional = Decimal("0")
+    last_execution_at: datetime | None = None
+    matched_count = 0
+
+    for fill in fills:
+        execution_id = fill.external_execution_id or f"execution-fill:{fill.id}"
+        if execution_id in seen_execution_ids:
+            continue
+        seen_execution_ids.add(execution_id)
+
+        quantity = _parse_decimal(fill.quantity)
+        if quantity <= 0:
+            continue
+
+        price = _parse_decimal(fill.price)
+        total_quantity += quantity
+        if price > 0:
+            weighted_notional += price * quantity
+        matched_count += 1
+        if fill.executed_at is not None and (
+            last_execution_at is None or fill.executed_at > last_execution_at
+        ):
+            last_execution_at = fill.executed_at
+
+    average_price = None
+    if total_quantity > 0 and weighted_notional > 0:
+        average_price = weighted_notional / total_quantity
+
+    return ExecutionAggregate(
+        quantity=total_quantity,
+        average_price=average_price,
+        executed_at=_ensure_utc(last_execution_at),
+        execution_count=matched_count,
+    )
+
+
 def _quantize_like(value: Decimal, reference: Decimal) -> Decimal:
     exponent = reference.as_tuple().exponent
     if exponent >= 0:
@@ -915,52 +992,51 @@ def _persisted_open_order_ids_by_instruction(
 
     with session_scope(session_factory) as session:
         rows = session.execute(
-            select(
-                BrokerOrderRecord.instruction_id,
-                BrokerOrderRecord.external_order_id,
-                BrokerOrderRecord.external_perm_id,
-                BrokerOrderRecord.order_ref,
-                BrokerOrderRecord.status,
-                BrokerOrderRecord.last_status_at,
-                BrokerOrderRecord.id,
-            ).where(
+            select(BrokerOrderRecord).where(
                 BrokerOrderRecord.instruction_id.in_(tuple(instruction_ids_by_record_id.keys())),
                 BrokerOrderRecord.order_role == order_role,
             ).order_by(
                 BrokerOrderRecord.last_status_at.desc(),
                 BrokerOrderRecord.id.desc(),
             )
-        ).all()
+        ).scalars().all()
 
     seen_lineages: dict[str, set[tuple[str, str]]] = {
         record.instruction_id: set()
         for record in records
     }
 
-    for (
-        instruction_record_id,
-        external_order_id,
-        external_perm_id,
-        order_ref,
-        status,
-        _last_status_at,
-        _broker_order_id,
-    ) in rows:
-        public_instruction_id = instruction_ids_by_record_id.get(instruction_record_id)
+    for broker_order in rows:
+        public_instruction_id = instruction_ids_by_record_id.get(broker_order.instruction_id)
         if public_instruction_id is None:
             continue
-        if _normalize_broker_order_status(status) in _CLOSED_BROKER_ORDER_STATUSES:
+        if _normalize_broker_order_status(broker_order.status) in _CLOSED_BROKER_ORDER_STATUSES:
             continue
-        if external_order_id in (None, ""):
+        if broker_order.external_order_id in (None, ""):
+            continue
+        if _broker_order_has_matching_execution_fill(
+            session_factory,
+            broker_order=broker_order,
+        ):
             continue
         lineage_key = (
-            str(external_perm_id).strip() if external_perm_id not in (None, "") else "",
-            str(order_ref).strip() if order_ref not in (None, "") else str(external_order_id),
+            (
+                str(broker_order.external_perm_id).strip()
+                if broker_order.external_perm_id not in (None, "")
+                else ""
+            ),
+            (
+                str(broker_order.order_ref).strip()
+                if broker_order.order_ref not in (None, "")
+                else str(broker_order.external_order_id)
+            ),
         )
         if lineage_key in seen_lineages[public_instruction_id]:
             continue
         try:
-            persisted_order_ids[public_instruction_id].append(int(str(external_order_id)))
+            persisted_order_ids[public_instruction_id].append(
+                int(str(broker_order.external_order_id))
+            )
         except ValueError:
             continue
         seen_lineages[public_instruction_id].add(lineage_key)
@@ -986,6 +1062,48 @@ def _has_persisted_open_forced_exit_order(
             )
         ).first()
     return forced_exit_order is not None
+
+
+def _broker_order_has_matching_execution_fill(
+    session_factory: sessionmaker[Session],
+    *,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    lineage_predicates = []
+    if broker_order.external_perm_id not in (None, ""):
+        lineage_predicates.append(
+            ExecutionFillRecord.external_perm_id == broker_order.external_perm_id
+        )
+    if broker_order.external_order_id not in (None, ""):
+        lineage_predicates.append(
+            ExecutionFillRecord.external_order_id == broker_order.external_order_id
+        )
+    if broker_order.order_ref not in (None, ""):
+        lineage_predicates.append(ExecutionFillRecord.order_ref == broker_order.order_ref)
+    if broker_order.instruction_id is not None and (
+        (broker_order.order_role or "").strip().upper() == "EXIT"
+    ):
+        lineage_predicates.append(
+            and_(
+                ExecutionFillRecord.instruction_id == broker_order.instruction_id,
+                ExecutionFillRecord.order_ref.is_not(None),
+                ExecutionFillRecord.order_ref.like("%:exit:%"),
+            )
+        )
+
+    if not lineage_predicates:
+        return False
+
+    with session_scope(session_factory) as session:
+        row = session.execute(
+            select(ExecutionFillRecord.id)
+            .where(
+                ExecutionFillRecord.broker_account_id == broker_order.broker_account_id,
+                or_(*lineage_predicates),
+            )
+            .limit(1)
+        ).first()
+    return row is not None
 
 
 def _remaining_position_quantity(
@@ -1463,6 +1581,7 @@ def _record_exit_fill_and_complete(
             str(exit_fill.average_price) if exit_fill.average_price is not None else None
         )
         record.exit_filled_at = exit_fill.executed_at
+        record.exit_order_status = "Filled"
         record.state = ExecutionState.COMPLETED.value
         session.add(
             InstructionEventRecord(
@@ -1889,6 +2008,13 @@ def run_runtime_cycle(
                 order_ref_exact=instruction.instruction_id,
             )
             if not entry_fill.has_fill:
+                entry_fill = _aggregate_persisted_execution_fill(
+                    session_factory,
+                    record=record,
+                    order_role="ENTRY",
+                    external_order_id=record.broker_order_id,
+                )
+            if not entry_fill.has_fill:
                 entry_fill = _aggregate_broker_order_status_fill(
                     session_factory,
                     record=record,
@@ -1899,6 +2025,12 @@ def run_runtime_cycle(
                 snapshot.executions,
                 order_ref_prefix=f"{instruction.instruction_id}:exit:",
             )
+            if not exit_fill.has_fill:
+                exit_fill = _aggregate_persisted_execution_fill(
+                    session_factory,
+                    record=record,
+                    order_role="EXIT",
+                )
             if not exit_fill.has_fill:
                 exit_fill = _aggregate_broker_order_status_fill(
                     session_factory,

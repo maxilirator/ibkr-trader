@@ -18,6 +18,7 @@ from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.models import AccountSnapshotRecord
 from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
@@ -2557,3 +2558,191 @@ class RuntimeWorkerTests(TestCase):
         )
 
         self.assertEqual(result["runtime-sive-1"], (3953,))
+
+    def test_persisted_open_order_ids_ignore_orders_with_matching_execution_fill(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            exit_order_id=3953,
+            entry_filled_quantity="100",
+        )
+
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-sive-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="GTW05",
+                base_currency="USD",
+                metadata_json={},
+            )
+            session.add(broker_account)
+            session.flush()
+            broker_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="GTW05",
+                order_role="EXIT",
+                external_order_id="3953",
+                external_perm_id="449407988",
+                order_ref="runtime-sive-1:exit:forced",
+                symbol="SIVE",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                side="SELL",
+                order_type="MKT",
+                status="PendingCancel",
+                total_quantity="100",
+                last_status_at=datetime(2026, 4, 10, 7, 31, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.flush()
+            session.add(
+                ExecutionFillRecord(
+                    broker_order_id=broker_order.id,
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="GTW05",
+                    external_execution_id="0001",
+                    external_order_id="3953",
+                    external_perm_id="449407988",
+                    order_ref="runtime-sive-1:exit:forced",
+                    symbol="SIVE",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    side="SLD",
+                    quantity="100",
+                    price="22.61",
+                    executed_at=datetime(2026, 4, 10, 7, 32, tzinfo=timezone.utc),
+                    raw_payload={},
+                )
+            )
+            session.commit()
+            records = [instruction]
+        finally:
+            session.close()
+
+        result = _persisted_open_order_ids_by_instruction(
+            self.session_factory,
+            records=records,
+            order_role="EXIT",
+        )
+
+        self.assertEqual(result["runtime-sive-1"], ())
+
+    def test_run_runtime_cycle_completes_instruction_from_persisted_exit_fill(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            exit_order_id=3953,
+            entry_filled_quantity="100",
+        )
+
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-sive-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="GTW05",
+                base_currency="USD",
+                metadata_json={},
+            )
+            session.add(broker_account)
+            session.flush()
+            broker_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="GTW05",
+                order_role="EXIT",
+                external_order_id="3953",
+                external_perm_id="449407988",
+                order_ref="runtime-sive-1:exit:forced",
+                symbol="SIVE",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                side="SELL",
+                order_type="MKT",
+                status="PendingCancel",
+                total_quantity="100",
+                last_status_at=datetime(2026, 4, 10, 7, 31, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.flush()
+            session.add(
+                ExecutionFillRecord(
+                    broker_order_id=broker_order.id,
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="GTW05",
+                    external_execution_id="0001",
+                    external_order_id="3953",
+                    external_perm_id="449407988",
+                    order_ref="runtime-sive-1:exit:forced",
+                    symbol="SIVE",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    side="SLD",
+                    quantity="100",
+                    price="22.61",
+                    executed_at=datetime(2026, 4, 10, 7, 32, tzinfo=timezone.utc),
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(len(result.completed_instructions), 1)
+        record = self._read_record("runtime-sive-1")
+        self.assertEqual(record.state, ExecutionState.COMPLETED.value)
+        self.assertEqual(record.exit_order_status, "Filled")
+        self.assertEqual(record.exit_filled_quantity, "100")

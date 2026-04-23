@@ -24,6 +24,7 @@ from ibkr_trader.api.server import (
     parse_tick_stream_payload,
     serialize_execution_batch,
     serialize_runtime_schedule_preview,
+    should_include_background_execution_recovery,
 )
 from ibkr_trader.config import AppConfig
 from ibkr_trader.config import ApiServerConfig
@@ -247,6 +248,87 @@ class ApiServerTests(TestCase):
         self.assertEqual(query.max_symbols, 25)
         self.assertEqual(query.max_concurrent, 10)
         self.assertEqual(query.per_symbol_timeout_seconds, 1.5)
+
+    def test_background_execution_recovery_runs_when_instruction_is_active(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "recovery_active.db"
+            engine = build_engine(f"sqlite+pysqlite:///{database_path}")
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+
+            session = session_factory()
+            try:
+                session.add(
+                    InstructionRecord(
+                        instruction_id="runtime-sive-1",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="batch-1",
+                        account_key="GTW05",
+                        book_key="long_risk_book",
+                        symbol="SIVE",
+                        exchange="SMART",
+                        currency="SEK",
+                        state="EXIT_PENDING",
+                        submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+                        expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        payload={"instruction": {"instruction_id": "runtime-sive-1"}},
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+
+            self.assertTrue(should_include_background_execution_recovery(session_factory))
+
+    def test_background_execution_recovery_runs_when_broker_order_is_unsettled(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "recovery_order.db"
+            engine = build_engine(f"sqlite+pysqlite:///{database_path}")
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+
+            session = session_factory()
+            try:
+                broker_account = BrokerAccountRecord(
+                    broker_kind="IBKR",
+                    account_key="GTW05",
+                    base_currency="SEK",
+                )
+                session.add(broker_account)
+                session.flush()
+                session.add(
+                    BrokerOrderRecord(
+                        instruction_id=None,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="GTW05",
+                        order_role="EXIT",
+                        external_order_id="3953",
+                        external_perm_id="449407988",
+                        external_client_id="0",
+                        order_ref="runtime-sive-1:exit:forced",
+                        symbol="SIVE",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        side="SELL",
+                        order_type="MKT",
+                        status="PendingCancel",
+                        total_quantity="100",
+                        submitted_at=datetime(2026, 4, 10, 7, 30, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 10, 7, 31, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+
+            self.assertTrue(should_include_background_execution_recovery(session_factory))
 
     def test_operator_snapshot_endpoint_returns_durable_ledger_state(self) -> None:
         try:

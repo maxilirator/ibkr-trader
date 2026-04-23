@@ -292,10 +292,14 @@ class BrokerLedgerPersistenceTests(TestCase):
             self.assertEqual(len(broker_orders), 1)
             self.assertEqual(broker_orders[0].status, "Submitted")
             self.assertEqual(broker_orders[0].instruction_id, 1)
-            self.assertEqual(len(broker_order_events), 2)
+            self.assertEqual(len(broker_order_events), 3)
+            self.assertEqual(
+                [event.event_type for event in broker_order_events],
+                ["open_order_observed", "execution_fill_observed", "open_order_updated"],
+            )
             self.assertEqual(
                 [event.status_after for event in broker_order_events],
-                ["PreSubmitted", "Submitted"],
+                ["PreSubmitted", "FILLED", "Submitted"],
             )
             self.assertEqual(len(execution_fills), 1)
             self.assertEqual(execution_fills[0].external_execution_id, "00014800.69ddd749.01.01")

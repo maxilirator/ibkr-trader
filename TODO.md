@@ -13,6 +13,12 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Recovery now heals stale fills and instruction state after broker trouble:
+  background diagnostic snapshots automatically pull executions while there
+  are active instructions or unsettled broker orders, execution persistence
+  marks matching durable broker orders as filled, and runtime reconciliation
+  now trusts persisted execution fills so stale exit rows no longer block an
+  instruction from completing after the broker has already flattened it
 - [x] Startup and operator-triggered runtime reconciliation now use a rich
   broker snapshot:
   recovery paths pull executions, open orders, and positions again so stale

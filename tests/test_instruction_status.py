@@ -11,6 +11,7 @@ from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.orchestration.instruction_status import (
@@ -384,3 +385,86 @@ class InstructionStatusTests(TestCase):
 
         self.assertEqual(result.exit_order_id, 3953)
         self.assertEqual(result.exit_order_display, "3953 / PreSubmitted")
+
+    def test_completed_instruction_prefers_filled_exit_display_over_stale_order_status(self) -> None:
+        self._insert_instruction(
+            instruction_id="status-volcar-filled",
+            state="COMPLETED",
+        )
+
+        session = self.session_factory()
+        try:
+            record = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "status-volcar-filled"
+                )
+            ).scalar_one()
+            record.exit_order_status = "PendingCancel"
+            record.exit_filled_quantity = "827"
+            record.exit_avg_fill_price = "22.61"
+            session.add(record)
+
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key=record.account_key,
+                base_currency=record.currency,
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key=record.account_key,
+                    order_role="EXIT",
+                    external_order_id="3953",
+                    external_perm_id="449407988",
+                    external_client_id="0",
+                    order_ref=f"{record.instruction_id}:exit:forced",
+                    symbol=record.symbol,
+                    exchange=record.exchange,
+                    currency=record.currency,
+                    security_type="STK",
+                    side="SELL",
+                    order_type="MKT",
+                    status="PendingCancel",
+                    submitted_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                )
+            )
+            session.add(
+                ExecutionFillRecord(
+                    instruction_id=record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key=record.account_key,
+                    external_execution_id="00014800.69e9aa5b.01.01",
+                    external_order_id="3953",
+                    external_perm_id="449407988",
+                    order_ref=f"{record.instruction_id}:exit:forced",
+                    symbol=record.symbol,
+                    exchange=record.exchange,
+                    currency=record.currency,
+                    security_type="STK",
+                    side="SLD",
+                    quantity="827",
+                    price="22.61",
+                    executed_at=datetime(2026, 4, 23, 7, 0, tzinfo=timezone.utc),
+                    raw_payload={"source": "test"},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        result = read_instruction_status(
+            self.session_factory,
+            "status-volcar-filled",
+            include_events=False,
+        )
+
+        self.assertEqual(result.exit_order_status, "Filled")
+        self.assertEqual(result.exit_order_id, 3953)
+        self.assertEqual(result.exit_perm_id, 449407988)
+        self.assertEqual(result.exit_order_display, "3953 / Filled")

@@ -1841,6 +1841,20 @@ def _persist_executions(
         else:
             if broker_order.instruction_id is None and instruction_record is not None:
                 broker_order.instruction_id = instruction_record.id
+            previous_status = broker_order.status
+            broker_order.status = "FILLED"
+            broker_order.last_status_at = execution.executed_at or captured_at
+            if previous_status != broker_order.status:
+                _record_broker_order_event(
+                    session,
+                    broker_order=broker_order,
+                    event_type="execution_fill_observed",
+                    event_at=execution.executed_at or captured_at,
+                    status_before=previous_status,
+                    status_after=broker_order.status,
+                    payload=_serialize_for_json(asdict(execution)),
+                    note="Observed broker execution and marked the durable order as filled.",
+                )
 
         executed_at = execution.executed_at
         fill_raw_payload = _serialize_for_json(asdict(execution))
