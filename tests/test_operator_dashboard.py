@@ -807,6 +807,167 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
         self.assertEqual(len(volcar_orders), 1)
         self.assertEqual(volcar_orders[0].external_order_id, "3953")
 
+    def test_build_operator_dashboard_snapshot_hides_effectively_closed_exit_orders(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            volcar_instruction = InstructionRecord(
+                instruction_id="2026-04-21-U25245596-long_risk_book-VOLCAR B-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-volcar",
+                account_key="U25245596",
+                book_key="long_risk_book",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                state="EXIT_PENDING",
+                submit_at=datetime(2026, 4, 21, 7, 20, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 21, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            sive_instruction = InstructionRecord(
+                instruction_id="2026-04-20-U25245596-manual_delayed_sive-buy-01",
+                schema_version="2026-04-10",
+                source_system="manual-test",
+                batch_id="batch-sive",
+                account_key="U25245596",
+                book_key="manual_delayed_sive",
+                symbol="SIVE",
+                exchange="SMART",
+                currency="SEK",
+                state="EXIT_PENDING",
+                submit_at=datetime(2026, 4, 20, 13, 55, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 20, 13, 58, tzinfo=timezone.utc),
+                order_type="MKT",
+                side="BUY",
+                payload={},
+            )
+            session.add_all([volcar_instruction, sive_instruction])
+            session.flush()
+
+            session.add_all(
+                [
+                    BrokerOrderRecord(
+                        instruction_id=volcar_instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        order_role="EXIT",
+                        external_order_id="3953",
+                        external_perm_id="449407988",
+                        external_client_id="0",
+                        order_ref=f"{volcar_instruction.instruction_id}:exit:forced",
+                        symbol="VOLCAR.B",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange="SFB",
+                        local_symbol="VOLCAR B",
+                        side="SELL",
+                        order_type="MKT",
+                        time_in_force="DAY",
+                        status="PendingCancel",
+                        total_quantity="827",
+                        submitted_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 23, 7, 44, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=sive_instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        order_role="EXIT",
+                        external_order_id="38",
+                        external_perm_id="156906838",
+                        external_client_id="0",
+                        order_ref=f"{sive_instruction.instruction_id}:exit:delayed_limit",
+                        symbol="SIVE",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange="SFB",
+                        local_symbol="SIVE",
+                        side="SELL",
+                        order_type="LMT",
+                        time_in_force="DAY",
+                        status="Submitted",
+                        total_quantity="1",
+                        limit_price="32.7",
+                        submitted_at=datetime(2026, 4, 20, 13, 58, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 21, 15, 15, 47, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                    PositionSnapshotRecord(
+                        broker_account_id=broker_account.id,
+                        snapshot_at=datetime(2026, 4, 23, 19, 42, tzinfo=timezone.utc),
+                        source="runtime_snapshot",
+                        symbol="VOLCAR.B",
+                        exchange="SFB",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange=None,
+                        local_symbol="VOLCAR B",
+                        quantity="0",
+                        average_cost="0.0",
+                        market_price="22.55",
+                        market_value="0.0",
+                        unrealized_pnl="0",
+                        realized_pnl="-635.55",
+                    ),
+                    ExecutionFillRecord(
+                        broker_order_id=None,
+                        instruction_id=sive_instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        external_execution_id="00014800.69e72208.01.01",
+                        external_order_id="67",
+                        external_perm_id="156906838",
+                        order_ref=f"{sive_instruction.instruction_id}:exit:delayed_limit",
+                        symbol="SIVE",
+                        exchange="SFB",
+                        currency="SEK",
+                        security_type="STK",
+                        side="SLD",
+                        quantity="1",
+                        price="32.7",
+                        commission="49.0",
+                        commission_currency="SEK",
+                        executed_at=datetime(2026, 4, 21, 15, 15, 58, tzinfo=timezone.utc),
+                        raw_payload={},
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        symbols = {row.symbol for row in snapshot.open_orders}
+        self.assertNotIn("VOLCAR.B", symbols)
+        self.assertNotIn("SIVE", symbols)
+
 
 if __name__ == "__main__":
     unittest.main()

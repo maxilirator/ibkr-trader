@@ -10,7 +10,9 @@ from enum import Enum
 import re
 from typing import Any
 
+from sqlalchemy import and_
 from sqlalchemy import func
+from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
@@ -504,6 +506,96 @@ def _position_snapshot_matches_order(
     return True
 
 
+def _latest_matching_position_quantity(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> Decimal | None:
+    rows = session.execute(
+        select(PositionSnapshotRecord)
+        .where(
+            PositionSnapshotRecord.broker_account_id == broker_order.broker_account_id,
+            PositionSnapshotRecord.symbol == broker_order.symbol,
+            PositionSnapshotRecord.currency == broker_order.currency,
+            PositionSnapshotRecord.security_type == broker_order.security_type,
+        )
+        .order_by(
+            PositionSnapshotRecord.snapshot_at.desc(),
+            PositionSnapshotRecord.id.desc(),
+        )
+        .limit(8)
+    ).scalars()
+
+    for position_snapshot in rows:
+        if not _position_snapshot_matches_order(
+            position_snapshot,
+            broker_order=broker_order,
+        ):
+            continue
+        return _to_decimal(position_snapshot.quantity)
+    return None
+
+
+def _has_matching_execution_fill(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    lineage_clauses = []
+    if broker_order.external_perm_id not in (None, ""):
+        lineage_clauses.append(
+            ExecutionFillRecord.external_perm_id == broker_order.external_perm_id
+        )
+    if broker_order.external_order_id not in (None, ""):
+        lineage_clauses.append(
+            ExecutionFillRecord.external_order_id == broker_order.external_order_id
+        )
+    if broker_order.order_ref not in (None, ""):
+        lineage_clauses.append(ExecutionFillRecord.order_ref == broker_order.order_ref)
+    if broker_order.instruction_id is not None and (
+        broker_order.order_role or ""
+    ).strip().upper() == "EXIT":
+        lineage_clauses.append(
+            and_(
+                ExecutionFillRecord.instruction_id == broker_order.instruction_id,
+                ExecutionFillRecord.order_ref.is_not(None),
+                ExecutionFillRecord.order_ref.like("%:exit:%"),
+            )
+        )
+
+    if not lineage_clauses:
+        return False
+
+    row = session.execute(
+        select(ExecutionFillRecord.id)
+        .where(
+            ExecutionFillRecord.broker_account_id == broker_order.broker_account_id,
+            or_(*lineage_clauses),
+        )
+        .limit(1)
+    ).first()
+    return row is not None
+
+
+def _is_effectively_closed_open_order(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    normalized_role = (broker_order.order_role or "").strip().upper()
+    if normalized_role != "EXIT":
+        return False
+
+    if _has_matching_execution_fill(session, broker_order=broker_order):
+        return True
+
+    latest_position_quantity = _latest_matching_position_quantity(
+        session,
+        broker_order=broker_order,
+    )
+    return latest_position_quantity == Decimal("0")
+
+
 def _open_order_market_context(
     session: Session,
     *,
@@ -773,6 +865,8 @@ def _build_open_orders(
     seen_lineages: set[tuple[str, str, str]] = set()
     for broker_order, broker_account in rows:
         if _normalize_order_status(broker_order.status) in _CLOSED_ORDER_STATUSES:
+            continue
+        if _is_effectively_closed_open_order(session, broker_order=broker_order):
             continue
         lineage_key = (
             broker_order.account_key,
