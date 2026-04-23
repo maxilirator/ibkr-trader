@@ -313,3 +313,74 @@ class InstructionStatusTests(TestCase):
         self.assertEqual(result.entry_order_display, "44 / Filled")
         self.assertEqual(result.exit_order_display, "55, 56 / Submitted, PreSubmitted")
         self.assertEqual(result.updated_at.isoformat(), "2026-04-10T20:04:00")
+
+    def test_instruction_status_dedupes_replaced_exit_order_lineage_in_display(self) -> None:
+        self._insert_instruction(
+            instruction_id="status-volcar-1",
+            state="EXIT_PENDING",
+            updated_at=datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+        )
+        session = self.session_factory()
+        try:
+            record = session.execute(
+                select(InstructionRecord).where(InstructionRecord.instruction_id == "status-volcar-1")
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key=record.account_key,
+                base_currency=record.currency,
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add_all(
+                [
+                    BrokerOrderRecord(
+                        instruction_id=record.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key=record.account_key,
+                        order_role="EXIT",
+                        external_order_id="3952",
+                        external_perm_id="449407988",
+                        external_client_id="0",
+                        order_ref=f"{record.instruction_id}:exit:forced",
+                        symbol=record.symbol,
+                        exchange=record.exchange,
+                        currency=record.currency,
+                        security_type="STK",
+                        side="SELL",
+                        order_type="MKT",
+                        status="PreSubmitted",
+                        submitted_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=record.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key=record.account_key,
+                        order_role="EXIT",
+                        external_order_id="3953",
+                        external_perm_id="449407988",
+                        external_client_id="0",
+                        order_ref=f"{record.instruction_id}:exit:forced",
+                        symbol=record.symbol,
+                        exchange=record.exchange,
+                        currency=record.currency,
+                        security_type="STK",
+                        side="SELL",
+                        order_type="MKT",
+                        status="PreSubmitted",
+                        submitted_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        result = read_instruction_status(self.session_factory, "status-volcar-1", include_events=False)
+
+        self.assertEqual(result.exit_order_id, 3953)
+        self.assertEqual(result.exit_order_display, "3953 / PreSubmitted")

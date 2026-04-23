@@ -145,6 +145,33 @@ def _latest_matching_order(
     return max(matching_orders, key=_broker_order_sort_key)
 
 
+def _dedupe_order_lineages(
+    broker_orders: tuple[BrokerOrderRecord, ...],
+) -> tuple[BrokerOrderRecord, ...]:
+    if not broker_orders:
+        return ()
+
+    ordered = tuple(
+        sorted(
+            broker_orders,
+            key=_broker_order_sort_key,
+            reverse=True,
+        )
+    )
+    deduped: list[BrokerOrderRecord] = []
+    seen_lineages: set[tuple[str, str]] = set()
+    for order in ordered:
+        lineage_key = (
+            str(order.external_perm_id or "").strip(),
+            str(order.order_ref or order.external_order_id or order.id).strip(),
+        )
+        if lineage_key in seen_lineages:
+            continue
+        deduped.append(order)
+        seen_lineages.add(lineage_key)
+    return tuple(deduped)
+
+
 def _display_for_orders(
     broker_orders: tuple[BrokerOrderRecord, ...],
     *,
@@ -155,6 +182,7 @@ def _display_for_orders(
         for order in broker_orders
         if (order.order_role or "").strip().upper() == order_role
     )
+    matching_orders = _dedupe_order_lineages(matching_orders)
     if not matching_orders:
         return None
 
