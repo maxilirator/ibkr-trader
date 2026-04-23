@@ -31,6 +31,9 @@ class RuntimeSnapshotSyncWrapperProtocol(Protocol):
     def get_positions(self, timeout: int = 10) -> dict[str, list[Any]]: ...
 
 
+_EXECUTION_LOOKBACK_DAYS = 7
+
+
 @dataclass(slots=True)
 class BrokerOpenOrder:
     order_id: int
@@ -228,6 +231,23 @@ def _configured_snapshot_account_ids(
             continue
         ordered_accounts.append(normalized)
     return tuple(ordered_accounts)
+
+
+def _build_runtime_execution_filter(config: IbkrConnectionConfig) -> Any:
+    try:
+        from ibapi.execution import ExecutionFilter
+    except ModuleNotFoundError:
+        return None
+
+    execution_filter = ExecutionFilter()
+    configured_account_ids = _configured_snapshot_account_ids(config)
+    preferred_account_id = str(config.account_id).strip() if config.account_id else ""
+    if preferred_account_id:
+        execution_filter.acctCode = preferred_account_id
+    elif len(configured_account_ids) == 1:
+        execution_filter.acctCode = configured_account_ids[0]
+    execution_filter.lastNDays = _EXECUTION_LOOKBACK_DAYS
+    return execution_filter
 
 
 def _serialize_open_order(raw_payload: Any) -> BrokerOpenOrder | None:
@@ -513,7 +533,10 @@ def fetch_broker_runtime_snapshot(
     config: IbkrConnectionConfig,
     *,
     timeout: int = 10,
+    include_open_orders: bool = True,
+    include_executions: bool = True,
     include_account_updates: bool = True,
+    include_positions: bool = True,
     sync_wrapper_cls: type[RuntimeSnapshotSyncWrapperProtocol] | None = None,
     response_timeout_cls: type[Exception] | None = None,
     app: RuntimeSnapshotSyncWrapperProtocol | None = None,
@@ -535,9 +558,20 @@ def fetch_broker_runtime_snapshot(
             )
 
     try:
+        raw_open_orders: dict[int, Any] = {}
+        snapshot_stage = "open_orders"
         try:
-            raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
-            raw_executions = runtime_app.get_executions(timeout=timeout)
+            if include_open_orders:
+                raw_open_orders = runtime_app.get_open_orders(timeout=timeout)
+            snapshot_stage = "executions"
+            raw_executions = (
+                runtime_app.get_executions(
+                    exec_filter=_build_runtime_execution_filter(config),
+                    timeout=timeout,
+                )
+                if include_executions
+                else []
+            )
             raw_account_updates_payloads: list[dict[str, Any]] = []
             if include_account_updates:
                 configured_account_ids = _configured_snapshot_account_ids(config)
@@ -545,6 +579,7 @@ def fetch_broker_runtime_snapshot(
                     # Keep the long-lived monitor on reqAccountUpdates instead of
                     # reqAccountSummary so we do not burn summary subscriptions.
                     for account_id in configured_account_ids:
+                        snapshot_stage = f"account_updates:{account_id}"
                         raw_account_updates_payloads.append(
                             runtime_app.get_account_updates(
                                 account_code=account_id,
@@ -552,20 +587,29 @@ def fetch_broker_runtime_snapshot(
                             )
                         )
                 else:
+                    snapshot_stage = "account_updates"
                     raw_account_updates_payloads.append(
                         runtime_app.get_account_updates(
                             account_code="",
                             timeout=timeout,
                         )
                     )
-            raw_positions = runtime_app.get_positions(timeout=timeout)
+            snapshot_stage = "positions"
+            raw_positions = (
+                runtime_app.get_positions(timeout=timeout)
+                if include_positions
+                else {}
+            )
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:
                 raise LookupError(
-                    f"IBKR rejected the runtime snapshot request: {broker_error}"
+                    "IBKR rejected the runtime snapshot request during "
+                    f"{snapshot_stage}: {broker_error}"
                 ) from exc
-            raise TimeoutError("Timed out while requesting the IBKR runtime snapshot.") from exc
+            raise TimeoutError(
+                f"Timed out while requesting {snapshot_stage} for the IBKR runtime snapshot."
+            ) from exc
     finally:
         if owns_connection:
             runtime_app.disconnect_and_stop()

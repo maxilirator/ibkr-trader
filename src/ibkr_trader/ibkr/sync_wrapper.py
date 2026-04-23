@@ -46,6 +46,8 @@ def load_sync_wrapper_class() -> type[Any]:
             self._broker_callback_events_lock = threading.Lock()
             self._suppressed_callback_kinds: dict[str, int] = {}
             self._known_order_ids: set[int] = set()
+            self._closed_execution_request_ids: deque[int] = deque(maxlen=512)
+            self._closed_execution_request_ids_lookup: set[int] = set()
             self.account_values: dict[str, dict[str, dict[str, str | None]]] = {}
             self.execution_commissions: dict[str, Any] = {}
 
@@ -96,6 +98,15 @@ def load_sync_wrapper_class() -> type[Any]:
             except (TypeError, ValueError):
                 return
             self._known_order_ids.add(normalized_order_id)
+
+        def _mark_execution_request_closed(self, req_id: int) -> None:
+            if req_id in self._closed_execution_request_ids_lookup:
+                return
+            if len(self._closed_execution_request_ids) == self._closed_execution_request_ids.maxlen:
+                dropped_req_id = self._closed_execution_request_ids.popleft()
+                self._closed_execution_request_ids_lookup.discard(dropped_req_id)
+            self._closed_execution_request_ids.append(req_id)
+            self._closed_execution_request_ids_lookup.add(req_id)
 
         def _is_callback_suppressed(self, kind: str) -> bool:
             return self._suppressed_callback_kinds.get(kind, 0) > 0
@@ -391,7 +402,9 @@ def load_sync_wrapper_class() -> type[Any]:
         def get_open_orders(self, timeout: int = 3) -> dict[int, Any]:
             self.open_orders = {}
             with self._suppress_broker_callback_events("open_order", "order_status"):
-                self.reqOpenOrders()
+                # Use the API-wide open-order query instead of reqOpenOrders()
+                # so client_id=0 does not try to bind manual TWS orders.
+                self.reqAllOpenOrders()
                 return self._wait_for_response(0, "open_orders", timeout)
 
         def get_historical_data(
@@ -439,10 +452,15 @@ def load_sync_wrapper_class() -> type[Any]:
                 exec_filter = ExecutionFilter()
 
             req_id = self._next_local_request_id()
+            self._closed_execution_request_ids_lookup.discard(req_id)
             if req_id in self.executions:
                 del self.executions[req_id]
             self.reqExecutions(req_id, exec_filter)
-            raw_executions = self._wait_for_response(req_id, "executions", timeout)
+            try:
+                raw_executions = self._wait_for_response(req_id, "executions", timeout)
+            finally:
+                self._mark_execution_request_closed(req_id)
+                self.executions.pop(req_id, None)
             return self._merge_execution_commissions(raw_executions)
 
         def updateAccountValue(
@@ -560,6 +578,16 @@ def load_sync_wrapper_class() -> type[Any]:
                     mktCapPrice,
                 )
             )
+
+        def execDetails(self, reqId: int, contract: Any, execution: Any) -> None:  # noqa: N802
+            if reqId in self._closed_execution_request_ids_lookup:
+                return
+            super().execDetails(reqId, contract, execution)
+
+        def execDetailsEnd(self, reqId: int) -> None:  # noqa: N802
+            if reqId in self._closed_execution_request_ids_lookup:
+                return
+            super().execDetailsEnd(reqId)
 
         def openOrder(  # noqa: N802
             self,

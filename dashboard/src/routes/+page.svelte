@@ -45,6 +45,7 @@
   let acknowledgeAllLogsResult = null;
   let reconciliationClearResult = null;
   let referenceNow = new Date();
+  let refreshInFlight = false;
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const AUTO_REFRESH_INTERVAL_MS = 15000;
   let timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
@@ -259,14 +260,29 @@
       await applyAction(result);
 
       if (result.type === 'success') {
-        await invalidateAll();
+        await refreshDashboard();
       }
     };
   }
 
-  onMount(() => {
-    const intervalId = window.setInterval(async () => {
+  async function refreshDashboard() {
+    if (refreshInFlight) {
+      return;
+    }
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+    refreshInFlight = true;
+    try {
       await invalidateAll();
+    } finally {
+      refreshInFlight = false;
+    }
+  }
+
+  onMount(() => {
+    const intervalId = window.setInterval(() => {
+      void refreshDashboard();
     }, AUTO_REFRESH_INTERVAL_MS);
 
     return () => {

@@ -16,6 +16,7 @@
   let instructionSetCancellations = [];
   let reconciliationIssues = [];
   let endpointErrors = [];
+  let refreshInFlight = false;
 
   $: ledgerSnapshot = data.ledgerSnapshot ?? {};
   $: summary = ledgerSnapshot.summary ?? {};
@@ -28,9 +29,24 @@
   $: reconciliationIssues = ledgerSnapshot.reconciliation_issues ?? [];
   $: endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
 
-  onMount(() => {
-    const intervalId = window.setInterval(async () => {
+  async function refreshLedger() {
+    if (refreshInFlight) {
+      return;
+    }
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+    refreshInFlight = true;
+    try {
       await invalidateAll();
+    } finally {
+      refreshInFlight = false;
+    }
+  }
+
+  onMount(() => {
+    const intervalId = window.setInterval(() => {
+      void refreshLedger();
     }, AUTO_REFRESH_INTERVAL_MS);
 
     return () => {

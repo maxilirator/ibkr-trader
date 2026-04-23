@@ -263,3 +263,37 @@ class SyncWrapperTests(TestCase):
 
         self.assertEqual(app.execution_commissions["exec-002"].currency, "USD")
         self.assertEqual(app.execution_commissions["exec-002"].commissionAndFees, "0.95")
+
+    def test_get_executions_cleans_up_request_buffer_after_success(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app._next_local_request_id = lambda: 41  # type: ignore[method-assign]
+        app.reqExecutions = lambda req_id, exec_filter: None  # type: ignore[method-assign]
+
+        def fake_wait_for_response(req_id: int, response_name: str, timeout: int):
+            app.executions[req_id] = [{"execution": SimpleNamespace(execId="exec-001")}]
+            return list(app.executions[req_id])
+
+        app._wait_for_response = fake_wait_for_response  # type: ignore[method-assign]
+
+        executions = app.get_executions(timeout=5)
+
+        self.assertEqual(len(executions), 1)
+        self.assertNotIn(41, app.executions)
+        self.assertIn(41, app._closed_execution_request_ids_lookup)
+
+    def test_exec_details_ignores_late_callbacks_for_closed_request(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app._mark_execution_request_closed(41)
+
+        app.execDetails(
+            41,
+            SimpleNamespace(symbol="SIVE"),
+            SimpleNamespace(execId="exec-late"),
+        )
+        app.execDetailsEnd(41)
+
+        self.assertNotIn(41, app.executions)

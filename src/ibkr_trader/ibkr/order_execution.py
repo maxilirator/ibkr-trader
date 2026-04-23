@@ -490,7 +490,10 @@ def _resolve_instruction_contract_and_account(
     try:
         contract_matches = app.get_contract_details(raw_contract, timeout=timeout)
     except timeout_cls as exc:
-        broker_error = _extract_broker_error_message(app)
+        broker_error = _extract_broker_error_message(
+            app,
+            include_known_order_ids=True,
+        )
         if broker_error is not None:
             raise LookupError(
                 f"IBKR rejected the contract lookup: {broker_error}"
@@ -707,7 +710,10 @@ def submit_order_from_instruction(
                     timeout=timeout,
                 )
             except timeout_cls as exc:
-                broker_error = _extract_broker_error_message(runtime_app)
+                broker_error = _extract_broker_error_message(
+                    runtime_app,
+                    include_known_order_ids=True,
+                )
                 if broker_error is not None:
                     raise LookupError(
                         f"IBKR rejected the order submission: {broker_error}"
@@ -927,7 +933,10 @@ def submit_exit_order_from_instruction(
                 timeout=timeout,
             )
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
+            broker_error = _extract_broker_error_message(
+                runtime_app,
+                include_known_order_ids=True,
+            )
             if broker_error is not None:
                 raise LookupError(
                     f"IBKR rejected the order submission: {broker_error}"
@@ -998,7 +1007,10 @@ def cancel_broker_order(
         try:
             order_status = runtime_app.cancel_order_sync(order_id, timeout=timeout)
         except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
+            broker_error = _extract_broker_error_message(
+                runtime_app,
+                include_known_order_ids=True,
+            )
             if broker_error is not None:
                 if f"[{_ORDER_CANCEL_NOT_FOUND_CODE}]" in broker_error:
                     return _serialize_for_json(

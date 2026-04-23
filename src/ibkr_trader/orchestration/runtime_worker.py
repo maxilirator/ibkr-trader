@@ -50,6 +50,7 @@ from ibkr_trader.ibkr.runtime_snapshot import fetch_broker_runtime_snapshot
 from ibkr_trader.ibkr.session_manager import CanonicalSyncSessions
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
 from ibkr_trader.ledger.persistence import persist_broker_callback_events
+from ibkr_trader.ledger.persistence import persist_broker_order_cancellation_result
 from ibkr_trader.ledger.persistence import persist_broker_order_submission
 from ibkr_trader.ledger.persistence import persist_broker_runtime_snapshot
 from ibkr_trader.orchestration.entry_submission import (
@@ -699,6 +700,85 @@ def _aggregate_executions(
     )
 
 
+def _aggregate_broker_order_status_fill(
+    session_factory: sessionmaker[Session],
+    *,
+    record: InstructionRecord,
+    order_role: str,
+    external_order_id: int | None = None,
+) -> ExecutionAggregate:
+    with session_scope(session_factory) as session:
+        statement = select(BrokerOrderRecord).where(
+            BrokerOrderRecord.instruction_id == record.id,
+            BrokerOrderRecord.order_role == order_role,
+        )
+        if external_order_id is not None:
+            statement = statement.where(
+                BrokerOrderRecord.external_order_id == str(external_order_id)
+            )
+        broker_orders = session.execute(statement).scalars().all()
+
+    seen_order_keys: set[str] = set()
+    total_quantity = Decimal("0")
+    weighted_notional = Decimal("0")
+    last_execution_at: datetime | None = None
+    matched_count = 0
+
+    for broker_order in broker_orders:
+        order_key = (
+            broker_order.external_order_id
+            or broker_order.external_perm_id
+            or f"broker-order:{broker_order.id}"
+        )
+        if order_key in seen_order_keys:
+            continue
+        seen_order_keys.add(order_key)
+
+        status_payload = broker_order.metadata_json.get("last_order_status_callback")
+        if not isinstance(status_payload, dict):
+            continue
+
+        filled_quantity = _parse_decimal(
+            str(status_payload.get("filled"))
+            if status_payload.get("filled") not in (None, "")
+            else None
+        )
+        if filled_quantity <= 0:
+            continue
+
+        average_fill_price = _parse_decimal(
+            str(status_payload.get("avgFillPrice"))
+            if status_payload.get("avgFillPrice") not in (None, "")
+            else None
+        )
+        if average_fill_price <= 0:
+            average_fill_price = _parse_decimal(
+                str(status_payload.get("lastFillPrice"))
+                if status_payload.get("lastFillPrice") not in (None, "")
+                else None
+            )
+
+        total_quantity += filled_quantity
+        if average_fill_price > 0:
+            weighted_notional += average_fill_price * filled_quantity
+        matched_count += 1
+        if broker_order.last_status_at is not None and (
+            last_execution_at is None or broker_order.last_status_at > last_execution_at
+        ):
+            last_execution_at = broker_order.last_status_at
+
+    average_price = None
+    if total_quantity > 0 and weighted_notional > 0:
+        average_price = weighted_notional / total_quantity
+
+    return ExecutionAggregate(
+        quantity=total_quantity,
+        average_price=average_price,
+        executed_at=_ensure_utc(last_execution_at),
+        execution_count=matched_count,
+    )
+
+
 def _quantize_like(value: Decimal, reference: Decimal) -> Decimal:
     exponent = reference.as_tuple().exponent
     if exponent >= 0:
@@ -814,10 +894,11 @@ def _normalize_broker_order_status(status: str | None) -> str | None:
     return normalized.upper()
 
 
-def _persisted_open_exit_orders_by_instruction(
+def _persisted_open_order_ids_by_instruction(
     session_factory: sessionmaker[Session],
     *,
     records: list[InstructionRecord],
+    order_role: str,
 ) -> dict[str, tuple[int, ...]]:
     if not records:
         return {}
@@ -844,7 +925,7 @@ def _persisted_open_exit_orders_by_instruction(
                 BrokerOrderRecord.id,
             ).where(
                 BrokerOrderRecord.instruction_id.in_(tuple(instruction_ids_by_record_id.keys())),
-                BrokerOrderRecord.order_role == "EXIT",
+                BrokerOrderRecord.order_role == order_role,
             ).order_by(
                 BrokerOrderRecord.last_status_at.desc(),
                 BrokerOrderRecord.id.desc(),
@@ -890,6 +971,23 @@ def _persisted_open_exit_orders_by_instruction(
     }
 
 
+def _has_persisted_open_forced_exit_order(
+    session_factory: sessionmaker[Session],
+    *,
+    record: InstructionRecord,
+) -> bool:
+    with session_scope(session_factory) as session:
+        forced_exit_order = session.execute(
+            select(BrokerOrderRecord.id).where(
+                BrokerOrderRecord.instruction_id == record.id,
+                BrokerOrderRecord.order_role == "EXIT",
+                BrokerOrderRecord.order_ref == f"{record.instruction_id}:exit:forced",
+                BrokerOrderRecord.status.not_in(_CLOSED_BROKER_ORDER_STATUSES),
+            )
+        ).first()
+    return forced_exit_order is not None
+
+
 def _remaining_position_quantity(
     record: InstructionRecord,
     exit_fill: ExecutionAggregate,
@@ -899,6 +997,33 @@ def _remaining_position_quantity(
         return Decimal("0")
     remaining = entry_filled - exit_fill.quantity
     return remaining if remaining > 0 else Decimal("0")
+
+
+def _cancel_broker_order_and_persist(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    *,
+    order_id: int,
+    timeout: int,
+    canceler: Callable[..., dict[str, Any]],
+    event_type: str,
+    note: str,
+) -> dict[str, Any]:
+    broker_cancellation = canceler(
+        broker_config,
+        order_id,
+        timeout=timeout,
+    )
+    persist_broker_order_cancellation_result(
+        session_factory,
+        broker_kind=BROKER_KIND_IBKR,
+        broker_cancellation=broker_cancellation,
+        observed_at=utc_now(),
+        fallback_account_key=broker_config.account_id,
+        event_type=event_type,
+        note=note,
+    )
+    return broker_cancellation
 
 
 def _record_entry_fill_and_optional_exit(
@@ -1739,9 +1864,15 @@ def run_runtime_cycle(
     records_by_instruction_id = {
         record.instruction_id: record for record in records
     }
-    persisted_open_exit_order_ids_by_instruction = _persisted_open_exit_orders_by_instruction(
+    persisted_open_exit_order_ids_by_instruction = _persisted_open_order_ids_by_instruction(
         session_factory,
         records=records,
+        order_role="EXIT",
+    )
+    persisted_open_entry_order_ids_by_instruction = _persisted_open_order_ids_by_instruction(
+        session_factory,
+        records=records,
+        order_role="ENTRY",
     )
     blocking_due_exit_instruction_ids: list[str] = []
 
@@ -1757,14 +1888,34 @@ def run_runtime_cycle(
                 order_id=record.broker_order_id,
                 order_ref_exact=instruction.instruction_id,
             )
+            if not entry_fill.has_fill:
+                entry_fill = _aggregate_broker_order_status_fill(
+                    session_factory,
+                    record=record,
+                    order_role="ENTRY",
+                    external_order_id=record.broker_order_id,
+                )
             exit_fill = _aggregate_executions(
                 snapshot.executions,
                 order_ref_prefix=f"{instruction.instruction_id}:exit:",
             )
+            if not exit_fill.has_fill:
+                exit_fill = _aggregate_broker_order_status_fill(
+                    session_factory,
+                    record=record,
+                    order_role="EXIT",
+                )
 
+            persisted_entry_open_order_ids = persisted_open_entry_order_ids_by_instruction.get(
+                instruction_id,
+                (),
+            )
             entry_open = (
-                record.broker_order_id is not None
-                and record.broker_order_id in snapshot.open_orders
+                (
+                    record.broker_order_id is not None
+                    and record.broker_order_id in snapshot.open_orders
+                )
+                or bool(persisted_entry_open_order_ids)
             )
             exit_open_order_ids = _open_order_ids_with_ref_prefix(
                 snapshot,
@@ -1785,10 +1936,17 @@ def run_runtime_cycle(
                     if entry_fill.has_fill:
                         if entry_open:
                             _run_with_broker_retries(
-                                lambda: runtime_order_canceler(
+                                lambda: _cancel_broker_order_and_persist(
+                                    session_factory,
                                     broker_config,
-                                    record.broker_order_id,
+                                    order_id=record.broker_order_id,
                                     timeout=timeout,
+                                    canceler=runtime_order_canceler,
+                                    event_type="entry_order_cancelled_after_fill",
+                                    note=(
+                                        "Persisted broker cancellation after the entry "
+                                        "fill was already observed."
+                                    ),
                                 ),
                                 retry_delays=broker_retry_delays,
                                 sleep_fn=sleep_fn,
@@ -1853,10 +2011,17 @@ def run_runtime_cycle(
                         continue
                     if entry_open and instruction.entry.cancel_unfilled_at_expiry:
                         _run_with_broker_retries(
-                            lambda: runtime_order_canceler(
+                            lambda: _cancel_broker_order_and_persist(
+                                session_factory,
                                 broker_config,
-                                record.broker_order_id,
+                                order_id=record.broker_order_id,
                                 timeout=timeout,
+                                canceler=runtime_order_canceler,
+                                event_type="entry_order_cancelled_post_expiry_fill",
+                                note=(
+                                    "Persisted broker cancellation after an entry fill "
+                                    "arrived beyond the entry expiry window."
+                                ),
                             ),
                             retry_delays=broker_retry_delays,
                             sleep_fn=sleep_fn,
@@ -2001,12 +2166,24 @@ def run_runtime_cycle(
                     continue
 
                 blocking_due_exit_instruction_ids.append(instruction_id)
+                if _has_persisted_open_forced_exit_order(
+                    session_factory,
+                    record=record,
+                ):
+                    continue
                 for open_exit_order_id in combined_exit_open_order_ids:
                     _run_with_broker_retries(
-                        lambda order_id=open_exit_order_id: runtime_order_canceler(
+                        lambda order_id=open_exit_order_id: _cancel_broker_order_and_persist(
+                            session_factory,
                             broker_config,
-                            order_id,
+                            order_id=order_id,
                             timeout=timeout,
+                            canceler=runtime_order_canceler,
+                            event_type="exit_order_cancelled_before_forced_exit",
+                            note=(
+                                "Persisted broker cancellation before submitting the "
+                                "next-session forced exit."
+                            ),
                         ),
                         retry_delays=broker_retry_delays,
                         sleep_fn=sleep_fn,
@@ -2237,7 +2414,10 @@ def _build_runtime_broker_operations(
             lambda broker_app: fetch_broker_runtime_snapshot(
                 broker_config,
                 timeout=timeout,
+                include_open_orders=False,
+                include_executions=False,
                 include_account_updates=False,
+                include_positions=False,
                 app=broker_app,
             ),
         )

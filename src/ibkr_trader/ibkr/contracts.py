@@ -68,13 +68,27 @@ def _serialize_sec_ids(raw_sec_ids: Any) -> dict[str, str]:
     return sec_ids
 
 
-def _extract_broker_error_message(app: Any) -> str | None:
+def _extract_broker_error_message(
+    app: Any,
+    *,
+    include_known_order_ids: bool = False,
+) -> str | None:
     raw_errors = getattr(app, "errors", {})
     if not raw_errors:
         return None
 
+    known_order_ids = set()
+    if not include_known_order_ids:
+        raw_known_order_ids = getattr(app, "_known_order_ids", set())
+        if isinstance(raw_known_order_ids, set):
+            known_order_ids = {value for value in raw_known_order_ids if isinstance(value, int)}
+
     nonnegative_req_ids = [
-        req_id for req_id in raw_errors if isinstance(req_id, int) and req_id >= 0
+        req_id
+        for req_id in raw_errors
+        if isinstance(req_id, int)
+        and req_id >= 0
+        and (include_known_order_ids or req_id not in known_order_ids)
     ]
     ordered_req_ids = sorted(nonnegative_req_ids)
     if not ordered_req_ids:

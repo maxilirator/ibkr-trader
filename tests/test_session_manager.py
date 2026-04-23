@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from unittest import TestCase
 
 from ibkr_trader.config import IbkrConnectionConfig
@@ -159,3 +161,65 @@ class SessionManagerTests(TestCase):
         self.assertEqual(events, [{"event_type": "order_status"}])
         status = session.status()
         self.assertEqual(status.metrics.checkout_count, 1)
+
+    def test_execute_serializes_access_to_shared_session(self) -> None:
+        session = ManagedSyncSession(
+            "primary",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=0,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FakeSyncWrapper,
+        )
+
+        state_lock = threading.Lock()
+        inflight = 0
+        max_inflight = 0
+        start_second = threading.Event()
+        finish_first = threading.Event()
+
+        def operation_one(app: object) -> str:
+            nonlocal inflight, max_inflight
+            with state_lock:
+                inflight += 1
+                max_inflight = max(max_inflight, inflight)
+            start_second.set()
+            finish_first.wait(timeout=2)
+            with state_lock:
+                inflight -= 1
+            return "first"
+
+        def operation_two(app: object) -> str:
+            nonlocal inflight, max_inflight
+            with state_lock:
+                inflight += 1
+                max_inflight = max(max_inflight, inflight)
+            with state_lock:
+                inflight -= 1
+            return "second"
+
+        first_result: list[str] = []
+        second_result: list[str] = []
+
+        first_thread = threading.Thread(
+            target=lambda: first_result.append(session.execute("first", operation_one))
+        )
+        second_thread = threading.Thread(
+            target=lambda: second_result.append(session.execute("second", operation_two))
+        )
+
+        first_thread.start()
+        start_second.wait(timeout=2)
+        second_thread.start()
+        time.sleep(0.1)
+        finish_first.set()
+
+        first_thread.join(timeout=2)
+        second_thread.join(timeout=2)
+
+        self.assertEqual(first_result, ["first"])
+        self.assertEqual(second_result, ["second"])
+        self.assertEqual(max_inflight, 1)

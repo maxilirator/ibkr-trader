@@ -16,6 +16,7 @@ from ibkr_trader.api.broker_monitor import serialize_broker_monitor_status
 from ibkr_trader.config import AppConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_session_factory
+from ibkr_trader.db.base import utc_now
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import (
     ExecutionInstructionBatch,
@@ -93,7 +94,9 @@ from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_res
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
+from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
 from ibkr_trader.ledger.persistence import persist_broker_runtime_snapshot
+from ibkr_trader.ledger.persistence import persist_broker_order_cancellation_result
 from ibkr_trader.read_models import build_operator_dashboard_snapshot
 from ibkr_trader.read_models import build_ledger_dashboard_snapshot
 from ibkr_trader.read_models import serialize_ledger_dashboard_snapshot
@@ -542,14 +545,58 @@ def create_app(config: AppConfig | None = None) -> Any:
         broker_config: Any,
         *,
         timeout: int = 10,
+        include_open_orders: bool = True,
+        include_executions: bool = True,
+        include_account_updates: bool = True,
+        include_positions: bool = True,
     ) -> Any:
         return with_primary_session(
             "broker_runtime_snapshot",
             lambda broker_app: fetch_broker_runtime_snapshot(
                 broker_config,
                 timeout=timeout,
+                include_open_orders=include_open_orders,
+                include_executions=include_executions,
+                include_account_updates=include_account_updates,
+                include_positions=include_positions,
                 app=broker_app,
             )
+        )
+
+    def fetch_runtime_snapshot_with_diagnostic(
+        broker_config: Any,
+        *,
+        timeout: int = 10,
+        include_open_orders: bool = True,
+        include_executions: bool = True,
+        include_account_updates: bool = True,
+        include_positions: bool = True,
+    ) -> Any:
+        return with_diagnostic_session(
+            "broker_runtime_snapshot",
+            lambda broker_app: fetch_broker_runtime_snapshot(
+                broker_config,
+                timeout=timeout,
+                include_open_orders=include_open_orders,
+                include_executions=include_executions,
+                include_account_updates=include_account_updates,
+                include_positions=include_positions,
+                app=broker_app,
+            )
+        )
+
+    def fetch_internal_runtime_snapshot_with_primary(
+        broker_config: Any,
+        *,
+        timeout: int = 10,
+    ) -> Any:
+        return fetch_runtime_snapshot_with_primary(
+            broker_config,
+            timeout=timeout,
+            include_open_orders=False,
+            include_executions=False,
+            include_account_updates=False,
+            include_positions=False,
         )
 
     def drain_broker_callbacks_with_primary() -> list[dict[str, Any]]:
@@ -566,9 +613,12 @@ def create_app(config: AppConfig | None = None) -> Any:
         )
 
     def fetch_background_runtime_snapshot() -> Any:
-        return fetch_runtime_snapshot_with_primary(
-            app_config.ibkr.primary_session(),
+        return fetch_runtime_snapshot_with_diagnostic(
+            app_config.ibkr.diagnostic_session(),
             timeout=app_config.broker_snapshot_refresh_timeout_seconds,
+            include_open_orders=False,
+            include_executions=False,
+            include_positions=False,
         )
 
     def persist_background_runtime_snapshot(snapshot: Any, captured_at: datetime) -> None:
@@ -927,6 +977,7 @@ def create_app(config: AppConfig | None = None) -> Any:
 
     @app.post("/v1/orders/{order_id}/cancel")
     def cancel_order(order_id: int, timeout: int = 10) -> dict[str, Any]:
+        ledger_warning: str | None = None
         try:
             result = with_primary_session(
                 "order_cancel",
@@ -948,13 +999,31 @@ def create_app(config: AppConfig | None = None) -> Any:
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
 
-        return {
+        broker_status = result.get("broker_order_status")
+        if isinstance(broker_status, dict):
+            try:
+                persist_broker_order_cancellation_result(
+                    session_factory,
+                    broker_kind=BROKER_KIND_IBKR,
+                    broker_cancellation=result,
+                    observed_at=utc_now(),
+                    fallback_account_key=app_config.ibkr.account_id or None,
+                    event_type="manual_broker_order_cancelled",
+                    note="Persisted manual broker-order cancellation from the API.",
+                )
+            except ValueError as exc:
+                ledger_warning = str(exc)
+
+        response = {
             "accepted": True,
             "mode": "manual_broker_cancel",
             "session_client_id": app_config.ibkr.client_id,
             "order_id": order_id,
             "cancelled_order": result,
         }
+        if ledger_warning is not None:
+            response["ledger_warning"] = ledger_warning
+        return response
 
     @app.post("/v1/instructions/validate")
     def validate_instruction(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1382,7 +1451,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 instruction_ids=instruction_ids,
                 entry_submitter=submit_order_with_primary,
                 exit_submitter=submit_exit_with_primary,
-                broker_snapshot_fetcher=fetch_runtime_snapshot_with_primary,
+                broker_snapshot_fetcher=fetch_internal_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
                 submission_lead_time=timedelta(
@@ -1421,7 +1490,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 timeout=timeout,
                 instruction_ids=instruction_ids,
                 exit_submitter=submit_exit_with_primary,
-                broker_snapshot_fetcher=fetch_runtime_snapshot_with_primary,
+                broker_snapshot_fetcher=fetch_internal_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
                 submission_lead_time=timedelta(

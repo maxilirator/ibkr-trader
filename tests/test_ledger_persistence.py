@@ -898,5 +898,7 @@ class BrokerLedgerPersistenceTests(TestCase):
                 [event.event_type for event in broker_order_events],
                 ["order_error_callback"],
             )
+            self.assertEqual(broker_order_events[0].status_before, "PreSubmitted")
+            self.assertEqual(broker_order_events[0].status_after, "NOT_FOUND_AT_BROKER")
         finally:
             session.close()

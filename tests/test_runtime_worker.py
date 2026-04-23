@@ -28,7 +28,7 @@ from ibkr_trader.ibkr.runtime_snapshot import BrokerPortfolioItem
 from ibkr_trader.ibkr.runtime_snapshot import BrokerPosition
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
-from ibkr_trader.orchestration.runtime_worker import _persisted_open_exit_orders_by_instruction
+from ibkr_trader.orchestration.runtime_worker import _persisted_open_order_ids_by_instruction
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
 from ibkr_trader.orchestration.state_machine import ExecutionState
@@ -1468,6 +1468,146 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.exit_order_id, 21)
         self.assertEqual(record.exit_submitted_quantity, "1")
 
+    def test_run_runtime_cycle_can_use_persisted_order_status_fill_without_executions(self) -> None:
+        payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_SUBMITTED.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+            payload=payload,
+            broker_order_id=11,
+        )
+
+        session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            instruction_record = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-aapl-1"
+                )
+            ).scalar_one()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction_record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="ENTRY",
+                    external_order_id="11",
+                    external_perm_id="8001",
+                    external_client_id="0",
+                    order_ref="runtime-aapl-1",
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    local_symbol="AAPL",
+                    side="BUY",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Filled",
+                    total_quantity="1",
+                    limit_price="200.00",
+                    stop_price=None,
+                    submitted_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={
+                        "last_order_status_callback": {
+                            "orderId": 11,
+                            "status": "Filled",
+                            "filled": "1",
+                            "remaining": "0",
+                            "avgFillPrice": "200.00",
+                            "permId": 8001,
+                            "parentId": 0,
+                            "lastFillPrice": "200.00",
+                            "clientId": 0,
+                            "whyHeld": "",
+                            "mktCapPrice": "0.0",
+                        }
+                    },
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: Decimal,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: Decimal | None = None,
+            stop_price: Decimal | None = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            return {
+                "contract": {"symbol": "AAPL", "exchange": "SMART", "currency": "USD"},
+                "order": {
+                    "order_id": 21,
+                    "order_ref": order_ref,
+                    "order_type": "LMT",
+                    "action": "SELL",
+                    "time_in_force": "DAY",
+                    "limit_price": "204.00",
+                    "total_quantity": str(quantity),
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 21,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": str(quantity),
+                    "avgFillPrice": 0.0,
+                    "permId": 9001,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 5, tzinfo=timezone.utc),
+            exit_submitter=fake_exit_submitter,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(len(result.filled_entries), 1)
+        self.assertEqual(len(result.submitted_exits), 1)
+        record = self._read_record("runtime-aapl-1")
+        self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
+        self.assertEqual(record.entry_filled_quantity, "1")
+        self.assertEqual(record.entry_avg_fill_price, "200.00")
+
     def test_run_runtime_cycle_submits_delayed_market_anchored_limit_exit(self) -> None:
         payload = _sive_payload()
         payload["instruction"]["exit"] = {
@@ -2052,6 +2192,134 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(cancelled_ids, [21, 22])
         self.assertEqual(len(result.submitted_exits), 1)
 
+    def test_run_runtime_cycle_keeps_existing_forced_exit_order(self) -> None:
+        payload = _sive_payload()
+        payload["instruction"]["exit"]["take_profit_pct"] = "0.02"
+        payload["instruction"]["exit"]["catastrophic_stop_loss_pct"] = "0.15"
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+            exit_order_id=31,
+        )
+
+        session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+            instruction_record = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-sive-1"
+                )
+            ).scalar_one()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction_record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="EXIT",
+                    external_order_id="31",
+                    external_perm_id="9101",
+                    external_client_id="0",
+                    order_ref="runtime-sive-1:exit:forced",
+                    symbol="SIVE",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="SIVE",
+                    side="SELL",
+                    order_type="MKT",
+                    time_in_force="DAY",
+                    status="PreSubmitted",
+                    total_quantity="100",
+                    limit_price=None,
+                    stop_price=None,
+                    submitted_at=datetime(2026, 4, 13, 6, 58, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 13, 6, 58, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        cancelled_ids: list[int] = []
+        submitted_refs: list[str] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            cancelled_ids.append(order_id)
+            return {"broker_order_status": {"orderId": order_id, "status": "Cancelled"}}
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            submitted_refs.append(order_ref)
+            return {}
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                broker_order_canceler=fake_canceler,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={},
+                    executions=(),
+                    portfolio=(),
+                    positions=(),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(cancelled_ids, [])
+        self.assertEqual(submitted_refs, [])
+        self.assertEqual(len(result.submitted_exits), 0)
+
     def test_run_runtime_cycle_completes_instruction_after_exit_fill(self) -> None:
         payload = _aapl_payload()
         self._insert_instruction(
@@ -2221,9 +2489,10 @@ class RuntimeWorkerTests(TestCase):
         finally:
             session.close()
 
-        result = _persisted_open_exit_orders_by_instruction(
+        result = _persisted_open_order_ids_by_instruction(
             self.session_factory,
             records=records,
+            order_role="EXIT",
         )
 
         self.assertEqual(result["runtime-sive-1"], (3953,))

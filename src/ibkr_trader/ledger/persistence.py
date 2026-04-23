@@ -1219,6 +1219,32 @@ def persist_broker_order_cancellation(
     return broker_order
 
 
+def persist_broker_order_cancellation_result(
+    session_factory: sessionmaker[Session],
+    *,
+    broker_kind: str,
+    broker_cancellation: dict[str, Any],
+    observed_at: datetime,
+    instruction_record: InstructionRecord | None = None,
+    fallback_account_key: str | None = None,
+    event_type: str = "broker_order_cancelled",
+    note: str | None = "Persisted broker order cancellation into the ledger.",
+) -> None:
+    """Persist a broker cancel response into the durable ledger."""
+
+    with session_scope(session_factory) as session:
+        persist_broker_order_cancellation(
+            session,
+            broker_kind=broker_kind,
+            broker_cancellation=broker_cancellation,
+            observed_at=observed_at,
+            instruction_record=instruction_record,
+            fallback_account_key=fallback_account_key,
+            event_type=event_type,
+            note=note,
+        )
+
+
 def _upsert_open_order(
     session: Session,
     *,
@@ -2250,17 +2276,19 @@ def _persist_order_error_callback_event(
     metadata = dict(broker_order.metadata_json)
     metadata["last_order_error_callback"] = _serialize_for_json(error_payload)
     broker_order.metadata_json = metadata
+    status_before = broker_order.status
     error_code = error_payload.get("errorCode")
     if error_code == 10147:
         broker_order.status = "NOT_FOUND_AT_BROKER"
         broker_order.last_status_at = event_at
+    status_after = broker_order.status
     _record_broker_order_event(
         session,
         broker_order=broker_order,
         event_type="order_error_callback",
         event_at=event_at,
-        status_before=broker_order.status,
-        status_after=broker_order.status,
+        status_before=status_before,
+        status_after=status_after,
         payload=_serialize_for_json(error_payload),
         note="Persisted broker order error callback directly from the live session.",
     )

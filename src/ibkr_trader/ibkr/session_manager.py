@@ -303,8 +303,8 @@ class ManagedSyncSession:
     @contextmanager
     def checkout(self, *, operation_name: str = "unspecified") -> Iterator[Any]:
         started_at = _utc_now()
-        try:
-            with self._lock:
+        with self._lock:
+            try:
                 self._ensure_connected_locked()
                 self._record_checkout_locked()
                 app = self._app
@@ -314,49 +314,46 @@ class ManagedSyncSession:
                         f"client_id={self.config.client_id}."
                     )
                     raise ConnectionError(message)
-        except Exception as exc:
-            with self._lock:
+            except Exception as exc:
                 self._failed_checkout_count += 1
                 self._last_error = str(exc)
-            if self._activity_tracker is not None:
-                self._activity_tracker.record(
-                    role=self.role,
-                    operation_name=operation_name,
-                    started_at=started_at,
-                    completed_at=_utc_now(),
-                    success=False,
-                    error=str(exc),
-                )
-            raise
+                if self._activity_tracker is not None:
+                    self._activity_tracker.record(
+                        role=self.role,
+                        operation_name=operation_name,
+                        started_at=started_at,
+                        completed_at=_utc_now(),
+                        success=False,
+                        error=str(exc),
+                    )
+                raise
 
-        try:
-            yield app
-        except Exception as exc:
-            with self._lock:
+            try:
+                yield app
+            except Exception as exc:
                 self._failed_checkout_count += 1
                 self._last_error = str(exc)
-            if self._activity_tracker is not None:
-                self._activity_tracker.record(
-                    role=self.role,
-                    operation_name=operation_name,
-                    started_at=started_at,
-                    completed_at=_utc_now(),
-                    success=False,
-                    error=str(exc),
-                )
-            raise
-        else:
-            if self._activity_tracker is not None:
-                self._activity_tracker.record(
-                    role=self.role,
-                    operation_name=operation_name,
-                    started_at=started_at,
-                    completed_at=_utc_now(),
-                    success=True,
-                    error=None,
-                )
-        finally:
-            with self._lock:
+                if self._activity_tracker is not None:
+                    self._activity_tracker.record(
+                        role=self.role,
+                        operation_name=operation_name,
+                        started_at=started_at,
+                        completed_at=_utc_now(),
+                        success=False,
+                        error=str(exc),
+                    )
+                raise
+            else:
+                if self._activity_tracker is not None:
+                    self._activity_tracker.record(
+                        role=self.role,
+                        operation_name=operation_name,
+                        started_at=started_at,
+                        completed_at=_utc_now(),
+                        success=True,
+                        error=None,
+                    )
+            finally:
                 if not _is_connected(app):
                     self._disconnect_locked()
 

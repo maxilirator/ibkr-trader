@@ -16,6 +16,8 @@ class _FakeRuntimeSnapshotSyncWrapper:
         self.connected = False
         self.disconnected = False
         self.account_update_calls: list[tuple[str, int]] = []
+        self.execution_calls: list[tuple[object | None, int]] = []
+        self.position_calls: list[int] = []
         _FakeRuntimeSnapshotSyncWrapper.last_instance = self
 
     def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
@@ -62,6 +64,7 @@ class _FakeRuntimeSnapshotSyncWrapper:
         }
 
     def get_executions(self, exec_filter: object | None = None, timeout: int = 10) -> list[object]:
+        self.execution_calls.append((exec_filter, timeout))
         return [
             {
                 "contract": SimpleNamespace(
@@ -147,6 +150,7 @@ class _FakeRuntimeSnapshotSyncWrapper:
         return {"portfolio": [], "account_values": {}}
 
     def get_positions(self, timeout: int = 10) -> dict[str, list[object]]:
+        self.position_calls.append(timeout)
         return {
             "U25245596": [
                 {
@@ -226,7 +230,7 @@ class RuntimeSnapshotTests(TestCase):
             client_id=0,
             diagnostic_client_id=7,
             account_id="U25245596",
-            account_ids=("U25245596",),
+            account_ids=("U25245595", "U25245596"),
         )
 
         snapshot = fetch_broker_runtime_snapshot(
@@ -242,3 +246,66 @@ class RuntimeSnapshotTests(TestCase):
             _FakeRuntimeSnapshotSyncWrapper.last_instance.account_update_calls,
             [],
         )
+
+    def test_fetch_broker_runtime_snapshot_can_skip_open_orders(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=7496,
+            client_id=0,
+            diagnostic_client_id=7,
+            account_id="U25245596",
+            account_ids=("U25245596",),
+        )
+
+        snapshot = fetch_broker_runtime_snapshot(
+            config,
+            sync_wrapper_cls=_FakeRuntimeSnapshotSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            include_open_orders=False,
+            include_account_updates=False,
+        )
+
+        self.assertEqual(snapshot.open_orders, {})
+
+    def test_fetch_broker_runtime_snapshot_uses_bounded_execution_filter(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=7496,
+            client_id=0,
+            diagnostic_client_id=7,
+            account_id="U25245596",
+            account_ids=("U25245596",),
+        )
+
+        fetch_broker_runtime_snapshot(
+            config,
+            sync_wrapper_cls=_FakeRuntimeSnapshotSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            include_account_updates=False,
+        )
+
+        execution_filter, timeout = _FakeRuntimeSnapshotSyncWrapper.last_instance.execution_calls[0]
+        self.assertEqual(timeout, 10)
+        self.assertEqual(getattr(execution_filter, "acctCode", None), "U25245596")
+        self.assertEqual(getattr(execution_filter, "lastNDays", None), 7)
+
+    def test_fetch_broker_runtime_snapshot_can_skip_positions(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=7496,
+            client_id=0,
+            diagnostic_client_id=7,
+            account_id="U25245596",
+            account_ids=("U25245595", "U25245596"),
+        )
+
+        snapshot = fetch_broker_runtime_snapshot(
+            config,
+            sync_wrapper_cls=_FakeRuntimeSnapshotSyncWrapper,
+            response_timeout_cls=TimeoutError,
+            include_account_updates=False,
+            include_positions=False,
+        )
+
+        self.assertEqual(snapshot.positions, ())
+        self.assertEqual(_FakeRuntimeSnapshotSyncWrapper.last_instance.position_calls, [])

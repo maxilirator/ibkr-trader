@@ -7,6 +7,7 @@ from unittest import TestCase
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.ibkr.contracts import (
+    _extract_broker_error_message,
     build_ibkr_contract,
     resolve_contracts,
     serialize_contract_resolve_result,
@@ -160,3 +161,21 @@ class ContractResolverTests(TestCase):
         self.assertEqual(payload["match_count"], 1)
         self.assertTrue(payload["is_unique"])
         self.assertEqual(payload["matches"][0]["min_tick"], "0.0001")
+
+    def test_extract_broker_error_message_ignores_known_order_ids_by_default(self) -> None:
+        app = SimpleNamespace(
+            errors={
+                17: [{"errorCode": 200, "errorString": "No security definition has been found."}],
+                38: [{"errorCode": 10147, "errorString": "OrderId 38 that needs to be cancelled is not found."}],
+            },
+            _known_order_ids={38},
+        )
+
+        self.assertEqual(
+            _extract_broker_error_message(app),
+            "[200] No security definition has been found.",
+        )
+        self.assertEqual(
+            _extract_broker_error_message(app, include_known_order_ids=True),
+            "[10147] OrderId 38 that needs to be cancelled is not found.",
+        )
