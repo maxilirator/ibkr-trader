@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from sqlalchemy import select
 
@@ -28,6 +29,7 @@ from ibkr_trader.ibkr.runtime_snapshot import BrokerPortfolioItem
 from ibkr_trader.ibkr.runtime_snapshot import BrokerPosition
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
+from ibkr_trader.orchestration.runtime_worker import _build_runtime_broker_operations
 from ibkr_trader.orchestration.runtime_worker import _persisted_open_order_ids_by_instruction
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
@@ -259,6 +261,68 @@ class RuntimeWorkerTests(TestCase):
             session.commit()
         finally:
             session.close()
+
+    def test_runtime_broker_operations_keep_normal_cycle_snapshot_light(self) -> None:
+        recorded_operations: list[str] = []
+
+        class _FakePrimary:
+            def execute(self, operation_name: str, fn: object) -> object:
+                recorded_operations.append(operation_name)
+                return fn(object())
+
+        class _FakeSessions:
+            primary = _FakePrimary()
+
+        with patch(
+            "ibkr_trader.orchestration.runtime_worker.fetch_broker_runtime_snapshot",
+            return_value=BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        ) as snapshot_fetch:
+            broker_ops = _build_runtime_broker_operations(_FakeSessions())
+            broker_ops.fetch_snapshot(self.config, timeout=17)
+
+        self.assertEqual(recorded_operations, ["runtime_snapshot"])
+        self.assertEqual(snapshot_fetch.call_args.kwargs["timeout"], 17)
+        self.assertFalse(snapshot_fetch.call_args.kwargs["include_open_orders"])
+        self.assertFalse(snapshot_fetch.call_args.kwargs["include_executions"])
+        self.assertFalse(snapshot_fetch.call_args.kwargs["include_account_updates"])
+        self.assertFalse(snapshot_fetch.call_args.kwargs["include_positions"])
+
+    def test_runtime_broker_operations_use_rich_snapshot_for_reconciliation(self) -> None:
+        recorded_operations: list[str] = []
+
+        class _FakePrimary:
+            def execute(self, operation_name: str, fn: object) -> object:
+                recorded_operations.append(operation_name)
+                return fn(object())
+
+        class _FakeSessions:
+            primary = _FakePrimary()
+
+        with patch(
+            "ibkr_trader.orchestration.runtime_worker.fetch_broker_runtime_snapshot",
+            return_value=BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        ) as snapshot_fetch:
+            broker_ops = _build_runtime_broker_operations(_FakeSessions())
+            broker_ops.fetch_reconciliation_snapshot(self.config, timeout=23)
+
+        self.assertEqual(recorded_operations, ["runtime_reconciliation_snapshot"])
+        self.assertEqual(snapshot_fetch.call_args.kwargs["timeout"], 23)
+        self.assertTrue(snapshot_fetch.call_args.kwargs["include_open_orders"])
+        self.assertTrue(snapshot_fetch.call_args.kwargs["include_executions"])
+        self.assertFalse(snapshot_fetch.call_args.kwargs["include_account_updates"])
+        self.assertTrue(snapshot_fetch.call_args.kwargs["include_positions"])
 
     def test_run_runtime_cycle_submits_due_entry(self) -> None:
         payload = _aapl_payload()

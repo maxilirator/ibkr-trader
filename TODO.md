@@ -13,6 +13,11 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Startup and operator-triggered runtime reconciliation now use a rich
+  broker snapshot:
+  recovery paths pull executions, open orders, and positions again so stale
+  fills and instruction states can repair themselves from broker truth after
+  callback loss, timeouts, or other live-session trouble
 - [x] Repo now includes a session-bound IB Gateway IBC service scaffold:
   the repo ships a user-level `systemd` unit, a session-env capture helper,
   a root-managed system-service variant, and an explicit IBC launcher wrapper

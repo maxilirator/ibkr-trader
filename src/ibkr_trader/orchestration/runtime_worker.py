@@ -2322,6 +2322,7 @@ class RuntimeBrokerOperations:
     submit_exit: Callable[..., dict[str, Any]]
     read_market_price: Callable[..., dict[str, Any]]
     fetch_snapshot: Callable[..., BrokerRuntimeSnapshot]
+    fetch_reconciliation_snapshot: Callable[..., BrokerRuntimeSnapshot]
     drain_callbacks: Callable[[], list[dict[str, Any]]]
     cancel_order: Callable[..., dict[str, Any]]
 
@@ -2416,6 +2417,24 @@ def _build_runtime_broker_operations(
             ),
         )
 
+    def fetch_reconciliation_snapshot_with_primary(
+        broker_config: IbkrConnectionConfig,
+        *,
+        timeout: int = 10,
+    ) -> BrokerRuntimeSnapshot:
+        return broker_sessions.primary.execute(
+            "runtime_reconciliation_snapshot",
+            lambda broker_app: fetch_broker_runtime_snapshot(
+                broker_config,
+                timeout=timeout,
+                include_open_orders=True,
+                include_executions=True,
+                include_account_updates=False,
+                include_positions=True,
+                app=broker_app,
+            ),
+        )
+
     def drain_callbacks_with_primary() -> list[dict[str, Any]]:
         return broker_sessions.primary.drain_broker_callback_events()
 
@@ -2440,6 +2459,7 @@ def _build_runtime_broker_operations(
         submit_exit=submit_exit_with_primary,
         read_market_price=read_market_price_with_primary,
         fetch_snapshot=fetch_snapshot_with_primary,
+        fetch_reconciliation_snapshot=fetch_reconciliation_snapshot_with_primary,
         drain_callbacks=drain_callbacks_with_primary,
         cancel_order=cancel_order_with_primary,
     )
@@ -2514,7 +2534,7 @@ def run_persistent_execution_runtime(
                 timeout=timeout,
                 exit_submitter=broker_ops.submit_exit,
                 market_price_reader=broker_ops.read_market_price,
-                broker_snapshot_fetcher=broker_ops.fetch_snapshot,
+                broker_snapshot_fetcher=broker_ops.fetch_reconciliation_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
                 submission_lead_time=submission_lead_time,

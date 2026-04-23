@@ -586,7 +586,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             )
         )
 
-    def fetch_internal_runtime_snapshot_with_primary(
+    def fetch_reconciliation_runtime_snapshot_with_primary(
         broker_config: Any,
         *,
         timeout: int = 10,
@@ -594,10 +594,10 @@ def create_app(config: AppConfig | None = None) -> Any:
         return fetch_runtime_snapshot_with_primary(
             broker_config,
             timeout=timeout,
-            include_open_orders=False,
-            include_executions=False,
+            include_open_orders=True,
+            include_executions=True,
             include_account_updates=False,
-            include_positions=False,
+            include_positions=True,
         )
 
     def drain_broker_callbacks_with_primary() -> list[dict[str, Any]]:
@@ -1460,7 +1460,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 instruction_ids=instruction_ids,
                 entry_submitter=submit_order_with_primary,
                 exit_submitter=submit_exit_with_primary,
-                broker_snapshot_fetcher=fetch_internal_runtime_snapshot_with_primary,
+                broker_snapshot_fetcher=fetch_reconciliation_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
                 submission_lead_time=timedelta(
@@ -1499,7 +1499,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 timeout=timeout,
                 instruction_ids=instruction_ids,
                 exit_submitter=submit_exit_with_primary,
-                broker_snapshot_fetcher=fetch_internal_runtime_snapshot_with_primary,
+                broker_snapshot_fetcher=fetch_reconciliation_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
                 submission_lead_time=timedelta(
