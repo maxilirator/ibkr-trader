@@ -2222,16 +2222,10 @@ def run_runtime_cycle(
         # Active exit workflows take priority over fresh entries so we do not
         # size or submit new risk before urgent carry-over positions are handled.
         if blocking_due_exit_instruction_ids and due_instruction_ids:
-            _append_issue(
-                issues,
-                instruction_id=None,
-                stage="entry_submit_blocked",
-                message=(
-                    "Skipped due entry submissions while urgent next-session exits were "
-                    "still active for: "
-                    f"{', '.join(sorted(set(blocking_due_exit_instruction_ids)))}"
-                ),
-            )
+            # This is expected sequencing, not a new runtime fault. Keep entries
+            # pending quietly while the carry-over exit is active; otherwise a
+            # due entry can flood the reconciliation log every runtime cycle.
+            pass
         else:
             _submit_due_pending_entries(
                 session_factory,

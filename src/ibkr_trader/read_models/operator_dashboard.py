@@ -10,6 +10,7 @@ from enum import Enum
 import re
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
@@ -585,8 +586,17 @@ def _open_order_market_context(
 def _build_account_snapshots(
     session: Session,
 ) -> tuple[OperatorAccountSnapshot, ...]:
+    latest_snapshot_ids = (
+        select(func.max(AccountSnapshotRecord.id).label("snapshot_id"))
+        .group_by(AccountSnapshotRecord.broker_account_id)
+        .subquery()
+    )
     rows = session.execute(
         select(AccountSnapshotRecord, BrokerAccountRecord)
+        .join(
+            latest_snapshot_ids,
+            AccountSnapshotRecord.id == latest_snapshot_ids.c.snapshot_id,
+        )
         .join(
             BrokerAccountRecord,
             BrokerAccountRecord.id == AccountSnapshotRecord.broker_account_id,
@@ -661,8 +671,24 @@ def _build_position_snapshots(
     *,
     include_flat_positions: bool,
 ) -> tuple[OperatorPositionSnapshot, ...]:
+    latest_snapshot_ids = (
+        select(func.max(PositionSnapshotRecord.id).label("snapshot_id"))
+        .group_by(
+            PositionSnapshotRecord.broker_account_id,
+            PositionSnapshotRecord.symbol,
+            PositionSnapshotRecord.exchange,
+            PositionSnapshotRecord.currency,
+            PositionSnapshotRecord.security_type,
+            PositionSnapshotRecord.local_symbol,
+        )
+        .subquery()
+    )
     rows = session.execute(
         select(PositionSnapshotRecord, BrokerAccountRecord)
+        .join(
+            latest_snapshot_ids,
+            PositionSnapshotRecord.id == latest_snapshot_ids.c.snapshot_id,
+        )
         .join(
             BrokerAccountRecord,
             BrokerAccountRecord.id == PositionSnapshotRecord.broker_account_id,

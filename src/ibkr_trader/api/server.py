@@ -4,9 +4,10 @@ import argparse
 import ipaddress
 import json
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from dataclasses import asdict
+from dataclasses import replace
 from datetime import date, datetime
+from datetime import timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping
@@ -613,8 +614,16 @@ def create_app(config: AppConfig | None = None) -> Any:
         )
 
     def fetch_background_runtime_snapshot() -> Any:
+        account_id = app_config.ibkr.account_id.strip()
+        diagnostic_config = app_config.ibkr.diagnostic_session()
+        if account_id:
+            diagnostic_config = replace(
+                diagnostic_config,
+                account_id=account_id,
+                account_ids=(account_id,),
+            )
         return fetch_runtime_snapshot_with_diagnostic(
-            app_config.ibkr.diagnostic_session(),
+            diagnostic_config,
             timeout=app_config.broker_snapshot_refresh_timeout_seconds,
             include_open_orders=False,
             include_executions=False,

@@ -2042,10 +2042,7 @@ class RuntimeWorkerTests(TestCase):
 
         self.assertEqual(entry_submit_calls, [])
         self.assertEqual(len(result.submitted_exits), 1)
-        self.assertEqual(
-            [issue.stage for issue in result.issues],
-            ["entry_submit_blocked"],
-        )
+        self.assertEqual(result.issues, ())
         self.assertEqual(
             self._read_record("runtime-aapl-1").state,
             ExecutionState.ENTRY_PENDING.value,
