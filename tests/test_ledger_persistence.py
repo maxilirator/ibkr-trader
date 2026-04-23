@@ -756,3 +756,147 @@ class BrokerLedgerPersistenceTests(TestCase):
             )
         finally:
             session.close()
+
+    def test_persist_broker_callback_events_marks_not_found_order_as_closed(self) -> None:
+        session = self.session_factory()
+        try:
+            instruction = InstructionRecord(
+                instruction_id="persisted-volcar-exit-1",
+                schema_version="2026-04-10",
+                source_system="q-training",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="long_book",
+                symbol="VOLCAR.B",
+                exchange="SFB",
+                currency="SEK",
+                state=ExecutionState.EXIT_PENDING.value,
+                submit_at=datetime(2026, 4, 23, 6, 59, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 23, 15, 30, tzinfo=timezone.utc),
+                order_type="MKT",
+                side="BUY",
+                entry_submitted_quantity="827",
+                entry_filled_quantity="827",
+                entry_avg_fill_price="23.26",
+                entry_filled_at=datetime(2026, 4, 21, 8, 2, tzinfo=timezone.utc),
+                exit_order_id=3952,
+                exit_perm_id=449407988,
+                exit_order_status="PreSubmitted",
+                exit_submitted_quantity="827",
+                payload={
+                    "instruction": {
+                        "instruction_id": "persisted-volcar-exit-1",
+                        "account": {
+                            "account_key": "U25245596",
+                            "book_key": "long_book",
+                        },
+                        "instrument": {
+                            "symbol": "VOLCAR.B",
+                            "security_type": "STK",
+                            "exchange": "SFB",
+                            "currency": "SEK",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "target_quantity",
+                            "target_quantity": "827",
+                        },
+                        "entry": {
+                            "order_type": "MKT",
+                            "submit_at": "2026-04-23T08:59:00+02:00",
+                            "expire_at": "2026-04-23T17:30:00+02:00",
+                        },
+                        "exit": {
+                            "force_exit_next_session_open": True,
+                        },
+                        "trace": {
+                            "reason_code": "ledger-test",
+                        },
+                    }
+                },
+            )
+            session.add(instruction)
+            session.flush()
+            broker_account = BrokerAccountRecord(
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="U25245596",
+                base_currency="SEK",
+                metadata_json={},
+            )
+            session.add(broker_account)
+            session.flush()
+            broker_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="3952",
+                external_perm_id="449407988",
+                external_client_id="0",
+                order_ref="persisted-volcar-exit-1:exit:forced",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="VOLCAR B",
+                side="SELL",
+                order_type="MKT",
+                time_in_force="DAY",
+                status="PreSubmitted",
+                total_quantity="827",
+                submitted_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_callback_events(
+            self.session_factory,
+            [
+                {
+                    "event_type": "order_error",
+                    "event_at": datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                    "error": {
+                        "orderId": 3952,
+                        "errorTime": 0,
+                        "errorCode": 10147,
+                        "errorString": "OrderId 3952 that needs to be cancelled is not found.",
+                        "advancedOrderRejectJson": None,
+                    },
+                }
+            ],
+            broker_kind=BROKER_KIND_IBKR,
+            default_account_key="U25245596",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(
+                select(BrokerOrderRecord).where(BrokerOrderRecord.external_order_id == "3952")
+            ).scalar_one()
+            broker_order_events = session.execute(
+                select(BrokerOrderEventRecord)
+                .where(BrokerOrderEventRecord.broker_order_id == broker_order.id)
+                .order_by(BrokerOrderEventRecord.id)
+            ).scalars().all()
+
+            self.assertEqual(broker_order.status, "NOT_FOUND_AT_BROKER")
+            self.assertEqual(
+                broker_order.metadata_json["last_order_error_callback"]["errorCode"],
+                10147,
+            )
+            self.assertEqual(
+                [event.event_type for event in broker_order_events],
+                ["order_error_callback"],
+            )
+        finally:
+            session.close()

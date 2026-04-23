@@ -703,6 +703,110 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
 
         self.assertEqual(tuple(snapshot.recent_broker_attention), ())
 
+    def test_build_operator_dashboard_snapshot_dedupes_replaced_open_order_lineage(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="2026-04-21-U25245596-long_risk_book-VOLCAR B-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="long_risk_book",
+                symbol="VOLCAR.B",
+                exchange="SMART",
+                currency="SEK",
+                state="EXIT_PENDING",
+                submit_at=datetime(2026, 4, 21, 7, 20, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 21, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            session.add(instruction)
+            session.flush()
+
+            session.add_all(
+                [
+                    BrokerOrderRecord(
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        order_role="EXIT",
+                        external_order_id="3952",
+                        external_perm_id="449407988",
+                        external_client_id="0",
+                        order_ref=f"{instruction.instruction_id}:exit:forced",
+                        symbol="VOLCAR.B",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange="SFB",
+                        local_symbol="VOLCAR B",
+                        side="SELL",
+                        order_type="MKT",
+                        time_in_force="DAY",
+                        status="PreSubmitted",
+                        total_quantity="827",
+                        submitted_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 23, 6, 30, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        order_role="EXIT",
+                        external_order_id="3953",
+                        external_perm_id="449407988",
+                        external_client_id="0",
+                        order_ref=f"{instruction.instruction_id}:exit:forced",
+                        symbol="VOLCAR.B",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange="SFB",
+                        local_symbol="VOLCAR B",
+                        side="SELL",
+                        order_type="MKT",
+                        time_in_force="DAY",
+                        status="PreSubmitted",
+                        total_quantity="827",
+                        submitted_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 23, 6, 31, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        volcar_orders = [row for row in snapshot.open_orders if row.symbol == "VOLCAR.B"]
+        self.assertEqual(len(volcar_orders), 1)
+        self.assertEqual(volcar_orders[0].external_order_id, "3953")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2250,6 +2250,10 @@ def _persist_order_error_callback_event(
     metadata = dict(broker_order.metadata_json)
     metadata["last_order_error_callback"] = _serialize_for_json(error_payload)
     broker_order.metadata_json = metadata
+    error_code = error_payload.get("errorCode")
+    if error_code == 10147:
+        broker_order.status = "NOT_FOUND_AT_BROKER"
+        broker_order.last_status_at = event_at
     _record_broker_order_event(
         session,
         broker_order=broker_order,

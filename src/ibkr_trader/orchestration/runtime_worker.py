@@ -837,14 +837,34 @@ def _persisted_open_exit_orders_by_instruction(
             select(
                 BrokerOrderRecord.instruction_id,
                 BrokerOrderRecord.external_order_id,
+                BrokerOrderRecord.external_perm_id,
+                BrokerOrderRecord.order_ref,
                 BrokerOrderRecord.status,
+                BrokerOrderRecord.last_status_at,
+                BrokerOrderRecord.id,
             ).where(
                 BrokerOrderRecord.instruction_id.in_(tuple(instruction_ids_by_record_id.keys())),
                 BrokerOrderRecord.order_role == "EXIT",
+            ).order_by(
+                BrokerOrderRecord.last_status_at.desc(),
+                BrokerOrderRecord.id.desc(),
             )
         ).all()
 
-    for instruction_record_id, external_order_id, status in rows:
+    seen_lineages: dict[str, set[tuple[str, str]]] = {
+        record.instruction_id: set()
+        for record in records
+    }
+
+    for (
+        instruction_record_id,
+        external_order_id,
+        external_perm_id,
+        order_ref,
+        status,
+        _last_status_at,
+        _broker_order_id,
+    ) in rows:
         public_instruction_id = instruction_ids_by_record_id.get(instruction_record_id)
         if public_instruction_id is None:
             continue
@@ -852,10 +872,17 @@ def _persisted_open_exit_orders_by_instruction(
             continue
         if external_order_id in (None, ""):
             continue
+        lineage_key = (
+            str(external_perm_id).strip() if external_perm_id not in (None, "") else "",
+            str(order_ref).strip() if order_ref not in (None, "") else str(external_order_id),
+        )
+        if lineage_key in seen_lineages[public_instruction_id]:
+            continue
         try:
             persisted_order_ids[public_instruction_id].append(int(str(external_order_id)))
         except ValueError:
             continue
+        seen_lineages[public_instruction_id].add(lineage_key)
 
     return {
         instruction_id: tuple(sorted(set(order_ids)))

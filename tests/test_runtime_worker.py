@@ -28,6 +28,7 @@ from ibkr_trader.ibkr.runtime_snapshot import BrokerPortfolioItem
 from ibkr_trader.ibkr.runtime_snapshot import BrokerPosition
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
+from ibkr_trader.orchestration.runtime_worker import _persisted_open_exit_orders_by_instruction
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
 from ibkr_trader.orchestration.state_machine import ExecutionState
@@ -2138,3 +2139,91 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(len(result.cancelled_entries), 1)
         record = self._read_record("runtime-aapl-1")
         self.assertEqual(record.state, ExecutionState.ENTRY_CANCELLED.value)
+
+    def test_persisted_open_exit_orders_dedupes_replaced_order_lineage(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            exit_order_id=3953,
+            entry_filled_quantity="100",
+        )
+
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-sive-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="GTW05",
+                base_currency="USD",
+                metadata_json={},
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add_all(
+                [
+                    BrokerOrderRecord(
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="GTW05",
+                        order_role="EXIT",
+                        external_order_id="3952",
+                        external_perm_id="449407988",
+                        order_ref="runtime-sive-1:exit:forced",
+                        symbol="SIVE",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        side="SELL",
+                        order_type="MKT",
+                        status="PreSubmitted",
+                        total_quantity="100",
+                        last_status_at=datetime(2026, 4, 10, 7, 30, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="GTW05",
+                        order_role="EXIT",
+                        external_order_id="3953",
+                        external_perm_id="449407988",
+                        order_ref="runtime-sive-1:exit:forced",
+                        symbol="SIVE",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        side="SELL",
+                        order_type="MKT",
+                        status="PreSubmitted",
+                        total_quantity="100",
+                        last_status_at=datetime(2026, 4, 10, 7, 31, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                ]
+            )
+            session.commit()
+            records = [instruction]
+        finally:
+            session.close()
+
+        result = _persisted_open_exit_orders_by_instruction(
+            self.session_factory,
+            records=records,
+        )
+
+        self.assertEqual(result["runtime-sive-1"], (3953,))

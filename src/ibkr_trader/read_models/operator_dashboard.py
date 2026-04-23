@@ -744,8 +744,16 @@ def _build_open_orders(
     ).all()
 
     open_orders: list[OperatorOpenOrder] = []
+    seen_lineages: set[tuple[str, str, str]] = set()
     for broker_order, broker_account in rows:
         if _normalize_order_status(broker_order.status) in _CLOSED_ORDER_STATUSES:
+            continue
+        lineage_key = (
+            broker_order.account_key,
+            str(broker_order.external_perm_id or "").strip(),
+            str(broker_order.order_ref or broker_order.external_order_id or "").strip(),
+        )
+        if lineage_key in seen_lineages:
             continue
         metadata_json = broker_order.metadata_json or {}
         (
@@ -815,6 +823,7 @@ def _build_open_orders(
                 spread_reference=spread_reference,
             )
         )
+        seen_lineages.add(lineage_key)
         if len(open_orders) >= limit:
             break
     return tuple(open_orders)
