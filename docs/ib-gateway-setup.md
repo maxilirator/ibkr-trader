@@ -94,6 +94,7 @@ service is useful later, but it does not satisfy the operator requirement of
 The repo now includes:
 
 - [ibgateway-ibc.service](/home/mattias/dev/ibkr-trader/ops/systemd/ibgateway-ibc.service)
+- [ibgateway-ibc-system.service](/home/mattias/dev/ibkr-trader/ops/systemd/ibgateway-ibc-system.service)
 - [run_ibgateway_ibc.sh](/home/mattias/dev/ibkr-trader/ops/scripts/run_ibgateway_ibc.sh)
 - [write_ibgateway_session_env.sh](/home/mattias/dev/ibkr-trader/ops/scripts/write_ibgateway_session_env.sh)
 - [ibgateway-ibc.env.example](/home/mattias/dev/ibkr-trader/ops/examples/ibgateway-ibc.env.example)
@@ -147,6 +148,33 @@ systemctl --user enable --now ibgateway-ibc.service
 systemctl --user status ibgateway-ibc.service
 journalctl --user -u ibgateway-ibc.service -n 200 --no-pager
 ```
+
+### If `systemctl --user` has no session bus
+
+Some XRDP and SSH combinations do not provide a usable `systemd --user` bus for
+the `ibgateway` account. If you see:
+
+```text
+Failed to connect to bus: No medium found
+```
+
+use the root-managed system service instead. It still runs the Gateway as the
+`ibgateway` user and still consumes the same `session.env` file, but it is
+managed by the host's system `systemd`.
+
+Install it as `root`:
+
+```bash
+cp /home/ibgateway/ibkr-trader/ops/systemd/ibgateway-ibc-system.service \
+  /etc/systemd/system/ibgateway-ibc.service
+systemctl daemon-reload
+systemctl enable --now ibgateway-ibc.service
+systemctl status ibgateway-ibc.service --no-pager
+journalctl -u ibgateway-ibc.service -n 200 --no-pager
+```
+
+This is the recommended path on `quant.geisler.se` if `systemctl --user` is not
+reliably available.
 
 ### Operational notes
 

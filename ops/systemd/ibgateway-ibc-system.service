@@ -1,0 +1,29 @@
+[Unit]
+Description=IB Gateway via IBC (system-managed, session-bound)
+Documentation=file:/home/ibgateway/ibkr-trader/docs/ib-gateway-setup.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/ibgateway/.config/ibgateway/session.env
+ConditionPathExists=/home/ibgateway/ibkr-trader/ops/scripts/run_ibgateway_ibc.sh
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ibgateway
+Group=ibgateway
+WorkingDirectory=/home/ibgateway
+Environment=HOME=/home/ibgateway
+EnvironmentFile=-/home/ibgateway/.config/ibgateway/ibgateway.env
+EnvironmentFile=/home/ibgateway/.config/ibgateway/session.env
+ExecStart=/home/ibgateway/ibkr-trader/ops/scripts/run_ibgateway_ibc.sh
+Restart=on-failure
+RestartSec=20
+TimeoutStopSec=30
+KillMode=mixed
+SuccessExitStatus=0 143
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

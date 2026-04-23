@@ -114,6 +114,7 @@ The repo now includes a first production-style IB Gateway service model for the
 `ibgateway` operator account:
 
 - [ibgateway-ibc.service](ops/systemd/ibgateway-ibc.service)
+- [ibgateway-ibc-system.service](ops/systemd/ibgateway-ibc-system.service)
 - [run_ibgateway_ibc.sh](ops/scripts/run_ibgateway_ibc.sh)
 - [write_ibgateway_session_env.sh](ops/scripts/write_ibgateway_session_env.sh)
 - [ibgateway-ibc.env.example](ops/examples/ibgateway-ibc.env.example)
@@ -122,7 +123,9 @@ This first version is deliberately **session-bound** rather than headless. It
 attaches IBC and IB Gateway to the user's persistent XRDP desktop so an
 operator can disconnect and reconnect to the same live Gateway screen. See
 [docs/ib-gateway-setup.md](docs/ib-gateway-setup.md) for the exact install
-steps.
+steps. The repo includes both a user service and a root-managed system service;
+the latter is the safer path when `systemctl --user` is not reliable on the
+host.
 
 ## Local API wrapper
 
