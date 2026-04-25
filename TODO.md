@@ -4,6 +4,18 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Next
 
+- [ ] RL trader registry and deployment layer:
+  add durable `trader_model`, `trader_deployment`, `trader_action`, and
+  `trader_heartbeat` objects so promoted RL policies can run through the same
+  instruction and broker-order path as every other strategy
+- [ ] Short RL action translation:
+  map the promoted short action set (`skip`, `wait`, `market_entry`,
+  `cancel_entry`, `exit_market`, `clear_exit`, `entry_prevclose_88bp`,
+  `exit_tp_180bp`) into the existing execution contract with explicit
+  deployment-symbol state validation
+- [ ] RL dashboard and execution pane:
+  add a dedicated operator page for RL deployments, action stream, deployment
+  health, and account-bound risk state
 - [x] Operator controls for reconciliation warnings and broker attention:
   the dashboard can now trigger a durable startup reconciliation run and
   shows operator review state on broker-attention and reconciliation items

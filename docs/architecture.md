@@ -252,6 +252,225 @@ Implementation notes:
 - contract-master refresh should be a separate slower job, not part of the nightly bar backfill
 - the calling repo should handle persistence and keep the nightly job idempotent at the `(date, conId, bar_size, what_to_show)` level
 
+## RL Trader Execution Layer
+
+The next execution layer should let a promoted RL policy trade through the same
+durable instruction and broker-order path as every other strategy in this repo.
+
+Strong boundary:
+
+- the RL agent should emit **strategy actions**, not raw IBKR orders
+- this trader should translate those actions into our normal validated
+  instruction contract
+- the ledger, reconciliation, and operator controls should stay shared
+
+### Account model
+
+Recommended deployment model:
+
+- use a real IBKR account as the top-level execution boundary
+- keep `account_key` equal to that real broker account
+- use `book_key` as the internal strategy sleeve, such as
+  `rl_short_trial36_live_01`
+
+Reasoning:
+
+- shortability, margin, minimum-equity rules, cash, and statements are all real
+  broker-account concerns
+- autonomous RL strategies deserve hard financial separation when possible
+- internal virtual books are still useful, but only **inside** a real account
+
+Practical rule:
+
+- start with one live RL deployment per real IBKR account
+- only allow multiple autonomous RL deployments inside the same account later,
+  once we add explicit cross-model position arbitration
+
+### Core registry objects
+
+Suggested durable objects:
+
+- `trader_model`
+  - immutable model identity and artifact lineage
+  - source workflow path
+  - promoted checkpoint path
+  - observation contract
+  - action-space version
+  - default execution mapping version
+- `trader_deployment`
+  - one live or paper binding of a model
+  - immutable `account_key`
+  - immutable `book_key`
+  - mode: `paper` or `live`
+  - status: `draft`, `paused`, `running`, `degraded`, `stopped`
+  - approved symbol universe
+  - deployment-level risk limits
+- `trader_action`
+  - append-only action log emitted by the RL runtime
+  - observed-at timestamp
+  - symbol
+  - action name
+  - decision metadata
+  - resulting instruction ID or rejection detail
+- `trader_heartbeat`
+  - runtime liveness, last bar seen, last policy step, and degradation reason
+
+For the first pass, the observation contract and action-space metadata can live
+as JSON on `trader_model`; we can normalize later if we need multiple schemas.
+
+### Short RL action space
+
+The promoted short-side action set from the current research line is:
+
+- `skip`
+- `wait`
+- `market_entry`
+- `cancel_entry`
+- `exit_market`
+- `clear_exit`
+- `entry_prevclose_88bp`
+- `exit_tp_180bp`
+
+These should map to trader behavior like this:
+
+- `skip`
+  - do nothing for the symbol and mark the decision as intentionally idle
+- `wait`
+  - advance one observation step with no execution change
+- `market_entry`
+  - create a short `SELL` market entry instruction on the deployment account
+- `cancel_entry`
+  - cancel an existing pending short entry instruction for that deployment and symbol
+- `exit_market`
+  - flatten an open short position at market and cancel conflicting pending exits first
+- `clear_exit`
+  - cancel a pending take-profit or other exit order while leaving the short position open
+- `entry_prevclose_88bp`
+  - create a short limit entry using the prior close as reference and a `+0.88%`
+    offset
+- `exit_tp_180bp`
+  - create or replace the take-profit exit at `1.80%` favorable move from fill for
+    the short
+
+### Symbol state machine
+
+To keep the action set safe, every deployment-symbol pair should have an explicit
+state machine:
+
+- `FLAT`
+- `ENTRY_PENDING`
+- `SHORT_OPEN`
+- `EXIT_PENDING`
+- `BLOCKED`
+
+Valid actions by state should be constrained:
+
+- `FLAT`
+  - `skip`
+  - `wait`
+  - `market_entry`
+  - `entry_prevclose_88bp`
+- `ENTRY_PENDING`
+  - `wait`
+  - `cancel_entry`
+- `SHORT_OPEN`
+  - `wait`
+  - `exit_market`
+  - `exit_tp_180bp`
+- `EXIT_PENDING`
+  - `wait`
+  - `clear_exit`
+  - `exit_market`
+
+Any invalid action should be:
+
+- rejected before execution
+- written to the append-only `trader_action` log
+- surfaced in the RL dashboard as `invalid_action`
+
+### Observation contract
+
+Every promoted RL model should declare the bar and feature contract it expects.
+
+For the current short research line, the model metadata should carry at least:
+
+- the promoted workflow and checkpoint path
+- bar family, for example `stockholm_intraday_1m_v1`
+- required series, such as:
+  - `TRADES`
+  - optional `MIDPOINT`, `BID`, `ASK`, `ADJUSTED_LAST`
+- lookback or sequence length
+- whether market context is required
+- whether vol-normalized state is required
+- feature-schema version
+
+The execution layer should reject a deployment start if the market-data backend
+cannot satisfy the declared observation contract.
+
+### Execution contract translation
+
+The RL runtime should not invent its own broker protocol. It should translate
+actions into the existing execution contract:
+
+- short entries must use:
+  - `intent.side = SELL`
+  - `intent.position_side = SHORT`
+- deployment sizing rules should be explicit and bounded
+- take-profit exits should reuse `exit.take_profit_pct`
+- next-session forced flattening should remain available through
+  `exit.force_exit_next_session_open`
+
+This preserves:
+
+- short-sale validation
+- account and margin validation
+- duplicate-order prevention
+- restart-safe reconciliation
+
+### Operator UX
+
+Add a dedicated RL dashboard view, not just more rows in the general operator page.
+
+Suggested sections:
+
+- `Deployments`
+  - model
+  - deployment ID
+  - account
+  - book
+  - mode
+  - status
+  - last heartbeat
+- `Action Stream`
+  - continuous append-only list of model actions
+  - symbol
+  - state before
+  - action
+  - execution result
+  - linked instruction ID
+- `Risk`
+  - live notional
+  - open shorts
+  - pending entries
+  - rejected/invalid action count
+  - kill-switch exposure
+- `Health`
+  - market-data freshness
+  - feature freshness
+  - last runtime error
+  - broker account preflight status
+
+### Immediate implementation slice
+
+The safest first slice is:
+
+1. add `trader_model`, `trader_deployment`, `trader_action`, and
+   `trader_heartbeat`
+2. add a deployment-bound action intake API that writes append-only action rows
+3. translate valid actions into the existing instruction contract
+4. add a read model and dashboard page for RL deployments and action history
+5. require every deployment to bind to one real `account_key`
+
 ## Recommended near-term roadmap
 
 1. Keep the configured IB Gateway connection healthy and stable.
