@@ -145,6 +145,7 @@ The initial FastAPI wrapper includes:
 - `POST /v1/contracts/resolve`
 - `POST /v1/accounts/summary`
 - `POST /v1/market-data/historical-bars`
+- `POST /v1/market-data/stockholm-intraday-backfill`
 - `POST /v1/market-data/shortability-snapshot`
 - `POST /v1/market-data/tick-stream-sample`
 - `POST /v1/orders/preview`
