@@ -155,8 +155,6 @@ def _build_known_aliases(slug: str, identity: StockholmIdentity | None) -> tuple
     if identity is not None:
         add(identity.ticker_alias)
         add(identity.yahoo_symbol)
-        for alias in identity.instrument_aliases:
-            add(alias)
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -228,13 +226,6 @@ def _build_fallback_attempts(slug: str, identity: StockholmIdentity | None) -> t
         add("slug_dot_isin_smart", symbol=share_dot, isin=isin)
         add("slug_concat_isin_smart", symbol=share_concat, isin=isin)
         add("slug_root_local_isin_smart", symbol=root, local_symbol=share_space, isin=isin)
-
-    if identity is not None:
-        for index, raw_alias in enumerate(identity.instrument_aliases):
-            alias_value = _strip_yahoo_suffix(raw_alias)
-            if not alias_value:
-                continue
-            add(f"identity_alias_{index}_isin_smart", symbol=alias_value, isin=isin)
 
     unique_attempts: list[AttemptSpec] = []
     seen: set[tuple[str, str, str | None, str | None, str | None]] = set()
