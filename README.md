@@ -157,6 +157,11 @@ The initial FastAPI wrapper includes:
 - `POST /v1/instructions/{instruction_id}/cancel-entry`
 - `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
+- `POST /v1/rl/models/register`
+- `POST /v1/rl/deployments`
+- `POST /v1/rl/actions/log`
+- `POST /v1/rl/deployments/{deployment_key}/heartbeat`
+- `GET /v1/read/rl-dashboard`
 - `POST /v1/runtime/run-once`
 
 For colocated deployment, the execution runtime now lives in the API host process by default, so one supervised API service is enough to keep the broker heartbeat, operator API, and execution loop alive together.

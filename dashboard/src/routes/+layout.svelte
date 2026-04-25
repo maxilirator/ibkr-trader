@@ -3,7 +3,8 @@
 
   const navigationItems = [
     { href: '/', label: 'Operator Dashboard' },
-    { href: '/ledger', label: 'Ledger Dashboard' }
+    { href: '/ledger', label: 'Ledger Dashboard' },
+    { href: '/rl', label: 'RL Trader' }
   ];
 
   function isActive(href, pathname) {

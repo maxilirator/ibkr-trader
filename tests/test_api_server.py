@@ -23,6 +23,10 @@ from ibkr_trader.api.server import (
     parse_stockholm_intraday_backfill_payload,
     parse_shortability_snapshot_payload,
     parse_tick_stream_payload,
+    parse_trader_action_payload,
+    parse_trader_deployment_payload,
+    parse_trader_heartbeat_payload,
+    parse_trader_model_payload,
     serialize_execution_batch,
     serialize_runtime_schedule_preview,
     should_include_background_execution_recovery,
@@ -206,6 +210,63 @@ class ApiServerTests(TestCase):
         self.assertTrue(query.include_remapped)
         self.assertEqual(query.sleep_seconds, 0.0)
 
+    def test_parse_trader_payloads_normalize_values(self) -> None:
+        model_payload = parse_trader_model_payload(
+            {
+                "model_key": "Short_Trial36_V1",
+                "display_name": "Short Trial 36 V1",
+                "strategy_family": "canonical_short_live_execution_policy",
+                "side": "short",
+                "action_space": ["skip", "market_entry", "exit_market"],
+                "observation_contract": {"bar_family": "stockholm_intraday_1m_v1"},
+                "metadata": {"canonical_seed": 140},
+            }
+        )
+        deployment_payload = parse_trader_deployment_payload(
+            {
+                "deployment_key": "Short_Trial36_Live_01",
+                "model_key": "Short_Trial36_V1",
+                "account_key": "u25245596",
+                "book_key": "RL_SHORT_TRIAL36_LIVE_01",
+                "mode": "live",
+                "status": "running",
+                "allowed_symbols": ["sive", "volv-b"],
+            }
+        )
+        action_payload = parse_trader_action_payload(
+            {
+                "deployment_key": "Short_Trial36_Live_01",
+                "symbol": "sive",
+                "action_name": "market_entry",
+                "observed_at": "2026-04-25T09:25:00+02:00",
+                "state_before": "flat",
+                "state_after": "entry_pending",
+                "action_status": "translated",
+                "payload": {"confidence": 0.73},
+            }
+        )
+        heartbeat_payload = parse_trader_heartbeat_payload(
+            {
+                "status": "running",
+                "last_seen_at": "2026-04-25T09:30:00+02:00",
+                "last_bar_at": "2026-04-25T09:29:00+02:00",
+                "metrics": {"bar_lag_seconds": 4},
+            }
+        )
+
+        self.assertEqual(model_payload["model_key"], "short_trial36_v1")
+        self.assertEqual(model_payload["side"], "SHORT")
+        self.assertEqual(deployment_payload["deployment_key"], "short_trial36_live_01")
+        self.assertEqual(deployment_payload["account_key"], "U25245596")
+        self.assertEqual(deployment_payload["allowed_symbols"], ("SIVE", "VOLV-B"))
+        self.assertEqual(action_payload["symbol"], "SIVE")
+        self.assertEqual(action_payload["state_before"], "FLAT")
+        self.assertEqual(heartbeat_payload["status"], "running")
+        self.assertEqual(
+            heartbeat_payload["last_bar_at"].isoformat(),
+            "2026-04-25T09:29:00+02:00",
+        )
+
     def test_stockholm_intraday_backfill_endpoint_returns_paged_batch(self) -> None:
         try:
             from fastapi.testclient import TestClient
@@ -295,6 +356,103 @@ class ApiServerTests(TestCase):
         self.assertEqual(body["summary"]["requested_symbol_count"], 2)
         self.assertEqual(body["universe"]["next_cursor"], "sive")
         collect_mock.assert_called_once()
+
+    def test_rl_registry_endpoints_round_trip(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        app = create_app(
+            AppConfig(
+                environment="test",
+                timezone="Europe/Stockholm",
+                database_url="sqlite+pysqlite:///:memory:",
+                session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                stockholm_instruments_path=Path("/tmp/all.txt"),
+                stockholm_identity_path=Path("/tmp/identity.parquet"),
+                api=ApiServerConfig(
+                    host="127.0.0.1",
+                    port=8000,
+                    require_loopback_only=False,
+                ),
+                ibkr=IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4001,
+                    client_id=0,
+                    diagnostic_client_id=7,
+                    streaming_client_id=9,
+                    account_id="DU1234567",
+                ),
+            )
+        )
+
+        with (
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+            TestClient(app) as client,
+        ):
+            register_response = client.post(
+                "/v1/rl/models/register",
+                json={
+                    "model_key": "short_trial36_v1",
+                    "display_name": "Short Trial 36 V1",
+                    "strategy_family": "canonical_short_live_execution_policy",
+                    "side": "SHORT",
+                    "action_space": ["skip", "market_entry", "exit_market"],
+                    "observation_contract": {"bar_family": "stockholm_intraday_1m_v1"}
+                },
+            )
+            self.assertEqual(register_response.status_code, 200)
+
+            deployment_response = client.post(
+                "/v1/rl/deployments",
+                json={
+                    "deployment_key": "short_trial36_live_01",
+                    "model_key": "short_trial36_v1",
+                    "account_key": "U25245596",
+                    "book_key": "rl_short_trial36_live_01",
+                    "mode": "live",
+                    "status": "running",
+                    "allowed_symbols": ["SIVE", "VOLV-B"]
+                },
+            )
+            self.assertEqual(deployment_response.status_code, 200)
+
+            action_response = client.post(
+                "/v1/rl/actions/log",
+                json={
+                    "deployment_key": "short_trial36_live_01",
+                    "symbol": "SIVE",
+                    "action_name": "market_entry",
+                    "observed_at": "2026-04-25T09:25:00+02:00",
+                    "state_before": "FLAT",
+                    "state_after": "ENTRY_PENDING",
+                    "action_status": "translated"
+                },
+            )
+            self.assertEqual(action_response.status_code, 200)
+
+            heartbeat_response = client.post(
+                "/v1/rl/deployments/short_trial36_live_01/heartbeat",
+                json={
+                    "status": "running",
+                    "last_seen_at": "2026-04-25T09:30:00+02:00",
+                    "last_bar_at": "2026-04-25T09:29:00+02:00",
+                    "metrics": {"bar_lag_seconds": 4}
+                },
+            )
+            self.assertEqual(heartbeat_response.status_code, 200)
+
+            dashboard_response = client.get("/v1/read/rl-dashboard")
+            self.assertEqual(dashboard_response.status_code, 200)
+            body = dashboard_response.json()
+            self.assertTrue(body["accepted"])
+            self.assertEqual(body["rl_dashboard"]["summary"]["model_count"], 1)
+            self.assertEqual(body["rl_dashboard"]["summary"]["deployment_count"], 1)
+            self.assertEqual(body["rl_dashboard"]["summary"]["recent_action_count"], 1)
+            self.assertEqual(body["rl_dashboard"]["deployments"][0]["account_key"], "U25245596")
+            self.assertEqual(body["rl_dashboard"]["recent_actions"][0]["action_name"], "market_entry")
 
     def test_parse_tick_stream_payload_normalizes_tick_types(self) -> None:
         query = parse_tick_stream_payload(

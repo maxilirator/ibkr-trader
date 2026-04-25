@@ -399,6 +399,111 @@ Cancels a broker order by IBKR order ID through the primary client session.
 
 This endpoint is the cleanup companion to `POST /v1/orders/submit`.
 
+### RL Trader Registry
+
+The API now includes an early RL trader control surface.
+
+Current registry endpoints:
+
+- `POST /v1/rl/models/register`
+- `POST /v1/rl/deployments`
+- `POST /v1/rl/actions/log`
+- `POST /v1/rl/deployments/{deployment_key}/heartbeat`
+- `GET /v1/read/rl-dashboard`
+
+Purpose:
+
+- register promoted RL model metadata and artifact lineage
+- bind one deployment to one real broker account and one internal book
+- log append-only model actions before or after execution translation
+- expose heartbeat and recent action visibility to the dashboard
+
+Important current behavior:
+
+- these endpoints do **not** submit broker orders directly yet
+- the RL layer is currently a durable registry and operator view
+- action logging already validates that an action belongs to the registered model action space
+- deployments are explicitly account-bound through `account_key`
+
+Example model registration body:
+
+```json
+{
+  "model_key": "short_trial36_v1",
+  "display_name": "Short Trial 36 V1",
+  "strategy_family": "canonical_short_live_execution_policy",
+  "side": "SHORT",
+  "action_space": [
+    "skip",
+    "wait",
+    "market_entry",
+    "cancel_entry",
+    "exit_market",
+    "clear_exit",
+    "entry_prevclose_88bp",
+    "exit_tp_180bp"
+  ],
+  "observation_contract": {
+    "bar_family": "stockholm_intraday_1m_v1",
+    "required_series": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
+    "feature_schema_version": "short_live_v1"
+  }
+}
+```
+
+Example deployment body:
+
+```json
+{
+  "deployment_key": "short_trial36_live_01",
+  "model_key": "short_trial36_v1",
+  "account_key": "U25245596",
+  "book_key": "rl_short_trial36_live_01",
+  "mode": "live",
+  "status": "running",
+  "allowed_symbols": ["SIVE", "VOLV-B"],
+  "risk_limits": {
+    "max_open_positions": 8,
+    "max_notional_per_name_sek": 25000
+  },
+  "action_constraints": {
+    "position_side": "SHORT",
+    "state_machine_version": "short_symbol_state_v1"
+  }
+}
+```
+
+Example RL dashboard response shape:
+
+```json
+{
+  "accepted": true,
+  "recommended_short_action_space": [
+    "skip",
+    "wait",
+    "market_entry",
+    "cancel_entry",
+    "exit_market",
+    "clear_exit",
+    "entry_prevclose_88bp",
+    "exit_tp_180bp"
+  ],
+  "rl_dashboard": {
+    "summary": {
+      "model_count": 1,
+      "deployment_count": 1,
+      "live_deployment_count": 1,
+      "running_deployment_count": 1,
+      "stale_heartbeat_count": 0,
+      "recent_action_count": 5
+    },
+    "models": [],
+    "deployments": [],
+    "recent_actions": []
+  }
+}
+```
+
 ### `POST /v1/instructions/submit`
 
 Accepts the canonical instruction batch, validates it, computes the Stockholm runtime schedule, and persists the instruction into Postgres.

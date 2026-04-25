@@ -107,13 +107,26 @@ from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
+from ibkr_trader.orchestration.trader_registry import (
+    RL_SHORT_ACTION_SPACE,
+    TraderDeploymentConflictError,
+    TraderDeploymentNotFoundError,
+    TraderModelConflictError,
+    TraderModelNotFoundError,
+    create_trader_deployment,
+    log_trader_action,
+    register_trader_model,
+    upsert_trader_heartbeat,
+)
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
 from ibkr_trader.ledger.persistence import persist_broker_runtime_snapshot
 from ibkr_trader.ledger.persistence import persist_broker_order_cancellation_result
 from ibkr_trader.read_models import build_operator_dashboard_snapshot
 from ibkr_trader.read_models import build_ledger_dashboard_snapshot
+from ibkr_trader.read_models import build_rl_trader_dashboard_snapshot
 from ibkr_trader.read_models import serialize_ledger_dashboard_snapshot
 from ibkr_trader.read_models import serialize_operator_dashboard_snapshot
+from ibkr_trader.read_models import serialize_rl_trader_dashboard_snapshot
 
 
 class ApiDependencyError(RuntimeError):
@@ -323,6 +336,168 @@ def parse_stockholm_intraday_backfill_payload(
     )
     query.validate()
     return query
+
+
+def _parse_string_list(
+    payload: Mapping[str, Any],
+    field_name: str,
+    *,
+    required: bool = False,
+    normalize: Any | None = None,
+) -> tuple[str, ...]:
+    raw_value = payload.get(field_name)
+    if raw_value is None:
+        if required:
+            raise ValueError(f"{field_name} is required")
+        return ()
+    if not isinstance(raw_value, list) or not raw_value:
+        raise ValueError(f"{field_name} must be a non-empty array of strings")
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        value = str(item).strip()
+        if normalize is not None:
+            value = normalize(value)
+        if not value:
+            raise ValueError(f"{field_name} must contain only non-empty strings")
+        if value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return tuple(values)
+
+
+def _parse_json_object_field(
+    payload: Mapping[str, Any],
+    field_name: str,
+) -> dict[str, Any]:
+    raw_value = payload.get(field_name)
+    if raw_value is None:
+        return {}
+    if not isinstance(raw_value, Mapping):
+        raise ValueError(f"{field_name} must be an object")
+    return dict(raw_value)
+
+
+def parse_trader_model_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    model_key = str(payload.get("model_key", "")).strip().lower()
+    display_name = str(payload.get("display_name", "")).strip()
+    strategy_family = str(payload.get("strategy_family", "")).strip()
+    side = str(payload.get("side", "SHORT")).strip().upper()
+    action_space = _parse_string_list(
+        payload,
+        "action_space",
+        required=True,
+        normalize=lambda value: value.lower(),
+    )
+    return {
+        "model_key": model_key,
+        "display_name": display_name,
+        "strategy_family": strategy_family,
+        "side": side,
+        "source_workflow_path": (
+            str(payload["source_workflow_path"]).strip()
+            if payload.get("source_workflow_path") is not None
+            else None
+        ),
+        "promoted_checkpoint_path": (
+            str(payload["promoted_checkpoint_path"]).strip()
+            if payload.get("promoted_checkpoint_path") is not None
+            else None
+        ),
+        "action_space": action_space,
+        "observation_contract": _parse_json_object_field(
+            payload,
+            "observation_contract",
+        ),
+        "execution_mapping_version": (
+            str(payload["execution_mapping_version"]).strip()
+            if payload.get("execution_mapping_version") is not None
+            else None
+        ),
+        "metadata": _parse_json_object_field(payload, "metadata"),
+    }
+
+
+def parse_trader_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "deployment_key": str(payload.get("deployment_key", "")).strip().lower(),
+        "model_key": str(payload.get("model_key", "")).strip().lower(),
+        "account_key": str(payload.get("account_key", "")).strip().upper(),
+        "book_key": str(payload.get("book_key", "")).strip().lower(),
+        "mode": str(payload.get("mode", "paper")).strip().lower(),
+        "status": str(payload.get("status", "draft")).strip().lower(),
+        "allowed_symbols": _parse_string_list(
+            payload,
+            "allowed_symbols",
+            normalize=lambda value: value.upper(),
+        ),
+        "risk_limits": _parse_json_object_field(payload, "risk_limits"),
+        "action_constraints": _parse_json_object_field(payload, "action_constraints"),
+        "metadata": _parse_json_object_field(payload, "metadata"),
+    }
+
+
+def parse_trader_action_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    observed_at = (
+        parse_datetime(payload["observed_at"], "observed_at")
+        if payload.get("observed_at") is not None
+        else utc_now()
+    )
+    return {
+        "deployment_key": str(payload.get("deployment_key", "")).strip().lower(),
+        "symbol": str(payload.get("symbol", "")).strip().upper(),
+        "action_name": str(payload.get("action_name", "")).strip().lower(),
+        "observed_at": observed_at,
+        "state_before": (
+            str(payload["state_before"]).strip().upper()
+            if payload.get("state_before") is not None
+            else None
+        ),
+        "state_after": (
+            str(payload["state_after"]).strip().upper()
+            if payload.get("state_after") is not None
+            else None
+        ),
+        "action_status": str(payload.get("action_status", "logged")).strip().lower(),
+        "instruction_id": (
+            str(payload["instruction_id"]).strip()
+            if payload.get("instruction_id") is not None
+            else None
+        ),
+        "payload": _parse_json_object_field(payload, "payload"),
+        "note": str(payload["note"]).strip() if payload.get("note") is not None else None,
+    }
+
+
+def parse_trader_heartbeat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    last_seen_at = (
+        parse_datetime(payload["last_seen_at"], "last_seen_at")
+        if payload.get("last_seen_at") is not None
+        else utc_now()
+    )
+    last_bar_at = (
+        parse_datetime(payload["last_bar_at"], "last_bar_at")
+        if payload.get("last_bar_at") is not None
+        else None
+    )
+    last_action_at = (
+        parse_datetime(payload["last_action_at"], "last_action_at")
+        if payload.get("last_action_at") is not None
+        else None
+    )
+    return {
+        "status": str(payload.get("status", "")).strip().lower(),
+        "last_seen_at": last_seen_at,
+        "last_bar_at": last_bar_at,
+        "last_action_at": last_action_at,
+        "runtime_error": (
+            str(payload["runtime_error"]).strip()
+            if payload.get("runtime_error") is not None
+            else None
+        ),
+        "metrics": _parse_json_object_field(payload, "metrics"),
+    }
 
 
 def parse_runtime_cycle_payload(
@@ -1237,6 +1412,119 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "instruction": serialize_instruction_status(result),
+        }
+
+    @app.post("/v1/rl/models/register")
+    def create_trader_model(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_model_payload(payload)
+            result = register_trader_model(session_factory, **parsed)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraderModelConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_model": _serialize_for_json(asdict(result)),
+        }
+
+    @app.post("/v1/rl/deployments")
+    def create_rl_deployment(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_deployment_payload(payload)
+            result = create_trader_deployment(session_factory, **parsed)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraderModelNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TraderDeploymentConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_deployment": _serialize_for_json(asdict(result)),
+        }
+
+    @app.post("/v1/rl/actions/log")
+    def log_rl_action(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_action_payload(payload)
+            result = log_trader_action(session_factory, **parsed)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraderDeploymentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_action": _serialize_for_json(asdict(result)),
+        }
+
+    @app.post("/v1/rl/deployments/{deployment_key}/heartbeat")
+    def update_rl_heartbeat(
+        deployment_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_heartbeat_payload(payload)
+            result = upsert_trader_heartbeat(
+                session_factory,
+                deployment_key=deployment_key,
+                **parsed,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraderDeploymentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_heartbeat": _serialize_for_json(asdict(result)),
+        }
+
+    @app.get("/v1/read/rl-dashboard")
+    def get_rl_dashboard(
+        model_limit: int = 40,
+        deployment_limit: int = 40,
+        action_limit: int = 120,
+        heartbeat_stale_after_seconds: int = 120,
+    ) -> dict[str, Any]:
+        try:
+            validated_model_limit = parse_positive_limit(
+                model_limit,
+                field_name="model_limit",
+                maximum=500,
+            )
+            validated_deployment_limit = parse_positive_limit(
+                deployment_limit,
+                field_name="deployment_limit",
+                maximum=500,
+            )
+            validated_action_limit = parse_positive_limit(
+                action_limit,
+                field_name="action_limit",
+                maximum=1000,
+            )
+            validated_stale_after_seconds = parse_positive_limit(
+                heartbeat_stale_after_seconds,
+                field_name="heartbeat_stale_after_seconds",
+                maximum=86400,
+            )
+            snapshot = build_rl_trader_dashboard_snapshot(
+                session_factory,
+                model_limit=validated_model_limit,
+                deployment_limit=validated_deployment_limit,
+                action_limit=validated_action_limit,
+                heartbeat_stale_after_seconds=validated_stale_after_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "recommended_short_action_space": list(RL_SHORT_ACTION_SPACE),
+            "rl_dashboard": serialize_rl_trader_dashboard_snapshot(snapshot),
         }
 
     @app.get("/v1/read/operator-snapshot")

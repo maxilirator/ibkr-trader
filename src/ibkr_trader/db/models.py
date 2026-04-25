@@ -64,6 +64,148 @@ class InstrumentRecord(TimestampMixin, Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class TraderModelRecord(TimestampMixin, Base):
+    """Registered RL trader model metadata and promoted artifact lineage."""
+
+    __tablename__ = "trader_model"
+    __table_args__ = (
+        UniqueConstraint("model_key", name="uq_trader_model_model_key"),
+        Index("ix_trader_model_strategy_family", "strategy_family"),
+        Index("ix_trader_model_side", "side"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    strategy_family: Mapped[str] = mapped_column(String(128), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_workflow_path: Mapped[str | None] = mapped_column(String(1024))
+    promoted_checkpoint_path: Mapped[str | None] = mapped_column(String(1024))
+    action_space_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    observation_contract_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        default=dict,
+        nullable=False,
+    )
+    execution_mapping_version: Mapped[str | None] = mapped_column(String(64))
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    deployments: Mapped[list["TraderDeploymentRecord"]] = relationship(
+        back_populates="trader_model"
+    )
+
+
+class TraderDeploymentRecord(TimestampMixin, Base):
+    """Live or paper binding of a trader model to one broker account and book."""
+
+    __tablename__ = "trader_deployment"
+    __table_args__ = (
+        UniqueConstraint("deployment_key", name="uq_trader_deployment_deployment_key"),
+        Index("ix_trader_deployment_model_id", "trader_model_id"),
+        Index("ix_trader_deployment_account_key", "account_key"),
+        Index("ix_trader_deployment_book_key", "book_key"),
+        Index("ix_trader_deployment_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trader_model_id: Mapped[int] = mapped_column(
+        ForeignKey("trader_model.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    deployment_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    book_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    allowed_symbols_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    risk_limits_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    action_constraints_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        default=dict,
+        nullable=False,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    trader_model: Mapped[TraderModelRecord] = relationship(back_populates="deployments")
+    actions: Mapped[list["TraderActionRecord"]] = relationship(
+        back_populates="trader_deployment",
+        cascade="all, delete-orphan",
+    )
+    heartbeat: Mapped["TraderHeartbeatRecord | None"] = relationship(
+        back_populates="trader_deployment",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class TraderActionRecord(Base):
+    """Append-only RL trader action log before or after execution translation."""
+
+    __tablename__ = "trader_action"
+    __table_args__ = (
+        Index("ix_trader_action_deployment_id", "trader_deployment_id"),
+        Index("ix_trader_action_action_at", "action_at"),
+        Index("ix_trader_action_symbol", "symbol"),
+        Index("ix_trader_action_action_name", "action_name"),
+        Index("ix_trader_action_action_status", "action_status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trader_deployment_id: Mapped[int] = mapped_column(
+        ForeignKey("trader_deployment.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    action_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    action_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    state_before: Mapped[str | None] = mapped_column(String(32))
+    state_after: Mapped[str | None] = mapped_column(String(32))
+    action_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    instruction_id: Mapped[str | None] = mapped_column(String(128))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+
+    trader_deployment: Mapped[TraderDeploymentRecord] = relationship(back_populates="actions")
+
+
+class TraderHeartbeatRecord(TimestampMixin, Base):
+    """Latest liveness and market-data freshness state for one trader deployment."""
+
+    __tablename__ = "trader_heartbeat"
+    __table_args__ = (
+        UniqueConstraint(
+            "trader_deployment_id",
+            name="uq_trader_heartbeat_deployment_id",
+        ),
+        Index("ix_trader_heartbeat_status", "status"),
+        Index("ix_trader_heartbeat_last_seen_at", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trader_deployment_id: Mapped[int] = mapped_column(
+        ForeignKey("trader_deployment.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_bar_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    runtime_error: Mapped[str | None] = mapped_column(Text)
+    metrics_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    trader_deployment: Mapped[TraderDeploymentRecord] = relationship(
+        back_populates="heartbeat"
+    )
+
+
 class InstructionRecord(TimestampMixin, Base):
     """Strategy intent persisted before any specific broker orders are emitted."""
 

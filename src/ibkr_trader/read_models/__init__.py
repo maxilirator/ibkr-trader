@@ -8,6 +8,11 @@ from ibkr_trader.read_models.operator_dashboard import (
     build_operator_dashboard_snapshot,
     serialize_operator_dashboard_snapshot,
 )
+from ibkr_trader.read_models.rl_dashboard import (
+    RLTraderDashboardSnapshot,
+    build_rl_trader_dashboard_snapshot,
+    serialize_rl_trader_dashboard_snapshot,
+)
 
 __all__ = [
     "LedgerDashboardSnapshot",
@@ -16,4 +21,7 @@ __all__ = [
     "OperatorDashboardSnapshot",
     "build_operator_dashboard_snapshot",
     "serialize_operator_dashboard_snapshot",
+    "RLTraderDashboardSnapshot",
+    "build_rl_trader_dashboard_snapshot",
+    "serialize_rl_trader_dashboard_snapshot",
 ]

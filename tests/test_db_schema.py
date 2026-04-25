@@ -28,6 +28,10 @@ from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.db.models import RuntimeServiceEventRecord
 from ibkr_trader.db.models import RuntimeServiceRecord
+from ibkr_trader.db.models import TraderActionRecord
+from ibkr_trader.db.models import TraderDeploymentRecord
+from ibkr_trader.db.models import TraderHeartbeatRecord
+from ibkr_trader.db.models import TraderModelRecord
 
 
 class DatabaseSchemaTests(unittest.TestCase):
@@ -67,6 +71,10 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "reconciliation_run",
                 "runtime_service",
                 "runtime_service_event",
+                "trader_action",
+                "trader_deployment",
+                "trader_heartbeat",
+                "trader_model",
             },
         )
         instruction_columns = {
@@ -406,6 +414,62 @@ class DatabaseSchemaTests(unittest.TestCase):
             self.assertEqual(runtime_service.runtime_key, "EXECUTION_RUNTIME")
             self.assertEqual(len(runtime_service.events), 1)
             self.assertEqual(runtime_service.events[0].event_type, "runtime_started")
+        finally:
+            session.close()
+
+    def test_trader_registry_tables_round_trip(self) -> None:
+        session = self.session_factory()
+        try:
+            model = TraderModelRecord(
+                model_key="short_trial36_v1",
+                display_name="Short Trial 36 V1",
+                strategy_family="canonical_short_live_execution_policy",
+                side="SHORT",
+                source_workflow_path="/tmp/workflow.yaml",
+                promoted_checkpoint_path="/tmp/best_dqn_state.pt",
+                action_space_json=["skip", "market_entry", "exit_market"],
+                observation_contract_json={"bar_family": "stockholm_intraday_1m_v1"},
+                execution_mapping_version="short_actions_v1",
+            )
+            deployment = TraderDeploymentRecord(
+                trader_model=model,
+                deployment_key="short_trial36_live_01",
+                account_key="U25245596",
+                book_key="rl_short_trial36_live_01",
+                mode="live",
+                status="running",
+                allowed_symbols_json=["SIVE", "VOLV-B"],
+                risk_limits_json={"max_open_positions": 8},
+                action_constraints_json={"position_side": "SHORT"},
+            )
+            action = TraderActionRecord(
+                trader_deployment=deployment,
+                observed_at=datetime(2026, 4, 25, 7, 25, tzinfo=timezone.utc),
+                symbol="SIVE",
+                action_name="market_entry",
+                state_before="FLAT",
+                state_after="ENTRY_PENDING",
+                action_status="logged",
+                payload={"confidence": 0.73},
+            )
+            heartbeat = TraderHeartbeatRecord(
+                trader_deployment=deployment,
+                status="running",
+                last_seen_at=datetime(2026, 4, 25, 7, 26, tzinfo=timezone.utc),
+                last_bar_at=datetime(2026, 4, 25, 7, 25, tzinfo=timezone.utc),
+                metrics_json={"bar_lag_seconds": 2},
+            )
+            session.add_all([model, deployment, action, heartbeat])
+            session.commit()
+
+            persisted_deployment = session.execute(
+                select(TraderDeploymentRecord).where(
+                    TraderDeploymentRecord.deployment_key == "short_trial36_live_01"
+                )
+            ).scalar_one()
+            self.assertEqual(persisted_deployment.trader_model.model_key, "short_trial36_v1")
+            self.assertEqual(len(persisted_deployment.actions), 1)
+            self.assertEqual(persisted_deployment.heartbeat.status, "running")
         finally:
             session.close()
 
