@@ -154,6 +154,7 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Later
 
+- [ ] Nightly Stockholm intraday backfill endpoint from the IBKR tradable master
 - [ ] Long-lived live market-data runtime for agent subscriptions
 - [ ] Parquet persistence for raw ticks and bar builds
 - [ ] Decoupled read API for the operator UI

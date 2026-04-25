@@ -100,6 +100,42 @@ Suggested responsibilities:
 - shortability and borrow metadata
 - fills, order events, and account snapshots
 
+### 5A. Stockholm Intraday Backfill
+
+For Stockholm `5 min` intraday bars, the right replacement shape for EODHD is:
+
+- treat IBKR-resolved Stockholm stocks as the canonical nightly universe
+- maintain a broker-resolved contract master instead of relying on raw q-data slugs
+- classify names into:
+  - resolves cleanly
+  - resolves suspiciously/remapped
+  - does not resolve at IBKR
+
+Operational rule:
+
+- the nightly intraday collector should use only:
+  - cleanly resolved names by default
+  - explicitly approved remapped names when we have validated the broker symbol lineage
+- unresolved names should stay out of the nightly IBKR backfill and remain on the exception list
+
+Current live evidence from `quant`:
+
+- current Stockholm universe scanned: `955`
+- resolves cleanly at IBKR: `705`
+- resolves suspiciously/remapped: `21`
+- does not resolve at IBKR: `229`
+- live Friday `2026-04-24` `5 min` sample across `40` cleanly resolved names:
+  - `40/40` historical-bar requests succeeded
+  - `29/40` returned the full `102` Stockholm session bars
+  - the remaining `11/40` returned fewer bars, but still succeeded
+  - average request latency was about `0.309s`
+
+Interpretation:
+
+- for the names IBKR can actually trade and resolve, nightly `5 min` intraday retrieval is strong enough to replace EODHD
+- sparse `TRADES` bars are expected for thinner names and should not be treated as failed retrievals
+- if we need a dense price-only grid for thin names, a controlled `MIDPOINT` fallback can be added later, but `TRADES` should remain the primary series
+
 Currency rule for stored market and execution data:
 
 - bars, ticks, quotes, order prices, and fills should be stored in the instrument's native trading currency
@@ -137,6 +173,78 @@ If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar 
 - clear separation between paper and live trading
 - exchange calendar awareness with Europe/Stockholm as the default runtime timezone
 - complete audit history for compliance and debugging
+
+## Suggested Nightly Endpoint
+
+Suggested control-plane endpoint:
+
+- `POST /v1/market-data/stockholm-intraday-backfill`
+
+Purpose:
+
+- collect one trading day of Stockholm intraday bars every night from IBKR
+- persist them into our own backend
+- make the run restart-safe and resumable
+
+Suggested request shape:
+
+```json
+{
+  "as_of_date": "2026-04-24",
+  "bar_size": "5 mins",
+  "what_to_show": "TRADES",
+  "use_rth": true,
+  "universe_source": "IBKR_TRADABLE_MASTER",
+  "include_remapped": false,
+  "persist": true
+}
+```
+
+Suggested behavior:
+
+1. Load the broker-resolved Stockholm contract master.
+2. Select:
+   - all `resolves_cleanly` names
+   - optionally `resolves_suspiciously_remapped` names only when explicitly enabled or approved
+3. For each selected contract:
+   - request `1 D` of `5 mins` bars ending at Stockholm close for `as_of_date`
+   - store bars in native trading currency
+   - keep the resolved IBKR identifiers with the payload:
+     - `conId`
+     - `symbol`
+     - `localSymbol`
+     - `primaryExchange`
+     - `ISIN`
+4. Persist a run manifest with:
+   - requested symbol count
+   - completed symbol count
+   - failed symbol count
+   - sparse-bar symbol count
+   - unresolved symbol count
+   - start and finish timestamps
+5. Return a compact run summary immediately and keep the run durable in the ledger or data manifest table.
+
+Suggested response shape:
+
+```json
+{
+  "run_id": "2026-04-25-xsto-5m-trades",
+  "status": "completed",
+  "requested_symbol_count": 705,
+  "completed_symbol_count": 705,
+  "failed_symbol_count": 0,
+  "sparse_bar_symbol_count": 184,
+  "storage_path": "../q-data/xsto/intraday/5m/2026-04-24/"
+}
+```
+
+Implementation notes:
+
+- use one dedicated diagnostic client ID for the collector
+- pace requests gently and keep the job single-session
+- do not resolve contracts on every nightly run; resolve them ahead of time into a contract master and use that as the nightly source of truth
+- contract-master refresh should be a separate slower job, not part of the nightly bar backfill
+- keep the nightly job idempotent at the `(date, conId, bar_size, what_to_show)` level
 
 ## Recommended near-term roadmap
 
