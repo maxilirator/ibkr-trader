@@ -13,6 +13,12 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Done
 
+- [x] Nightly Stockholm intraday collector endpoint for the external data repo:
+  the API now exposes `POST /v1/market-data/stockholm-intraday-backfill`,
+  returning paged batches of `1 min` Stockholm intraday series such as
+  `TRADES`, `MIDPOINT`, `BID`, `ASK`, and `ADJUSTED_LAST` so another repo
+  can page through the IBKR-tradable universe nightly and own persistence,
+  rollups, and downstream manipulation
 - [x] Operator dashboard now groups repeated broker/reconciliation noise,
   persists per-column filters, and gives buttons visible click/work/done
   feedback:
@@ -154,7 +160,7 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Later
 
-- [ ] Nightly Stockholm intraday backfill endpoint from the IBKR tradable master
+- [ ] Durable IBKR tradable contract master for the nightly Stockholm collector
 - [ ] Long-lived live market-data runtime for agent subscriptions
 - [ ] Parquet persistence for raw ticks and bar builds
 - [ ] Decoupled read API for the operator UI

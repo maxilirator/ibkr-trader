@@ -145,6 +145,105 @@ Example request body:
 }
 ```
 
+### `POST /v1/market-data/stockholm-intraday-backfill`
+
+Collects one paged batch of Stockholm intraday bars through the diagnostic IBKR session.
+
+Use it to:
+
+- nightly pull `1 min` Stockholm intraday data from this repo
+- page through the IBKR-tradable Stockholm stock universe from another repo or job runner
+- fetch multiple series for the same symbol set, such as `TRADES`, `MIDPOINT`, `BID`, `ASK`, and `ADJUSTED_LAST`
+
+Important current behavior:
+
+- this endpoint is a collector only; it does **not** persist bars in this repo
+- it returns one page at a time, with `next_cursor` for the caller to continue the nightly batch
+- by default it uses the current Stockholm universe from `XSTO_INSTRUMENTS_PATH`
+- it enriches names with `XSTO_IDENTITY_PATH`
+- it classifies each result as:
+  - `resolves_cleanly`
+  - `resolves_suspiciously_remapped`
+  - `lookup_error` / `timeout` / `error`
+- suspicious remaps are skipped by default unless `include_remapped=true`
+
+Recommended nightly request body:
+
+```json
+{
+  "as_of_date": "2026-04-24",
+  "bar_size": "1 min",
+  "what_to_show": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
+  "use_rth": true,
+  "max_symbols": 25,
+  "sleep_seconds": 0.05
+}
+```
+
+Useful paging fields:
+
+- `max_symbols`: how many Stockholm names to fetch in this batch
+- `start_after`: optional cursor from the previous response
+- `symbols`: optional explicit slug list instead of paging the whole universe
+
+Example response shape:
+
+```json
+{
+  "accepted": true,
+  "session_client_id": 7,
+  "market": "stockholm",
+  "series_mode": "paged_batch",
+  "query": {
+    "as_of_date": "2026-04-24",
+    "bar_size": "1 min",
+    "what_to_show": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
+    "use_rth": true,
+    "max_symbols": 25,
+    "start_after": null,
+    "symbols": null,
+    "include_remapped": false,
+    "sleep_seconds": 0.05
+  },
+  "universe": {
+    "current_universe_size": 955,
+    "page_size": 25,
+    "next_cursor": "volcar-b"
+  },
+  "summary": {
+    "requested_symbol_count": 25,
+    "ok_count": 24,
+    "lookup_error_count": 1,
+    "timeout_count": 0,
+    "error_count": 0,
+    "skipped_remapped_count": 0,
+    "resolves_cleanly_count": 24,
+    "resolves_suspiciously_remapped_count": 0
+  },
+  "entries": [
+    {
+      "slug": "sive",
+      "status": "ok",
+      "classification": "resolves_cleanly",
+      "resolved_contract": {
+        "con_id": 123456789,
+        "symbol": "SIVE",
+        "local_symbol": "SIVE",
+        "primary_exchange": "SFB"
+      },
+      "series": {
+        "TRADES": {
+          "status": "ok",
+          "bar_count": 510,
+          "currency": "SEK",
+          "bars": []
+        }
+      }
+    }
+  ]
+}
+```
+
 ### `POST /v1/market-data/tick-stream-sample`
 
 Collects a short live sample from IBKR's tick-by-tick streaming API through the dedicated streaming client session.

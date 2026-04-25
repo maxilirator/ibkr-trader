@@ -102,7 +102,7 @@ Suggested responsibilities:
 
 ### 5A. Stockholm Intraday Backfill
 
-For Stockholm `5 min` intraday bars, the right replacement shape for EODHD is:
+For Stockholm intraday bars, the right replacement shape for EODHD is:
 
 - treat IBKR-resolved Stockholm stocks as the canonical nightly universe
 - maintain a broker-resolved contract master instead of relying on raw q-data slugs
@@ -132,9 +132,10 @@ Current live evidence from `quant`:
 
 Interpretation:
 
-- for the names IBKR can actually trade and resolve, nightly `5 min` intraday retrieval is strong enough to replace EODHD
+- for the names IBKR can actually trade and resolve, nightly intraday retrieval is strong enough to replace EODHD for this slice
 - sparse `TRADES` bars are expected for thinner names and should not be treated as failed retrievals
 - if we need a dense price-only grid for thin names, a controlled `MIDPOINT` fallback can be added later, but `TRADES` should remain the primary series
+- the right first collector shape is nightly `1 min` data capture, then downstream rollups into `5 min` and higher bars
 
 Currency rule for stored market and execution data:
 
@@ -174,67 +175,72 @@ If intraday storage grows quickly, evaluate TimescaleDB or a dedicated columnar 
 - exchange calendar awareness with Europe/Stockholm as the default runtime timezone
 - complete audit history for compliance and debugging
 
-## Suggested Nightly Endpoint
+## Nightly Collector Endpoint
 
-Suggested control-plane endpoint:
+Implemented control-plane endpoint:
 
 - `POST /v1/market-data/stockholm-intraday-backfill`
 
 Purpose:
 
 - collect one trading day of Stockholm intraday bars every night from IBKR
-- persist them into our own backend
-- make the run restart-safe and resumable
+- return them page by page to the calling repo or batch runner
+- make the run restart-safe and resumable through cursor paging
 
-Suggested request shape:
+Current request shape:
 
 ```json
 {
   "as_of_date": "2026-04-24",
-  "bar_size": "5 mins",
-  "what_to_show": "TRADES",
+  "bar_size": "1 min",
+  "what_to_show": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
   "use_rth": true,
-  "universe_source": "IBKR_TRADABLE_MASTER",
+  "max_symbols": 25,
+  "start_after": null,
   "include_remapped": false,
-  "persist": true
+  "sleep_seconds": 0.05
 }
 ```
 
-Suggested behavior:
+Current behavior:
 
 1. Load the broker-resolved Stockholm contract master.
 2. Select:
    - all `resolves_cleanly` names
    - optionally `resolves_suspiciously_remapped` names only when explicitly enabled or approved
 3. For each selected contract:
-   - request `1 D` of `5 mins` bars ending at Stockholm close for `as_of_date`
-   - store bars in native trading currency
+   - request `1 D` of `1 min` bars ending at Stockholm close for `as_of_date`
+   - return bars in native trading currency
    - keep the resolved IBKR identifiers with the payload:
      - `conId`
      - `symbol`
      - `localSymbol`
      - `primaryExchange`
      - `ISIN`
-4. Persist a run manifest with:
+4. Return a batch summary with:
    - requested symbol count
    - completed symbol count
    - failed symbol count
-   - sparse-bar symbol count
-   - unresolved symbol count
-   - start and finish timestamps
-5. Return a compact run summary immediately and keep the run durable in the ledger or data manifest table.
+   - skipped remap count
+   - resolution classification counts
+   - `next_cursor` for the next page
 
-Suggested response shape:
+Current response shape:
 
 ```json
 {
-  "run_id": "2026-04-25-xsto-5m-trades",
-  "status": "completed",
-  "requested_symbol_count": 705,
-  "completed_symbol_count": 705,
-  "failed_symbol_count": 0,
-  "sparse_bar_symbol_count": 184,
-  "storage_path": "../q-data/xsto/intraday/5m/2026-04-24/"
+  "accepted": true,
+  "market": "stockholm",
+  "series_mode": "paged_batch",
+  "summary": {
+    "requested_symbol_count": 25,
+    "ok_count": 24,
+    "lookup_error_count": 1
+  },
+  "universe": {
+    "next_cursor": "volcar-b"
+  },
+  "entries": []
 }
 ```
 
@@ -242,9 +248,9 @@ Implementation notes:
 
 - use one dedicated diagnostic client ID for the collector
 - pace requests gently and keep the job single-session
-- do not resolve contracts on every nightly run; resolve them ahead of time into a contract master and use that as the nightly source of truth
+- the current endpoint still resolves via the Stockholm identity map on each run; the next hardening step is to move it to a durable broker-resolved master
 - contract-master refresh should be a separate slower job, not part of the nightly bar backfill
-- keep the nightly job idempotent at the `(date, conId, bar_size, what_to_show)` level
+- the calling repo should handle persistence and keep the nightly job idempotent at the `(date, conId, bar_size, what_to_show)` level
 
 ## Recommended near-term roadmap
 

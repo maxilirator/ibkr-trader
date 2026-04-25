@@ -20,6 +20,7 @@ from ibkr_trader.api.server import (
     parse_operator_review_payload,
     parse_positive_limit,
     parse_runtime_cycle_payload,
+    parse_stockholm_intraday_backfill_payload,
     parse_shortability_snapshot_payload,
     parse_tick_stream_payload,
     serialize_execution_batch,
@@ -179,6 +180,121 @@ class ApiServerTests(TestCase):
         self.assertEqual(query.what_to_show, "TRADES")
         self.assertTrue(query.use_rth)
         self.assertEqual(query.end_at.isoformat(), "2026-04-10T17:30:00+02:00")
+
+    def test_parse_stockholm_intraday_backfill_payload_normalizes_values(self) -> None:
+        query = parse_stockholm_intraday_backfill_payload(
+            {
+                "as_of_date": "2026-04-24",
+                "bar_size": "1 min",
+                "what_to_show": ["trades", "midpoint", "ask"],
+                "use_rth": True,
+                "max_symbols": 10,
+                "start_after": "sive",
+                "symbols": ["volcar-b", "sive"],
+                "include_remapped": True,
+                "sleep_seconds": 0.0,
+            }
+        )
+
+        self.assertEqual(query.as_of_date.isoformat(), "2026-04-24")
+        self.assertEqual(query.bar_size, "1 min")
+        self.assertEqual(query.what_to_show, ("TRADES", "MIDPOINT", "ASK"))
+        self.assertTrue(query.use_rth)
+        self.assertEqual(query.max_symbols, 10)
+        self.assertEqual(query.start_after, "sive")
+        self.assertEqual(query.symbols, ("volcar-b", "sive"))
+        self.assertTrue(query.include_remapped)
+        self.assertEqual(query.sleep_seconds, 0.0)
+
+    def test_stockholm_intraday_backfill_endpoint_returns_paged_batch(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        app = create_app(
+            AppConfig(
+                environment="test",
+                timezone="Europe/Stockholm",
+                database_url="sqlite+pysqlite:///:memory:",
+                session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                stockholm_instruments_path=Path("/tmp/all.txt"),
+                stockholm_identity_path=Path("/tmp/identity.parquet"),
+                api=ApiServerConfig(
+                    host="127.0.0.1",
+                    port=8000,
+                    require_loopback_only=False,
+                ),
+                ibkr=IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4001,
+                    client_id=0,
+                    diagnostic_client_id=7,
+                    streaming_client_id=9,
+                    account_id="DU1234567",
+                ),
+            )
+        )
+
+        expected_payload = {
+            "query": {
+                "as_of_date": "2026-04-24",
+                "bar_size": "1 min",
+                "what_to_show": ["TRADES", "MIDPOINT"],
+                "use_rth": True,
+                "max_symbols": 2,
+                "start_after": None,
+                "symbols": None,
+                "include_remapped": False,
+                "sleep_seconds": 0.0,
+            },
+            "universe": {
+                "stockholm_instruments_path": "/tmp/all.txt",
+                "stockholm_identity_path": "/tmp/identity.parquet",
+                "current_universe_size": 705,
+                "page_size": 2,
+                "next_cursor": "sive",
+            },
+            "summary": {
+                "requested_symbol_count": 2,
+                "ok_count": 2,
+                "lookup_error_count": 0,
+                "timeout_count": 0,
+                "error_count": 0,
+                "skipped_remapped_count": 0,
+                "resolves_cleanly_count": 2,
+                "resolves_suspiciously_remapped_count": 0,
+            },
+            "entries": [],
+        }
+
+        with (
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+            patch(
+                "ibkr_trader.api.server.collect_stockholm_intraday_backfill",
+                return_value=expected_payload,
+            ) as collect_mock,
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/v1/market-data/stockholm-intraday-backfill",
+                json={
+                    "as_of_date": "2026-04-24",
+                    "what_to_show": ["trades", "midpoint"],
+                    "max_symbols": 2,
+                    "sleep_seconds": 0.0,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["accepted"])
+        self.assertEqual(body["market"], "stockholm")
+        self.assertEqual(body["series_mode"], "paged_batch")
+        self.assertEqual(body["summary"]["requested_symbol_count"], 2)
+        self.assertEqual(body["universe"]["next_cursor"], "sive")
+        collect_mock.assert_called_once()
 
     def test_parse_tick_stream_payload_normalizes_tick_types(self) -> None:
         query = parse_tick_stream_payload(

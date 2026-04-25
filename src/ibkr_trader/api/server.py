@@ -59,6 +59,11 @@ from ibkr_trader.ibkr.shortability import (
     collect_shortability_snapshot,
     persist_shortability_snapshot,
 )
+from ibkr_trader.ibkr.stockholm_intraday import (
+    DEFAULT_STOCKHOLM_INTRADAY_TYPES,
+    StockholmIntradayBackfillQuery,
+    collect_stockholm_intraday_backfill,
+)
 from ibkr_trader.ibkr.tick_stream import TickStreamQuery
 from ibkr_trader.ibkr.tick_stream import _normalize_tick_type
 from ibkr_trader.ibkr.tick_stream import collect_tick_stream_sample
@@ -264,6 +269,57 @@ def parse_historical_bars_payload(payload: Mapping[str, Any]) -> HistoricalBarsQ
         what_to_show=str(payload.get("what_to_show", "TRADES")).upper(),
         use_rth=bool(payload.get("use_rth", True)),
         end_at=end_at,
+    )
+    query.validate()
+    return query
+
+
+def parse_stockholm_intraday_backfill_payload(
+    payload: Mapping[str, Any],
+) -> StockholmIntradayBackfillQuery:
+    if payload.get("as_of_date") is None:
+        raise ValueError("as_of_date is required")
+
+    as_of_date = parse_date(payload["as_of_date"], "as_of_date")
+
+    raw_what_to_show = payload.get("what_to_show")
+    if raw_what_to_show is None:
+        what_to_show = DEFAULT_STOCKHOLM_INTRADAY_TYPES
+    else:
+        if not isinstance(raw_what_to_show, list) or not raw_what_to_show:
+            raise ValueError("what_to_show must be a non-empty array of strings")
+        what_to_show = tuple(str(item).strip().upper() for item in raw_what_to_show)
+        if not all(what_to_show):
+            raise ValueError("what_to_show must contain only non-empty strings")
+        if len(set(what_to_show)) != len(what_to_show):
+            raise ValueError("what_to_show must not contain duplicates")
+
+    raw_symbols = payload.get("symbols")
+    symbols: tuple[str, ...] | None = None
+    if raw_symbols is not None:
+        if not isinstance(raw_symbols, list) or not raw_symbols:
+            raise ValueError("symbols must be a non-empty array of strings")
+        parsed_symbols = tuple(str(item).strip().lower() for item in raw_symbols)
+        if not all(parsed_symbols):
+            raise ValueError("symbols must contain only non-empty strings")
+        if len(set(parsed_symbols)) != len(parsed_symbols):
+            raise ValueError("symbols must not contain duplicates")
+        symbols = parsed_symbols
+
+    query = StockholmIntradayBackfillQuery(
+        as_of_date=as_of_date,
+        bar_size=str(payload.get("bar_size", "1 min")),
+        what_to_show=what_to_show,
+        use_rth=bool(payload.get("use_rth", True)),
+        max_symbols=int(payload.get("max_symbols", 25)),
+        start_after=(
+            str(payload["start_after"]).strip().lower()
+            if payload.get("start_after") is not None
+            else None
+        ),
+        symbols=symbols,
+        include_remapped=bool(payload.get("include_remapped", False)),
+        sleep_seconds=float(payload.get("sleep_seconds", 0.05)),
     )
     query.validate()
     return query
@@ -910,6 +966,45 @@ def create_app(config: AppConfig | None = None) -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+    @app.post("/v1/market-data/stockholm-intraday-backfill")
+    def get_stockholm_intraday_backfill(
+        payload: dict[str, Any],
+        timeout: int = 20,
+    ) -> dict[str, Any]:
+        try:
+            query = parse_stockholm_intraday_backfill_payload(payload)
+            result = with_diagnostic_session(
+                "stockholm_intraday_backfill",
+                lambda broker_app: collect_stockholm_intraday_backfill(
+                    app_config.ibkr.diagnostic_session(),
+                    query,
+                    instruments_path=app_config.stockholm_instruments_path,
+                    identity_path=app_config.stockholm_identity_path,
+                    timeout=timeout,
+                    app=broker_app,
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "session_client_id": app_config.ibkr.diagnostic_client_id,
+            "market": "stockholm",
+            "series_mode": "paged_batch",
+            **result,
+        }
 
     @app.post("/v1/market-data/tick-stream-sample")
     def get_tick_stream_sample(payload: dict[str, Any], timeout: int = 15) -> dict[str, Any]:
