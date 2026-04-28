@@ -16,7 +16,6 @@ from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import TraderActionRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
-from ibkr_trader.db.models import TraderHeartbeatRecord
 from ibkr_trader.db.models import TraderModelRecord
 
 
@@ -57,6 +56,7 @@ class RLTraderDeployment:
     book_key: str
     mode: str
     status: str
+    is_virtual: bool
     allowed_symbols: tuple[str, ...]
     risk_limits: dict[str, Any]
     action_constraints: dict[str, Any]
@@ -77,6 +77,7 @@ class RLTraderAction:
     model_display_name: str
     account_key: str
     book_key: str
+    is_virtual: bool
     symbol: str
     action_name: str
     state_before: str | None
@@ -94,6 +95,7 @@ class RLTraderSummary:
     model_count: int
     deployment_count: int
     live_deployment_count: int
+    virtual_deployment_count: int
     running_deployment_count: int
     stale_heartbeat_count: int
     recent_action_count: int
@@ -198,7 +200,10 @@ def build_rl_trader_dashboard_snapshot(
                 normalized_last_seen_at = _normalize_timestamp(
                     heartbeat_record.last_seen_at
                 )
-                is_stale = normalized_last_seen_at.timestamp() < stale_cutoff
+                is_stale = (
+                    record.status in {"running", "degraded"}
+                    and normalized_last_seen_at.timestamp() < stale_cutoff
+                )
                 if is_stale:
                     stale_heartbeat_count += 1
                 heartbeat = RLDeploymentHeartbeat(
@@ -229,6 +234,7 @@ def build_rl_trader_dashboard_snapshot(
                     book_key=record.book_key,
                     mode=record.mode,
                     status=record.status,
+                    is_virtual=record.is_virtual,
                     allowed_symbols=tuple(record.allowed_symbols_json),
                     risk_limits=dict(record.risk_limits_json),
                     action_constraints=dict(record.action_constraints_json),
@@ -250,6 +256,7 @@ def build_rl_trader_dashboard_snapshot(
                 model_display_name=record.trader_deployment.trader_model.display_name,
                 account_key=record.trader_deployment.account_key,
                 book_key=record.trader_deployment.book_key,
+                is_virtual=record.trader_deployment.is_virtual,
                 symbol=record.symbol,
                 action_name=record.action_name,
                 state_before=record.state_before,
@@ -270,6 +277,11 @@ def build_rl_trader_dashboard_snapshot(
         live_deployment_count = session.execute(
             select(TraderDeploymentRecord.id).where(TraderDeploymentRecord.mode == "live")
         ).scalars().all()
+        virtual_deployment_count = session.execute(
+            select(TraderDeploymentRecord.id).where(
+                TraderDeploymentRecord.is_virtual.is_(True)
+            )
+        ).scalars().all()
         running_deployment_count = session.execute(
             select(TraderDeploymentRecord.id).where(
                 TraderDeploymentRecord.status == "running"
@@ -283,6 +295,7 @@ def build_rl_trader_dashboard_snapshot(
             model_count=len(model_count),
             deployment_count=len(deployment_count),
             live_deployment_count=len(live_deployment_count),
+            virtual_deployment_count=len(virtual_deployment_count),
             running_deployment_count=len(running_deployment_count),
             stale_heartbeat_count=stale_heartbeat_count,
             recent_action_count=len(recent_actions),

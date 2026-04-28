@@ -57,13 +57,54 @@ def create_schema(engine: Engine) -> None:
 
 def _upgrade_control_plane_schema(engine: Engine) -> None:
     inspector = inspect(engine)
-    if "instruction" not in inspector.get_table_names():
+    table_names = set(inspector.get_table_names())
+    if "instruction" not in table_names:
         return
 
     existing_columns = {
         column["name"] for column in inspector.get_columns("instruction")
     }
     upgrade_statements: list[str] = []
+
+    def add_boolean_if_missing(table_name: str, column_name: str) -> None:
+        if table_name not in table_names:
+            return
+        table_columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        if column_name not in table_columns:
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+
+    def add_archive_columns_if_missing(table_name: str) -> None:
+        if table_name not in table_names:
+            return
+        table_columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        if "archived_at" not in table_columns:
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ADD COLUMN archived_at TIMESTAMP WITH TIME ZONE"
+            )
+        if "archived_by" not in table_columns:
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ADD COLUMN archived_by VARCHAR(64)"
+            )
+        if "archive_reason" not in table_columns:
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ADD COLUMN archive_reason TEXT"
+            )
+
+    add_boolean_if_missing("trader_deployment", "is_virtual")
+    add_boolean_if_missing("instruction", "is_virtual")
+    add_boolean_if_missing("broker_account", "is_virtual")
+    add_boolean_if_missing("broker_order", "is_virtual")
+    add_boolean_if_missing("execution_fill", "is_virtual")
+    add_boolean_if_missing("account_snapshot", "is_virtual")
+    add_boolean_if_missing("position_snapshot", "is_virtual")
+    add_archive_columns_if_missing("broker_order_event")
+    add_archive_columns_if_missing("reconciliation_issue")
 
     if "broker_order_id" not in existing_columns:
         upgrade_statements.append(
@@ -129,6 +170,18 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
         upgrade_statements.append(
             "ALTER TABLE instruction ADD COLUMN exit_filled_at TIMESTAMP WITH TIME ZONE"
         )
+    if "archived_at" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN archived_at TIMESTAMP WITH TIME ZONE"
+        )
+    if "archived_by" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN archived_by VARCHAR(64)"
+        )
+    if "archive_reason" not in existing_columns:
+        upgrade_statements.append(
+            "ALTER TABLE instruction ADD COLUMN archive_reason TEXT"
+        )
 
     with engine.begin() as connection:
         for statement in upgrade_statements:
@@ -149,5 +202,41 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_instruction_exit_order_id "
                 "ON instruction (exit_order_id)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_instruction_archived_at "
+                "ON instruction (archived_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_broker_order_event_archived_at "
+                "ON broker_order_event (archived_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_reconciliation_issue_archived_at "
+                "ON reconciliation_issue (archived_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_broker_account_is_virtual "
+                "ON broker_account (is_virtual)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_broker_order_is_virtual "
+                "ON broker_order (is_virtual)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_execution_fill_is_virtual "
+                "ON execution_fill (is_virtual)"
             )
         )

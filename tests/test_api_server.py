@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -17,14 +19,17 @@ from ibkr_trader.api.server import (
     parse_execution_batch_payload,
     parse_historical_bars_payload,
     parse_kill_switch_payload,
+    parse_market_stream_subscribe_payload,
     parse_operator_review_payload,
     parse_positive_limit,
     parse_runtime_cycle_payload,
+    parse_rl_observation_build_payload,
     parse_stockholm_intraday_backfill_payload,
     parse_shortability_snapshot_payload,
     parse_tick_stream_payload,
     parse_trader_action_payload,
     parse_trader_deployment_payload,
+    parse_trader_deployment_update_payload,
     parse_trader_heartbeat_payload,
     parse_trader_model_payload,
     serialize_execution_batch,
@@ -47,6 +52,9 @@ from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import InstructionSetCancellationRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
+from ibkr_trader.db.models import TraderDeploymentRecord
+from ibkr_trader.db.models import TraderModelRecord
+from ibkr_trader.db.models import VirtualMarketQuoteRecord
 from ibkr_trader.ibkr.shortability import ShortabilityMarketDataType
 from ibkr_trader.ibkr.shortability import ShortabilitySource
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
@@ -197,6 +205,7 @@ class ApiServerTests(TestCase):
                 "symbols": ["volcar-b", "sive"],
                 "include_remapped": True,
                 "sleep_seconds": 0.0,
+                "max_runtime_seconds": 12.5,
             }
         )
 
@@ -209,6 +218,7 @@ class ApiServerTests(TestCase):
         self.assertEqual(query.symbols, ("volcar-b", "sive"))
         self.assertTrue(query.include_remapped)
         self.assertEqual(query.sleep_seconds, 0.0)
+        self.assertEqual(query.max_runtime_seconds, 12.5)
 
     def test_parse_trader_payloads_normalize_values(self) -> None:
         model_payload = parse_trader_model_payload(
@@ -259,6 +269,22 @@ class ApiServerTests(TestCase):
         self.assertEqual(deployment_payload["deployment_key"], "short_trial36_live_01")
         self.assertEqual(deployment_payload["account_key"], "U25245596")
         self.assertEqual(deployment_payload["allowed_symbols"], ("SIVE", "VOLV-B"))
+        deployment_update_payload = parse_trader_deployment_update_payload(
+            {
+                "status": "running",
+                "allowed_symbols": ["volv-b", "sive", "volv-b"],
+                "metadata": {"edited_by": "operator"},
+            }
+        )
+        self.assertEqual(deployment_update_payload["status"], "running")
+        self.assertEqual(
+            deployment_update_payload["allowed_symbols"],
+            ("VOLV-B", "SIVE"),
+        )
+        self.assertEqual(
+            deployment_update_payload["metadata"]["edited_by"],
+            "operator",
+        )
         self.assertEqual(action_payload["symbol"], "SIVE")
         self.assertEqual(action_payload["state_before"], "FLAT")
         self.assertEqual(heartbeat_payload["status"], "running")
@@ -266,6 +292,68 @@ class ApiServerTests(TestCase):
             heartbeat_payload["last_bar_at"].isoformat(),
             "2026-04-25T09:29:00+02:00",
         )
+
+    def test_parse_trader_payloads_require_explicit_runtime_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, "side is required"):
+            parse_trader_model_payload(
+                {
+                    "model_key": "long_trial_v1",
+                    "display_name": "Long Trial V1",
+                    "strategy_family": "canonical_long_live_execution_policy",
+                    "action_space": ["skip", "market_entry"],
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "mode is required"):
+            parse_trader_deployment_payload(
+                {
+                    "deployment_key": "long_trial_virtual_01",
+                    "model_key": "long_trial_v1",
+                    "account_key": "virtual0001",
+                    "book_key": "rl_long_trial_virtual_01",
+                    "status": "running",
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "observed_at is required"):
+            parse_trader_action_payload(
+                {
+                    "deployment_key": "long_trial_virtual_01",
+                    "symbol": "SIVE",
+                    "action_name": "market_entry",
+                    "action_status": "translated",
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "last_seen_at is required"):
+            parse_trader_heartbeat_payload({"status": "running"})
+
+    def test_parse_rl_observation_build_payload_accepts_source_bars(self) -> None:
+        payload = parse_rl_observation_build_payload(
+            {
+                "deployment_key": "Long_Trial_106_Virtual_Shared_01",
+                "symbols": ["axfo", "azn"],
+                "as_of": "2026-04-28T09:07:30+02:00",
+                "source_bars": {"AXFO": []},
+                "history_overrides": {"AXFO": {"prev_close": "100"}},
+                "static_features": {
+                    "AXFO": {
+                        "feature_names": ["rank_score_z"],
+                        "values": ["0.25"],
+                    }
+                },
+                "include_source_bars": True,
+            }
+        )
+
+        self.assertEqual(payload["deployment_key"], "long_trial_106_virtual_shared_01")
+        self.assertEqual(payload["symbols"], ("AXFO", "AZN"))
+        self.assertEqual(payload["as_of"].isoformat(), "2026-04-28T09:07:30+02:00")
+        self.assertEqual(
+            payload["static_features"]["AXFO"]["feature_names"],
+            ["rank_score_z"],
+        )
+        self.assertTrue(payload["include_source_bars"])
 
     def test_stockholm_intraday_backfill_endpoint_returns_paged_batch(self) -> None:
         try:
@@ -308,6 +396,7 @@ class ApiServerTests(TestCase):
                 "symbols": None,
                 "include_remapped": False,
                 "sleep_seconds": 0.0,
+                "max_runtime_seconds": 55.0,
             },
             "universe": {
                 "stockholm_instruments_path": "/tmp/all.txt",
@@ -315,16 +404,23 @@ class ApiServerTests(TestCase):
                 "current_universe_size": 705,
                 "page_size": 2,
                 "next_cursor": "sive",
+                "requested_page_next_cursor": "sive",
             },
             "summary": {
                 "requested_symbol_count": 2,
+                "processed_symbol_count": 2,
                 "ok_count": 2,
                 "lookup_error_count": 0,
                 "timeout_count": 0,
                 "error_count": 0,
+                "partial_count": 0,
                 "skipped_remapped_count": 0,
+                "unsupported_series_count": 0,
+                "not_requested_series_count": 0,
                 "resolves_cleanly_count": 2,
                 "resolves_suspiciously_remapped_count": 0,
+                "budget_exhausted": False,
+                "elapsed_seconds": 0.0,
             },
             "entries": [],
         }
@@ -332,6 +428,10 @@ class ApiServerTests(TestCase):
         with (
             patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
             patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+            patch(
+                "ibkr_trader.ibkr.session_manager.ManagedSyncSession.execute",
+                side_effect=lambda _operation_name, callback: callback(None),
+            ),
             patch(
                 "ibkr_trader.api.server.collect_stockholm_intraday_backfill",
                 return_value=expected_payload,
@@ -363,96 +463,300 @@ class ApiServerTests(TestCase):
         except (ModuleNotFoundError, RuntimeError):
             self.skipTest("fastapi test dependencies are not installed")
 
-        app = create_app(
-            AppConfig(
-                environment="test",
-                timezone="Europe/Stockholm",
-                database_url="sqlite+pysqlite:///:memory:",
-                session_calendar_path=Path("/tmp/day_sessions.parquet"),
-                stockholm_instruments_path=Path("/tmp/all.txt"),
-                stockholm_identity_path=Path("/tmp/identity.parquet"),
-                api=ApiServerConfig(
-                    host="127.0.0.1",
-                    port=8000,
-                    require_loopback_only=False,
-                ),
-                ibkr=IbkrConnectionConfig(
-                    host="127.0.0.1",
-                    port=4001,
-                    client_id=0,
-                    diagnostic_client_id=7,
-                    streaming_client_id=9,
-                    account_id="DU1234567",
-                ),
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "rl_registry.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
             )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                register_response = client.post(
+                    "/v1/rl/models/register",
+                    json={
+                        "model_key": "short_trial36_v1",
+                        "display_name": "Short Trial 36 V1",
+                        "strategy_family": "canonical_short_live_execution_policy",
+                        "side": "SHORT",
+                        "action_space": ["skip", "market_entry", "exit_market"],
+                        "observation_contract": {
+                            "bar_family": "stockholm_intraday_1m_v1"
+                        },
+                    },
+                )
+                self.assertEqual(register_response.status_code, 200)
+
+                upsert_response = client.post(
+                    "/v1/rl/models/upsert",
+                    json={
+                        "model_key": "short_trial36_v1",
+                        "display_name": "Short Trial 36 V1",
+                        "strategy_family": "canonical_short_live_execution_policy",
+                        "side": "SHORT",
+                        "action_space": [
+                            "skip",
+                            "market_entry",
+                            "exit_market",
+                            "exit_tp_180bp",
+                        ],
+                        "observation_contract": {
+                            "bar_family": "phase1_intraday_ohlc_v1",
+                            "bar_interval": "5m",
+                        },
+                        "execution_mapping_version": "short_actions_v1",
+                    },
+                )
+                self.assertEqual(upsert_response.status_code, 200)
+                self.assertEqual(
+                    upsert_response.json()["trader_model"]["observation_contract"][
+                        "bar_family"
+                    ],
+                    "phase1_intraday_ohlc_v1",
+                )
+
+                deployment_response = client.post(
+                    "/v1/rl/deployments",
+                    json={
+                        "deployment_key": "short_trial36_live_01",
+                        "model_key": "short_trial36_v1",
+                        "account_key": "U25245596",
+                        "book_key": "rl_short_trial36_live_01",
+                        "mode": "live",
+                        "status": "running",
+                        "allowed_symbols": ["SIVE", "VOLV-B"],
+                    },
+                )
+                self.assertEqual(deployment_response.status_code, 200)
+
+                update_deployment_response = client.patch(
+                    "/v1/rl/deployments/short_trial36_live_01",
+                    json={
+                        "allowed_symbols": ["SIVE", "VOLV-B", "ERIC-B"],
+                        "risk_limits": {"max_open_positions": 3},
+                        "metadata": {"edited_by": "test"},
+                    },
+                )
+                self.assertEqual(update_deployment_response.status_code, 200)
+                updated_deployment = update_deployment_response.json()[
+                    "trader_deployment"
+                ]
+                self.assertEqual(
+                    updated_deployment["allowed_symbols"],
+                    ["SIVE", "VOLV-B", "ERIC-B"],
+                )
+                self.assertEqual(
+                    updated_deployment["risk_limits"]["max_open_positions"],
+                    3,
+                )
+
+                action_response = client.post(
+                    "/v1/rl/actions/log",
+                    json={
+                        "deployment_key": "short_trial36_live_01",
+                        "symbol": "SIVE",
+                        "action_name": "market_entry",
+                        "observed_at": "2026-04-25T09:25:00+02:00",
+                        "state_before": "FLAT",
+                        "state_after": "ENTRY_PENDING",
+                        "action_status": "translated",
+                    },
+                )
+                self.assertEqual(action_response.status_code, 200)
+
+                heartbeat_response = client.post(
+                    "/v1/rl/deployments/short_trial36_live_01/heartbeat",
+                    json={
+                        "status": "running",
+                        "last_seen_at": "2026-04-25T09:30:00+02:00",
+                        "last_bar_at": "2026-04-25T09:29:00+02:00",
+                        "metrics": {"bar_lag_seconds": 4},
+                    },
+                )
+                self.assertEqual(heartbeat_response.status_code, 200)
+
+                dashboard_response = client.get("/v1/read/rl-dashboard")
+                self.assertEqual(dashboard_response.status_code, 200)
+                body = dashboard_response.json()
+                self.assertTrue(body["accepted"])
+                self.assertEqual(body["rl_dashboard"]["summary"]["model_count"], 1)
+                self.assertEqual(
+                    body["rl_dashboard"]["summary"]["deployment_count"],
+                    1,
+                )
+                self.assertEqual(
+                    body["rl_dashboard"]["summary"]["recent_action_count"],
+                    1,
+                )
+                self.assertEqual(
+                    body["rl_dashboard"]["deployments"][0]["account_key"],
+                    "U25245596",
+                )
+                self.assertEqual(
+                    body["rl_dashboard"]["recent_actions"][0]["action_name"],
+                    "market_entry",
+                )
+
+    def test_rl_observation_endpoint_builds_model_facing_prefix(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        def bars_for_live_day() -> list[dict[str, str]]:
+            bars: list[dict[str, str]] = []
+            for minute in range(8):
+                bars.append(
+                    {
+                        "timestamp": f"20260428 09:{minute:02d}:00",
+                        "open": f"{110 + minute:.2f}",
+                        "high": f"{111 + minute:.2f}",
+                        "low": f"{109 + minute:.2f}",
+                        "close": f"{110.5 + minute:.2f}",
+                    }
+                )
+            return bars
+
+        history_features = {
+            "prev_open_rel_close": 0.01,
+            "prev_high_rel_close": 0.02,
+            "prev_low_rel_close": -0.01,
+            "prev_close_rel_open": 0.03,
+            "prev_high_rel_low": 0.04,
+            "trailing_intraday_realized_vol": 0.02,
+            "trailing_session_count_norm": 0.5,
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "rl_observations.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                register_response = client.post(
+                    "/v1/rl/models/register",
+                    json={
+                        "model_key": "long_trial_106_v1",
+                        "display_name": "Long Trial 106 V1",
+                        "strategy_family": "canonical_long_live_execution_policy",
+                        "side": "LONG",
+                        "action_space": ["skip", "wait", "market_entry"],
+                        "observation_contract": {
+                            "bar_family": "phase1_intraday_ohlc_v1",
+                            "bar_interval": "5m",
+                            "session_timezone": "Europe/Stockholm",
+                            "session_open_local": "09:00",
+                            "session_close_local": "17:30",
+                            "include_market_context": False,
+                            "include_vol_normalized_intraday_state": True,
+                        },
+                    },
+                )
+                self.assertEqual(register_response.status_code, 200)
+                deployment_response = client.post(
+                    "/v1/rl/deployments",
+                    json={
+                        "deployment_key": "long_trial_106_virtual_shared_01",
+                        "model_key": "long_trial_106_v1",
+                        "account_key": "VIRTUALRL01",
+                        "book_key": "rl_shared_long_trial_106_virtual_01",
+                        "mode": "virtual",
+                        "status": "running",
+                        "allowed_symbols": ["AXFO"],
+                    },
+                )
+                self.assertEqual(deployment_response.status_code, 200)
+                observation_response = client.post(
+                    "/v1/rl/observations/build",
+                    json={
+                        "deployment_key": "long_trial_106_virtual_shared_01",
+                        "symbols": ["AXFO"],
+                        "as_of": "2026-04-28T09:07:30+02:00",
+                        "source_bars": {"AXFO": bars_for_live_day()},
+                        "history_overrides": {
+                            "AXFO": {
+                                "prev_close": "100",
+                                "history_features": history_features,
+                            }
+                        },
+                    },
+                )
+
+        self.assertEqual(observation_response.status_code, 200)
+        body = observation_response.json()
+        self.assertTrue(body["accepted"])
+        observation = body["rl_observation"]
+        self.assertEqual(observation["input_contract"]["bar_interval"], "5m")
+        self.assertEqual(observation["input_contract"]["decision_cadence"], "5m")
+        self.assertEqual(
+            observation["observations"]["AXFO"]["latest_bar_complete"],
+            False,
         )
-
-        with (
-            patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
-            patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
-            TestClient(app) as client,
-        ):
-            register_response = client.post(
-                "/v1/rl/models/register",
-                json={
-                    "model_key": "short_trial36_v1",
-                    "display_name": "Short Trial 36 V1",
-                    "strategy_family": "canonical_short_live_execution_policy",
-                    "side": "SHORT",
-                    "action_space": ["skip", "market_entry", "exit_market"],
-                    "observation_contract": {"bar_family": "stockholm_intraday_1m_v1"}
-                },
-            )
-            self.assertEqual(register_response.status_code, 200)
-
-            deployment_response = client.post(
-                "/v1/rl/deployments",
-                json={
-                    "deployment_key": "short_trial36_live_01",
-                    "model_key": "short_trial36_v1",
-                    "account_key": "U25245596",
-                    "book_key": "rl_short_trial36_live_01",
-                    "mode": "live",
-                    "status": "running",
-                    "allowed_symbols": ["SIVE", "VOLV-B"]
-                },
-            )
-            self.assertEqual(deployment_response.status_code, 200)
-
-            action_response = client.post(
-                "/v1/rl/actions/log",
-                json={
-                    "deployment_key": "short_trial36_live_01",
-                    "symbol": "SIVE",
-                    "action_name": "market_entry",
-                    "observed_at": "2026-04-25T09:25:00+02:00",
-                    "state_before": "FLAT",
-                    "state_after": "ENTRY_PENDING",
-                    "action_status": "translated"
-                },
-            )
-            self.assertEqual(action_response.status_code, 200)
-
-            heartbeat_response = client.post(
-                "/v1/rl/deployments/short_trial36_live_01/heartbeat",
-                json={
-                    "status": "running",
-                    "last_seen_at": "2026-04-25T09:30:00+02:00",
-                    "last_bar_at": "2026-04-25T09:29:00+02:00",
-                    "metrics": {"bar_lag_seconds": 4}
-                },
-            )
-            self.assertEqual(heartbeat_response.status_code, 200)
-
-            dashboard_response = client.get("/v1/read/rl-dashboard")
-            self.assertEqual(dashboard_response.status_code, 200)
-            body = dashboard_response.json()
-            self.assertTrue(body["accepted"])
-            self.assertEqual(body["rl_dashboard"]["summary"]["model_count"], 1)
-            self.assertEqual(body["rl_dashboard"]["summary"]["deployment_count"], 1)
-            self.assertEqual(body["rl_dashboard"]["summary"]["recent_action_count"], 1)
-            self.assertEqual(body["rl_dashboard"]["deployments"][0]["account_key"], "U25245596")
-            self.assertEqual(body["rl_dashboard"]["recent_actions"][0]["action_name"], "market_entry")
+        self.assertEqual(
+            observation["observations"]["AXFO"]["model_decision"]["usable_bar_count"],
+            1,
+        )
+        self.assertAlmostEqual(
+            observation["observations"]["AXFO"]["features"]["base_dynamic"][1][0],
+            1.0 / 101.0,
+        )
 
     def test_parse_tick_stream_payload_normalizes_tick_types(self) -> None:
         query = parse_tick_stream_payload(
@@ -486,6 +790,352 @@ class ApiServerTests(TestCase):
                     "tick_types": [],
                 }
             )
+
+    def test_parse_market_stream_subscribe_payload_normalizes_symbols(self) -> None:
+        payload = parse_market_stream_subscribe_payload(
+            {
+                "symbols": ["axfo", "azn"],
+                "market_data_type": "delayed",
+                "replace": True,
+            }
+        )
+
+        self.assertEqual([item.symbol for item in payload["contracts"]], ["AXFO", "AZN"])
+        self.assertEqual(payload["contracts"][0].exchange, "SMART")
+        self.assertEqual(payload["contracts"][0].primary_exchange, "SFB")
+        self.assertEqual(payload["market_data_type"], "DELAYED")
+        self.assertTrue(payload["replace"])
+
+    def test_parse_market_stream_subscribe_payload_enriches_stockholm_identity(self) -> None:
+        payload = parse_market_stream_subscribe_payload(
+            {
+                "symbols": ["eric-b"],
+                "market_data_type": "live",
+            },
+            stockholm_identity_map={
+                "ERIC-B": SimpleNamespace(
+                    ticker_alias="ERIC B",
+                    isin="SE0000108656",
+                )
+            },
+        )
+
+        contract = payload["contracts"][0]
+        self.assertEqual(contract.symbol, "ERIC-B")
+        self.assertEqual(contract.local_symbol, "ERIC B")
+        self.assertEqual(contract.isin, "SE0000108656")
+
+    def test_tick_stream_sample_endpoint_returns_stream_events(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        app = create_app(
+            AppConfig(
+                environment="test",
+                timezone="Europe/Stockholm",
+                database_url="sqlite+pysqlite:///:memory:",
+                session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                stockholm_instruments_path=Path("/tmp/all.txt"),
+                stockholm_identity_path=Path("/tmp/identity.parquet"),
+                api=ApiServerConfig(
+                    host="127.0.0.1",
+                    port=8000,
+                    require_loopback_only=False,
+                ),
+                ibkr=IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4001,
+                    client_id=0,
+                    diagnostic_client_id=7,
+                    streaming_client_id=9,
+                    account_id="DU1234567",
+                ),
+            )
+        )
+
+        expected_payload = {
+            "query": {
+                "symbol": "AAPL",
+                "exchange": "SMART",
+                "currency": "USD",
+                "tick_types": ["Last"],
+            },
+            "event_count": 1,
+            "events": [
+                {
+                    "stream": "Last",
+                    "timestamp": "2026-04-27T13:31:00Z",
+                    "price": "180.25",
+                    "size": "100",
+                }
+            ],
+        }
+
+        with (
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+            patch(
+                "ibkr_trader.api.server.collect_tick_stream_sample",
+                return_value=expected_payload,
+            ) as collect_mock,
+            TestClient(app) as client,
+        ):
+            response = client.post(
+                "/v1/market-data/tick-stream-sample",
+                json={
+                    "symbol": "aapl",
+                    "exchange": "smart",
+                    "currency": "usd",
+                    "primary_exchange": "nasdaq",
+                    "tick_types": ["last"],
+                    "duration_seconds": 1,
+                    "max_events": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["event_count"], 1)
+        collect_mock.assert_called_once()
+        query = collect_mock.call_args.args[1]
+        self.assertEqual(query.symbol, "AAPL")
+        self.assertEqual(query.primary_exchange, "NASDAQ")
+        self.assertEqual(query.tick_types, ("Last",))
+
+    def test_rl_observation_endpoint_reads_market_stream_by_default(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        class FakeMarketStreamService:
+            def snapshot(self, *, symbols=None, bar_limit=390):
+                _ = bar_limit
+                return {
+                    "bars_by_symbol": {
+                        symbol: [
+                            {
+                                "timestamp": "2026-04-28T09:00:00+02:00",
+                                "open": "100",
+                                "high": "101",
+                                "low": "99",
+                                "close": "100",
+                                "currency": "SEK",
+                            },
+                            {
+                                "timestamp": "2026-04-28T09:01:00+02:00",
+                                "open": "100",
+                                "high": "102",
+                                "low": "100",
+                                "close": "101",
+                                "currency": "SEK",
+                            },
+                            {
+                                "timestamp": "2026-04-28T09:05:00+02:00",
+                                "open": "101",
+                                "high": "103",
+                                "low": "101",
+                                "close": "102",
+                                "currency": "SEK",
+                            },
+                        ]
+                        for symbol in symbols or []
+                    }
+                }
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "stream_observation.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                client.app.state.market_stream_service = FakeMarketStreamService()
+                self.assertEqual(
+                    client.post(
+                        "/v1/rl/models/register",
+                        json={
+                            "model_key": "long_trial_106_v1",
+                            "display_name": "Long Trial 106 V1",
+                            "strategy_family": "canonical_long_live_execution_policy",
+                            "side": "LONG",
+                            "action_space": ["skip", "wait", "market_entry"],
+                            "observation_contract": {
+                                "bar_family": "phase1_intraday_ohlc_v1",
+                                "bar_interval": "5m",
+                                "session_timezone": "Europe/Stockholm",
+                                "session_open_local": "09:00",
+                                "session_close_local": "17:30",
+                                "include_market_context": False,
+                            },
+                        },
+                    ).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    client.post(
+                        "/v1/rl/deployments",
+                        json={
+                            "deployment_key": "long_trial_106_virtual_shared_01",
+                            "model_key": "long_trial_106_v1",
+                            "account_key": "VIRTUALRL01",
+                            "book_key": "rl_shared_long_trial_106_virtual_01",
+                            "mode": "virtual",
+                            "status": "running",
+                            "allowed_symbols": ["AXFO"],
+                        },
+                    ).status_code,
+                    200,
+                )
+                response = client.post(
+                    "/v1/rl/observations/build",
+                    json={
+                        "deployment_key": "long_trial_106_virtual_shared_01",
+                        "symbols": ["AXFO"],
+                        "as_of": "2026-04-28T09:07:30+02:00",
+                        "history_overrides": {
+                            "AXFO": {
+                                "prev_close": "100",
+                                "history_features": {
+                                    "prev_open_rel_close": 0.0,
+                                    "prev_high_rel_close": 0.02,
+                                    "prev_low_rel_close": -0.02,
+                                    "prev_close_rel_open": 0.0,
+                                    "prev_high_rel_low": 0.04,
+                                    "trailing_intraday_realized_vol": 0.01,
+                                    "trailing_session_count_norm": 1.0,
+                                },
+                            }
+                        },
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["source_mode"], "market_stream")
+        self.assertEqual(body["streamed_symbols"], ["AXFO"])
+        self.assertEqual(
+            body["rl_observation"]["observations"]["AXFO"]["model_decision"]["usable_bar_count"],
+            1,
+        )
+
+    def test_market_stream_endpoints_use_persistent_service(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        class FakeMarketStreamService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def subscribe_many(self, contracts, *, replace, market_data_type):
+                self.calls.append((contracts, replace, market_data_type))
+                return {
+                    "running": True,
+                    "subscribed_count": len(contracts),
+                    "subscriptions": [],
+                    "quote_count": 0,
+                    "quotes": [],
+                    "bars_by_symbol": {contract.symbol: [] for contract in contracts},
+                    "errors": [],
+                }
+
+            def snapshot(self, *, symbols=None, bar_limit=390):
+                return {
+                    "running": True,
+                    "subscribed_count": 2,
+                    "subscriptions": [],
+                    "quote_count": 0,
+                    "quotes": [],
+                    "bars_by_symbol": {symbol: [] for symbol in symbols or []},
+                    "errors": [],
+                    "bar_limit": bar_limit,
+                }
+
+            def stop(self):
+                self.calls.append(("stop",))
+
+        app = create_app(
+            AppConfig(
+                environment="test",
+                timezone="Europe/Stockholm",
+                database_url="sqlite+pysqlite:///:memory:",
+                session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                stockholm_instruments_path=Path("/tmp/all.txt"),
+                stockholm_identity_path=Path("/tmp/identity.parquet"),
+                api=ApiServerConfig(
+                    host="127.0.0.1",
+                    port=8000,
+                    require_loopback_only=False,
+                ),
+                ibkr=IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4001,
+                    client_id=0,
+                    diagnostic_client_id=7,
+                    streaming_client_id=9,
+                    account_id="DU1234567",
+                ),
+            )
+        )
+        fake_service = FakeMarketStreamService()
+
+        with (
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+            patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+            TestClient(app) as client,
+        ):
+            client.app.state.market_stream_service = fake_service
+            subscribe_response = client.post(
+                "/v1/market-data/stream/subscribe",
+                json={"symbols": ["axfo", "azn"], "market_data_type": "delayed"},
+            )
+            snapshot_response = client.get(
+                "/v1/market-data/stream/snapshot?symbols=AXFO,AZN&bar_limit=10"
+            )
+
+        self.assertEqual(subscribe_response.status_code, 200)
+        self.assertEqual(snapshot_response.status_code, 200)
+        self.assertEqual(subscribe_response.json()["stream"]["subscribed_count"], 2)
+        contracts, replace, market_data_type = fake_service.calls[0]
+        self.assertEqual([contract.symbol for contract in contracts], ["AXFO", "AZN"])
+        self.assertTrue(replace)
+        self.assertEqual(market_data_type, "DELAYED")
+        self.assertEqual(
+            sorted(snapshot_response.json()["stream"]["bars_by_symbol"]),
+            ["AXFO", "AZN"],
+        )
 
     def test_parse_shortability_snapshot_payload_uses_stockholm_defaults(self) -> None:
         query = parse_shortability_snapshot_payload({})
@@ -702,6 +1352,182 @@ class ApiServerTests(TestCase):
             self.assertEqual(
                 body["operator_snapshot"]["instructions"][0]["instruction_id"],
                 "instr-001",
+            )
+
+    def test_rl_candidates_endpoint_returns_model_routed_names(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "rl_candidates.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                trader_model = TraderModelRecord(
+                    model_key="long_trial_106_v1",
+                    display_name="Long Trial 106 V1",
+                    strategy_family="canonical_long_live_execution_policy",
+                    side="LONG",
+                    action_space_json=["wait", "entry_prevclose_-50bp"],
+                    observation_contract_json={"bar_family": "phase1_intraday_ohlc_v1"},
+                    execution_mapping_version="long_actions_v1",
+                    metadata_json={},
+                )
+                session.add(trader_model)
+                session.flush()
+                session.add(
+                    TraderDeploymentRecord(
+                        trader_model_id=trader_model.id,
+                        deployment_key="long_trial_106_virtual_shared_01",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        mode="virtual",
+                        status="running",
+                        is_virtual=True,
+                        allowed_symbols_json=["AXFO"],
+                        risk_limits_json={},
+                        action_constraints_json={},
+                        metadata_json={},
+                    )
+                )
+                session.add(
+                    InstructionRecord(
+                        instruction_id="candidate-AXFO",
+                        schema_version="2026-04-25",
+                        source_system="upstream-agent",
+                        batch_id="candidate-batch-001",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        symbol="AXFO",
+                        exchange="XSTO",
+                        currency="SEK",
+                        state="MODEL_ROUTED_PENDING",
+                        submit_at=datetime(2026, 4, 28, 7, 0, tzinfo=timezone.utc),
+                        expire_at=datetime(2026, 4, 28, 15, 30, tzinfo=timezone.utc),
+                        order_type="MODEL_ROUTED",
+                        side="BUY",
+                        payload={
+                            "schema_version": "2026-04-25",
+                            "source": {
+                                "system": "upstream-agent",
+                                "batch_id": "candidate-batch-001",
+                                "generated_at": "2026-04-28T06:30:00Z",
+                            },
+                            "instruction": {
+                                "instruction_id": "candidate-AXFO",
+                                "account": {
+                                    "account_key": "VIRTUALRL01",
+                                    "book_key": "rl_shared_long_trial_106_virtual_01",
+                                },
+                                "instrument": {
+                                    "symbol": "AXFO",
+                                    "security_type": "STK",
+                                    "exchange": "XSTO",
+                                    "currency": "SEK",
+                                },
+                                "intent": {
+                                    "side": "BUY",
+                                    "position_side": "LONG",
+                                },
+                                "sizing": {
+                                    "mode": "target_notional",
+                                    "target_notional": "1000",
+                                },
+                                "execution": {
+                                    "mode": "model_routed",
+                                    "model_id": "long_trial_106_v1",
+                                    "model_family": (
+                                        "canonical_long_live_execution_policy"
+                                    ),
+                                    "window": {
+                                        "start_at": "2026-04-28T09:00:00+02:00",
+                                        "end_at": "2026-04-28T17:30:00+02:00",
+                                    },
+                                },
+                                "trace": {
+                                    "reason_code": "rl_model_routed_candidate",
+                                    "trade_date": "2026-04-28",
+                                },
+                            },
+                        },
+                    )
+                )
+                session.add(
+                    InstructionRecord(
+                        instruction_id="entry-instruction-001",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="entry-batch-001",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        symbol="AXFO",
+                        exchange="XSTO",
+                        currency="SEK",
+                        state="ENTRY_PENDING",
+                        submit_at=datetime(2026, 4, 28, 7, 0, tzinfo=timezone.utc),
+                        expire_at=datetime(2026, 4, 28, 15, 30, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        payload={"instruction": {"instruction_id": "entry-instruction-001"}},
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+                engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="U25245596",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                response = client.get(
+                    "/v1/rl/candidates",
+                    params={"deployment_key": "long_trial_106_virtual_shared_01"},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertTrue(body["accepted"])
+            self.assertEqual(body["candidate_count"], 1)
+            candidate = body["candidates"][0]
+            self.assertEqual(candidate["candidate_id"], "candidate-AXFO")
+            self.assertEqual(candidate["state"], "MODEL_ROUTED_PENDING")
+            self.assertEqual(candidate["model_id"], "long_trial_106_v1")
+            self.assertEqual(candidate["symbol"], "AXFO")
+            self.assertEqual(candidate["execution_window"]["start_at"], "2026-04-28T09:00:00+02:00")
+            self.assertEqual(
+                candidate["candidate"]["instruction_id"],
+                "candidate-AXFO",
             )
 
     def test_ledger_snapshot_endpoint_returns_append_only_history(self) -> None:
@@ -1115,7 +1941,7 @@ class ApiServerTests(TestCase):
             ):
                 attention_response = client.post(
                     "/v1/broker-attention/1/review",
-                    json={"action": "ACKNOWLEDGE", "updated_by": "test-suite"},
+                    json={"action": "ARCHIVE", "updated_by": "test-suite"},
                 )
                 issue_response = client.post(
                     "/v1/reconciliation-issues/1/review",
@@ -1125,7 +1951,7 @@ class ApiServerTests(TestCase):
             self.assertEqual(attention_response.status_code, 200)
             self.assertEqual(
                 attention_response.json()["operator_review"]["status"],
-                "ACKNOWLEDGED",
+                "ARCHIVED",
             )
             self.assertEqual(issue_response.status_code, 200)
             self.assertEqual(
@@ -1189,6 +2015,191 @@ class ApiServerTests(TestCase):
 
             self.assertEqual(response.status_code, 409)
             self.assertIn("kill switch", response.text)
+
+    def test_submit_endpoint_accepts_exact_replay_and_rejects_changed_duplicate(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "submit_idempotency.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            _write_schedule_fixture(schedule_path)
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=schedule_path,
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
+            )
+
+            changed_payload = deepcopy(_sample_submit_payload())
+            changed_instruction = changed_payload["instructions"][0]
+            assert isinstance(changed_instruction, dict)
+            changed_entry = changed_instruction["entry"]
+            assert isinstance(changed_entry, dict)
+            changed_entry["limit_price"] = "11.9999"
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                first = client.post("/v1/instructions/submit", json=_sample_submit_payload())
+                replay = client.post("/v1/instructions/submit", json=_sample_submit_payload())
+                changed = client.post("/v1/instructions/submit", json=changed_payload)
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(replay.status_code, 200)
+            self.assertEqual(
+                replay.json()["submitted"]["instructions"][0]["record_id"],
+                first.json()["submitted"]["instructions"][0]["record_id"],
+            )
+            self.assertEqual(changed.status_code, 409)
+            self.assertIn("different payload", changed.text)
+
+    def test_virtual_account_and_market_watch_endpoints_persist_virtual_rows(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "virtual_api.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                account_response = client.post(
+                    "/v1/virtual/accounts",
+                    json={
+                        "account_key": "virtual0001",
+                        "base_currency": "SEK",
+                        "account_label": "RL virtual sandbox",
+                        "cash_balance": "200000",
+                    },
+                )
+                quote_response = client.post(
+                    "/v1/virtual/market-watch",
+                    json={
+                        "account_key": "virtual0001",
+                        "observed_at": "2026-04-27T09:01:00Z",
+                        "symbol": "sive",
+                        "security_type": "stk",
+                        "exchange": "xsto",
+                        "currency": "sek",
+                        "bid_price": "10.00",
+                        "ask_price": "10.00",
+                        "last_price": "10.00",
+                        "source": "test-suite",
+                    },
+                )
+                list_response = client.get(
+                    "/v1/virtual/market-watch?account_key=virtual0001&limit=5"
+                )
+
+            self.assertEqual(account_response.status_code, 200)
+            self.assertEqual(quote_response.status_code, 200)
+            self.assertEqual(list_response.status_code, 200)
+            account_body = account_response.json()["virtual_account"]
+            self.assertEqual(account_body["account_key"], "VIRTUAL0001")
+            self.assertEqual(account_body["broker_kind"], "VIRTUAL")
+            self.assertTrue(account_body["is_virtual"])
+            self.assertEqual(account_body["cash_balance"], "200000")
+
+            quote_body = quote_response.json()["virtual_market_watch"]
+            self.assertEqual(quote_body["quote"]["account_key"], "VIRTUAL0001")
+            self.assertEqual(quote_body["quote"]["symbol"], "SIVE")
+            self.assertEqual(quote_body["filled_order_count"], 0)
+            self.assertEqual(list_response.json()["quote_count"], 1)
+
+            engine = build_engine(database_url)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                account = (
+                    session.query(BrokerAccountRecord)
+                    .filter_by(broker_kind="VIRTUAL", account_key="VIRTUAL0001")
+                    .one()
+                )
+                quote = (
+                    session.query(VirtualMarketQuoteRecord)
+                    .filter_by(account_key="VIRTUAL0001", symbol="SIVE")
+                    .one()
+                )
+                snapshot_count = (
+                    session.query(AccountSnapshotRecord)
+                    .filter_by(broker_account_id=account.id, is_virtual=True)
+                    .count()
+                )
+                self.assertTrue(account.is_virtual)
+                self.assertEqual(quote.currency, "SEK")
+                self.assertEqual(quote.ask_price, "10.00")
+                self.assertGreaterEqual(snapshot_count, 1)
+                latest_snapshot = (
+                    session.query(AccountSnapshotRecord)
+                    .filter_by(broker_account_id=account.id, is_virtual=True)
+                    .order_by(AccountSnapshotRecord.snapshot_at.desc())
+                    .first()
+                )
+                self.assertEqual(latest_snapshot.total_cash_value, "200000")
+                self.assertEqual(latest_snapshot.buying_power, "200000")
+                self.assertEqual(latest_snapshot.available_funds, "200000")
+            finally:
+                session.close()
+                engine.dispose()
 
     def test_cancel_set_endpoint_cancels_pending_instructions(self) -> None:
         try:

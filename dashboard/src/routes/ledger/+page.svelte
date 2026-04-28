@@ -4,30 +4,32 @@
 
   export let data;
 
-  const AUTO_REFRESH_INTERVAL_MS = 15000;
+  const AUTO_REFRESH_INTERVAL_MS = 30000;
 
-  let ledgerSnapshot = {};
-  let summary = {};
-  let focusInstruction = null;
-  let instructionEvents = [];
-  let brokerOrderEvents = [];
-  let recentFills = [];
-  let controlEvents = [];
-  let instructionSetCancellations = [];
-  let reconciliationIssues = [];
+  let ledgerSnapshot = data.ledgerSnapshot;
+  let brokerMonitor = data.health.broker_monitor;
+  let summary = ledgerSnapshot.summary;
+  let focusInstruction = ledgerSnapshot.focus_instruction;
+  let instructionEvents = ledgerSnapshot.instruction_events;
+  let brokerOrderEvents = ledgerSnapshot.broker_order_events;
+  let recentFills = ledgerSnapshot.recent_fills;
+  let controlEvents = ledgerSnapshot.control_events;
+  let instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations;
+  let reconciliationIssues = ledgerSnapshot.reconciliation_issues;
   let endpointErrors = [];
   let refreshInFlight = false;
 
-  $: ledgerSnapshot = data.ledgerSnapshot ?? {};
-  $: summary = ledgerSnapshot.summary ?? {};
-  $: focusInstruction = ledgerSnapshot.focus_instruction ?? null;
-  $: instructionEvents = ledgerSnapshot.instruction_events ?? [];
-  $: brokerOrderEvents = ledgerSnapshot.broker_order_events ?? [];
-  $: recentFills = ledgerSnapshot.recent_fills ?? [];
-  $: controlEvents = ledgerSnapshot.control_events ?? [];
-  $: instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations ?? [];
-  $: reconciliationIssues = ledgerSnapshot.reconciliation_issues ?? [];
-  $: endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
+  $: ledgerSnapshot = data.ledgerSnapshot;
+  $: brokerMonitor = data.health.broker_monitor;
+  $: summary = ledgerSnapshot.summary;
+  $: focusInstruction = ledgerSnapshot.focus_instruction;
+  $: instructionEvents = ledgerSnapshot.instruction_events;
+  $: brokerOrderEvents = ledgerSnapshot.broker_order_events;
+  $: recentFills = ledgerSnapshot.recent_fills;
+  $: controlEvents = ledgerSnapshot.control_events;
+  $: instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations;
+  $: reconciliationIssues = ledgerSnapshot.reconciliation_issues;
+  $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
 
   async function refreshLedger() {
     if (refreshInFlight) {
@@ -55,15 +57,37 @@
   });
 
   function brokerConnected(role) {
-    return data.health?.broker_sessions?.[role]?.connected === true;
+    return data.health.broker_sessions[role].connected === true;
   }
 
   function connectionLabel(role) {
-    return brokerConnected(role) ? 'Connected' : 'Disconnected';
+    const heartbeat = brokerMonitor?.heartbeat ?? {};
+    const session = data.health.broker_sessions[role] ?? {};
+    if (heartbeat.is_stale) return 'Stale check';
+    if (heartbeat.ok === false) return 'Gateway failing';
+    if (session.connected === true) return 'Connected';
+    if (session.cooldown_seconds_remaining !== null && session.cooldown_seconds_remaining !== undefined) {
+      return 'Cooling down';
+    }
+    if (role === 'primary' && !session.last_error && Number(session.consecutive_failures ?? 0) === 0) {
+      return 'Idle';
+    }
+    return 'Disconnected';
   }
 
   function connectionClass(role) {
-    return brokerConnected(role) ? 'ok' : 'bad';
+    const heartbeat = brokerMonitor?.heartbeat ?? {};
+    const session = data.health.broker_sessions[role] ?? {};
+    if (heartbeat.is_stale) return 'warn';
+    if (heartbeat.ok === false) return 'bad';
+    if (session.connected === true) return 'ok';
+    if (session.cooldown_seconds_remaining !== null && session.cooldown_seconds_remaining !== undefined) {
+      return 'warn';
+    }
+    if (role === 'primary' && !session.last_error && Number(session.consecutive_failures ?? 0) === 0) {
+      return 'ok';
+    }
+    return 'bad';
   }
 </script>
 
@@ -93,7 +117,7 @@
       </div>
       <div>
         <span>Snapshot generated</span>
-        <strong>{ledgerSnapshot.generated_at ?? 'n/a'}</strong>
+        <strong>{ledgerSnapshot.generated_at}</strong>
       </div>
     </div>
   </header>
@@ -112,7 +136,10 @@
         <article class="focus-card">
           <span>Instruction</span>
           <strong class="mono">{focusInstruction.instruction_id}</strong>
-          <small>{focusInstruction.symbol} · {focusInstruction.account_key} · {focusInstruction.book_key}</small>
+          <small>
+            {focusInstruction.symbol} · {focusInstruction.account_key} · {focusInstruction.book_key}
+            {#if focusInstruction.is_virtual} · Virtual{/if}
+          </small>
         </article>
         <article class="focus-card">
           <span>State</span>
@@ -154,46 +181,46 @@
     <article class="stat-card">
       <span>Primary Broker Session</span>
       <strong class={connectionClass('primary')}>{connectionLabel('primary')}</strong>
-      <small>Client ID {data.health?.broker_sessions?.primary?.client_id ?? 'n/a'}</small>
+      <small>Client ID {data.health.broker_sessions.primary.client_id}, on demand</small>
     </article>
     <article class="stat-card">
       <span>Instruction Rows</span>
-      <strong>{summary.instruction_count ?? 0}</strong>
+      <strong>{summary.instruction_count}</strong>
       <small>Persisted intent rows in scope</small>
     </article>
     <article class="stat-card">
       <span>Instruction Events</span>
-      <strong>{summary.instruction_event_count ?? 0}</strong>
+      <strong>{summary.instruction_event_count}</strong>
       <small>Append-only instruction lifecycle events</small>
     </article>
     <article class="stat-card">
       <span>Broker Orders</span>
-      <strong>{summary.broker_order_count ?? 0}</strong>
+      <strong>{summary.broker_order_count}</strong>
       <small>Persisted broker order envelopes in scope</small>
     </article>
     <article class="stat-card">
       <span>Broker Order Events</span>
-      <strong>{summary.broker_order_event_count ?? 0}</strong>
+      <strong>{summary.broker_order_event_count}</strong>
       <small>Broker callback and order lifecycle rows</small>
     </article>
     <article class="stat-card">
       <span>Fills</span>
-      <strong>{summary.execution_fill_count ?? 0}</strong>
+      <strong>{summary.execution_fill_count}</strong>
       <small>Durable executions in scope</small>
     </article>
     <article class="stat-card">
       <span>Control Events</span>
-      <strong>{summary.control_event_count ?? 0}</strong>
+      <strong>{summary.control_event_count}</strong>
       <small>Kill switch and future controls history</small>
     </article>
     <article class="stat-card">
       <span>Cancellation Requests</span>
-      <strong>{summary.instruction_set_cancellation_count ?? 0}</strong>
+      <strong>{summary.instruction_set_cancellation_count}</strong>
       <small>Operator cancellation audit rows</small>
     </article>
     <article class="stat-card">
       <span>Reconciliation Issues</span>
-      <strong>{summary.reconciliation_issue_count ?? 0}</strong>
+      <strong>{summary.reconciliation_issue_count}</strong>
       <small>Durable warning and error rows in scope</small>
     </article>
   </section>
@@ -223,7 +250,10 @@
             {#each instructionEvents as event}
               <tr>
                 <td>{event.event_at}</td>
-                <td class="mono">{event.instruction_id}</td>
+                <td class="mono">
+                  {event.instruction_id}
+                  {#if event.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                </td>
                 <td>{event.symbol}</td>
                 <td>{event.event_type}</td>
                 <td>{event.state_before ?? 'n/a'} → {event.state_after ?? 'n/a'}</td>
@@ -263,7 +293,10 @@
               <tr>
                 <td>{event.event_at}</td>
                 <td>{event.symbol}</td>
-                <td class="mono">{event.instruction_id ?? 'n/a'}</td>
+                <td class="mono">
+                  {event.instruction_id ?? 'n/a'}
+                  {#if event.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                </td>
                 <td>{event.external_order_id ?? event.broker_order_id}</td>
                 <td>{event.event_type}</td>
                 <td>{event.status_before ?? 'n/a'} → {event.status_after ?? 'n/a'}</td>
@@ -302,7 +335,10 @@
               {#each recentFills as fill}
                 <tr>
                   <td>{fill.executed_at}</td>
-                  <td class="mono">{fill.instruction_id ?? 'n/a'}</td>
+                  <td class="mono">
+                    {fill.instruction_id ?? 'n/a'}
+                    {#if fill.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                  </td>
                   <td>{fill.symbol}</td>
                   <td>{fill.side ?? 'n/a'}</td>
                   <td>{fill.quantity}</td>
@@ -615,6 +651,18 @@
   .pill.neutral {
     color: var(--text-secondary);
     border-color: var(--border-strong);
+  }
+
+  .mini-badge {
+    display: inline-flex;
+    margin-left: 0.35rem;
+    padding: 0.08rem 0.35rem;
+    border: 1px solid var(--warn);
+    border-radius: 999px;
+    color: var(--warn);
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
   }
 
   .ok {

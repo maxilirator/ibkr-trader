@@ -185,6 +185,116 @@ So the rule is:
 }
 ```
 
+## Virtual Account Targeting
+
+To run the same contract through the virtual execution path, keep the payload
+shape unchanged and set `account.account_key` to a key that starts with
+`virtual`, for example `virtual0001`.
+
+The API normalizes that key to uppercase, marks all persisted execution rows
+with `is_virtual=true`, and routes order submission, cancellation, market-price
+reads, fills, account snapshots, and position snapshots through the local
+virtual adapter instead of IB Gateway.
+
+Minimal account fragment:
+
+```json
+{
+  "account": {
+    "account_key": "virtual0001",
+    "book_key": "rl_virtual_book",
+    "book_role": "virtual",
+    "book_side": "LONG"
+  }
+}
+```
+
+Virtual execution currently ignores requested quantity and fills `quantity="1"`
+when the virtual market-watch price crosses the order condition. Each virtual
+fill uses a fixed commission of `49 SEK`.
+
+See [Virtual Trading](virtual-trading.md) for the full API contract and smoke
+test sequence.
+
+## Model-Routed Candidate Lists
+
+Use schema version `2026-04-25` with `execution.mode="model_routed"` when the
+payload is a candidate list for an RL/model runner rather than a deterministic
+broker order. In this mode, omit `entry` and `exit`. The API validates and
+persists the instruction in `MODEL_ROUTED_PENDING`; the normal execution worker
+does not submit it to IBKR or the virtual adapter.
+
+The envelope still uses the word `instructions` because it shares the validated
+submit contract, but model-routed rows are RL candidate names. The runner should
+read them from `GET /v1/rl/candidates`, roll each symbol forward bar by bar,
+and only create an executable trader instruction after the model emits an
+action.
+
+Example instruction:
+
+```json
+{
+  "instruction_id": "2026-04-28-VIRTUALRL01-long-AXFO-model-routed",
+  "account": {
+    "account_key": "VIRTUALRL01",
+    "book_key": "rl_shared_long_trial_106_virtual_01",
+    "book_role": "virtual",
+    "book_side": "LONG"
+  },
+  "instrument": {
+    "symbol": "AXFO",
+    "security_type": "STK",
+    "exchange": "XSTO",
+    "currency": "SEK"
+  },
+  "intent": {
+    "side": "BUY",
+    "position_side": "LONG"
+  },
+  "sizing": {
+    "mode": "target_notional",
+    "target_notional": "1000",
+    "funding_basis": "cash"
+  },
+  "execution": {
+    "mode": "model_routed",
+    "model_id": "long_trial_106_v1",
+    "model_family": "canonical_long_live_execution_policy",
+    "model_version": "v1",
+    "model_artifact_id": "trial_106",
+    "window": {
+      "start_at": "2026-04-28T09:00:00+02:00",
+      "end_at": "2026-04-28T17:30:00+02:00"
+    }
+  },
+  "trace": {
+    "reason_code": "rl_model_routed_candidate",
+    "trade_date": "2026-04-28",
+    "data_cutoff_date": "2026-03-23",
+    "metadata": {
+      "static_features": {
+        "schema_version": "rl_static_features_v1",
+        "model_key": "long_trial_106_v1",
+        "feature_schema_version": "long_trial_106_static_v1",
+        "feature_names": ["rank_score_z", "turnover_z"],
+        "values": [0.25, -1.5],
+        "normalized": true,
+        "source": "upstream_candidate_payload"
+      }
+    }
+  }
+}
+```
+
+For RL candidates, `trace.metadata.static_features` is the preferred per-name
+static feature vector. `feature_names` must be in the exact order expected by
+the promoted model's `static_feature_cols.csv`, `values` must be finite numbers,
+and `normalized` must be `true`.
+
+`GET /v1/rl/candidates` is the preferred RL-agent view. `GET /v1/instructions`
+and `GET /v1/instructions/{instruction_id}` still include the persisted payload
+for auditing and debugging.
+
 ## What changes from the current payload
 
 ### Remove entirely

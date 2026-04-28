@@ -75,6 +75,30 @@ Responsibilities:
 - expose probe, validation, and later order-management endpoints
 - keep broker access isolated even when the trader API itself is LAN-visible
 
+### 3B. Virtual Execution Adapter
+
+Local execution adapter for accounts whose key starts with `virtual`, such as
+`virtual0001`.
+
+Responsibilities:
+
+- create virtual broker-account records and snapshots
+- accept virtual market-watch quotes through the Trader Control API
+- route virtual entry, exit, cancel, and market-price reads away from IBKR
+- fill virtual orders when the virtual quote crosses the order condition
+- write broker orders, fills, account snapshots, and position snapshots into the
+  same ledger tables as real broker execution
+- mark every virtual row with `is_virtual=true`
+
+Current simulation rules:
+
+- requested quantity is intentionally ignored for now and every fill uses
+  `quantity="1"`
+- every fill records a fixed `49 SEK` commission
+- virtual-only runtime cycles do not fetch a broker runtime snapshot from IBKR
+- the operator, ledger, and RL dashboards display virtual accounts and rows with
+  a `Virtual` badge
+
 ### 4. Risk and Controls
 
 Independent guardrail layer between instruction intake and broker execution.
@@ -96,9 +120,16 @@ Suggested responsibilities:
 
 - top-of-book snapshots
 - intraday bars
-- optional tick streams where justified
+- persistent live tick/market streams for active intraday agents
 - shortability and borrow metadata
 - fills, order events, and account snapshots
+
+For RL candidate lists, the live path is a persistent market-data stream:
+subscribe the active names once, maintain an in-memory 1-minute OHLC buffer from
+last-price ticks, and let the RL observation builder aggregate those source bars
+into the 5-minute `phase1_intraday_ohlc_v1` contract. The active name count is
+dynamic per booster run, so a 5-name day and a 30-name day use the same stream
+path. Do not implement this as one historical-bar request per name every minute.
 
 ### 5A. Stockholm Intraday Backfill
 
@@ -193,12 +224,13 @@ Current request shape:
 {
   "as_of_date": "2026-04-24",
   "bar_size": "1 min",
-  "what_to_show": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
+  "what_to_show": ["TRADES"],
   "use_rth": true,
   "max_symbols": 25,
   "start_after": null,
   "include_remapped": false,
-  "sleep_seconds": 0.05
+  "sleep_seconds": 0.05,
+  "max_runtime_seconds": 55
 }
 ```
 
@@ -209,7 +241,7 @@ Current behavior:
    - all `resolves_cleanly` names
    - optionally `resolves_suspiciously_remapped` names only when explicitly enabled or approved
 3. For each selected contract:
-   - request `1 D` of `1 min` bars ending at Stockholm close for `as_of_date`
+   - request `1 D` of `1 min` raw trade bars ending at Stockholm close for `as_of_date`
    - return bars in native trading currency
    - keep the resolved IBKR identifiers with the payload:
      - `conId`
@@ -248,11 +280,20 @@ Implementation notes:
 
 - use one dedicated diagnostic client ID for the collector
 - pace requests gently and keep the job single-session
+- use `max_runtime_seconds` so a nightly page returns partial results with a
+  resumable cursor instead of timing out at the HTTP client
+- collect optional `MIDPOINT`, `BID`, and `ASK` series in smaller second-pass
+  pages if they are needed
+- do not request `ADJUSTED_LAST` through this dated intraday endpoint; IBKR
+  rejects explicit end dates for that series, so adjusted prices should come
+  from downstream adjustment factors or a separate adjusted-close source
 - the current endpoint still resolves via the Stockholm identity map on each run; the next hardening step is to move it to a durable broker-resolved master
 - contract-master refresh should be a separate slower job, not part of the nightly bar backfill
 - the calling repo should handle persistence and keep the nightly job idempotent at the `(date, conId, bar_size, what_to_show)` level
 
 ## RL Trader Execution Layer
+
+For the operational setup version of this section, see [RL Setup Guide](rl-setup.md).
 
 The next execution layer should let a promoted RL policy trade through the same
 durable instruction and broker-order path as every other strategy in this repo.
@@ -266,7 +307,7 @@ Strong boundary:
 
 ### Account model
 
-Recommended deployment model:
+Recommended real-broker deployment model:
 
 - use a real IBKR account as the top-level execution boundary
 - keep `account_key` equal to that real broker account
@@ -286,6 +327,15 @@ Practical rule:
 - only allow multiple autonomous RL deployments inside the same account later,
   once we add explicit cross-model position arbitration
 
+Virtual exception:
+
+- for local RL testing without paper-account live data, bind the deployment to a
+  virtual account such as `virtual0001`
+- use `mode="virtual"`
+- publish quotes through `/v1/virtual/market-watch`
+- let the normal instruction runtime submit and reconcile the virtual orders
+- keep virtual and real rows distinguishable through `is_virtual=true`
+
 ### Core registry objects
 
 Suggested durable objects:
@@ -298,10 +348,10 @@ Suggested durable objects:
   - action-space version
   - default execution mapping version
 - `trader_deployment`
-  - one live or paper binding of a model
+  - one live, paper, or virtual binding of a model
   - immutable `account_key`
   - immutable `book_key`
-  - mode: `paper` or `live`
+  - mode: `paper`, `live`, or `virtual`
   - status: `draft`, `paused`, `running`, `degraded`, `stopped`
   - approved symbol universe
   - deployment-level risk limits
@@ -395,7 +445,9 @@ Every promoted RL model should declare the bar and feature contract it expects.
 For the current short research line, the model metadata should carry at least:
 
 - the promoted workflow and checkpoint path
-- bar family, for example `stockholm_intraday_1m_v1`
+- model bar family, for example `phase1_intraday_ohlc_v1`
+- target model bar interval, currently `5m`
+- source adapter, currently `ibkr_live_market_stream_1m_to_phase1_5m_ohlc_v1`
 - required series, such as:
   - `TRADES`
   - optional `MIDPOINT`, `BID`, `ASK`, `ADJUSTED_LAST`
@@ -430,6 +482,13 @@ This preserves:
 ### Operator UX
 
 Add a dedicated RL dashboard view, not just more rows in the general operator page.
+
+Safety rule:
+
+- dashboards must fail visibly when the API base URL, health response, read
+  model, or required registry payload field is missing
+- do not render synthetic account, model, deployment, action, or heartbeat data
+  as a fallback
 
 Suggested sections:
 
@@ -469,7 +528,8 @@ The safest first slice is:
 2. add a deployment-bound action intake API that writes append-only action rows
 3. translate valid actions into the existing instruction contract
 4. add a read model and dashboard page for RL deployments and action history
-5. require every deployment to bind to one real `account_key`
+5. allow virtual deployments for local simulation, while real broker
+   deployments still bind to one real `account_key`
 
 ## Recommended near-term roadmap
 

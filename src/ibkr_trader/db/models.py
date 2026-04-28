@@ -117,6 +117,7 @@ class TraderDeploymentRecord(TimestampMixin, Base):
     book_key: Mapped[str] = mapped_column(String(64), nullable=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     allowed_symbols_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     risk_limits_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     action_constraints_json: Mapped[dict[str, Any]] = mapped_column(
@@ -218,6 +219,7 @@ class InstructionRecord(TimestampMixin, Base):
         Index("ix_instruction_broker_order_id", "broker_order_id"),
         Index("ix_instruction_broker_perm_id", "broker_perm_id"),
         Index("ix_instruction_exit_order_id", "exit_order_id"),
+        Index("ix_instruction_archived_at", "archived_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -227,6 +229,7 @@ class InstructionRecord(TimestampMixin, Base):
     batch_id: Mapped[str] = mapped_column(String(128), nullable=False)
     account_key: Mapped[str] = mapped_column(String(64), nullable=False)
     book_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     exchange: Mapped[str] = mapped_column(String(32), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
@@ -251,6 +254,9 @@ class InstructionRecord(TimestampMixin, Base):
     exit_filled_quantity: Mapped[str | None] = mapped_column(String(64))
     exit_avg_fill_price: Mapped[str | None] = mapped_column(String(64))
     exit_filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by: Mapped[str | None] = mapped_column(String(64))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
     events: Mapped[list["InstructionEventRecord"]] = relationship(
@@ -419,6 +425,7 @@ class BrokerAccountRecord(TimestampMixin, Base):
     account_label: Mapped[str | None] = mapped_column(String(256))
     base_currency: Mapped[str | None] = mapped_column(String(8))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     orders: Mapped[list["BrokerOrderRecord"]] = relationship(back_populates="broker_account")
@@ -460,6 +467,7 @@ class BrokerOrderRecord(TimestampMixin, Base):
     )
     broker_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     account_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     order_role: Mapped[str] = mapped_column(String(32), nullable=False)
     external_order_id: Mapped[str | None] = mapped_column(String(64))
     external_perm_id: Mapped[str | None] = mapped_column(String(64))
@@ -518,6 +526,9 @@ class BrokerOrderEventRecord(Base):
     )
     status_before: Mapped[str | None] = mapped_column(String(32))
     status_after: Mapped[str | None] = mapped_column(String(32))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by: Mapped[str | None] = mapped_column(String(64))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
 
@@ -554,6 +565,7 @@ class ExecutionFillRecord(TimestampMixin, Base):
     )
     broker_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     account_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     external_execution_id: Mapped[str] = mapped_column(String(128), nullable=False)
     external_order_id: Mapped[str | None] = mapped_column(String(64))
     external_perm_id: Mapped[str | None] = mapped_column(String(64))
@@ -590,6 +602,7 @@ class AccountSnapshotRecord(TimestampMixin, Base):
         ForeignKey("broker_account.id", ondelete="CASCADE"),
         nullable=False,
     )
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     net_liquidation: Mapped[str | None] = mapped_column(String(64))
@@ -621,6 +634,7 @@ class PositionSnapshotRecord(TimestampMixin, Base):
         ForeignKey("broker_account.id", ondelete="CASCADE"),
         nullable=False,
     )
+    is_virtual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -640,6 +654,34 @@ class PositionSnapshotRecord(TimestampMixin, Base):
     broker_account: Mapped[BrokerAccountRecord] = relationship(
         back_populates="position_snapshots"
     )
+
+
+class VirtualMarketQuoteRecord(TimestampMixin, Base):
+    """Append-only virtual market-watch quote used by simulated accounts."""
+
+    __tablename__ = "virtual_market_quote"
+    __table_args__ = (
+        Index("ix_virtual_market_quote_account_symbol", "account_key", "symbol"),
+        Index("ix_virtual_market_quote_observed_at", "observed_at"),
+        Index("ix_virtual_market_quote_instrument", "symbol", "exchange", "currency"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    security_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    primary_exchange: Mapped[str | None] = mapped_column(String(32))
+    local_symbol: Mapped[str | None] = mapped_column(String(64))
+    bid_price: Mapped[str | None] = mapped_column(String(64))
+    ask_price: Mapped[str | None] = mapped_column(String(64))
+    last_price: Mapped[str | None] = mapped_column(String(64))
+    midpoint_price: Mapped[str | None] = mapped_column(String(64))
+    source: Mapped[str | None] = mapped_column(String(64))
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class ReconciliationRunRecord(TimestampMixin, Base):
@@ -695,6 +737,9 @@ class ReconciliationIssueRecord(Base):
         default=utc_now,
         nullable=False,
     )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by: Mapped[str | None] = mapped_column(String(64))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     reconciliation_run: Mapped[ReconciliationRunRecord] = relationship(

@@ -36,6 +36,18 @@ class _FakeSyncWrapper:
         return [{"event_type": "order_status"}]
 
 
+class _FailingSyncWrapper(_FakeSyncWrapper):
+    def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
+        self.connect_calls += 1
+        self.connected = False
+        self.connection_args = (host, port, client_id)
+        return False
+
+
+class _FailingSyncWrapperWithReason(_FailingSyncWrapper):
+    last_connect_failure_reason = "socket connected but API startup did not return nextValidId"
+
+
 class SessionManagerTests(TestCase):
     def setUp(self) -> None:
         _FakeSyncWrapper.instances = []
@@ -161,6 +173,91 @@ class SessionManagerTests(TestCase):
         self.assertEqual(events, [{"event_type": "order_status"}])
         status = session.status()
         self.assertEqual(status.metrics.checkout_count, 1)
+
+    def test_failed_connect_enters_cooldown_without_repeated_socket_attempts(self) -> None:
+        session = ManagedSyncSession(
+            "primary",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=0,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FailingSyncWrapper,
+            initial_connect_backoff_seconds=60,
+            max_connect_backoff_seconds=60,
+        )
+
+        with self.assertRaisesRegex(ConnectionError, "Failed to connect"):
+            session.execute("probe", lambda app: app.connection_args)
+        with self.assertRaisesRegex(ConnectionError, "cooling down"):
+            session.execute("probe", lambda app: app.connection_args)
+
+        status = session.status()
+        self.assertFalse(status.connected)
+        self.assertEqual(status.metrics.connect_attempt_count, 1)
+        self.assertEqual(status.consecutive_failures, 1)
+        self.assertIsNotNone(status.cooldown_until)
+        self.assertIsNotNone(status.cooldown_seconds_remaining)
+        self.assertIn("Failed to connect", status.last_error or "")
+        self.assertNotIn("cooling down after", status.last_error or "")
+
+    def test_failed_connect_reports_wrapper_failure_reason(self) -> None:
+        session = ManagedSyncSession(
+            "diagnostic",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FailingSyncWrapperWithReason,
+            initial_connect_backoff_seconds=60,
+            max_connect_backoff_seconds=60,
+        )
+
+        with self.assertRaisesRegex(ConnectionError, "nextValidId"):
+            session.execute("heartbeat_probe", lambda app: app.connection_args)
+
+        status = session.status()
+        self.assertEqual(
+            status.last_error,
+            "socket connected but API startup did not return nextValidId",
+        )
+
+    def test_execute_can_ignore_cooldown_for_explicit_health_checks(self) -> None:
+        session = ManagedSyncSession(
+            "diagnostic",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FailingSyncWrapper,
+            initial_connect_backoff_seconds=60,
+            max_connect_backoff_seconds=60,
+        )
+
+        with self.assertRaisesRegex(ConnectionError, "Failed to connect"):
+            session.execute("probe", lambda app: app.connection_args)
+        with self.assertRaisesRegex(ConnectionError, "cooling down"):
+            session.execute("probe", lambda app: app.connection_args)
+        with self.assertRaisesRegex(ConnectionError, "Failed to connect"):
+            session.execute(
+                "heartbeat_probe",
+                lambda app: app.connection_args,
+                ignore_cooldown=True,
+            )
+
+        status = session.status()
+        self.assertEqual(status.metrics.connect_attempt_count, 2)
+        self.assertEqual(status.consecutive_failures, 2)
+        self.assertIn("Failed to connect", status.last_error or "")
+        self.assertNotIn("cooling down after", status.last_error or "")
 
     def test_execute_serializes_access_to_shared_session(self) -> None:
         session = ManagedSyncSession(

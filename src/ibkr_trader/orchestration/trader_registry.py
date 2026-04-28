@@ -14,18 +14,7 @@ from ibkr_trader.db.models import TraderActionRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderHeartbeatRecord
 from ibkr_trader.db.models import TraderModelRecord
-
-
-RL_SHORT_ACTION_SPACE = (
-    "skip",
-    "wait",
-    "market_entry",
-    "cancel_entry",
-    "exit_market",
-    "clear_exit",
-    "entry_prevclose_88bp",
-    "exit_tp_180bp",
-)
+from ibkr_trader.virtual.accounts import is_virtual_account_key
 
 
 class TraderModelConflictError(RuntimeError):
@@ -69,6 +58,7 @@ class TraderDeploymentRegistration:
     book_key: str
     mode: str
     status: str
+    is_virtual: bool
     allowed_symbols: tuple[str, ...]
     risk_limits: dict[str, Any]
     action_constraints: dict[str, Any]
@@ -146,8 +136,7 @@ def _normalize_action_space(action_space: list[str] | tuple[str, ...]) -> list[s
     return normalized
 
 
-def register_trader_model(
-    session_factory: sessionmaker,
+def _normalize_model_registration_fields(
     *,
     model_key: str,
     display_name: str,
@@ -156,10 +145,10 @@ def register_trader_model(
     source_workflow_path: str | None,
     promoted_checkpoint_path: str | None,
     action_space: list[str] | tuple[str, ...],
-    observation_contract: dict[str, Any] | None = None,
-    execution_mapping_version: str | None = None,
-    metadata: dict[str, Any] | None = None,
-) -> TraderModelRegistration:
+    observation_contract: dict[str, Any] | None,
+    execution_mapping_version: str | None,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
     normalized_model_key = model_key.strip().lower()
     if not normalized_model_key:
         raise ValueError("model_key is required")
@@ -176,55 +165,169 @@ def register_trader_model(
     if normalized_side not in {"LONG", "SHORT", "MIXED"}:
         raise ValueError("side must be LONG, SHORT, or MIXED")
 
-    normalized_action_space = _normalize_action_space(action_space)
+    return {
+        "model_key": normalized_model_key,
+        "display_name": normalized_display_name,
+        "strategy_family": normalized_strategy_family,
+        "side": normalized_side,
+        "source_workflow_path": source_workflow_path.strip()
+        if source_workflow_path
+        else None,
+        "promoted_checkpoint_path": promoted_checkpoint_path.strip()
+        if promoted_checkpoint_path
+        else None,
+        "action_space_json": _normalize_action_space(action_space),
+        "observation_contract_json": dict(observation_contract or {}),
+        "execution_mapping_version": execution_mapping_version.strip()
+        if execution_mapping_version
+        else None,
+        "metadata_json": dict(metadata or {}),
+    }
+
+
+def _model_registration_from_record(
+    record: TraderModelRecord,
+) -> TraderModelRegistration:
+    return TraderModelRegistration(
+        model_key=record.model_key,
+        display_name=record.display_name,
+        strategy_family=record.strategy_family,
+        side=record.side,
+        source_workflow_path=record.source_workflow_path,
+        promoted_checkpoint_path=record.promoted_checkpoint_path,
+        action_space=tuple(record.action_space_json),
+        observation_contract=dict(record.observation_contract_json),
+        execution_mapping_version=record.execution_mapping_version,
+        metadata=dict(record.metadata_json),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _deployment_registration_from_record(
+    record: TraderDeploymentRecord,
+) -> TraderDeploymentRegistration:
+    return TraderDeploymentRegistration(
+        deployment_key=record.deployment_key,
+        model_key=record.trader_model.model_key,
+        display_name=record.trader_model.display_name,
+        account_key=record.account_key,
+        book_key=record.book_key,
+        mode=record.mode,
+        status=record.status,
+        is_virtual=record.is_virtual,
+        allowed_symbols=tuple(record.allowed_symbols_json),
+        risk_limits=dict(record.risk_limits_json),
+        action_constraints=dict(record.action_constraints_json),
+        metadata=dict(record.metadata_json),
+        started_at=record.started_at,
+        paused_at=record.paused_at,
+        stopped_at=record.stopped_at,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _normalize_deployment_status(status: str) -> str:
+    normalized_status = status.strip().lower()
+    if normalized_status not in {"draft", "paused", "running", "degraded", "stopped"}:
+        raise ValueError(
+            "status must be draft, paused, running, degraded, or stopped"
+        )
+    return normalized_status
+
+
+def register_trader_model(
+    session_factory: sessionmaker,
+    *,
+    model_key: str,
+    display_name: str,
+    strategy_family: str,
+    side: str,
+    source_workflow_path: str | None,
+    promoted_checkpoint_path: str | None,
+    action_space: list[str] | tuple[str, ...],
+    observation_contract: dict[str, Any] | None = None,
+    execution_mapping_version: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> TraderModelRegistration:
+    normalized = _normalize_model_registration_fields(
+        model_key=model_key,
+        display_name=display_name,
+        strategy_family=strategy_family,
+        side=side,
+        source_workflow_path=source_workflow_path,
+        promoted_checkpoint_path=promoted_checkpoint_path,
+        action_space=action_space,
+        observation_contract=observation_contract,
+        execution_mapping_version=execution_mapping_version,
+        metadata=metadata,
+    )
 
     with session_scope(session_factory) as session:
         existing = session.execute(
             select(TraderModelRecord).where(
-                TraderModelRecord.model_key == normalized_model_key
+                TraderModelRecord.model_key == normalized["model_key"]
             )
         ).scalar_one_or_none()
         if existing is not None:
             raise TraderModelConflictError(
-                f"Trader model '{normalized_model_key}' already exists."
+                f"Trader model '{normalized['model_key']}' already exists."
             )
 
-        record = TraderModelRecord(
-            model_key=normalized_model_key,
-            display_name=normalized_display_name,
-            strategy_family=normalized_strategy_family,
-            side=normalized_side,
-            source_workflow_path=source_workflow_path.strip()
-            if source_workflow_path
-            else None,
-            promoted_checkpoint_path=promoted_checkpoint_path.strip()
-            if promoted_checkpoint_path
-            else None,
-            action_space_json=normalized_action_space,
-            observation_contract_json=dict(observation_contract or {}),
-            execution_mapping_version=execution_mapping_version.strip()
-            if execution_mapping_version
-            else None,
-            metadata_json=dict(metadata or {}),
-        )
+        record = TraderModelRecord(**normalized)
         session.add(record)
         session.flush()
         session.refresh(record)
 
-        return TraderModelRegistration(
-            model_key=record.model_key,
-            display_name=record.display_name,
-            strategy_family=record.strategy_family,
-            side=record.side,
-            source_workflow_path=record.source_workflow_path,
-            promoted_checkpoint_path=record.promoted_checkpoint_path,
-            action_space=tuple(record.action_space_json),
-            observation_contract=dict(record.observation_contract_json),
-            execution_mapping_version=record.execution_mapping_version,
-            metadata=dict(record.metadata_json),
-            created_at=record.created_at,
-            updated_at=record.updated_at,
-        )
+        return _model_registration_from_record(record)
+
+
+def upsert_trader_model(
+    session_factory: sessionmaker,
+    *,
+    model_key: str,
+    display_name: str,
+    strategy_family: str,
+    side: str,
+    source_workflow_path: str | None,
+    promoted_checkpoint_path: str | None,
+    action_space: list[str] | tuple[str, ...],
+    observation_contract: dict[str, Any] | None = None,
+    execution_mapping_version: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> TraderModelRegistration:
+    normalized = _normalize_model_registration_fields(
+        model_key=model_key,
+        display_name=display_name,
+        strategy_family=strategy_family,
+        side=side,
+        source_workflow_path=source_workflow_path,
+        promoted_checkpoint_path=promoted_checkpoint_path,
+        action_space=action_space,
+        observation_contract=observation_contract,
+        execution_mapping_version=execution_mapping_version,
+        metadata=metadata,
+    )
+
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(TraderModelRecord).where(
+                TraderModelRecord.model_key == normalized["model_key"]
+            )
+        ).scalar_one_or_none()
+        if record is None:
+            record = TraderModelRecord(**normalized)
+            session.add(record)
+        else:
+            for field_name, value in normalized.items():
+                if field_name == "model_key":
+                    continue
+                setattr(record, field_name, value)
+        session.flush()
+        session.refresh(record)
+
+        return _model_registration_from_record(record)
 
 
 def create_trader_deployment(
@@ -258,14 +361,15 @@ def create_trader_deployment(
         raise ValueError("book_key is required")
 
     normalized_mode = mode.strip().lower()
-    if normalized_mode not in {"paper", "live"}:
-        raise ValueError("mode must be paper or live")
+    if normalized_mode not in {"paper", "live", "virtual"}:
+        raise ValueError("mode must be paper, live, or virtual")
+    account_is_virtual = is_virtual_account_key(normalized_account_key)
+    if account_is_virtual and normalized_mode != "virtual":
+        raise ValueError("virtual account_key requires mode virtual")
+    if normalized_mode == "virtual" and not account_is_virtual:
+        raise ValueError("mode virtual requires an account_key starting with VIRTUAL")
 
-    normalized_status = status.strip().lower()
-    if normalized_status not in {"draft", "paused", "running", "degraded", "stopped"}:
-        raise ValueError(
-            "status must be draft, paused, running, degraded, or stopped"
-        )
+    normalized_status = _normalize_deployment_status(status)
 
     normalized_allowed_symbols = _normalize_symbol_list(allowed_symbols)
     started_at = utc_now() if normalized_status == "running" else None
@@ -300,6 +404,7 @@ def create_trader_deployment(
             book_key=normalized_book_key,
             mode=normalized_mode,
             status=normalized_status,
+            is_virtual=account_is_virtual,
             allowed_symbols_json=normalized_allowed_symbols,
             risk_limits_json=dict(risk_limits or {}),
             action_constraints_json=dict(action_constraints or {}),
@@ -312,24 +417,93 @@ def create_trader_deployment(
         session.flush()
         session.refresh(record)
 
-        return TraderDeploymentRegistration(
-            deployment_key=record.deployment_key,
-            model_key=model_record.model_key,
-            display_name=model_record.display_name,
-            account_key=record.account_key,
-            book_key=record.book_key,
-            mode=record.mode,
-            status=record.status,
-            allowed_symbols=tuple(record.allowed_symbols_json),
-            risk_limits=dict(record.risk_limits_json),
-            action_constraints=dict(record.action_constraints_json),
-            metadata=dict(record.metadata_json),
-            started_at=record.started_at,
-            paused_at=record.paused_at,
-            stopped_at=record.stopped_at,
-            created_at=record.created_at,
-            updated_at=record.updated_at,
-        )
+        return _deployment_registration_from_record(record)
+
+
+def update_trader_deployment(
+    session_factory: sessionmaker,
+    *,
+    deployment_key: str,
+    account_key: str | None = None,
+    book_key: str | None = None,
+    mode: str | None = None,
+    status: str | None = None,
+    allowed_symbols: list[str] | tuple[str, ...] | None = None,
+    risk_limits: dict[str, Any] | None = None,
+    action_constraints: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> TraderDeploymentRegistration:
+    normalized_deployment_key = deployment_key.strip().lower()
+    if not normalized_deployment_key:
+        raise ValueError("deployment_key is required")
+
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(TraderDeploymentRecord)
+            .join(TraderModelRecord)
+            .where(TraderDeploymentRecord.deployment_key == normalized_deployment_key)
+        ).scalar_one_or_none()
+        if record is None:
+            raise TraderDeploymentNotFoundError(
+                f"Trader deployment '{normalized_deployment_key}' was not found."
+            )
+
+        next_account_key = record.account_key
+        if account_key is not None:
+            next_account_key = account_key.strip().upper()
+            if not next_account_key:
+                raise ValueError("account_key is required")
+
+        next_mode = record.mode
+        if mode is not None:
+            next_mode = mode.strip().lower()
+            if next_mode not in {"paper", "live", "virtual"}:
+                raise ValueError("mode must be paper, live, or virtual")
+
+        account_is_virtual = is_virtual_account_key(next_account_key)
+        if account_is_virtual and next_mode != "virtual":
+            raise ValueError("virtual account_key requires mode virtual")
+        if next_mode == "virtual" and not account_is_virtual:
+            raise ValueError("mode virtual requires an account_key starting with VIRTUAL")
+
+        record.account_key = next_account_key
+        record.mode = next_mode
+        record.is_virtual = account_is_virtual
+
+        if book_key is not None:
+            normalized_book_key = book_key.strip().lower()
+            if not normalized_book_key:
+                raise ValueError("book_key is required")
+            record.book_key = normalized_book_key
+
+        if status is not None:
+            normalized_status = _normalize_deployment_status(status)
+            now = utc_now()
+            record.status = normalized_status
+            if normalized_status == "running" and record.started_at is None:
+                record.started_at = now
+            if normalized_status == "running":
+                record.paused_at = None
+                record.stopped_at = None
+            if normalized_status == "paused":
+                record.paused_at = now
+                record.stopped_at = None
+            if normalized_status == "stopped":
+                record.stopped_at = now
+
+        if allowed_symbols is not None:
+            record.allowed_symbols_json = _normalize_symbol_list(allowed_symbols)
+        if risk_limits is not None:
+            record.risk_limits_json = dict(risk_limits)
+        if action_constraints is not None:
+            record.action_constraints_json = dict(action_constraints)
+        if metadata is not None:
+            record.metadata_json = dict(metadata)
+
+        session.flush()
+        session.refresh(record)
+
+        return _deployment_registration_from_record(record)
 
 
 def log_trader_action(
@@ -489,7 +663,6 @@ def upsert_trader_heartbeat(
 
 
 __all__ = [
-    "RL_SHORT_ACTION_SPACE",
     "TraderActionLogEntry",
     "TraderDeploymentConflictError",
     "TraderDeploymentNotFoundError",
@@ -502,5 +675,7 @@ __all__ = [
     "create_trader_deployment",
     "log_trader_action",
     "register_trader_model",
+    "update_trader_deployment",
+    "upsert_trader_model",
     "upsert_trader_heartbeat",
 ]

@@ -158,7 +158,10 @@ The initial FastAPI wrapper includes:
 - `POST /v1/instructions/schedule-preview`
 - `POST /v1/instructions/validate`
 - `POST /v1/rl/models/register`
+- `POST /v1/rl/models/upsert`
+- `PUT /v1/rl/models/{model_key}`
 - `POST /v1/rl/deployments`
+- `PATCH /v1/rl/deployments/{deployment_key}`
 - `POST /v1/rl/actions/log`
 - `POST /v1/rl/deployments/{deployment_key}/heartbeat`
 - `GET /v1/read/rl-dashboard`

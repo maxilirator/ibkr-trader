@@ -1,6 +1,7 @@
-import { fail } from '@sveltejs/kit';
+import { error, fail } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import {
+  buildFallbackHealth,
   buildEndpointErrorMap,
   normalizeBaseUrl,
   postJson,
@@ -15,19 +16,6 @@ function readOptionalField(formData, fieldName) {
   }
   const normalized = String(value).trim();
   return normalized || null;
-}
-
-function parseInstructionIds(rawValue) {
-  if (!rawValue) {
-    return null;
-  }
-
-  const instructionIds = rawValue
-    .split(/[\s,]+/)
-    .map((value) => value.trim())
-    .filter(Boolean);
-
-  return instructionIds.length > 0 ? instructionIds : null;
 }
 
 function parsePositiveIntegerIds(rawValue) {
@@ -50,28 +38,90 @@ function parsePositiveIntegerIdsFromForm(formData, fieldName) {
 function operatorSnapshotUrl(apiBaseUrl) {
   return (
     `${apiBaseUrl}/v1/read/operator-snapshot` +
-    '?instruction_limit=50&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=12'
+    '?instruction_limit=50&candidate_limit=40' +
+    '&candidate_reason_code=rl_model_routed_selected_candidate' +
+    '&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=12'
   );
 }
 
-function defaultOperatorSnapshot() {
-  return {
-    generated_at: null,
-    kill_switch: {
-      enabled: false,
-      reason: null,
-      updated_by: null,
-      last_changed_at: null,
-      latest_event_at: null
-    },
-    accounts: [],
-    positions: [],
-    open_orders: [],
-    recent_fills: [],
-    recent_broker_attention: [],
-    recent_reconciliation_runs: [],
-    instructions: []
+function omxBenchmarkSnapshotUrl(apiBaseUrl) {
+  const params = new URLSearchParams({
+    symbols: 'OMXS30,OMX,XACT-OMXS30',
+    bar_limit: '390'
+  });
+  return `${apiBaseUrl}/v1/market-data/stream/snapshot?${params.toString()}`;
+}
+
+function parseFiniteNumber(value) {
+  const parsed = Number.parseFloat(String(value ?? ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildOmxBenchmark(result) {
+  const fallback = {
+    label: 'OMX',
+    symbol: 'OMXS30',
+    status: 'unavailable',
+    error: null,
+    latest_return_pct: null,
+    points: []
   };
+
+  if (!result.ok) {
+    return {
+      ...fallback,
+      error: result.error
+    };
+  }
+
+  const barsBySymbol = result.body?.stream?.bars_by_symbol ?? {};
+  for (const symbol of ['OMXS30', 'OMX', 'XACT-OMXS30']) {
+    const bars = Array.isArray(barsBySymbol[symbol]) ? barsBySymbol[symbol] : [];
+    const validBars = bars
+      .map((bar) => ({
+        timestamp: bar.timestamp,
+        value: parseFiniteNumber(bar.close)
+      }))
+      .filter((bar) => bar.timestamp && bar.value !== null);
+    const first = validBars.find((bar) => bar.value !== 0);
+    if (!first) {
+      continue;
+    }
+
+    const points = validBars.map((bar) => ({
+      timestamp: bar.timestamp,
+      value: bar.value,
+      return_pct: ((bar.value - first.value) / first.value) * 100
+    }));
+    const latest = points.at(-1);
+    return {
+      ...fallback,
+      symbol,
+      status: points.length > 1 ? 'ok' : 'insufficient_data',
+      latest_return_pct: latest ? latest.return_pct : null,
+      points
+    };
+  }
+
+  return fallback;
+}
+
+function requireResponseBody(result, endpointName) {
+  if (!result.ok) {
+    throw error(result.status || 502, `${endpointName} failed: ${result.error}`);
+  }
+  if (!result.body || typeof result.body !== 'object') {
+    throw error(502, `${endpointName} returned no JSON body`);
+  }
+  return result.body;
+}
+
+function requireBodyField(result, fieldName, endpointName) {
+  const body = requireResponseBody(result, endpointName);
+  if (body[fieldName] === undefined || body[fieldName] === null) {
+    throw error(502, `${endpointName} response missing ${fieldName}`);
+  }
+  return body[fieldName];
 }
 
 async function readOperatorSnapshot(fetch, apiBaseUrl) {
@@ -81,7 +131,15 @@ async function readOperatorSnapshot(fetch, apiBaseUrl) {
       ok: false,
       status: result.status,
       error: result.error,
-      snapshot: defaultOperatorSnapshot()
+      snapshot: null
+    };
+  }
+  if (!result.body || result.body.operator_snapshot === undefined || result.body.operator_snapshot === null) {
+    return {
+      ok: false,
+      status: 502,
+      error: 'Operator snapshot response missing operator_snapshot',
+      snapshot: null
     };
   }
 
@@ -89,7 +147,7 @@ async function readOperatorSnapshot(fetch, apiBaseUrl) {
     ok: true,
     status: result.status,
     error: null,
-    snapshot: result.body?.operator_snapshot ?? defaultOperatorSnapshot()
+    snapshot: result.body.operator_snapshot
   };
 }
 
@@ -97,12 +155,11 @@ export async function load({ fetch }) {
   const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
   const healthUrl = `${apiBaseUrl}/healthz`;
 
-  const [health, operatorSnapshot] = await Promise.all([
-    readJson(fetch, healthUrl),
-    readJson(fetch, operatorSnapshotUrl(apiBaseUrl))
+  const [health, operatorSnapshot, omxBenchmarkSnapshot] = await Promise.all([
+    readJson(fetch, healthUrl, { timeoutMs: 2500 }),
+    readJson(fetch, operatorSnapshotUrl(apiBaseUrl)),
+    readJson(fetch, omxBenchmarkSnapshotUrl(apiBaseUrl), { timeoutMs: 1200 })
   ]);
-
-  const operatorSnapshotBody = operatorSnapshot.body?.operator_snapshot ?? defaultOperatorSnapshot();
 
   return {
     generatedAt: new Date().toISOString(),
@@ -111,8 +168,15 @@ export async function load({ fetch }) {
       health,
       operatorSnapshot
     }),
-    health: health.body,
-    operatorSnapshot: operatorSnapshotBody
+    health: health.ok
+      ? requireResponseBody(health, 'healthz')
+      : buildFallbackHealth(apiBaseUrl, health.error),
+    operatorSnapshot: requireBodyField(
+      operatorSnapshot,
+      'operator_snapshot',
+      'Operator snapshot'
+    ),
+    omxBenchmark: buildOmxBenchmark(omxBenchmarkSnapshot)
   };
 }
 
@@ -129,7 +193,7 @@ export const actions = {
           fetch,
           `${apiBaseUrl}/v1/reconciliation-issues/${issueId}/review`,
           {
-            action: 'ACKNOWLEDGE',
+            action: 'ARCHIVE',
             updated_by: 'dashboard'
           }
         );
@@ -138,7 +202,7 @@ export const actions = {
             reconciliationClearResult: {
               ok: false,
               message:
-                `Cleared ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+                `Archived ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
                 `${result.error}`
             }
           });
@@ -151,8 +215,8 @@ export const actions = {
           ok: true,
           message:
             acknowledgedReconciliationIssueCount === 0
-              ? 'No visible reconciliation issues needed clearing.'
-              : `Cleared ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
+              ? 'No visible reconciliation issues needed archiving.'
+              : `Archived ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
         }
       };
     }
@@ -167,9 +231,9 @@ export const actions = {
       });
     }
 
-    const reconciliationRuns = snapshotResult.snapshot.recent_reconciliation_runs ?? [];
+    const reconciliationRuns = snapshotResult.snapshot.recent_reconciliation_runs;
     const openReconciliationIssues = reconciliationRuns.flatMap((run) =>
-      (run.issues ?? []).filter((issue) => (issue.operator_review?.status ?? 'OPEN') === 'OPEN')
+      run.issues.filter((issue) => issue.operator_review.status === 'OPEN')
     );
 
     let acknowledgedReconciliationIssueCount = 0;
@@ -178,7 +242,7 @@ export const actions = {
         fetch,
         `${apiBaseUrl}/v1/reconciliation-issues/${item.issue_id}/review`,
         {
-          action: 'ACKNOWLEDGE',
+          action: 'ARCHIVE',
           updated_by: 'dashboard'
         }
       );
@@ -187,7 +251,7 @@ export const actions = {
           reconciliationClearResult: {
             ok: false,
             message:
-              `Cleared ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
+              `Archived ${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
               `${result.error}`
           }
         });
@@ -200,8 +264,8 @@ export const actions = {
         ok: true,
         message:
           acknowledgedReconciliationIssueCount === 0
-            ? 'No open reconciliation issues needed clearing.'
-            : `Cleared ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
+            ? 'No open reconciliation issues needed archiving.'
+            : `Archived ${acknowledgedReconciliationIssueCount} visible reconciliation issues.`
       }
     };
   },
@@ -221,7 +285,7 @@ export const actions = {
           fetch,
           `${apiBaseUrl}/v1/broker-attention/${eventId}/review`,
           {
-            action: 'ACKNOWLEDGE',
+            action: 'ARCHIVE',
             updated_by: 'dashboard'
           }
         );
@@ -230,7 +294,7 @@ export const actions = {
             acknowledgeAllLogsResult: {
               ok: false,
               message:
-                `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+                `Archived ${acknowledgedBrokerAttentionCount} broker attention items and ` +
                 `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
                 `${result.error}`
             }
@@ -244,7 +308,7 @@ export const actions = {
           fetch,
           `${apiBaseUrl}/v1/reconciliation-issues/${issueId}/review`,
           {
-            action: 'ACKNOWLEDGE',
+            action: 'ARCHIVE',
             updated_by: 'dashboard'
           }
         );
@@ -253,7 +317,7 @@ export const actions = {
             acknowledgeAllLogsResult: {
               ok: false,
               message:
-                `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+                `Archived ${acknowledgedBrokerAttentionCount} broker attention items and ` +
                 `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
                 `${result.error}`
             }
@@ -269,8 +333,8 @@ export const actions = {
           ok: true,
           message:
             totalAcknowledged === 0
-              ? 'No visible broker-attention or reconciliation-log items needed clearing.'
-              : `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              ? 'No visible broker-attention or reconciliation-log items needed archiving.'
+              : `Archived ${acknowledgedBrokerAttentionCount} broker attention items and ` +
                 `${acknowledgedReconciliationIssueCount} reconciliation issues.`
         }
       };
@@ -286,13 +350,13 @@ export const actions = {
       });
     }
 
-    const brokerAttention = snapshotResult.snapshot.recent_broker_attention ?? [];
-    const reconciliationRuns = snapshotResult.snapshot.recent_reconciliation_runs ?? [];
+    const brokerAttention = snapshotResult.snapshot.recent_broker_attention;
+    const reconciliationRuns = snapshotResult.snapshot.recent_reconciliation_runs;
     const openBrokerAttention = brokerAttention.filter(
-      (item) => (item.operator_review?.status ?? 'OPEN') === 'OPEN'
+      (item) => item.operator_review.status === 'OPEN'
     );
     const openReconciliationIssues = reconciliationRuns.flatMap((run) =>
-      (run.issues ?? []).filter((issue) => (issue.operator_review?.status ?? 'OPEN') === 'OPEN')
+      run.issues.filter((issue) => issue.operator_review.status === 'OPEN')
     );
 
     let acknowledgedBrokerAttentionCount = 0;
@@ -303,7 +367,7 @@ export const actions = {
         fetch,
         `${apiBaseUrl}/v1/broker-attention/${item.event_id}/review`,
         {
-          action: 'ACKNOWLEDGE',
+          action: 'ARCHIVE',
           updated_by: 'dashboard'
         }
       );
@@ -312,7 +376,7 @@ export const actions = {
           acknowledgeAllLogsResult: {
             ok: false,
             message:
-              `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `Archived ${acknowledgedBrokerAttentionCount} broker attention items and ` +
               `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
               `${result.error}`
           }
@@ -326,7 +390,7 @@ export const actions = {
         fetch,
         `${apiBaseUrl}/v1/reconciliation-issues/${item.issue_id}/review`,
         {
-          action: 'ACKNOWLEDGE',
+          action: 'ARCHIVE',
           updated_by: 'dashboard'
         }
       );
@@ -335,7 +399,7 @@ export const actions = {
           acknowledgeAllLogsResult: {
             ok: false,
             message:
-              `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+              `Archived ${acknowledgedBrokerAttentionCount} broker attention items and ` +
               `${acknowledgedReconciliationIssueCount} reconciliation issues before failing: ` +
               `${result.error}`
           }
@@ -351,8 +415,8 @@ export const actions = {
         ok: true,
         message:
           totalAcknowledged === 0
-            ? 'No open broker-attention or reconciliation-log items needed clearing.'
-            : `Cleared ${acknowledgedBrokerAttentionCount} broker attention items and ` +
+            ? 'No open broker-attention or reconciliation-log items needed archiving.'
+            : `Archived ${acknowledgedBrokerAttentionCount} broker attention items and ` +
               `${acknowledgedReconciliationIssueCount} reconciliation issues.`
       }
     };
@@ -415,64 +479,71 @@ export const actions = {
     }
 
     const runtimeResult = result.body?.runtime_result;
+    if (!runtimeResult) {
+      return fail(502, {
+        startupReconcileResult: {
+          ok: false,
+          message: 'Startup reconciliation response missing runtime_result'
+        }
+      });
+    }
     return {
       startupReconcileResult: {
         ok: true,
         message:
-          `Startup reconciliation completed with status ${runtimeResult?.status ?? 'unknown'}: ` +
-          `${runtimeResult?.issue_count ?? 0} issues, ${runtimeResult?.action_count ?? 0} actions.`
+          `Startup reconciliation completed with status ${runtimeResult.status}: ` +
+          `${runtimeResult.issue_count} issues, ${runtimeResult.action_count} actions.`
       }
     };
   },
 
-  async cancelInstructionSet({ fetch, request }) {
+  async archiveDashboardNoise({ fetch }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
-    const formData = await request.formData();
-    const batchId = readOptionalField(formData, 'batch_id');
-    const accountKey = readOptionalField(formData, 'account_key');
-    const bookKey = readOptionalField(formData, 'book_key');
-    const reason = readOptionalField(formData, 'reason');
-    const instructionIds = parseInstructionIds(
-      readOptionalField(formData, 'instruction_ids')
-    );
-
-    if (!batchId && !accountKey && !bookKey && !instructionIds) {
-      return fail(400, {
-        cancelSetResult: {
-          ok: false,
-          message:
-            'Provide at least one selector: batch ID, account key, book key, or instruction IDs.'
-        }
-      });
-    }
-
-    const result = await postJson(fetch, `${apiBaseUrl}/v1/instructions/cancel-set`, {
+    const expireBefore = new Date().toISOString();
+    const staleCandidates = await postJson(fetch, `${apiBaseUrl}/v1/instructions/archive-set`, {
       requested_by: 'dashboard',
-      reason,
-      batch_id: batchId,
-      account_key: accountKey,
-      book_key: bookKey,
-      instruction_ids: instructionIds
+      reason: 'Dashboard archive of expired model-routed candidate rows.',
+      states: ['MODEL_ROUTED_PENDING'],
+      model_routed: true,
+      expire_before: expireBefore,
+      limit: 1000
     });
 
-    if (!result.ok) {
-      return fail(result.status || 500, {
-        cancelSetResult: {
+    if (!staleCandidates.ok) {
+      return fail(staleCandidates.status || 500, {
+        archiveResult: {
           ok: false,
-          message: result.error
+          message: staleCandidates.error
         }
       });
     }
 
-    const cancellation = result.body?.cancelled_instruction_set;
+    const terminalExecutions = await postJson(fetch, `${apiBaseUrl}/v1/instructions/archive-set`, {
+      requested_by: 'dashboard',
+      reason: 'Dashboard archive of terminal execution instruction rows.',
+      states: ['ENTRY_CANCELLED', 'COMPLETED', 'FAILED'],
+      model_routed: false,
+      expire_before: expireBefore,
+      limit: 1000
+    });
+
+    if (!terminalExecutions.ok) {
+      return fail(terminalExecutions.status || 500, {
+        archiveResult: {
+          ok: false,
+          message: terminalExecutions.error
+        }
+      });
+    }
+
+    const staleArchive = staleCandidates.body?.archived_instruction_set;
+    const terminalArchive = terminalExecutions.body?.archived_instruction_set;
     return {
-      cancelSetResult: {
+      archiveResult: {
         ok: true,
         message:
-          `Cancellation request completed: ${cancellation?.matched_instruction_count ?? 0} matched, ` +
-          `${cancellation?.cancelled_pending_count ?? 0} pending cancelled, ` +
-          `${cancellation?.cancelled_submitted_count ?? 0} submitted cancelled, ` +
-          `${cancellation?.skipped_count ?? 0} skipped.`
+          `Archived ${staleArchive?.archived_instruction_count ?? 0} expired RL candidates and ` +
+          `${terminalArchive?.archived_instruction_count ?? 0} terminal execution instructions.`
       }
     };
   },
@@ -628,7 +699,7 @@ export const actions = {
           brokerAttentionActionResult: {
             ok: false,
             message:
-              `Cleared ${processedCount} broker attention items before failing: ${result.error}`
+              `Archived ${processedCount} broker attention items before failing: ${result.error}`
           }
         });
       }
@@ -640,8 +711,8 @@ export const actions = {
         ok: true,
         message:
           processedCount === 1
-            ? `Cleared broker attention item ${normalizedEventIds[0]}.`
-            : `Cleared ${processedCount} broker attention items.`
+            ? `Archived broker attention item ${normalizedEventIds[0]}.`
+            : `Archived ${processedCount} broker attention items.`
       }
     };
   },
@@ -691,7 +762,7 @@ export const actions = {
           reconciliationIssueActionResult: {
             ok: false,
             message:
-              `Cleared ${processedCount} reconciliation issues before failing: ${result.error}`
+              `Archived ${processedCount} reconciliation issues before failing: ${result.error}`
           }
         });
       }
@@ -703,8 +774,8 @@ export const actions = {
         ok: true,
         message:
           processedCount === 1
-            ? `Cleared reconciliation issue ${normalizedIssueIds[0]}.`
-            : `Cleared ${processedCount} reconciliation issues.`
+            ? `Archived reconciliation issue ${normalizedIssueIds[0]}.`
+            : `Archived ${processedCount} reconciliation issues.`
       }
     };
   }

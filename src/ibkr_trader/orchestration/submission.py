@@ -19,9 +19,11 @@ from ibkr_trader.db.models import InstrumentRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
 from ibkr_trader.orchestration.operator_controls import assert_kill_switch_inactive
+from ibkr_trader.orchestration.scheduling import BatchRuntimeSchedule
 from ibkr_trader.orchestration.scheduling import InstructionRuntimeSchedule
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.state_machine import ExecutionState
+from ibkr_trader.virtual.accounts import is_virtual_account_key
 
 
 class SubmissionConflictError(ValueError):
@@ -120,21 +122,140 @@ def _ensure_unique_instruction_ids(batch: ExecutionInstructionBatch) -> None:
         )
 
 
-def _ensure_no_existing_instruction_ids(
+def _event_from_record(event: InstructionEventRecord) -> SubmittedInstructionEvent:
+    return SubmittedInstructionEvent(
+        event_id=event.id,
+        event_type=event.event_type,
+        source=event.source,
+        event_at=event.event_at,
+        state_before=event.state_before,
+        state_after=event.state_after,
+        payload=event.payload,
+        note=event.note,
+    )
+
+
+def _fallback_initial_event(
+    record: InstructionRecord,
+    runtime_schedule: InstructionRuntimeSchedule,
+) -> SubmittedInstructionEvent:
+    return SubmittedInstructionEvent(
+        event_id=0,
+        event_type="instruction_submitted",
+        source="api",
+        event_at=record.created_at,
+        state_before=None,
+        state_after=record.state,
+        payload={"runtime_schedule": _serialize_runtime_schedule(runtime_schedule)},
+        note="Existing instruction replayed idempotently.",
+    )
+
+
+def _instruction_from_record(
+    record: InstructionRecord,
+    runtime_schedule: InstructionRuntimeSchedule,
+    initial_event: SubmittedInstructionEvent,
+) -> SubmittedInstruction:
+    return SubmittedInstruction(
+        record_id=record.id,
+        instruction_id=record.instruction_id,
+        state=record.state,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        submit_at=record.submit_at,
+        expire_at=record.expire_at,
+        account_key=record.account_key,
+        book_key=record.book_key,
+        symbol=record.symbol,
+        exchange=record.exchange,
+        currency=record.currency,
+        order_type=record.order_type,
+        side=record.side,
+        runtime_schedule=_serialize_runtime_schedule(runtime_schedule),
+        initial_event=initial_event,
+    )
+
+
+def _build_idempotent_replay_batch(
     session: Session,
     batch: ExecutionInstructionBatch,
-) -> None:
+    schedule: BatchRuntimeSchedule,
+    *,
+    runtime_timezone: str,
+) -> SubmittedBatch | None:
     instruction_ids = [instruction.instruction_id for instruction in batch.instructions]
-    existing = session.execute(
-        select(InstructionRecord.instruction_id).where(
+    records = session.execute(
+        select(InstructionRecord).where(
             InstructionRecord.instruction_id.in_(instruction_ids)
         )
     ).scalars().all()
-    if existing:
-        duplicate_list = ", ".join(sorted(existing))
+    if not records:
+        return None
+
+    records_by_instruction_id = {record.instruction_id: record for record in records}
+    missing = [
+        instruction_id
+        for instruction_id in instruction_ids
+        if instruction_id not in records_by_instruction_id
+    ]
+    if missing:
+        existing_list = ", ".join(sorted(records_by_instruction_id))
+        missing_list = ", ".join(sorted(missing))
         raise SubmissionConflictError(
-            f"instruction_id already exists: {duplicate_list}"
+            "instruction_id already exists for part of the batch: "
+            f"existing={existing_list}; missing={missing_list}"
         )
+
+    mismatched = [
+        instruction.instruction_id
+        for instruction in batch.instructions
+        if records_by_instruction_id[instruction.instruction_id].payload
+        != _serialize_instruction_payload(batch, instruction)
+    ]
+    if mismatched:
+        mismatch_list = ", ".join(sorted(mismatched))
+        raise SubmissionConflictError(
+            f"instruction_id already exists with different payload: {mismatch_list}"
+        )
+
+    record_ids = [record.id for record in records_by_instruction_id.values()]
+    initial_events = session.execute(
+        select(InstructionEventRecord)
+        .where(
+            InstructionEventRecord.instruction_id.in_(record_ids),
+            InstructionEventRecord.event_type == "instruction_submitted",
+        )
+        .order_by(InstructionEventRecord.id)
+    ).scalars().all()
+    events_by_record_id: dict[int, InstructionEventRecord] = {}
+    for event in initial_events:
+        events_by_record_id.setdefault(event.instruction_id, event)
+
+    replayed: list[SubmittedInstruction] = []
+    for instruction, runtime_schedule in zip(
+        batch.instructions,
+        schedule.instructions,
+        strict=True,
+    ):
+        record = records_by_instruction_id[instruction.instruction_id]
+        event = events_by_record_id.get(record.id)
+        initial_event = (
+            _event_from_record(event)
+            if event is not None
+            else _fallback_initial_event(record, runtime_schedule)
+        )
+        replayed.append(
+            _instruction_from_record(record, runtime_schedule, initial_event)
+        )
+
+    return SubmittedBatch(
+        schema_version=batch.schema_version,
+        batch_id=batch.source.batch_id,
+        source_system=batch.source.system,
+        runtime_timezone=runtime_timezone,
+        instruction_count=len(replayed),
+        instructions=tuple(replayed),
+    )
 
 
 def _upsert_instrument(
@@ -173,7 +294,6 @@ def submit_execution_batch(
     runtime_timezone: str,
     session_calendar_path: Path,
 ) -> SubmittedBatch:
-    assert_kill_switch_inactive(session_factory)
     batch.validate()
     _ensure_unique_instruction_ids(batch)
 
@@ -183,11 +303,30 @@ def submit_execution_batch(
         session_calendar_path=session_calendar_path,
     )
 
+    with session_scope(session_factory) as session:
+        replayed_batch = _build_idempotent_replay_batch(
+            session,
+            batch,
+            schedule,
+            runtime_timezone=runtime_timezone,
+        )
+        if replayed_batch is not None:
+            return replayed_batch
+
+    if any(not instruction.is_model_routed for instruction in batch.instructions):
+        assert_kill_switch_inactive(session_factory)
+
     persisted_instructions: list[SubmittedInstruction] = []
-    initial_state = ExecutionState.ENTRY_PENDING.value
 
     with session_scope(session_factory) as session:
-        _ensure_no_existing_instruction_ids(session, batch)
+        replayed_batch = _build_idempotent_replay_batch(
+            session,
+            batch,
+            schedule,
+            runtime_timezone=runtime_timezone,
+        )
+        if replayed_batch is not None:
+            return replayed_batch
 
         for instruction, runtime_schedule in zip(
             batch.instructions,
@@ -195,6 +334,24 @@ def submit_execution_batch(
             strict=True,
         ):
             _upsert_instrument(session, instruction)
+            is_model_routed = instruction.is_model_routed
+            initial_state = (
+                ExecutionState.MODEL_ROUTED_PENDING.value
+                if is_model_routed
+                else ExecutionState.ENTRY_PENDING.value
+            )
+            if is_model_routed:
+                if instruction.execution is None:
+                    raise ValueError("execution is required for model-routed instructions")
+                submit_at = instruction.execution.window.start_at
+                expire_at = instruction.execution.window.end_at
+                order_type = "MODEL_ROUTED"
+            else:
+                if instruction.entry is None:
+                    raise ValueError("entry must be an object")
+                submit_at = instruction.entry.submit_at
+                expire_at = instruction.entry.expire_at
+                order_type = instruction.entry.order_type.value
 
             instruction_record = InstructionRecord(
                 instruction_id=instruction.instruction_id,
@@ -203,13 +360,14 @@ def submit_execution_batch(
                 batch_id=batch.source.batch_id,
                 account_key=instruction.account.account_key,
                 book_key=instruction.account.book_key,
+                is_virtual=is_virtual_account_key(instruction.account.account_key),
                 symbol=instruction.instrument.symbol,
                 exchange=instruction.instrument.exchange,
                 currency=instruction.instrument.currency,
                 state=initial_state,
-                submit_at=instruction.entry.submit_at,
-                expire_at=instruction.entry.expire_at,
-                order_type=instruction.entry.order_type.value,
+                submit_at=submit_at,
+                expire_at=expire_at,
+                order_type=order_type,
                 side=instruction.intent.side,
                 payload=_serialize_instruction_payload(batch, instruction),
             )
@@ -223,38 +381,20 @@ def submit_execution_batch(
                 state_before=None,
                 state_after=initial_state,
                 payload={"runtime_schedule": _serialize_runtime_schedule(runtime_schedule)},
-                note="Instruction validated and persisted for scheduled execution.",
+                note=(
+                    "Model-routed instruction validated and persisted for RL agent pickup."
+                    if is_model_routed
+                    else "Instruction validated and persisted for scheduled execution."
+                ),
             )
             session.add(initial_event)
             session.flush()
 
             persisted_instructions.append(
-                SubmittedInstruction(
-                    record_id=instruction_record.id,
-                    instruction_id=instruction_record.instruction_id,
-                    state=instruction_record.state,
-                    created_at=instruction_record.created_at,
-                    updated_at=instruction_record.updated_at,
-                    submit_at=instruction_record.submit_at,
-                    expire_at=instruction_record.expire_at,
-                    account_key=instruction_record.account_key,
-                    book_key=instruction_record.book_key,
-                    symbol=instruction_record.symbol,
-                    exchange=instruction_record.exchange,
-                    currency=instruction_record.currency,
-                    order_type=instruction_record.order_type,
-                    side=instruction_record.side,
-                    runtime_schedule=_serialize_runtime_schedule(runtime_schedule),
-                    initial_event=SubmittedInstructionEvent(
-                        event_id=initial_event.id,
-                        event_type=initial_event.event_type,
-                        source=initial_event.source,
-                        event_at=initial_event.event_at,
-                        state_before=initial_event.state_before,
-                        state_after=initial_event.state_after,
-                        payload=initial_event.payload,
-                        note=initial_event.note,
-                    ),
+                _instruction_from_record(
+                    instruction_record,
+                    runtime_schedule,
+                    _event_from_record(initial_event),
                 )
             )
 

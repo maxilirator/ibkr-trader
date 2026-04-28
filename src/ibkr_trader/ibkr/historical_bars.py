@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, MutableMapping, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
@@ -12,7 +12,6 @@ from ibkr_trader.ibkr.contracts import (
     build_ibkr_contract,
     serialize_contract_details,
 )
-from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.sync_wrapper import (
     load_response_timeout_class as _load_response_timeout_runtime_class,
 )
@@ -51,6 +50,17 @@ class HistoricalBarsQuery:
             raise ValueError("what_to_show is required")
         if self.end_at is not None and self.end_at.tzinfo is None:
             raise ValueError("end_at must include timezone information")
+
+
+ContractDetailsCacheKey = tuple[
+    str,
+    str,
+    str,
+    str,
+    str | None,
+    str | None,
+    str | None,
+]
 
 
 @runtime_checkable
@@ -115,6 +125,18 @@ def _serialize_historical_bar(raw_bar: Any, *, currency: str) -> dict[str, Any]:
     }
 
 
+def _contract_cache_key(query: HistoricalBarsQuery) -> ContractDetailsCacheKey:
+    return (
+        query.symbol.upper(),
+        query.security_type.upper(),
+        query.exchange.upper(),
+        query.currency.upper(),
+        query.primary_exchange.upper() if query.primary_exchange else None,
+        query.local_symbol.upper() if query.local_symbol else None,
+        query.isin.upper() if query.isin else None,
+    )
+
+
 def read_historical_bars(
     config: IbkrConnectionConfig,
     query: HistoricalBarsQuery,
@@ -124,6 +146,8 @@ def read_historical_bars(
     response_timeout_cls: type[Exception] | None = None,
     contract_cls: type[Any] | None = None,
     app: HistoricalBarsSyncWrapperProtocol | None = None,
+    contract_details_cache: MutableMapping[ContractDetailsCacheKey, list[Any]]
+    | None = None,
 ) -> dict[str, Any]:
     query.validate()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
@@ -156,7 +180,16 @@ def read_historical_bars(
                 isin=query.isin,
             )
             ib_contract = build_ibkr_contract(contract_query, contract_cls=contract_cls)
-            raw_matches = runtime_app.get_contract_details(ib_contract, timeout=timeout)
+            cache_key = _contract_cache_key(query)
+            if contract_details_cache is not None and cache_key in contract_details_cache:
+                raw_matches = contract_details_cache[cache_key]
+            else:
+                raw_matches = runtime_app.get_contract_details(
+                    ib_contract,
+                    timeout=timeout,
+                )
+                if contract_details_cache is not None:
+                    contract_details_cache[cache_key] = raw_matches
         except timeout_cls as exc:
             broker_error = _extract_broker_error_message(runtime_app)
             if broker_error is not None:

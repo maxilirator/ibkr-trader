@@ -33,6 +33,7 @@ class RuntimeServiceStatusSnapshot:
     runtime_key: str
     service_type: str
     status: str
+    effective_status: str
     owner_token: str | None
     owner_label: str | None
     hostname: str | None
@@ -46,6 +47,10 @@ class RuntimeServiceStatusSnapshot:
     last_cycle_completed_at: datetime | None
     last_successful_cycle_at: datetime | None
     lease_expires_at: datetime | None
+    checked_at: datetime
+    heartbeat_age_seconds: int | None
+    lease_seconds_remaining: int | None
+    is_stale: bool
     stop_requested: bool
     last_error: str | None
     metadata_json: dict[str, Any]
@@ -75,6 +80,18 @@ def _ensure_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _age_seconds(value: datetime | None, now: datetime) -> int | None:
+    if value is None:
+        return None
+    return max(0, int((now - value).total_seconds()))
+
+
+def _seconds_remaining(value: datetime | None, now: datetime) -> int | None:
+    if value is None:
+        return None
+    return int((value - now).total_seconds())
+
+
 def _serialize_runtime_cycle_result(
     result: RuntimeCycleResult | None,
 ) -> dict[str, Any] | None:
@@ -93,10 +110,20 @@ def _serialize_runtime_cycle_result(
 
 
 def _build_snapshot(record: RuntimeServiceRecord) -> RuntimeServiceStatusSnapshot:
+    now = utc_now()
+    heartbeat_at = _ensure_utc(record.heartbeat_at)
+    lease_expires_at = _ensure_utc(record.lease_expires_at)
+    lease_seconds_remaining = _seconds_remaining(lease_expires_at, now)
+    is_stale = (
+        record.status in ACTIVE_RUNTIME_SERVICE_STATUSES
+        and lease_expires_at is not None
+        and lease_expires_at <= now
+    )
     return RuntimeServiceStatusSnapshot(
         runtime_key=record.runtime_key,
         service_type=record.service_type,
         status=record.status,
+        effective_status="STALE" if is_stale else record.status,
         owner_token=record.owner_token,
         owner_label=record.owner_label,
         hostname=record.hostname,
@@ -105,11 +132,15 @@ def _build_snapshot(record: RuntimeServiceRecord) -> RuntimeServiceStatusSnapsho
         broker_kind=record.broker_kind,
         broker_client_id=record.broker_client_id,
         started_at=record.started_at,
-        heartbeat_at=record.heartbeat_at,
+        heartbeat_at=heartbeat_at,
         last_cycle_started_at=record.last_cycle_started_at,
         last_cycle_completed_at=record.last_cycle_completed_at,
         last_successful_cycle_at=record.last_successful_cycle_at,
-        lease_expires_at=record.lease_expires_at,
+        lease_expires_at=lease_expires_at,
+        checked_at=now,
+        heartbeat_age_seconds=_age_seconds(heartbeat_at, now),
+        lease_seconds_remaining=lease_seconds_remaining,
+        is_stale=is_stale,
         stop_requested=record.stop_requested,
         last_error=record.last_error,
         metadata_json=dict(record.metadata_json or {}),
@@ -430,6 +461,52 @@ def mark_runtime_service_failed(
             status_after=record.status,
             payload={"error": error},
             note="Runtime service exited with an unhandled error.",
+        )
+        return _build_snapshot(record)
+
+
+def mark_runtime_service_disabled(
+    session_factory: sessionmaker[Session],
+    *,
+    runtime_key: str = EXECUTION_RUNTIME_KEY,
+    note: str,
+) -> RuntimeServiceStatusSnapshot:
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        record = _get_runtime_record_for_update(session, runtime_key=runtime_key)
+        if record is None:
+            record = RuntimeServiceRecord(
+                runtime_key=runtime_key,
+                service_type="execution",
+                status="STOPPED",
+                metadata_json={},
+            )
+            session.add(record)
+            session.flush()
+        status_before = record.status
+        record.status = "DISABLED"
+        record.owner_token = None
+        record.owner_label = None
+        record.pid = None
+        record.heartbeat_at = now
+        record.lease_expires_at = None
+        record.stop_requested = False
+        record.last_error = None
+        record.metadata_json = {
+            **dict(record.metadata_json or {}),
+            "disabled": True,
+        }
+
+        _append_runtime_event(
+            session,
+            runtime_record=record,
+            event_type="runtime_disabled",
+            source="runtime_service",
+            event_at=now,
+            status_before=status_before,
+            status_after=record.status,
+            payload={},
+            note=note,
         )
         return _build_snapshot(record)
 

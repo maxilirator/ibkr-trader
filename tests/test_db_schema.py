@@ -75,6 +75,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "trader_deployment",
                 "trader_heartbeat",
                 "trader_model",
+                "virtual_market_quote",
             },
         )
         instruction_columns = {
@@ -87,6 +88,22 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "broker_client_id",
                 "broker_order_status",
             }.issubset(instruction_columns)
+        )
+        broker_order_event_columns = {
+            column["name"] for column in inspector.get_columns("broker_order_event")
+        }
+        reconciliation_issue_columns = {
+            column["name"] for column in inspector.get_columns("reconciliation_issue")
+        }
+        self.assertTrue(
+            {"archived_at", "archived_by", "archive_reason"}.issubset(
+                broker_order_event_columns
+            )
+        )
+        self.assertTrue(
+            {"archived_at", "archived_by", "archive_reason"}.issubset(
+                reconciliation_issue_columns
+            )
         )
 
     def test_instruction_event_relationship_round_trips(self) -> None:

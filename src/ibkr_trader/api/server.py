@@ -15,6 +15,11 @@ from typing import Any, Mapping
 from sqlalchemy import or_
 from sqlalchemy import select
 
+try:
+    from fastapi import Request as FastAPIRequest
+except ModuleNotFoundError:  # pragma: no cover - server extra is optional locally.
+    FastAPIRequest = Any  # type: ignore[misc,assignment]
+
 from ibkr_trader.api.broker_monitor import BrokerMonitorService
 from ibkr_trader.api.broker_monitor import serialize_broker_monitor_status
 from ibkr_trader.config import AppConfig
@@ -24,6 +29,8 @@ from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import InstructionRecord
+from ibkr_trader.db.models import TraderDeploymentRecord
+from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import (
     ExecutionInstructionBatch,
@@ -42,6 +49,8 @@ from ibkr_trader.ibkr.contracts import (
 )
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
+from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
+from ibkr_trader.ibkr.market_stream import MarketStreamContract
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
@@ -57,6 +66,7 @@ from ibkr_trader.ibkr.shortability import (
     ShortabilitySource,
     ShortabilitySnapshotQuery,
     collect_shortability_snapshot,
+    load_stockholm_identity_map,
     persist_shortability_snapshot,
 )
 from ibkr_trader.ibkr.stockholm_intraday import (
@@ -74,6 +84,11 @@ from ibkr_trader.orchestration.entry_submission import cancel_persisted_instruct
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_cancellation
 from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_submission
 from ibkr_trader.orchestration.entry_submission import submit_persisted_instruction_entry
+from ibkr_trader.orchestration.instruction_archive import (
+    InstructionArchiveSelectorError,
+    archive_instruction_set,
+    serialize_instruction_archive_result,
+)
 from ibkr_trader.orchestration.instruction_status import InstructionStatusNotFoundError
 from ibkr_trader.orchestration.instruction_status import list_instruction_statuses
 from ibkr_trader.orchestration.instruction_status import read_instruction_status
@@ -96,6 +111,7 @@ from ibkr_trader.orchestration.operator_reviews import (
 )
 from ibkr_trader.orchestration.runtime_service_state import (
     EXECUTION_RUNTIME_KEY,
+    mark_runtime_service_disabled,
     read_runtime_service_status,
     serialize_runtime_service_status,
 )
@@ -107,8 +123,13 @@ from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
+from ibkr_trader.orchestration.rl_action_execution import (
+    RLActionOwnershipError,
+    RLActionStateError,
+    execute_owned_rl_action,
+    serialize_rl_owned_action_execution,
+)
 from ibkr_trader.orchestration.trader_registry import (
-    RL_SHORT_ACTION_SPACE,
     TraderDeploymentConflictError,
     TraderDeploymentNotFoundError,
     TraderModelConflictError,
@@ -116,6 +137,8 @@ from ibkr_trader.orchestration.trader_registry import (
     create_trader_deployment,
     log_trader_action,
     register_trader_model,
+    update_trader_deployment,
+    upsert_trader_model,
     upsert_trader_heartbeat,
 )
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
@@ -127,6 +150,19 @@ from ibkr_trader.read_models import build_rl_trader_dashboard_snapshot
 from ibkr_trader.read_models import serialize_ledger_dashboard_snapshot
 from ibkr_trader.read_models import serialize_operator_dashboard_snapshot
 from ibkr_trader.read_models import serialize_rl_trader_dashboard_snapshot
+from ibkr_trader.rl.action_translation import ACTION_STATUS_EXECUTED
+from ibkr_trader.rl.action_translation import ACTION_STATUS_TRANSLATED
+from ibkr_trader.rl.action_translation import translate_rl_action
+from ibkr_trader.rl.observations import build_phase1_observation_payload
+from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
+from ibkr_trader.virtual.accounts import is_virtual_account_key
+from ibkr_trader.virtual.accounts import normalize_virtual_account_key
+from ibkr_trader.virtual.execution import cancel_virtual_order
+from ibkr_trader.virtual.execution import ensure_virtual_account_record
+from ibkr_trader.virtual.execution import list_virtual_market_quotes
+from ibkr_trader.virtual.execution import record_virtual_market_quote
+from ibkr_trader.virtual.execution import submit_virtual_entry_order
+from ibkr_trader.virtual.execution import submit_virtual_exit_order
 
 
 class ApiDependencyError(RuntimeError):
@@ -213,7 +249,8 @@ def should_include_background_execution_recovery(
             .where(
                 InstructionRecord.state.in_(
                     tuple(_BACKGROUND_RECOVERY_INSTRUCTION_STATES)
-                )
+                ),
+                InstructionRecord.is_virtual.is_(False),
             )
             .limit(1)
         ).first()
@@ -223,6 +260,7 @@ def should_include_background_execution_recovery(
         unsettled_order = session.execute(
             select(BrokerOrderRecord.id)
             .where(
+                BrokerOrderRecord.is_virtual.is_(False),
                 or_(
                     BrokerOrderRecord.status.is_(None),
                     BrokerOrderRecord.status.not_in(
@@ -319,6 +357,7 @@ def parse_stockholm_intraday_backfill_payload(
             raise ValueError("symbols must not contain duplicates")
         symbols = parsed_symbols
 
+    raw_max_runtime_seconds = payload.get("max_runtime_seconds", 55.0)
     query = StockholmIntradayBackfillQuery(
         as_of_date=as_of_date,
         bar_size=str(payload.get("bar_size", "1 min")),
@@ -333,6 +372,11 @@ def parse_stockholm_intraday_backfill_payload(
         symbols=symbols,
         include_remapped=bool(payload.get("include_remapped", False)),
         sleep_seconds=float(payload.get("sleep_seconds", 0.05)),
+        max_runtime_seconds=(
+            None
+            if raw_max_runtime_seconds is None
+            else float(raw_max_runtime_seconds)
+        ),
     )
     query.validate()
     return query
@@ -379,11 +423,33 @@ def _parse_json_object_field(
     return dict(raw_value)
 
 
+def _parse_required_string(
+    payload: Mapping[str, Any],
+    field_name: str,
+    *,
+    normalize: Any | None = None,
+) -> str:
+    value = str(payload.get(field_name, "")).strip()
+    if normalize is not None:
+        value = normalize(value)
+    if not value:
+        raise ValueError(f"{field_name} is required")
+    return value
+
+
 def parse_trader_model_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    model_key = str(payload.get("model_key", "")).strip().lower()
-    display_name = str(payload.get("display_name", "")).strip()
-    strategy_family = str(payload.get("strategy_family", "")).strip()
-    side = str(payload.get("side", "SHORT")).strip().upper()
+    model_key = _parse_required_string(
+        payload,
+        "model_key",
+        normalize=lambda value: value.lower(),
+    )
+    display_name = _parse_required_string(payload, "display_name")
+    strategy_family = _parse_required_string(payload, "strategy_family")
+    side = _parse_required_string(
+        payload,
+        "side",
+        normalize=lambda value: value.upper(),
+    )
     action_space = _parse_string_list(
         payload,
         "action_space",
@@ -420,13 +486,38 @@ def parse_trader_model_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def parse_trader_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    account_key = _parse_required_string(
+        payload,
+        "account_key",
+        normalize=lambda value: value.upper(),
+    )
     return {
-        "deployment_key": str(payload.get("deployment_key", "")).strip().lower(),
-        "model_key": str(payload.get("model_key", "")).strip().lower(),
-        "account_key": str(payload.get("account_key", "")).strip().upper(),
-        "book_key": str(payload.get("book_key", "")).strip().lower(),
-        "mode": str(payload.get("mode", "paper")).strip().lower(),
-        "status": str(payload.get("status", "draft")).strip().lower(),
+        "deployment_key": _parse_required_string(
+            payload,
+            "deployment_key",
+            normalize=lambda value: value.lower(),
+        ),
+        "model_key": _parse_required_string(
+            payload,
+            "model_key",
+            normalize=lambda value: value.lower(),
+        ),
+        "account_key": account_key,
+        "book_key": _parse_required_string(
+            payload,
+            "book_key",
+            normalize=lambda value: value.lower(),
+        ),
+        "mode": _parse_required_string(
+            payload,
+            "mode",
+            normalize=lambda value: value.lower(),
+        ),
+        "status": _parse_required_string(
+            payload,
+            "status",
+            normalize=lambda value: value.lower(),
+        ),
         "allowed_symbols": _parse_string_list(
             payload,
             "allowed_symbols",
@@ -438,16 +529,99 @@ def parse_trader_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any
     }
 
 
+def _parse_optional_string_list_update(
+    payload: Mapping[str, Any],
+    field_name: str,
+    *,
+    normalize: Any | None = None,
+) -> tuple[str, ...]:
+    raw_value = payload.get(field_name)
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, list):
+        raise ValueError(f"{field_name} must be an array of strings")
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        value = str(item).strip()
+        if normalize is not None:
+            value = normalize(value)
+        if not value:
+            raise ValueError(f"{field_name} must contain only non-empty strings")
+        if value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return tuple(values)
+
+
+def parse_trader_deployment_update_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    if "account_key" in payload:
+        parsed["account_key"] = _parse_required_string(
+            payload,
+            "account_key",
+            normalize=lambda value: value.upper(),
+        )
+    if "book_key" in payload:
+        parsed["book_key"] = _parse_required_string(
+            payload,
+            "book_key",
+            normalize=lambda value: value.lower(),
+        )
+    if "mode" in payload:
+        parsed["mode"] = _parse_required_string(
+            payload,
+            "mode",
+            normalize=lambda value: value.lower(),
+        )
+    if "status" in payload:
+        parsed["status"] = _parse_required_string(
+            payload,
+            "status",
+            normalize=lambda value: value.lower(),
+        )
+    if "allowed_symbols" in payload:
+        parsed["allowed_symbols"] = _parse_optional_string_list_update(
+            payload,
+            "allowed_symbols",
+            normalize=lambda value: value.upper(),
+        )
+    if "risk_limits" in payload:
+        parsed["risk_limits"] = _parse_json_object_field(payload, "risk_limits")
+    if "action_constraints" in payload:
+        parsed["action_constraints"] = _parse_json_object_field(
+            payload,
+            "action_constraints",
+        )
+    if "metadata" in payload:
+        parsed["metadata"] = _parse_json_object_field(payload, "metadata")
+    if not parsed:
+        raise ValueError("at least one deployment field is required")
+    return parsed
+
+
 def parse_trader_action_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    observed_at = (
-        parse_datetime(payload["observed_at"], "observed_at")
-        if payload.get("observed_at") is not None
-        else utc_now()
+    observed_at = parse_datetime(
+        _parse_required_string(payload, "observed_at"),
+        "observed_at",
     )
     return {
-        "deployment_key": str(payload.get("deployment_key", "")).strip().lower(),
-        "symbol": str(payload.get("symbol", "")).strip().upper(),
-        "action_name": str(payload.get("action_name", "")).strip().lower(),
+        "deployment_key": _parse_required_string(
+            payload,
+            "deployment_key",
+            normalize=lambda value: value.lower(),
+        ),
+        "symbol": _parse_required_string(
+            payload,
+            "symbol",
+            normalize=lambda value: value.upper(),
+        ),
+        "action_name": _parse_required_string(
+            payload,
+            "action_name",
+            normalize=lambda value: value.lower(),
+        ),
         "observed_at": observed_at,
         "state_before": (
             str(payload["state_before"]).strip().upper()
@@ -459,7 +633,11 @@ def parse_trader_action_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             if payload.get("state_after") is not None
             else None
         ),
-        "action_status": str(payload.get("action_status", "logged")).strip().lower(),
+        "action_status": _parse_required_string(
+            payload,
+            "action_status",
+            normalize=lambda value: value.lower(),
+        ),
         "instruction_id": (
             str(payload["instruction_id"]).strip()
             if payload.get("instruction_id") is not None
@@ -470,11 +648,52 @@ def parse_trader_action_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def parse_trader_heartbeat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    last_seen_at = (
-        parse_datetime(payload["last_seen_at"], "last_seen_at")
-        if payload.get("last_seen_at") is not None
+def parse_rl_action_translate_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    observed_at = (
+        parse_datetime(payload["observed_at"], "observed_at")
+        if payload.get("observed_at") is not None
         else utc_now()
+    )
+    previous_close = (
+        parse_decimal(payload["previous_close"], "previous_close")
+        if payload.get("previous_close") is not None
+        else None
+    )
+    decision_id = (
+        str(payload["decision_id"]).strip()
+        if payload.get("decision_id") is not None
+        else None
+    )
+    if decision_id == "":
+        decision_id = None
+    return {
+        "deployment_key": _parse_required_string(
+            payload,
+            "deployment_key",
+            normalize=lambda value: value.lower(),
+        ),
+        "source_instruction_id": _parse_required_string(
+            payload,
+            "source_instruction_id",
+        ),
+        "action_name": _parse_required_string(
+            payload,
+            "action_name",
+            normalize=lambda value: value.lower(),
+        ),
+        "state_before": str(payload.get("state_before", "FLAT")).strip().upper(),
+        "observed_at": observed_at,
+        "previous_close": previous_close,
+        "decision_id": decision_id,
+        "submit": bool(payload.get("submit", False)),
+        "log_action": bool(payload.get("log_action", False)),
+    }
+
+
+def parse_trader_heartbeat_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    last_seen_at = parse_datetime(
+        _parse_required_string(payload, "last_seen_at"),
+        "last_seen_at",
     )
     last_bar_at = (
         parse_datetime(payload["last_bar_at"], "last_bar_at")
@@ -487,7 +706,11 @@ def parse_trader_heartbeat_payload(payload: Mapping[str, Any]) -> dict[str, Any]
         else None
     )
     return {
-        "status": str(payload.get("status", "")).strip().lower(),
+        "status": _parse_required_string(
+            payload,
+            "status",
+            normalize=lambda value: value.lower(),
+        ),
         "last_seen_at": last_seen_at,
         "last_bar_at": last_bar_at,
         "last_action_at": last_action_at,
@@ -497,6 +720,169 @@ def parse_trader_heartbeat_payload(payload: Mapping[str, Any]) -> dict[str, Any]
             else None
         ),
         "metrics": _parse_json_object_field(payload, "metrics"),
+    }
+
+
+def parse_rl_observation_build_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_source_bars = payload.get("source_bars")
+    if raw_source_bars is None:
+        source_bars: dict[str, Any] = {}
+    elif isinstance(raw_source_bars, Mapping):
+        source_bars = dict(raw_source_bars)
+    else:
+        raise ValueError("source_bars must be an object keyed by symbol")
+
+    raw_history_overrides = (
+        payload.get("history_overrides")
+        if payload.get("history_overrides") is not None
+        else payload.get("history_features")
+    )
+    if raw_history_overrides is None:
+        history_overrides: dict[str, Any] = {}
+    elif isinstance(raw_history_overrides, Mapping):
+        history_overrides = dict(raw_history_overrides)
+    else:
+        raise ValueError("history_overrides must be an object keyed by symbol")
+
+    raw_static_features = (
+        payload.get("static_features")
+        if payload.get("static_features") is not None
+        else payload.get("static_features_by_symbol")
+    )
+    if raw_static_features is None:
+        static_features: dict[str, Any] = {}
+    elif isinstance(raw_static_features, Mapping):
+        static_features = dict(raw_static_features)
+    else:
+        raise ValueError("static_features must be an object keyed by symbol")
+
+    raw_fetch = payload.get("fetch", {})
+    if not isinstance(raw_fetch, Mapping):
+        raise ValueError("fetch must be an object")
+
+    return {
+        "deployment_key": _parse_required_string(
+            payload,
+            "deployment_key",
+            normalize=lambda value: value.lower(),
+        ),
+        "symbols": _parse_string_list(
+            payload,
+            "symbols",
+            normalize=lambda value: value.upper(),
+        ),
+        "as_of": (
+            parse_datetime(payload["as_of"], "as_of")
+            if payload.get("as_of") is not None
+            else utc_now()
+        ),
+        "source_bars": source_bars,
+        "history_overrides": history_overrides,
+        "static_features": static_features,
+        "config_overrides": _parse_json_object_field(payload, "observation"),
+        "include_source_bars": bool(payload.get("include_source_bars", False)),
+        "fetch": dict(raw_fetch),
+    }
+
+
+def parse_virtual_account_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    account_key = normalize_virtual_account_key(str(payload.get("account_key", "")))
+    base_currency = _parse_required_string(
+        payload,
+        "base_currency",
+        normalize=lambda value: value.upper(),
+    )
+    return {
+        "account_key": account_key,
+        "base_currency": base_currency,
+        "account_label": (
+            str(payload["account_label"]).strip()
+            if payload.get("account_label") is not None
+            else None
+        ),
+        "cash_balance": (
+            parse_decimal(payload["cash_balance"], "cash_balance")
+            if payload.get("cash_balance") is not None
+            else None
+        ),
+    }
+
+
+def parse_virtual_market_quote_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    observed_at = parse_datetime(
+        _parse_required_string(payload, "observed_at"),
+        "observed_at",
+    )
+    parsed_prices = {
+        "bid_price": (
+            parse_decimal(payload["bid_price"], "bid_price")
+            if payload.get("bid_price") is not None
+            else None
+        ),
+        "ask_price": (
+            parse_decimal(payload["ask_price"], "ask_price")
+            if payload.get("ask_price") is not None
+            else None
+        ),
+        "last_price": (
+            parse_decimal(payload["last_price"], "last_price")
+            if payload.get("last_price") is not None
+            else None
+        ),
+        "midpoint_price": (
+            parse_decimal(payload["midpoint_price"], "midpoint_price")
+            if payload.get("midpoint_price") is not None
+            else None
+        ),
+    }
+    if all(value is None for value in parsed_prices.values()):
+        raise ValueError(
+            "At least one of bid_price, ask_price, last_price, or midpoint_price is required"
+        )
+    symbol = _parse_required_string(
+        payload,
+        "symbol",
+        normalize=lambda value: value.upper(),
+    )
+    exchange = _parse_required_string(
+        payload,
+        "exchange",
+        normalize=lambda value: value.upper(),
+    )
+    currency = _parse_required_string(
+        payload,
+        "currency",
+        normalize=lambda value: value.upper(),
+    )
+    security_type = _parse_required_string(
+        payload,
+        "security_type",
+        normalize=lambda value: value.upper(),
+    )
+
+    return {
+        "account_key": normalize_virtual_account_key(
+            str(payload.get("account_key", ""))
+        ),
+        "symbol": symbol,
+        "exchange": exchange,
+        "currency": currency,
+        "security_type": security_type,
+        "observed_at": observed_at,
+        "primary_exchange": (
+            str(payload["primary_exchange"]).strip().upper()
+            if payload.get("primary_exchange") is not None
+            else None
+        ),
+        "local_symbol": (
+            str(payload["local_symbol"]).strip()
+            if payload.get("local_symbol") is not None
+            else None
+        ),
+        **parsed_prices,
+        "source": str(payload["source"]).strip() if payload.get("source") is not None else None,
+        "raw_payload": dict(payload),
+        "metadata": _parse_json_object_field(payload, "metadata"),
     }
 
 
@@ -606,6 +992,81 @@ def parse_instruction_set_cancellation_payload(
     return requested_by, reason, batch_id, account_key, book_key, instruction_ids, timeout
 
 
+def parse_instruction_archive_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    requested_by = str(payload.get("requested_by", "api")).strip()
+    if not requested_by:
+        raise ValueError("requested_by must be a non-empty string")
+
+    reason = payload.get("reason")
+    if reason is not None:
+        reason = str(reason).strip() or None
+
+    raw_instruction_ids = payload.get("instruction_ids")
+    instruction_ids: tuple[str, ...] | None = None
+    if raw_instruction_ids is not None:
+        if not isinstance(raw_instruction_ids, list) or not raw_instruction_ids:
+            raise ValueError("instruction_ids must be a non-empty array of strings")
+        parsed_instruction_ids = tuple(str(item).strip() for item in raw_instruction_ids)
+        if not all(parsed_instruction_ids):
+            raise ValueError("instruction_ids must contain only non-empty strings")
+        if len(set(parsed_instruction_ids)) != len(parsed_instruction_ids):
+            raise ValueError("instruction_ids must not contain duplicates")
+        instruction_ids = parsed_instruction_ids
+
+    raw_states = payload.get("states")
+    states: tuple[str, ...] | None = None
+    if raw_states is not None:
+        if not isinstance(raw_states, list) or not raw_states:
+            raise ValueError("states must be a non-empty array of strings")
+        states = tuple(str(item).strip().upper() for item in raw_states)
+        if not all(states):
+            raise ValueError("states must contain only non-empty strings")
+
+    expire_before = (
+        parse_datetime(payload["expire_before"], "expire_before")
+        if payload.get("expire_before") is not None
+        else None
+    )
+    limit = int(payload.get("limit", 500))
+    include_active = bool(payload.get("include_active", False))
+    model_routed = payload.get("model_routed")
+    if model_routed is not None and not isinstance(model_routed, bool):
+        raise ValueError("model_routed must be a boolean when provided")
+
+    return {
+        "requested_by": requested_by,
+        "reason": reason,
+        "instruction_ids": instruction_ids,
+        "states": states,
+        "batch_id": (
+            str(payload["batch_id"]).strip()
+            if payload.get("batch_id") is not None
+            else None
+        ),
+        "account_key": (
+            str(payload["account_key"]).strip()
+            if payload.get("account_key") is not None
+            else None
+        ),
+        "book_key": (
+            str(payload["book_key"]).strip()
+            if payload.get("book_key") is not None
+            else None
+        ),
+        "source_system": (
+            str(payload["source_system"]).strip()
+            if payload.get("source_system") is not None
+            else None
+        ),
+        "model_routed": model_routed,
+        "expire_before": expire_before,
+        "include_active": include_active,
+        "limit": limit,
+    }
+
+
 def parse_tick_stream_payload(payload: Mapping[str, Any]) -> TickStreamQuery:
     raw_tick_types = payload.get("tick_types", ["Last", "BidAsk"])
     if not isinstance(raw_tick_types, list) or not raw_tick_types:
@@ -634,6 +1095,139 @@ def parse_tick_stream_payload(payload: Mapping[str, Any]) -> TickStreamQuery:
     )
     query.validate()
     return query
+
+
+def _identity_lookup_key(symbol: str) -> str:
+    return symbol.strip().upper()
+
+
+def _identity_value(identity: Any, field_name: str) -> str | None:
+    if identity is None:
+        return None
+    raw_value = getattr(identity, field_name, None)
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    return value or None
+
+
+def _market_stream_contract_for_symbol(
+    *,
+    symbol: str,
+    security_type: str,
+    exchange: str,
+    currency: str,
+    primary_exchange: str | None,
+    local_symbol: str | None,
+    isin: str | None,
+    stockholm_identity_map: Mapping[str, Any] | None,
+) -> MarketStreamContract:
+    normalized_symbol = symbol.strip().upper()
+    identity = (stockholm_identity_map or {}).get(_identity_lookup_key(normalized_symbol))
+    enriched_local_symbol = local_symbol or _identity_value(identity, "ticker_alias")
+    enriched_isin = isin or _identity_value(identity, "isin")
+    return MarketStreamContract(
+        symbol=normalized_symbol,
+        security_type=security_type,
+        exchange=exchange,
+        currency=currency,
+        primary_exchange=primary_exchange,
+        local_symbol=enriched_local_symbol,
+        isin=enriched_isin,
+    )
+
+
+def parse_market_stream_subscribe_payload(
+    payload: Mapping[str, Any],
+    *,
+    stockholm_identity_map: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw_contracts = payload.get("contracts") or payload.get("instruments")
+    raw_symbols = payload.get("symbols")
+    contracts: list[MarketStreamContract] = []
+
+    if raw_contracts is not None:
+        if not isinstance(raw_contracts, list) or not raw_contracts:
+            raise ValueError("contracts must be a non-empty array")
+        for item in raw_contracts:
+            if not isinstance(item, Mapping):
+                raise ValueError("contracts entries must be objects")
+            local_symbol = (
+                str(item["local_symbol"]).strip()
+                if item.get("local_symbol") is not None
+                else None
+            )
+            isin = str(item["isin"]).strip() if item.get("isin") is not None else None
+            contract = _market_stream_contract_for_symbol(
+                symbol=str(item.get("symbol", "")).strip().upper(),
+                security_type=str(item.get("security_type", "STK")).strip().upper(),
+                exchange=str(item.get("exchange", payload.get("exchange", "SMART"))).strip().upper(),
+                currency=str(item.get("currency", payload.get("currency", "SEK"))).strip().upper(),
+                primary_exchange=(
+                    str(item["primary_exchange"]).strip().upper()
+                    if item.get("primary_exchange") is not None
+                    else (
+                        str(payload["primary_exchange"]).strip().upper()
+                        if payload.get("primary_exchange") is not None
+                        else "SFB"
+                    )
+                ),
+                local_symbol=local_symbol,
+                isin=isin,
+                stockholm_identity_map=stockholm_identity_map,
+            )
+            contract.validate()
+            contracts.append(contract)
+    else:
+        if not isinstance(raw_symbols, list) or not raw_symbols:
+            raise ValueError("symbols must be a non-empty array of strings")
+        symbols = tuple(str(symbol).strip().upper() for symbol in raw_symbols)
+        if not all(symbols):
+            raise ValueError("symbols must contain only non-empty strings")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("symbols must not contain duplicates")
+        contracts = [
+            _market_stream_contract_for_symbol(
+                symbol=symbol,
+                security_type=str(payload.get("security_type", "STK")).strip().upper(),
+                exchange=str(payload.get("exchange", "SMART")).strip().upper(),
+                currency=str(payload.get("currency", "SEK")).strip().upper(),
+                primary_exchange=(
+                    str(payload["primary_exchange"]).strip().upper()
+                    if payload.get("primary_exchange") is not None
+                    else "SFB"
+                ),
+                local_symbol=None,
+                isin=None,
+                stockholm_identity_map=stockholm_identity_map,
+            )
+            for symbol in symbols
+        ]
+
+    if len(contracts) > 100:
+        raise ValueError("market stream subscriptions are limited to 100 symbols")
+
+    market_data_type = (
+        str(payload["market_data_type"]).strip().upper()
+        if payload.get("market_data_type") is not None
+        else None
+    )
+    return {
+        "contracts": contracts,
+        "replace": bool(payload.get("replace", True)),
+        "market_data_type": market_data_type,
+    }
+
+
+def parse_market_stream_symbols(raw_value: str | None) -> list[str] | None:
+    if raw_value is None or not raw_value.strip():
+        return None
+    symbols = [
+        item.strip().upper()
+        for item in raw_value.replace("\n", ",").split(",")
+        if item.strip()
+    ]
+    return sorted(set(symbols)) or None
 
 
 def parse_shortability_snapshot_payload(
@@ -725,6 +1319,69 @@ def serialize_execution_batch(batch: ExecutionInstructionBatch) -> dict[str, Any
     return payload
 
 
+def serialize_rl_candidate_status(payload: Any) -> dict[str, Any]:
+    serialized_instruction = serialize_instruction_status(payload)
+    stored_payload = serialized_instruction.get("payload", {})
+    stored_instruction = (
+        stored_payload.get("instruction", {})
+        if isinstance(stored_payload, dict)
+        else {}
+    )
+    execution = (
+        stored_instruction.get("execution", {})
+        if isinstance(stored_instruction, dict)
+        else {}
+    )
+    model_id = None
+    if isinstance(execution, dict):
+        model_id = execution.get("model_id")
+    if model_id is None and isinstance(stored_instruction, dict):
+        model_id = stored_instruction.get("model")
+
+    return _serialize_for_json({
+        "candidate_id": payload.instruction_id,
+        "instruction_id": payload.instruction_id,
+        "state": payload.state,
+        "account_key": payload.account_key,
+        "book_key": payload.book_key,
+        "is_virtual": payload.is_virtual,
+        "symbol": payload.symbol,
+        "exchange": payload.exchange,
+        "currency": payload.currency,
+        "side": payload.side,
+        "model_id": model_id,
+        "model_family": (
+            execution.get("model_family") if isinstance(execution, dict) else None
+        ),
+        "model_version": (
+            execution.get("model_version") if isinstance(execution, dict) else None
+        ),
+        "model_artifact_id": (
+            execution.get("model_artifact_id") if isinstance(execution, dict) else None
+        ),
+        "execution_window": (
+            execution.get("window") if isinstance(execution, dict) else None
+        ),
+        "sizing": (
+            stored_instruction.get("sizing", {})
+            if isinstance(stored_instruction, dict)
+            else {}
+        ),
+        "trace": (
+            stored_instruction.get("trace", {})
+            if isinstance(stored_instruction, dict)
+            else {}
+        ),
+        "source": (
+            stored_payload.get("source", {})
+            if isinstance(stored_payload, dict)
+            else {}
+        ),
+        "updated_at": payload.updated_at,
+        "candidate": serialized_instruction,
+    })
+
+
 def serialize_runtime_schedule_preview(payload: Any) -> dict[str, Any]:
     serialized = asdict(payload)
     return _serialize_for_json(serialized)
@@ -757,13 +1414,35 @@ def create_app(config: AppConfig | None = None) -> Any:
         require_loopback_only=app_config.api.require_loopback_only,
     )
     FastAPI, HTTPException, Request, JSONResponse = _load_fastapi_runtime()
-    broker_sessions = CanonicalSyncSessions(app_config.ibkr)
+    broker_sessions = CanonicalSyncSessions(
+        app_config.ibkr,
+        initial_connect_backoff_seconds=app_config.broker_connect_backoff_initial_seconds,
+        max_connect_backoff_seconds=app_config.broker_connect_backoff_max_seconds,
+    )
 
-    def with_primary_session(operation_name: str, operation: Any) -> Any:
-        return broker_sessions.primary.execute(operation_name, operation)
+    def with_primary_session(
+        operation_name: str,
+        operation: Any,
+        *,
+        ignore_cooldown: bool = False,
+    ) -> Any:
+        return broker_sessions.primary.execute(
+            operation_name,
+            operation,
+            ignore_cooldown=ignore_cooldown,
+        )
 
-    def with_diagnostic_session(operation_name: str, operation: Any) -> Any:
-        return broker_sessions.diagnostic.execute(operation_name, operation)
+    def with_diagnostic_session(
+        operation_name: str,
+        operation: Any,
+        *,
+        ignore_cooldown: bool = False,
+    ) -> Any:
+        return broker_sessions.diagnostic.execute(
+            operation_name,
+            operation,
+            ignore_cooldown=ignore_cooldown,
+        )
 
     def submit_order_with_primary(
         broker_config: Any,
@@ -771,6 +1450,13 @@ def create_app(config: AppConfig | None = None) -> Any:
         *,
         timeout: int = 10,
     ) -> dict[str, Any]:
+        if is_virtual_account_key(instruction.account.account_key):
+            return submit_virtual_entry_order(
+                session_factory,
+                broker_config,
+                instruction,
+                timeout=timeout,
+            )
         return with_primary_session(
             "persisted_entry_submit",
             lambda broker_app: submit_order_from_instruction(
@@ -794,6 +1480,20 @@ def create_app(config: AppConfig | None = None) -> Any:
         oca_group: str | None = None,
         oca_type: int | None = None,
     ) -> dict[str, Any]:
+        if is_virtual_account_key(instruction.account.account_key):
+            return submit_virtual_exit_order(
+                session_factory,
+                broker_config,
+                instruction,
+                quantity=quantity,
+                order_type=order_type,
+                order_ref=order_ref,
+                timeout=timeout,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                oca_group=oca_group,
+                oca_type=oca_type,
+            )
         return with_primary_session(
             "runtime_exit_submit",
             lambda broker_app: submit_exit_order_from_instruction(
@@ -817,6 +1517,21 @@ def create_app(config: AppConfig | None = None) -> Any:
         *,
         timeout: int = 10,
     ) -> dict[str, Any]:
+        with session_scope(session_factory) as session:
+            is_virtual_order = bool(
+                session.execute(
+                    select(BrokerOrderRecord.is_virtual).where(
+                        BrokerOrderRecord.external_order_id == str(order_id)
+                    )
+                ).scalar_one_or_none()
+            )
+        if is_virtual_order:
+            return cancel_virtual_order(
+                session_factory,
+                broker_config,
+                order_id,
+                timeout=timeout,
+            )
         return with_primary_session(
             "broker_cancel",
             lambda broker_app: cancel_broker_order(
@@ -896,6 +1611,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 timeout=app_config.broker_heartbeat_timeout_seconds,
                 app=broker_app,
             ),
+            ignore_cooldown=True,
         )
 
     def fetch_background_runtime_snapshot() -> Any:
@@ -939,17 +1655,40 @@ def create_app(config: AppConfig | None = None) -> Any:
         app_config,
         broker_sessions,
     )
+    market_stream_service = LiveMarketDataStreamService(
+        app_config.ibkr.streaming_session(),
+        initial_connect_backoff_seconds=app_config.broker_connect_backoff_initial_seconds,
+        max_connect_backoff_seconds=app_config.broker_connect_backoff_max_seconds,
+    )
+    market_stream_identity_map = load_stockholm_identity_map(
+        app_config.stockholm_identity_path,
+    )
 
     @asynccontextmanager
     async def lifespan(_: Any) -> Any:
-        broker_sessions.warmup()
+        if app_config.broker_warmup_enabled:
+            broker_sessions.warmup()
         if app_config.broker_monitor_enabled and app_config.environment != "test":
             broker_monitor.start()
+        if (
+            app_config.market_stream_auto_reconnect_enabled
+            and app_config.environment != "test"
+        ):
+            market_stream_service.start_auto_reconnect(
+                interval_seconds=app_config.market_stream_reconnect_interval_seconds
+            )
         if app_config.execution_runtime_enabled and app_config.environment != "test":
             execution_runtime.start()
+        elif app_config.environment != "test":
+            mark_runtime_service_disabled(
+                session_factory,
+                runtime_key=EXECUTION_RUNTIME_KEY,
+                note="Execution runtime disabled by EXECUTION_RUNTIME_ENABLED=false.",
+            )
         try:
             yield
         finally:
+            market_stream_service.stop()
             execution_runtime.stop()
             broker_monitor.stop()
             broker_sessions.shutdown()
@@ -963,9 +1702,11 @@ def create_app(config: AppConfig | None = None) -> Any:
     app.state.broker_sessions = broker_sessions
     app.state.broker_monitor = broker_monitor
     app.state.execution_runtime = execution_runtime
+    app.state.market_stream_service = market_stream_service
+    app.state.market_stream_identity_map = market_stream_identity_map
 
     @app.middleware("http")
-    async def require_local_client(request: Request, call_next: Any) -> Any:
+    async def require_local_client(request: FastAPIRequest, call_next: Any) -> Any:
         client_host = request.client.host if request.client else None
         if (
             app_config.api.require_loopback_only
@@ -978,7 +1719,15 @@ def create_app(config: AppConfig | None = None) -> Any:
         return await call_next(request)
 
     @app.get("/healthz")
-    def healthz() -> dict[str, Any]:
+    def healthz(refresh_broker_status: bool = True) -> dict[str, Any]:
+        if (
+            refresh_broker_status
+            and app_config.broker_monitor_enabled
+            and app_config.environment != "test"
+        ):
+            broker_monitor.request_cycle_if_due(
+                min_interval_seconds=app_config.broker_status_refresh_min_interval_seconds
+            )
         return {
             "status": "ok",
             "local_only": app_config.api.require_loopback_only,
@@ -986,7 +1735,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             "api_port": app_config.api.port,
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
-            "broker_sessions": broker_sessions.status_snapshot(),
+            "broker_sessions": broker_sessions.status_snapshot(blocking=False),
             "broker_operations": broker_sessions.activity_tracker.snapshot(recent_limit=10),
             "broker_monitor": serialize_broker_monitor_status(broker_monitor.status()),
             "execution_runtime": (
@@ -1020,7 +1769,8 @@ def create_app(config: AppConfig | None = None) -> Any:
                     app_config.ibkr.diagnostic_session(),
                     timeout=timeout,
                     app=broker_app,
-                )
+                ),
+                ignore_cooldown=True,
             )
         except IbkrDependencyError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1201,6 +1951,63 @@ def create_app(config: AppConfig | None = None) -> Any:
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
 
+    @app.post("/v1/market-data/stream/subscribe")
+    def subscribe_market_data_stream(
+        payload: dict[str, Any],
+        request: FastAPIRequest,
+    ) -> dict[str, Any]:
+        try:
+            parsed = parse_market_stream_subscribe_payload(
+                payload,
+                stockholm_identity_map=request.app.state.market_stream_identity_map,
+            )
+            snapshot = request.app.state.market_stream_service.subscribe_many(
+                parsed["contracts"],
+                replace=parsed["replace"],
+                market_data_type=parsed["market_data_type"],
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "mode": "streaming_market_data",
+            "session_client_id": app_config.ibkr.streaming_client_id,
+            "stream": snapshot,
+        }
+
+    @app.get("/v1/market-data/stream/snapshot")
+    def get_market_data_stream_snapshot(
+        request: FastAPIRequest,
+        symbols: str | None = None,
+        bar_limit: int = 390,
+    ) -> dict[str, Any]:
+        if bar_limit <= 0:
+            raise HTTPException(status_code=400, detail="bar_limit must be positive")
+        if bar_limit > 2000:
+            raise HTTPException(status_code=400, detail="bar_limit must be at most 2000")
+        snapshot = request.app.state.market_stream_service.snapshot(
+            symbols=parse_market_stream_symbols(symbols),
+            bar_limit=bar_limit,
+        )
+        return {
+            "accepted": True,
+            "mode": "streaming_market_data",
+            "stream": snapshot,
+        }
+
+    @app.post("/v1/market-data/stream/stop")
+    def stop_market_data_stream(request: FastAPIRequest) -> dict[str, Any]:
+        request.app.state.market_stream_service.stop()
+        return {
+            "accepted": True,
+            "mode": "streaming_market_data_stopped",
+        }
+
     @app.post("/v1/market-data/shortability-snapshot")
     def get_shortability_snapshot(
         payload: dict[str, Any] | None = None,
@@ -1283,15 +2090,26 @@ def create_app(config: AppConfig | None = None) -> Any:
     def submit_order(payload: dict[str, Any], timeout: int = 10) -> dict[str, Any]:
         try:
             batch = parse_execution_batch_payload(payload)
-            result = with_primary_session(
-                "order_submit",
-                lambda broker_app: submit_order_from_batch(
+            if (
+                len(batch.instructions) == 1
+                and is_virtual_account_key(batch.instructions[0].account.account_key)
+            ):
+                result = submit_virtual_entry_order(
+                    session_factory,
                     app_config.ibkr.primary_session(),
-                    batch,
+                    batch.instructions[0],
                     timeout=timeout,
-                    app=broker_app,
                 )
-            )
+            else:
+                result = with_primary_session(
+                    "order_submit",
+                    lambda broker_app: submit_order_from_batch(
+                        app_config.ibkr.primary_session(),
+                        batch,
+                        timeout=timeout,
+                        app=broker_app,
+                    )
+                )
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except IbkrDependencyError as exc:
@@ -1305,9 +2123,17 @@ def create_app(config: AppConfig | None = None) -> Any:
 
         return {
             "accepted": True,
-            "mode": "manual_broker_submit",
+            "mode": (
+                "manual_virtual_submit"
+                if result.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else "manual_broker_submit"
+            ),
             "runtime_timezone": app_config.timezone,
-            "session_client_id": app_config.ibkr.client_id,
+            "session_client_id": (
+                None
+                if result.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else app_config.ibkr.client_id
+            ),
             "submitted_order": result,
         }
 
@@ -1315,14 +2141,10 @@ def create_app(config: AppConfig | None = None) -> Any:
     def cancel_order(order_id: int, timeout: int = 10) -> dict[str, Any]:
         ledger_warning: str | None = None
         try:
-            result = with_primary_session(
-                "order_cancel",
-                lambda broker_app: cancel_broker_order(
-                    app_config.ibkr.primary_session(),
-                    order_id,
-                    timeout=timeout,
-                    app=broker_app,
-                )
+            result = cancel_order_with_primary(
+                app_config.ibkr.primary_session(),
+                order_id,
+                timeout=timeout,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1340,20 +2162,40 @@ def create_app(config: AppConfig | None = None) -> Any:
             try:
                 persist_broker_order_cancellation_result(
                     session_factory,
-                    broker_kind=BROKER_KIND_IBKR,
+                    broker_kind=str(result.get("broker_kind") or BROKER_KIND_IBKR),
                     broker_cancellation=result,
                     observed_at=utc_now(),
-                    fallback_account_key=app_config.ibkr.account_id or None,
-                    event_type="manual_broker_order_cancelled",
-                    note="Persisted manual broker-order cancellation from the API.",
+                    fallback_account_key=(
+                        str(result["account"])
+                        if result.get("account") not in (None, "")
+                        else app_config.ibkr.account_id or None
+                    ),
+                    event_type=(
+                        "manual_virtual_order_cancelled"
+                        if result.get("broker_kind") == BROKER_KIND_VIRTUAL
+                        else "manual_broker_order_cancelled"
+                    ),
+                    note=(
+                        "Persisted manual virtual-order cancellation from the API."
+                        if result.get("broker_kind") == BROKER_KIND_VIRTUAL
+                        else "Persisted manual broker-order cancellation from the API."
+                    ),
                 )
             except ValueError as exc:
                 ledger_warning = str(exc)
 
         response = {
             "accepted": True,
-            "mode": "manual_broker_cancel",
-            "session_client_id": app_config.ibkr.client_id,
+            "mode": (
+                "manual_virtual_cancel"
+                if result.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else "manual_broker_cancel"
+            ),
+            "session_client_id": (
+                None
+                if result.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else app_config.ibkr.client_id
+            ),
             "order_id": order_id,
             "cancelled_order": result,
         }
@@ -1375,7 +2217,12 @@ def create_app(config: AppConfig | None = None) -> Any:
         }
 
     @app.get("/v1/instructions")
-    def list_instructions(limit: int = 100, state: str | None = None) -> dict[str, Any]:
+    def list_instructions(
+        limit: int = 100,
+        state: str | None = None,
+        include_archived: bool = False,
+        model_routed: bool | None = None,
+    ) -> dict[str, Any]:
         if limit <= 0:
             raise HTTPException(status_code=400, detail="limit must be positive")
         if limit > 500:
@@ -1386,6 +2233,8 @@ def create_app(config: AppConfig | None = None) -> Any:
             session_factory,
             limit=limit,
             state=normalized_state,
+            include_archived=include_archived,
+            model_routed=model_routed,
         )
         return {
             "accepted": True,
@@ -1414,6 +2263,62 @@ def create_app(config: AppConfig | None = None) -> Any:
             "instruction": serialize_instruction_status(result),
         }
 
+    @app.post("/v1/virtual/accounts")
+    def create_virtual_account(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_virtual_account_payload(payload)
+            result = ensure_virtual_account_record(session_factory, **parsed)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "virtual_account": result,
+        }
+
+    @app.post("/v1/virtual/market-watch")
+    def update_virtual_market_watch(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_virtual_market_quote_payload(payload)
+            result = record_virtual_market_quote(session_factory, **parsed)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "virtual_market_watch": result,
+        }
+
+    @app.get("/v1/virtual/market-watch")
+    def get_virtual_market_watch(
+        account_key: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            validated_limit = parse_positive_limit(
+                limit,
+                field_name="limit",
+                maximum=1000,
+            )
+            normalized_account_key = (
+                normalize_virtual_account_key(account_key)
+                if account_key is not None
+                else None
+            )
+            quotes = list_virtual_market_quotes(
+                session_factory,
+                account_key=normalized_account_key,
+                limit=validated_limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "quote_count": len(quotes),
+            "quotes": list(quotes),
+        }
+
     @app.post("/v1/rl/models/register")
     def create_trader_model(payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1423,6 +2328,35 @@ def create_app(config: AppConfig | None = None) -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except TraderModelConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_model": _serialize_for_json(asdict(result)),
+        }
+
+    @app.post("/v1/rl/models/upsert")
+    def upsert_rl_trader_model(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_model_payload(payload)
+            result = upsert_trader_model(session_factory, **parsed)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_model": _serialize_for_json(asdict(result)),
+        }
+
+    @app.put("/v1/rl/models/{model_key}")
+    def update_rl_trader_model(
+        model_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_model_payload({**payload, "model_key": model_key})
+            result = upsert_trader_model(session_factory, **parsed)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         return {
             "accepted": True,
@@ -1446,6 +2380,28 @@ def create_app(config: AppConfig | None = None) -> Any:
             "trader_deployment": _serialize_for_json(asdict(result)),
         }
 
+    @app.patch("/v1/rl/deployments/{deployment_key}")
+    def update_rl_deployment(
+        deployment_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            parsed = parse_trader_deployment_update_payload(payload)
+            result = update_trader_deployment(
+                session_factory,
+                deployment_key=deployment_key,
+                **parsed,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraderDeploymentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "trader_deployment": _serialize_for_json(asdict(result)),
+        }
+
     @app.post("/v1/rl/actions/log")
     def log_rl_action(payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1459,6 +2415,281 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "trader_action": _serialize_for_json(asdict(result)),
+        }
+
+    @app.get("/v1/rl/candidates")
+    def list_rl_candidates(
+        limit: int = 100,
+        deployment_key: str | None = None,
+        model_key: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            validated_limit = parse_positive_limit(
+                limit,
+                field_name="limit",
+                maximum=500,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        normalized_model_key = (
+            model_key.strip().lower() if model_key is not None else None
+        )
+        normalized_account_key = None
+        normalized_book_key = None
+        normalized_deployment_key = (
+            deployment_key.strip().lower() if deployment_key is not None else None
+        )
+        if normalized_deployment_key:
+            with session_scope(session_factory) as session:
+                deployment_row = session.execute(
+                    select(
+                        TraderDeploymentRecord.account_key,
+                        TraderDeploymentRecord.book_key,
+                        TraderModelRecord.model_key,
+                    )
+                    .join(TraderModelRecord)
+                    .where(
+                        TraderDeploymentRecord.deployment_key
+                        == normalized_deployment_key
+                    )
+                ).one_or_none()
+            if deployment_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Trader deployment '{normalized_deployment_key}' was not found."
+                    ),
+                )
+            normalized_account_key = deployment_row.account_key.upper()
+            normalized_book_key = deployment_row.book_key.lower()
+            normalized_model_key = deployment_row.model_key.lower()
+
+        candidates = list_instruction_statuses(
+            session_factory,
+            limit=500,
+            state=ExecutionState.MODEL_ROUTED_PENDING.value,
+        )
+
+        def candidate_matches(candidate: Any) -> bool:
+            stored_instruction = candidate.payload.get("instruction", {})
+            if not isinstance(stored_instruction, dict):
+                return False
+            execution = stored_instruction.get("execution", {})
+            if not isinstance(execution, dict):
+                return False
+            candidate_model_key = str(
+                execution.get("model_id") or stored_instruction.get("model") or ""
+            ).lower()
+            if normalized_model_key and candidate_model_key != normalized_model_key:
+                return False
+            if normalized_account_key and candidate.account_key.upper() != normalized_account_key:
+                return False
+            if normalized_book_key and candidate.book_key.lower() != normalized_book_key:
+                return False
+            return True
+
+        matched_candidates = tuple(
+            candidate for candidate in candidates if candidate_matches(candidate)
+        )[:validated_limit]
+        return {
+            "accepted": True,
+            "candidate_count": len(matched_candidates),
+            "candidates": [
+                serialize_rl_candidate_status(candidate)
+                for candidate in matched_candidates
+            ],
+        }
+
+    @app.post("/v1/rl/actions/translate")
+    def translate_rl_action_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_rl_action_translate_payload(payload)
+            source_status = read_instruction_status(
+                session_factory,
+                parsed["source_instruction_id"],
+                include_events=False,
+            )
+            if source_status.state != ExecutionState.MODEL_ROUTED_PENDING.value:
+                raise ValueError(
+                    "source_instruction_id must reference a MODEL_ROUTED_PENDING instruction"
+                )
+            stored_payload = source_status.payload
+            source_batch = parse_execution_batch_payload(
+                {
+                    "schema_version": stored_payload["schema_version"],
+                    "source": stored_payload["source"],
+                    "instructions": [stored_payload["instruction"]],
+                }
+            )
+            source_instruction = source_batch.instructions[0]
+            with session_scope(session_factory) as session:
+                deployment = session.execute(
+                    select(TraderDeploymentRecord)
+                    .join(TraderModelRecord)
+                    .where(
+                        TraderDeploymentRecord.deployment_key
+                        == parsed["deployment_key"]
+                    )
+                ).scalar_one_or_none()
+                if deployment is None:
+                    raise TraderDeploymentNotFoundError(
+                        f"Trader deployment '{parsed['deployment_key']}' was not found."
+                    )
+                if (
+                    source_instruction.execution is None
+                    or source_instruction.execution.model_id
+                    != deployment.trader_model.model_key
+                ):
+                    raise ValueError(
+                        "source instruction model_id must match the deployment model"
+                    )
+                if (
+                    source_instruction.account.account_key.upper()
+                    != deployment.account_key.upper()
+                    or source_instruction.account.book_key.lower()
+                    != deployment.book_key.lower()
+                ):
+                    raise ValueError(
+                        "source instruction account_key and book_key must match "
+                        "the deployment"
+                    )
+                allowed_symbols = {
+                    str(symbol).strip().upper()
+                    for symbol in deployment.allowed_symbols_json
+                }
+                if (
+                    allowed_symbols
+                    and source_instruction.instrument.symbol.upper()
+                    not in allowed_symbols
+                ):
+                    raise ValueError(
+                        "source instruction symbol is outside deployment allowed_symbols"
+                    )
+            translation = translate_rl_action(
+                source_batch,
+                source_instruction,
+                deployment_key=parsed["deployment_key"],
+                action_name=parsed["action_name"],
+                state_before=parsed["state_before"],
+                observed_at=parsed["observed_at"],
+                previous_close=parsed["previous_close"],
+                decision_id=parsed["decision_id"],
+            )
+
+            submitted_batch = None
+            generated_instruction_id = None
+            action_execution = None
+            if translation.instruction_payload is not None:
+                generated_instruction_id = str(
+                    translation.instruction_payload["instructions"][0]["instruction_id"]
+                )
+
+            if parsed["submit"] and translation.instruction_payload is not None:
+                deterministic_batch = parse_execution_batch_payload(
+                    translation.instruction_payload
+                )
+                submitted_batch = submit_execution_batch(
+                    session_factory,
+                    deterministic_batch,
+                    runtime_timezone=app_config.timezone,
+                    session_calendar_path=app_config.session_calendar_path,
+                )
+
+            if (
+                parsed["submit"]
+                and translation.instruction_payload is None
+                and translation.action_status == ACTION_STATUS_TRANSLATED
+            ):
+                action_execution = execute_owned_rl_action(
+                    session_factory,
+                    app_config.ibkr.primary_session(),
+                    source_instruction,
+                    deployment_key=parsed["deployment_key"],
+                    action_name=parsed["action_name"],
+                    timeout=10,
+                    canceler=cancel_order_with_primary,
+                    exit_submitter=submit_exit_with_primary,
+                )
+                generated_instruction_id = action_execution.instruction_id
+
+            action_log = None
+            if parsed["log_action"]:
+                action_execution_payload = (
+                    serialize_rl_owned_action_execution(action_execution)
+                    if action_execution is not None
+                    else None
+                )
+                action_log = log_trader_action(
+                    session_factory,
+                    deployment_key=parsed["deployment_key"],
+                    symbol=source_status.symbol,
+                    action_name=parsed["action_name"],
+                    observed_at=parsed["observed_at"],
+                    state_before=parsed["state_before"],
+                    state_after=(
+                        action_execution.state_after
+                        if action_execution is not None
+                        else translation.state_after
+                    ),
+                    action_status=(
+                        ACTION_STATUS_EXECUTED
+                        if action_execution is not None
+                        else translation.action_status
+                    ),
+                    instruction_id=generated_instruction_id,
+                    payload={
+                        "source_instruction_id": parsed["source_instruction_id"],
+                        "decision_id": parsed["decision_id"],
+                        "submitted": (
+                            submitted_batch is not None
+                            or action_execution is not None
+                        ),
+                        "translation_note": translation.note,
+                        "action_execution": action_execution_payload,
+                    },
+                    note=translation.note,
+                )
+        except InstructionStatusNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TraderDeploymentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RLActionOwnershipError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RLActionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except SubmissionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "submitted": submitted_batch is not None or action_execution is not None,
+            "translation": _serialize_for_json(asdict(translation)),
+            "submitted_batch": (
+                serialize_submitted_batch(submitted_batch)
+                if submitted_batch is not None
+                else None
+            ),
+            "action_execution": (
+                serialize_rl_owned_action_execution(action_execution)
+                if action_execution is not None
+                else None
+            ),
+            "trader_action": (
+                _serialize_for_json(asdict(action_log))
+                if action_log is not None
+                else None
+            ),
         }
 
     @app.post("/v1/rl/deployments/{deployment_key}/heartbeat")
@@ -1481,6 +2712,181 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "trader_heartbeat": _serialize_for_json(asdict(result)),
+        }
+
+    @app.post("/v1/rl/observations/build")
+    def build_rl_observation(
+        payload: dict[str, Any],
+        request: FastAPIRequest,
+        timeout: int = 20,
+    ) -> dict[str, Any]:
+        try:
+            parsed = parse_rl_observation_build_payload(payload)
+            with session_scope(session_factory) as session:
+                deployment = session.execute(
+                    select(TraderDeploymentRecord)
+                    .join(TraderModelRecord)
+                    .where(
+                        TraderDeploymentRecord.deployment_key
+                        == parsed["deployment_key"]
+                    )
+                ).scalar_one_or_none()
+                if deployment is None:
+                    raise TraderDeploymentNotFoundError(
+                        f"Trader deployment '{parsed['deployment_key']}' was not found."
+                    )
+                model = deployment.trader_model
+                deployment_snapshot = {
+                    "deployment_key": deployment.deployment_key,
+                    "model_key": model.model_key,
+                    "model_side": model.side,
+                    "action_space": list(model.action_space_json),
+                    "observation_contract": dict(model.observation_contract_json),
+                    "account_key": deployment.account_key,
+                    "book_key": deployment.book_key,
+                    "mode": deployment.mode,
+                    "allowed_symbols": list(deployment.allowed_symbols_json),
+                }
+
+            source_bars = dict(parsed["source_bars"])
+            requested_symbols = list(parsed["symbols"])
+            if not requested_symbols:
+                if source_bars:
+                    requested_symbols = sorted(
+                        str(symbol).strip().upper() for symbol in source_bars
+                    )
+                elif deployment_snapshot["allowed_symbols"]:
+                    requested_symbols = list(deployment_snapshot["allowed_symbols"])
+                else:
+                    raise ValueError(
+                        "symbols are required when the deployment has no allowed_symbols "
+                        "and source_bars are not provided"
+                    )
+            allowed_symbols = {
+                str(symbol).strip().upper()
+                for symbol in deployment_snapshot["allowed_symbols"]
+            }
+            if allowed_symbols:
+                disallowed = [
+                    symbol for symbol in requested_symbols if symbol not in allowed_symbols
+                ]
+                if disallowed:
+                    raise ValueError(
+                        f"symbols are outside deployment allowed_symbols: {disallowed}"
+                    )
+
+            fetched_symbols: list[str] = []
+            streamed_symbols: list[str] = []
+            source_mode = "provided"
+            if not source_bars:
+                fetch = dict(parsed["fetch"])
+                fetch_mode = (
+                    str(fetch.get("mode", fetch.get("source", "market_stream")))
+                    .strip()
+                    .lower()
+                    .replace("-", "_")
+                )
+                if fetch_mode in {"stream", "market_stream", "live_stream"}:
+                    bar_limit = int(fetch.get("bar_limit", 390))
+                    if bar_limit <= 0:
+                        raise ValueError("fetch.bar_limit must be positive")
+                    stream_snapshot = request.app.state.market_stream_service.snapshot(
+                        symbols=requested_symbols,
+                        bar_limit=bar_limit,
+                    )
+                    stream_bars = {
+                        str(symbol).strip().upper(): bars
+                        for symbol, bars in stream_snapshot["bars_by_symbol"].items()
+                        if bars
+                    }
+                    missing_stream_bars = [
+                        symbol for symbol in requested_symbols if symbol not in stream_bars
+                    ]
+                    if missing_stream_bars:
+                        raise ValueError(
+                            "market stream has no 1-minute bars for symbols: "
+                            f"{missing_stream_bars}. Subscribe first with "
+                            "POST /v1/market-data/stream/subscribe and wait for live ticks."
+                        )
+                    source_bars = stream_bars
+                    streamed_symbols = sorted(stream_bars)
+                    source_mode = "market_stream"
+                elif fetch_mode in {"historical", "historical_bars", "ibkr_historical_bars"}:
+                    for symbol in requested_symbols:
+                        query = HistoricalBarsQuery(
+                            symbol=symbol,
+                            security_type=str(fetch.get("security_type", "STK")).upper(),
+                            exchange=str(fetch.get("exchange", "SMART")).upper(),
+                            currency=str(fetch.get("currency", "SEK")).upper(),
+                            primary_exchange=(
+                                str(fetch["primary_exchange"]).upper()
+                                if fetch.get("primary_exchange") is not None
+                                else "SFB"
+                            ),
+                            isin=(
+                                str(fetch["isin"])
+                                if fetch.get("isin") is not None
+                                else None
+                            ),
+                            duration=str(fetch.get("duration", "25 D")),
+                            bar_size=str(fetch.get("bar_size", "1 min")),
+                            what_to_show=str(fetch.get("what_to_show", "TRADES")).upper(),
+                            use_rth=bool(fetch.get("use_rth", True)),
+                            end_at=parsed["as_of"],
+                        )
+                        result = with_diagnostic_session(
+                            "rl_observation_historical_bars",
+                            lambda broker_app, query=query: read_historical_bars(
+                                app_config.ibkr.diagnostic_session(),
+                                query,
+                                timeout=timeout,
+                                app=broker_app,
+                            ),
+                        )
+                        source_bars[symbol] = result["bars"]
+                        fetched_symbols.append(symbol)
+                    source_mode = "ibkr_historical_bars"
+                else:
+                    raise ValueError(
+                        "fetch.mode must be market_stream or historical_bars"
+                    )
+
+            observation = build_phase1_observation_payload(
+                deployment_key=deployment_snapshot["deployment_key"],
+                model_key=deployment_snapshot["model_key"],
+                model_side=deployment_snapshot["model_side"],
+                observation_contract=deployment_snapshot["observation_contract"],
+                action_space=deployment_snapshot["action_space"],
+                as_of=parsed["as_of"],
+                source_bars_by_symbol=source_bars,
+                symbols=requested_symbols,
+                history_overrides=parsed["history_overrides"],
+                static_features_by_symbol=parsed["static_features"],
+                config_overrides=parsed["config_overrides"],
+                include_source_bars=parsed["include_source_bars"],
+            )
+        except TraderDeploymentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "source_mode": source_mode,
+            "fetched_symbols": fetched_symbols,
+            "streamed_symbols": streamed_symbols,
+            "account_key": deployment_snapshot["account_key"],
+            "book_key": deployment_snapshot["book_key"],
+            "mode": deployment_snapshot["mode"],
+            "rl_observation": _serialize_for_json(observation),
         }
 
     @app.get("/v1/read/rl-dashboard")
@@ -1523,13 +2929,14 @@ def create_app(config: AppConfig | None = None) -> Any:
 
         return {
             "accepted": True,
-            "recommended_short_action_space": list(RL_SHORT_ACTION_SPACE),
             "rl_dashboard": serialize_rl_trader_dashboard_snapshot(snapshot),
         }
 
     @app.get("/v1/read/operator-snapshot")
     def get_operator_snapshot(
         instruction_limit: int = 50,
+        candidate_limit: int = 20,
+        candidate_reason_code: str | None = None,
         order_limit: int = 50,
         fill_limit: int = 50,
         attention_limit: int = 25,
@@ -1540,6 +2947,11 @@ def create_app(config: AppConfig | None = None) -> Any:
             validated_instruction_limit = parse_positive_limit(
                 instruction_limit,
                 field_name="instruction_limit",
+                maximum=500,
+            )
+            validated_candidate_limit = parse_positive_limit(
+                candidate_limit,
+                field_name="candidate_limit",
                 maximum=500,
             )
             validated_order_limit = parse_positive_limit(
@@ -1573,7 +2985,35 @@ def create_app(config: AppConfig | None = None) -> Any:
             instructions = list_instruction_statuses(
                 session_factory,
                 limit=validated_instruction_limit,
+                model_routed=False,
             )
+            rl_candidates = list_instruction_statuses(
+                session_factory,
+                limit=500,
+                state=ExecutionState.MODEL_ROUTED_PENDING.value,
+                model_routed=True,
+            )
+            normalized_candidate_reason_code = (
+                candidate_reason_code.strip()
+                if candidate_reason_code is not None and candidate_reason_code.strip()
+                else None
+            )
+            if normalized_candidate_reason_code is not None:
+                def candidate_reason_code(candidate: Any) -> Any:
+                    instruction_payload = candidate.payload.get("instruction", {})
+                    if not isinstance(instruction_payload, dict):
+                        return None
+                    trace_payload = instruction_payload.get("trace", {})
+                    if not isinstance(trace_payload, dict):
+                        return None
+                    return trace_payload.get("reason_code")
+
+                rl_candidates = tuple(
+                    candidate
+                    for candidate in rl_candidates
+                    if candidate_reason_code(candidate) == normalized_candidate_reason_code
+                )
+            rl_candidates = rl_candidates[:validated_candidate_limit]
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1583,7 +3023,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 **serialize_operator_dashboard_snapshot(operator_snapshot),
                 "instructions": [
                     serialize_instruction_status(instruction)
-                    for instruction in instructions
+                    for instruction in (*rl_candidates, *instructions)
                 ],
             },
         }
@@ -1735,12 +3175,12 @@ def create_app(config: AppConfig | None = None) -> Any:
                 runtime_timezone=app_config.timezone,
                 session_calendar_path=app_config.session_calendar_path,
             )
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except KillSwitchActiveError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SubmissionConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KillSwitchActiveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         return {
             "accepted": True,
@@ -1798,6 +3238,19 @@ def create_app(config: AppConfig | None = None) -> Any:
             ),
         }
 
+    @app.post("/v1/instructions/archive-set")
+    def archive_instruction_batch(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_instruction_archive_payload(payload)
+            result = archive_instruction_set(session_factory, **parsed)
+        except (InstructionArchiveSelectorError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "archived_instruction_set": serialize_instruction_archive_result(result),
+        }
+
     @app.post("/v1/instructions/{instruction_id}/submit-entry")
     def submit_instruction_entry(instruction_id: str, timeout: int = 10) -> dict[str, Any]:
         try:
@@ -1827,9 +3280,17 @@ def create_app(config: AppConfig | None = None) -> Any:
 
         return {
             "accepted": True,
-            "mode": "persisted_entry_submit",
+            "mode": (
+                "persisted_virtual_entry_submit"
+                if result.broker_submission.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else "persisted_entry_submit"
+            ),
             "runtime_timezone": app_config.timezone,
-            "session_client_id": app_config.ibkr.client_id,
+            "session_client_id": (
+                None
+                if result.broker_submission.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else app_config.ibkr.client_id
+            ),
             "submitted_entry": serialize_persisted_broker_submission(result),
         }
 
@@ -1860,9 +3321,17 @@ def create_app(config: AppConfig | None = None) -> Any:
 
         return {
             "accepted": True,
-            "mode": "persisted_entry_cancel",
+            "mode": (
+                "persisted_virtual_entry_cancel"
+                if result.broker_cancellation.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else "persisted_entry_cancel"
+            ),
             "runtime_timezone": app_config.timezone,
-            "session_client_id": app_config.ibkr.client_id,
+            "session_client_id": (
+                None
+                if result.broker_cancellation.get("broker_kind") == BROKER_KIND_VIRTUAL
+                else app_config.ibkr.client_id
+            ),
             "cancelled_entry": serialize_persisted_broker_cancellation(result),
         }
 

@@ -25,6 +25,10 @@ from ibkr_trader.ledger.persistence import persist_broker_order_cancellation
 from ibkr_trader.ledger.persistence import persist_broker_order_submission
 from ibkr_trader.orchestration.operator_controls import assert_kill_switch_inactive
 from ibkr_trader.orchestration.state_machine import ExecutionState
+from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
+from ibkr_trader.virtual.accounts import is_virtual_account_key
+from ibkr_trader.virtual.execution import cancel_virtual_order
+from ibkr_trader.virtual.execution import submit_virtual_entry_order
 
 
 class PersistedInstructionNotFoundError(LookupError):
@@ -139,13 +143,37 @@ def submit_persisted_instruction_entry(
             )
 
         instruction = parse_execution_instruction_payload(raw_instruction_payload)
-        runtime_submitter = submitter or submit_order_from_instruction
+        runtime_submitter = submitter
+        if runtime_submitter is None:
+            if is_virtual_account_key(instruction.account.account_key):
+                def _submit_virtual_entry(
+                    broker_config: IbkrConnectionConfig,
+                    runtime_instruction: Any,
+                    *,
+                    timeout: int = 10,
+                ) -> dict[str, Any]:
+                    return submit_virtual_entry_order(
+                        session_factory,
+                        broker_config,
+                        runtime_instruction,
+                        timeout=timeout,
+                    )
+
+                runtime_submitter = _submit_virtual_entry
+            else:
+                runtime_submitter = submit_order_from_instruction
         broker_submission = runtime_submitter(
             broker_config,
             instruction,
             timeout=timeout,
         )
         broker_status = broker_submission["broker_order_status"]
+        broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
+        fallback_account_key = (
+            str(broker_submission["account"])
+            if broker_submission.get("account") not in (None, "")
+            else broker_config.account_id
+        )
 
         previous_state = instruction_record.state
         instruction_record.state = ExecutionState.ENTRY_SUBMITTED.value
@@ -173,14 +201,18 @@ def submit_persisted_instruction_entry(
         event_at = utc_now()
         persist_broker_order_submission(
             session,
-            broker_kind=BROKER_KIND_IBKR,
+            broker_kind=broker_kind,
             instruction_record=instruction_record,
             broker_submission=broker_submission,
             observed_at=event_at,
-            fallback_account_key=broker_config.account_id,
+            fallback_account_key=fallback_account_key,
             order_role="ENTRY",
             event_type="entry_order_submitted",
-            note="Persisted instruction entry broker order submitted to IBKR.",
+            note=(
+                "Persisted instruction entry virtual order."
+                if broker_kind == BROKER_KIND_VIRTUAL
+                else "Persisted instruction entry broker order submitted to IBKR."
+            ),
         )
         event = InstructionEventRecord(
             instruction_id=instruction_record.id,
@@ -190,7 +222,11 @@ def submit_persisted_instruction_entry(
             state_before=previous_state,
             state_after=instruction_record.state,
             payload={"broker_submission": broker_submission},
-            note="Persisted instruction entry order submitted to IBKR.",
+            note=(
+                "Persisted instruction entry order submitted to the virtual broker."
+                if broker_kind == BROKER_KIND_VIRTUAL
+                else "Persisted instruction entry order submitted to IBKR."
+            ),
         )
         session.add(event)
         session.flush()
@@ -245,13 +281,37 @@ def cancel_persisted_instruction_entry(
                 f"Instruction '{instruction_id}' does not have a broker_order_id to cancel."
             )
 
-        runtime_canceler = canceler or cancel_broker_order
+        runtime_canceler = canceler
+        if runtime_canceler is None:
+            if instruction_record.is_virtual or is_virtual_account_key(instruction_record.account_key):
+                def _cancel_virtual_entry(
+                    broker_config: IbkrConnectionConfig,
+                    order_id: int,
+                    *,
+                    timeout: int = 10,
+                ) -> dict[str, Any]:
+                    return cancel_virtual_order(
+                        session_factory,
+                        broker_config,
+                        order_id,
+                        timeout=timeout,
+                    )
+
+                runtime_canceler = _cancel_virtual_entry
+            else:
+                runtime_canceler = cancel_broker_order
         broker_cancellation = runtime_canceler(
             broker_config,
             instruction_record.broker_order_id,
             timeout=timeout,
         )
         broker_status = broker_cancellation["broker_order_status"]
+        broker_kind = str(broker_cancellation.get("broker_kind") or BROKER_KIND_IBKR)
+        fallback_account_key = (
+            str(broker_cancellation["account"])
+            if broker_cancellation.get("account") not in (None, "")
+            else broker_config.account_id
+        )
 
         previous_state = instruction_record.state
         instruction_record.state = ExecutionState.ENTRY_CANCELLED.value
@@ -264,13 +324,17 @@ def cancel_persisted_instruction_entry(
         event_at = utc_now()
         persist_broker_order_cancellation(
             session,
-            broker_kind=BROKER_KIND_IBKR,
+            broker_kind=broker_kind,
             broker_cancellation=broker_cancellation,
             observed_at=event_at,
             instruction_record=instruction_record,
-            fallback_account_key=broker_config.account_id,
+            fallback_account_key=fallback_account_key,
             event_type="entry_order_cancelled",
-            note="Persisted instruction entry broker order cancelled at IBKR.",
+            note=(
+                "Persisted instruction entry virtual order cancellation."
+                if broker_kind == BROKER_KIND_VIRTUAL
+                else "Persisted instruction entry broker order cancelled at IBKR."
+            ),
         )
         event = InstructionEventRecord(
             instruction_id=instruction_record.id,
@@ -280,7 +344,11 @@ def cancel_persisted_instruction_entry(
             state_before=previous_state,
             state_after=instruction_record.state,
             payload={"broker_cancellation": broker_cancellation},
-            note="Persisted instruction entry order cancelled at IBKR.",
+            note=(
+                "Persisted instruction entry order cancelled at the virtual broker."
+                if broker_kind == BROKER_KIND_VIRTUAL
+                else "Persisted instruction entry order cancelled at IBKR."
+            ),
         )
         session.add(event)
         session.flush()

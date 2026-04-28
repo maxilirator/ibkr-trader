@@ -28,6 +28,7 @@ class _FakeHistoricalBarsSyncWrapper:
         self.connected = False
         self.disconnected = False
         self.contract_details: list[object] = []
+        self.contract_detail_call_count = 0
         self.errors: dict[int, list[dict[str, object]]] = {}
 
     def connect_and_start(self, *, host: str, port: int, client_id: int) -> bool:
@@ -39,6 +40,7 @@ class _FakeHistoricalBarsSyncWrapper:
         self.disconnected = True
 
     def get_contract_details(self, contract: _FakeContract, timeout: int | None = None) -> list[object]:
+        self.contract_detail_call_count += 1
         return [
             SimpleNamespace(
                 contract=SimpleNamespace(
@@ -183,3 +185,61 @@ class HistoricalBarsTests(TestCase):
         )
 
         self.assertEqual(wrapper.historical_args[1], "20260410-15:30:00")
+
+    def test_read_historical_bars_can_reuse_contract_details_cache(self) -> None:
+        wrapper = _FakeHistoricalBarsSyncWrapper(timeout=20)
+        cache = {}
+        query = HistoricalBarsQuery(
+            symbol="SIVE",
+            security_type="STK",
+            exchange="SMART",
+            currency="SEK",
+            primary_exchange="SFB",
+            isin="SE0003917798",
+            duration="1 D",
+            bar_size="1 min",
+            what_to_show="TRADES",
+            use_rth=True,
+        )
+
+        read_historical_bars(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            query,
+            sync_wrapper_cls=lambda timeout: wrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            contract_details_cache=cache,
+        )
+        read_historical_bars(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            HistoricalBarsQuery(
+                symbol=query.symbol,
+                security_type=query.security_type,
+                exchange=query.exchange,
+                currency=query.currency,
+                primary_exchange=query.primary_exchange,
+                isin=query.isin,
+                duration=query.duration,
+                bar_size=query.bar_size,
+                what_to_show="MIDPOINT",
+                use_rth=query.use_rth,
+            ),
+            sync_wrapper_cls=lambda timeout: wrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            contract_details_cache=cache,
+        )
+
+        self.assertEqual(wrapper.contract_detail_call_count, 1)

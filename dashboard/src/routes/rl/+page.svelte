@@ -1,48 +1,30 @@
 <script>
-  import { browser } from '$app/environment';
   import { applyAction, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { onMount } from 'svelte';
 
   export let data;
-  export let form;
 
-  const AUTO_REFRESH_INTERVAL_MS = 15000;
+  const AUTO_REFRESH_INTERVAL_MS = 30000;
   const BUTTON_CLICK_TO_WORK_MS = 120;
   const BUTTON_SUCCESS_RESET_MS = 1600;
   const BUTTON_ERROR_RESET_MS = 2200;
 
-  let rlDashboard = {};
-  let summary = {
-    model_count: 0,
-    deployment_count: 0,
-    live_deployment_count: 0,
-    running_deployment_count: 0,
-    stale_heartbeat_count: 0,
-    recent_action_count: 0
-  };
-  let models = [];
-  let deployments = [];
-  let recentActions = [];
+  let rlDashboard = data.rlDashboard;
+  let summary = rlDashboard.summary;
+  let models = rlDashboard.models;
+  let deployments = rlDashboard.deployments;
+  let recentActions = rlDashboard.recent_actions;
   let endpointErrors = [];
-  let recommendedShortActionSpace = [];
   let refreshInFlight = false;
   let buttonStates = {};
 
-  $: rlDashboard = data.rlDashboard ?? {};
-  $: summary = rlDashboard.summary ?? {
-    model_count: 0,
-    deployment_count: 0,
-    live_deployment_count: 0,
-    running_deployment_count: 0,
-    stale_heartbeat_count: 0,
-    recent_action_count: 0
-  };
-  $: models = rlDashboard.models ?? [];
-  $: deployments = rlDashboard.deployments ?? [];
-  $: recentActions = rlDashboard.recent_actions ?? [];
-  $: endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
-  $: recommendedShortActionSpace = data.recommendedShortActionSpace ?? [];
+  $: rlDashboard = data.rlDashboard;
+  $: summary = rlDashboard.summary;
+  $: models = rlDashboard.models;
+  $: deployments = rlDashboard.deployments;
+  $: recentActions = rlDashboard.recent_actions;
+  $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
 
   function setButtonState(buttonKey, phase, message = null) {
     buttonStates = {
@@ -111,10 +93,19 @@
     return JSON.stringify(value ?? {}, null, 2);
   }
 
-  function summarizeSymbols(symbols) {
-    if (!symbols || symbols.length === 0) return 'All resolved symbols';
+  function summarizeSymbols(symbols, deployment = null) {
+    if (!symbols || symbols.length === 0) {
+      if (deployment?.metadata?.daily_universe_source === 'model_routed_candidates') {
+        return 'Daily model-routed candidates';
+      }
+      return 'No deployment allow-list';
+    }
     if (symbols.length <= 4) return symbols.join(', ');
     return `${symbols.slice(0, 4).join(', ')} +${symbols.length - 4} more`;
+  }
+
+  function symbolsText(symbols) {
+    return (symbols ?? []).join('\n');
   }
 
   async function refreshNow() {
@@ -142,11 +133,10 @@
   <header class="hero">
     <div>
       <p class="eyebrow">RL Trader</p>
-      <h1>Model Registry And Execution Pane</h1>
+      <h1>Model Registry And Execution State</h1>
       <p class="lede">
-        This page is the early operator guide for account-bound RL deployments. Models,
-        deployments, heartbeats, and action logs are durable already; instruction translation
-        is the next layer we’ll attach.
+        This page is the operator view for account-bound RL deployments, runner heartbeats,
+        action logs, and virtual account state.
       </p>
     </div>
 
@@ -182,6 +172,10 @@
       <strong>{summary.live_deployment_count}</strong>
     </article>
     <article class="summary-card">
+      <span>Virtual</span>
+      <strong>{summary.virtual_deployment_count}</strong>
+    </article>
+    <article class="summary-card">
       <span>Running</span>
       <strong>{summary.running_deployment_count}</strong>
     </article>
@@ -192,366 +186,6 @@
     <article class="summary-card">
       <span>Recent Actions</span>
       <strong>{summary.recent_action_count}</strong>
-    </article>
-  </section>
-
-  <section class="panel">
-    <div class="panel-header">
-      <div>
-        <h2>Promoted Short Action Space</h2>
-        <p>
-          This is the fixed action set currently exposed by the short-side research line and
-          should stay synchronized with the registered model metadata.
-        </p>
-      </div>
-    </div>
-
-    <div class="pill-row">
-      {#each recommendedShortActionSpace as actionName}
-        <span class="pill">{actionName}</span>
-      {/each}
-    </div>
-  </section>
-
-  <section class="form-grid">
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2>Register Model</h2>
-          <p>Record promoted workflow lineage, action space, and observation contract.</p>
-        </div>
-      </div>
-
-      {#if form?.registerModelResult}
-        <p class:ok={form.registerModelResult.ok} class:error-text={!form.registerModelResult.ok}>
-          {form.registerModelResult.message}
-        </p>
-      {/if}
-
-      <form method="POST" action="?/registerModel" use:enhance={formEnhancer('registerModel')}>
-        <label>
-          <span>Model Key</span>
-          <input name="model_key" value="short_trial36_v1" required />
-        </label>
-        <label>
-          <span>Display Name</span>
-          <input name="display_name" value="Short Trial 36 V1" required />
-        </label>
-        <label>
-          <span>Strategy Family</span>
-          <input name="strategy_family" value="canonical_short_live_execution_policy" required />
-        </label>
-        <label>
-          <span>Side</span>
-          <select name="side">
-            <option value="SHORT">SHORT</option>
-            <option value="LONG">LONG</option>
-            <option value="MIXED">MIXED</option>
-          </select>
-        </label>
-        <label>
-          <span>Source Workflow Path</span>
-          <input
-            name="source_workflow_path"
-            value="/home/mattias/dev/q-training-bucket-booster/workflows/canonical/short_live/v1/execution_policy_short_trial36_v1.yaml"
-          />
-        </label>
-        <label>
-          <span>Promoted Checkpoint Path</span>
-          <input
-            name="promoted_checkpoint_path"
-            value="/home/mattias/dev/q-training-bucket-booster/artifacts/analysis/short_trial_36_ex_short_true_rl_dqn_w128_volnorm_market_context_triseed_v1/continuation/true_rl_dqn_w128_seed140/best_dqn_state.pt"
-          />
-        </label>
-        <label>
-          <span>Execution Mapping Version</span>
-          <input name="execution_mapping_version" value="short_actions_v1" />
-        </label>
-        <label class="full-width">
-          <span>Action Space</span>
-          <textarea name="action_space" rows="4">{recommendedShortActionSpace.join('\n')}</textarea>
-        </label>
-        <label class="full-width">
-          <span>Observation Contract JSON</span>
-          <textarea name="observation_contract" rows="10">{`{
-  "bar_family": "stockholm_intraday_1m_v1",
-  "required_series": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
-  "include_market_context": true,
-  "include_vol_normalized_intraday_state": true,
-  "feature_schema_version": "short_live_v1"
-}`}</textarea>
-        </label>
-        <label class="full-width">
-          <span>Metadata JSON</span>
-          <textarea name="metadata" rows="6">{`{
-  "notes": ["Promoted short-side true RL recipe"],
-  "canonical_seed": 140
-}`}</textarea>
-        </label>
-
-        <button
-          type="submit"
-          class="primary {getButtonState('registerModel').phase}"
-          disabled={getButtonState('registerModel').phase === 'working'}
-        >
-          {#if getButtonState('registerModel').phase === 'working'}
-            Registering...
-          {:else if getButtonState('registerModel').phase === 'done'}
-            Registered
-          {:else if getButtonState('registerModel').phase === 'error'}
-            Retry Register
-          {:else}
-            Register Model
-          {/if}
-        </button>
-      </form>
-    </article>
-
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2>Create Deployment</h2>
-          <p>Bind one RL deployment to one real account and one internal book.</p>
-        </div>
-      </div>
-
-      {#if form?.createDeploymentResult}
-        <p class:ok={form.createDeploymentResult.ok} class:error-text={!form.createDeploymentResult.ok}>
-          {form.createDeploymentResult.message}
-        </p>
-      {/if}
-
-      <form method="POST" action="?/createDeployment" use:enhance={formEnhancer('createDeployment')}>
-        <label>
-          <span>Deployment Key</span>
-          <input name="deployment_key" value="short_trial36_live_01" required />
-        </label>
-        <label>
-          <span>Model Key</span>
-          <input name="model_key" value="short_trial36_v1" required />
-        </label>
-        <label>
-          <span>IBKR Account</span>
-          <input name="account_key" placeholder="U25245596" required />
-        </label>
-        <label>
-          <span>Book Key</span>
-          <input name="book_key" value="rl_short_trial36_live_01" required />
-        </label>
-        <label>
-          <span>Mode</span>
-          <select name="mode">
-            <option value="paper">paper</option>
-            <option value="live">live</option>
-          </select>
-        </label>
-        <label>
-          <span>Status</span>
-          <select name="status">
-            <option value="draft">draft</option>
-            <option value="paused">paused</option>
-            <option value="running">running</option>
-            <option value="degraded">degraded</option>
-            <option value="stopped">stopped</option>
-          </select>
-        </label>
-        <label class="full-width">
-          <span>Allowed Symbols</span>
-          <textarea name="allowed_symbols" rows="3" placeholder="SIVE VOLV-B ABB"></textarea>
-        </label>
-        <label class="full-width">
-          <span>Risk Limits JSON</span>
-          <textarea name="risk_limits" rows="8">{`{
-  "max_open_positions": 8,
-  "max_notional_per_name_sek": 25000,
-  "max_daily_turnover_sek": 200000
-}`}</textarea>
-        </label>
-        <label class="full-width">
-          <span>Action Constraints JSON</span>
-          <textarea name="action_constraints" rows="8">{`{
-  "position_side": "SHORT",
-  "allow_actions": ["skip", "wait", "market_entry", "cancel_entry", "exit_market", "clear_exit", "entry_prevclose_88bp", "exit_tp_180bp"],
-  "state_machine_version": "short_symbol_state_v1"
-}`}</textarea>
-        </label>
-        <label class="full-width">
-          <span>Metadata JSON</span>
-          <textarea name="metadata" rows="5">{`{
-  "operator_notes": "One real account per autonomous deployment."
-}`}</textarea>
-        </label>
-
-        <button
-          type="submit"
-          class="primary {getButtonState('createDeployment').phase}"
-          disabled={getButtonState('createDeployment').phase === 'working'}
-        >
-          {#if getButtonState('createDeployment').phase === 'working'}
-            Creating...
-          {:else if getButtonState('createDeployment').phase === 'done'}
-            Created
-          {:else if getButtonState('createDeployment').phase === 'error'}
-            Retry Create
-          {:else}
-            Create Deployment
-          {/if}
-        </button>
-      </form>
-    </article>
-  </section>
-
-  <section class="form-grid">
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2>Log Action</h2>
-          <p>Append a model action so we can inspect the feed and state transitions early.</p>
-        </div>
-      </div>
-
-      {#if form?.logActionResult}
-        <p class:ok={form.logActionResult.ok} class:error-text={!form.logActionResult.ok}>
-          {form.logActionResult.message}
-        </p>
-      {/if}
-
-      <form method="POST" action="?/logAction" use:enhance={formEnhancer('logAction')}>
-        <label>
-          <span>Deployment Key</span>
-          <input name="deployment_key" value="short_trial36_live_01" required />
-        </label>
-        <label>
-          <span>Symbol</span>
-          <input name="symbol" value="SIVE" required />
-        </label>
-        <label>
-          <span>Action</span>
-          <select name="action_name">
-            {#each recommendedShortActionSpace as actionName}
-              <option value={actionName}>{actionName}</option>
-            {/each}
-          </select>
-        </label>
-        <label>
-          <span>Observed At</span>
-          <input name="observed_at" placeholder="2026-04-25T09:25:00+02:00" />
-        </label>
-        <label>
-          <span>State Before</span>
-          <input name="state_before" value="FLAT" />
-        </label>
-        <label>
-          <span>State After</span>
-          <input name="state_after" value="ENTRY_PENDING" />
-        </label>
-        <label>
-          <span>Action Status</span>
-          <input name="action_status" value="logged" />
-        </label>
-        <label>
-          <span>Instruction ID</span>
-          <input name="instruction_id" placeholder="optional until translation exists" />
-        </label>
-        <label class="full-width">
-          <span>Note</span>
-          <input name="note" value="Manual early dashboard log for execution-shape walkthrough." />
-        </label>
-        <label class="full-width">
-          <span>Payload JSON</span>
-          <textarea name="payload" rows="6">{`{
-  "reason": "dashboard_walkthrough",
-  "policy_confidence": 0.73
-}`}</textarea>
-        </label>
-
-        <button
-          type="submit"
-          class="primary {getButtonState('logAction').phase}"
-          disabled={getButtonState('logAction').phase === 'working'}
-        >
-          {#if getButtonState('logAction').phase === 'working'}
-            Logging...
-          {:else if getButtonState('logAction').phase === 'done'}
-            Logged
-          {:else if getButtonState('logAction').phase === 'error'}
-            Retry Log
-          {:else}
-            Log Action
-          {/if}
-        </button>
-      </form>
-    </article>
-
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2>Update Heartbeat</h2>
-          <p>Feed runtime liveness, last bar, and freshness state into the operator view.</p>
-        </div>
-      </div>
-
-      {#if form?.updateHeartbeatResult}
-        <p class:ok={form.updateHeartbeatResult.ok} class:error-text={!form.updateHeartbeatResult.ok}>
-          {form.updateHeartbeatResult.message}
-        </p>
-      {/if}
-
-      <form method="POST" action="?/updateHeartbeat" use:enhance={formEnhancer('updateHeartbeat')}>
-        <label>
-          <span>Deployment Key</span>
-          <input name="deployment_key" value="short_trial36_live_01" required />
-        </label>
-        <label>
-          <span>Status</span>
-          <select name="status">
-            <option value="running">running</option>
-            <option value="paused">paused</option>
-            <option value="degraded">degraded</option>
-            <option value="stopped">stopped</option>
-          </select>
-        </label>
-        <label>
-          <span>Last Seen At</span>
-          <input name="last_seen_at" placeholder="2026-04-25T09:30:00+02:00" />
-        </label>
-        <label>
-          <span>Last Bar At</span>
-          <input name="last_bar_at" placeholder="2026-04-25T09:29:00+02:00" />
-        </label>
-        <label>
-          <span>Last Action At</span>
-          <input name="last_action_at" placeholder="2026-04-25T09:25:00+02:00" />
-        </label>
-        <label class="full-width">
-          <span>Runtime Error</span>
-          <input name="runtime_error" placeholder="leave blank when healthy" />
-        </label>
-        <label class="full-width">
-          <span>Metrics JSON</span>
-          <textarea name="metrics" rows="7">{`{
-  "bar_lag_seconds": 4,
-  "action_queue_depth": 0,
-  "policy_step_ms": 18
-}`}</textarea>
-        </label>
-
-        <button
-          type="submit"
-          class="primary {getButtonState('updateHeartbeat').phase}"
-          disabled={getButtonState('updateHeartbeat').phase === 'working'}
-        >
-          {#if getButtonState('updateHeartbeat').phase === 'working'}
-            Updating...
-          {:else if getButtonState('updateHeartbeat').phase === 'done'}
-            Updated
-          {:else if getButtonState('updateHeartbeat').phase === 'error'}
-            Retry Update
-          {:else}
-            Update Heartbeat
-          {/if}
-        </button>
-      </form>
     </article>
   </section>
 
@@ -578,13 +212,19 @@
             </div>
 
             <dl class="detail-grid">
-              <div><dt>Account</dt><dd>{deployment.account_key}</dd></div>
+              <div>
+                <dt>Account</dt>
+                <dd>
+                  {deployment.account_key}
+                  {#if deployment.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                </dd>
+              </div>
               <div><dt>Book</dt><dd>{deployment.book_key}</dd></div>
               <div><dt>Mode</dt><dd>{deployment.mode}</dd></div>
               <div><dt>Updated</dt><dd>{formatTimestamp(deployment.updated_at)}</dd></div>
               <div class="full">
                 <dt>Allowed Symbols</dt>
-                <dd>{summarizeSymbols(deployment.allowed_symbols)}</dd>
+                <dd>{summarizeSymbols(deployment.allowed_symbols, deployment)}</dd>
               </div>
             </dl>
 
@@ -601,6 +241,58 @@
             {:else}
               <div class="heartbeat missing">No heartbeat yet.</div>
             {/if}
+
+            <details class="deployment-edit">
+              <summary>Edit Deployment</summary>
+              <form
+                method="POST"
+                action="?/updateDeployment"
+                use:enhance={formEnhancer(`updateDeployment-${deployment.deployment_key}`)}
+              >
+                <input type="hidden" name="deployment_key" value={deployment.deployment_key} />
+                <label>
+                  <span>Status</span>
+                  <select name="status">
+                    <option value="draft" selected={deployment.status === 'draft'}>draft</option>
+                    <option value="paused" selected={deployment.status === 'paused'}>paused</option>
+                    <option value="running" selected={deployment.status === 'running'}>running</option>
+                    <option value="degraded" selected={deployment.status === 'degraded'}>degraded</option>
+                    <option value="stopped" selected={deployment.status === 'stopped'}>stopped</option>
+                  </select>
+                </label>
+                <label class="full-width">
+                  <span>Allowed Symbols</span>
+                  <textarea name="allowed_symbols" rows="4">{symbolsText(deployment.allowed_symbols)}</textarea>
+                </label>
+                <label class="full-width">
+                  <span>Risk Limits JSON</span>
+                  <textarea name="risk_limits" rows="5">{stringifyJson(deployment.risk_limits)}</textarea>
+                </label>
+                <label class="full-width">
+                  <span>Action Constraints JSON</span>
+                  <textarea name="action_constraints" rows="6">{stringifyJson(deployment.action_constraints)}</textarea>
+                </label>
+                <label class="full-width">
+                  <span>Metadata JSON</span>
+                  <textarea name="metadata" rows="5">{stringifyJson(deployment.metadata)}</textarea>
+                </label>
+                <button
+                  type="submit"
+                  class="secondary {getButtonState(`updateDeployment-${deployment.deployment_key}`).phase}"
+                  disabled={getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'working'}
+                >
+                  {#if getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'working'}
+                    Updating...
+                  {:else if getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'done'}
+                    Updated
+                  {:else if getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'error'}
+                    Retry Update
+                  {:else}
+                    Update Deployment
+                  {/if}
+                </button>
+              </form>
+            </details>
           </article>
         {/each}
       </div>
@@ -761,7 +453,6 @@
   }
 
   .summary-grid,
-  .form-grid,
   .deployment-grid,
   .model-grid {
     display: grid;
@@ -785,10 +476,6 @@
 
   .summary-card strong {
     font-size: 1.65rem;
-  }
-
-  .form-grid {
-    grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr));
   }
 
   .panel-header {
@@ -877,6 +564,16 @@
     border-color: var(--panel-border);
   }
 
+  .secondary.done {
+    border-color: var(--ok);
+    color: var(--ok);
+  }
+
+  .secondary.error {
+    border-color: var(--bad);
+    color: var(--bad);
+  }
+
   .primary.working {
     filter: saturate(0.8);
   }
@@ -945,6 +642,18 @@
     color: var(--bad);
   }
 
+  .mini-badge {
+    display: inline-flex;
+    margin-left: 0.35rem;
+    padding: 0.08rem 0.35rem;
+    border: 1px solid var(--warn);
+    border-radius: 999px;
+    color: var(--warn);
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
   .deployment-grid,
   .model-grid {
     grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
@@ -955,6 +664,12 @@
     padding: 1rem;
     display: grid;
     gap: 0.9rem;
+  }
+
+  .deployment-edit summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-weight: 700;
   }
 
   .card-head {

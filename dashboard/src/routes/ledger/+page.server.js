@@ -1,9 +1,29 @@
+import { error } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import {
+  buildFallbackHealth,
   buildEndpointErrorMap,
   normalizeBaseUrl,
   readJson
 } from '$lib/server/trader-api';
+
+function requireResponseBody(result, endpointName) {
+  if (!result.ok) {
+    throw error(result.status || 502, `${endpointName} failed: ${result.error}`);
+  }
+  if (!result.body || typeof result.body !== 'object') {
+    throw error(502, `${endpointName} returned no JSON body`);
+  }
+  return result.body;
+}
+
+function requireBodyField(result, fieldName, endpointName) {
+  const body = requireResponseBody(result, endpointName);
+  if (body[fieldName] === undefined || body[fieldName] === null) {
+    throw error(502, `${endpointName} response missing ${fieldName}`);
+  }
+  return body[fieldName];
+}
 
 export async function load({ fetch, url }) {
   const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
@@ -25,30 +45,9 @@ export async function load({ fetch, url }) {
   const healthUrl = `${apiBaseUrl}/healthz`;
 
   const [health, ledgerSnapshot] = await Promise.all([
-    readJson(fetch, healthUrl),
+    readJson(fetch, healthUrl, { timeoutMs: 2500 }),
     readJson(fetch, ledgerSnapshotUrl)
   ]);
-
-  const ledgerSnapshotBody = ledgerSnapshot.body?.ledger_snapshot ?? {
-    generated_at: null,
-    focus_instruction: null,
-    summary: {
-      instruction_count: 0,
-      instruction_event_count: 0,
-      broker_order_count: 0,
-      broker_order_event_count: 0,
-      execution_fill_count: 0,
-      control_event_count: 0,
-      instruction_set_cancellation_count: 0,
-      reconciliation_issue_count: 0
-    },
-    instruction_events: [],
-    broker_order_events: [],
-    recent_fills: [],
-    control_events: [],
-    instruction_set_cancellations: [],
-    reconciliation_issues: []
-  };
 
   return {
     generatedAt: new Date().toISOString(),
@@ -58,7 +57,9 @@ export async function load({ fetch, url }) {
       health,
       ledgerSnapshot
     }),
-    health: health.body,
-    ledgerSnapshot: ledgerSnapshotBody
+    health: health.ok
+      ? requireResponseBody(health, 'healthz')
+      : buildFallbackHealth(apiBaseUrl, health.error),
+    ledgerSnapshot: requireBodyField(ledgerSnapshot, 'ledger_snapshot', 'Ledger snapshot')
   };
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime
 from datetime import timezone
+from unittest.mock import patch
 
 from sqlalchemy.orm import Session
 
@@ -361,6 +362,49 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
             snapshot.recent_reconciliation_runs[0].issues[0].operator_review.status,
             "RESOLVED",
         )
+
+    def test_build_operator_dashboard_snapshot_includes_account_day_performance(self) -> None:
+        self._seed_operator_data()
+
+        with patch(
+            "ibkr_trader.read_models.operator_dashboard.utc_now",
+            return_value=datetime(2026, 4, 19, 8, 0, tzinfo=timezone.utc),
+        ):
+            snapshot = build_operator_dashboard_snapshot(self.session_factory)
+
+        performance = snapshot.accounts[0].day_performance
+        self.assertEqual(performance.start_net_liquidation, "100000")
+        self.assertEqual(performance.latest_net_liquidation, "101500")
+        self.assertEqual(performance.latest_return_pct, "+1.50")
+        self.assertEqual(len(performance.points), 2)
+        self.assertEqual(performance.points[0].return_pct, "0.00")
+        self.assertEqual(performance.points[1].return_pct, "+1.50")
+
+    def test_build_operator_dashboard_snapshot_hides_archived_attention_and_warnings(self) -> None:
+        self._seed_operator_data()
+        record_broker_attention_review_action(
+            self.session_factory,
+            event_id=1,
+            action_type="ARCHIVE",
+            updated_by="dashboard",
+        )
+        record_reconciliation_issue_review_action(
+            self.session_factory,
+            issue_id=1,
+            action_type="ARCHIVE",
+            updated_by="dashboard",
+        )
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(snapshot.recent_broker_attention, ())
+        self.assertEqual(snapshot.recent_reconciliation_runs, ())
 
     def test_build_operator_dashboard_snapshot_reports_exit_orders_against_fill_basis(self) -> None:
         session: Session = self.session_factory()

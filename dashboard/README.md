@@ -18,12 +18,17 @@ The dashboard reads the Python API server and expects these endpoints:
 - `GET /healthz`
 - `GET /v1/read/operator-snapshot`
 - `GET /v1/read/ledger-snapshot`
+- `GET /v1/read/rl-dashboard`
 
 The API base URL is controlled by:
 
 ```bash
 IBKR_TRADER_API_BASE_URL=http://quant.geisler.se:8000
 ```
+
+`IBKR_TRADER_API_BASE_URL` is required. The dashboard intentionally fails when
+the base URL, health response, or read-model response is missing instead of
+rendering fallback trading data.
 
 ## Run
 

@@ -52,6 +52,7 @@ def load_sync_wrapper_class() -> type[Any]:
             self.execution_commissions: dict[str, Any] = {}
 
         def connect_and_start(self, host: str, port: int, client_id: int) -> bool:
+            self.last_connect_failure_reason = None
             self.next_valid_id_value = None
             self.connect(host, port, client_id)
 
@@ -60,6 +61,10 @@ def load_sync_wrapper_class() -> type[Any]:
                 time.sleep(0.1)
 
             if not self.isConnected():
+                self.last_connect_failure_reason = (
+                    f"Failed to open an IBKR API socket at {host}:{port} "
+                    f"with client_id={client_id}."
+                )
                 return False
 
             self.api_thread = threading.Thread(
@@ -74,6 +79,14 @@ def load_sync_wrapper_class() -> type[Any]:
                 time.sleep(0.1)
 
             if self.next_valid_id_value is None:
+                self.last_connect_failure_reason = (
+                    f"Connected to IBKR API socket at {host}:{port} with "
+                    f"client_id={client_id}, but Gateway did not complete API startup "
+                    "(no nextValidId callback). If the Gateway UI is green, check for "
+                    "a pending API connection approval prompt and verify API Settings: "
+                    "Enable ActiveX and Socket Clients, Socket port, and trusted "
+                    "localhost connections."
+                )
                 self.disconnect_and_stop()
                 return False
 

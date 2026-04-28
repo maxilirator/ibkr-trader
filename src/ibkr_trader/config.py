@@ -136,17 +136,25 @@ class AppConfig:
     stockholm_identity_path: Path
     api: ApiServerConfig
     ibkr: IbkrConnectionConfig
+    broker_warmup_enabled: bool = True
     broker_monitor_enabled: bool = True
+    broker_connect_backoff_initial_seconds: float = 5.0
+    broker_connect_backoff_max_seconds: float = 300.0
     broker_heartbeat_interval_seconds: float = 30.0
     broker_heartbeat_timeout_seconds: int = 5
     broker_snapshot_refresh_interval_seconds: float = 60.0
     broker_snapshot_refresh_timeout_seconds: int = 10
+    broker_status_refresh_min_interval_seconds: float = 30.0
+    market_stream_auto_reconnect_enabled: bool = True
+    market_stream_reconnect_interval_seconds: float = 15.0
     execution_runtime_enabled: bool = False
     execution_runtime_interval_seconds: float = 5.0
     execution_runtime_timeout_seconds: int = 10
     execution_runtime_submission_lead_seconds: float = 60.0
     execution_runtime_allow_startup_issues: bool = False
     execution_runtime_lease_seconds: float = 30.0
+    execution_runtime_restart_backoff_initial_seconds: float = 30.0
+    execution_runtime_restart_backoff_max_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -178,11 +186,22 @@ class AppConfig:
             ),
             api=ApiServerConfig.from_env(),
             ibkr=IbkrConnectionConfig.from_env(),
+            broker_warmup_enabled=getenv(
+                "BROKER_WARMUP_ENABLED",
+                "true",
+            ).lower()
+            not in {"0", "false", "no"},
             broker_monitor_enabled=getenv(
                 "BROKER_MONITOR_ENABLED",
                 "true",
             ).lower()
             not in {"0", "false", "no"},
+            broker_connect_backoff_initial_seconds=float(
+                getenv("BROKER_CONNECT_BACKOFF_INITIAL_SECONDS", "5")
+            ),
+            broker_connect_backoff_max_seconds=float(
+                getenv("BROKER_CONNECT_BACKOFF_MAX_SECONDS", "300")
+            ),
             broker_heartbeat_interval_seconds=float(
                 getenv("BROKER_HEARTBEAT_INTERVAL_SECONDS", "30")
             ),
@@ -194,6 +213,17 @@ class AppConfig:
             ),
             broker_snapshot_refresh_timeout_seconds=int(
                 getenv("BROKER_SNAPSHOT_REFRESH_TIMEOUT_SECONDS", "10")
+            ),
+            broker_status_refresh_min_interval_seconds=float(
+                getenv("BROKER_STATUS_REFRESH_MIN_INTERVAL_SECONDS", "30")
+            ),
+            market_stream_auto_reconnect_enabled=getenv(
+                "MARKET_STREAM_AUTO_RECONNECT_ENABLED",
+                "true",
+            ).lower()
+            not in {"0", "false", "no"},
+            market_stream_reconnect_interval_seconds=float(
+                getenv("MARKET_STREAM_RECONNECT_INTERVAL_SECONDS", "15")
             ),
             execution_runtime_enabled=getenv(
                 "EXECUTION_RUNTIME_ENABLED",
@@ -216,5 +246,11 @@ class AppConfig:
             not in {"0", "false", "no"},
             execution_runtime_lease_seconds=float(
                 getenv("EXECUTION_RUNTIME_LEASE_SECONDS", "30")
+            ),
+            execution_runtime_restart_backoff_initial_seconds=float(
+                getenv("EXECUTION_RUNTIME_RESTART_BACKOFF_INITIAL_SECONDS", "30")
+            ),
+            execution_runtime_restart_backoff_max_seconds=float(
+                getenv("EXECUTION_RUNTIME_RESTART_BACKOFF_MAX_SECONDS", "300")
             ),
         )

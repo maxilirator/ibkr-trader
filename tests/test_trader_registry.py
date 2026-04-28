@@ -13,6 +13,8 @@ from ibkr_trader.orchestration.trader_registry import (
     create_trader_deployment,
     log_trader_action,
     register_trader_model,
+    update_trader_deployment,
+    upsert_trader_model,
     upsert_trader_heartbeat,
 )
 
@@ -104,6 +106,122 @@ class TraderRegistryTests(TestCase):
                 action_space=("skip",),
             )
 
+    def test_upsert_model_updates_existing_metadata(self) -> None:
+        register_trader_model(
+            self.session_factory,
+            model_key="short_trial36_v1",
+            display_name="Short Trial 36 V1",
+            strategy_family="canonical_short_live_execution_policy",
+            side="SHORT",
+            source_workflow_path=None,
+            promoted_checkpoint_path=None,
+            action_space=("skip", "market_entry"),
+            observation_contract={"bar_family": "stockholm_intraday_1m_v1"},
+            execution_mapping_version="short_actions_v0",
+        )
+
+        updated = upsert_trader_model(
+            self.session_factory,
+            model_key="short_trial36_v1",
+            display_name="Short Trial 36 V1",
+            strategy_family="canonical_short_live_execution_policy",
+            side="SHORT",
+            source_workflow_path="/tmp/workflow.yaml",
+            promoted_checkpoint_path="/tmp/best_dqn_state.pt",
+            action_space=("skip", "market_entry", "exit_tp_180bp"),
+            observation_contract={"bar_family": "phase1_intraday_ohlc_v1"},
+            execution_mapping_version="short_actions_v1",
+            metadata={"feature_adapter": "ibkr_1m_to_phase1_5m_ohlc_v1"},
+        )
+
+        self.assertEqual(updated.model_key, "short_trial36_v1")
+        self.assertEqual(
+            updated.action_space,
+            ("skip", "market_entry", "exit_tp_180bp"),
+        )
+        self.assertEqual(
+            updated.observation_contract["bar_family"],
+            "phase1_intraday_ohlc_v1",
+        )
+        self.assertEqual(updated.execution_mapping_version, "short_actions_v1")
+        self.assertEqual(
+            updated.metadata["feature_adapter"],
+            "ibkr_1m_to_phase1_5m_ohlc_v1",
+        )
+
+    def test_upsert_model_creates_missing_model(self) -> None:
+        created = upsert_trader_model(
+            self.session_factory,
+            model_key="long_trial_106_v1",
+            display_name="Long Trial 106 V1",
+            strategy_family="canonical_long_research_execution_policy",
+            side="LONG",
+            source_workflow_path=None,
+            promoted_checkpoint_path=None,
+            action_space=("skip", "market_entry", "entry_prevclose_-50bp"),
+            observation_contract={"bar_family": "phase1_intraday_ohlc_v1"},
+            execution_mapping_version="long_actions_v1",
+        )
+
+        self.assertEqual(created.model_key, "long_trial_106_v1")
+        self.assertEqual(created.side, "LONG")
+        self.assertEqual(created.execution_mapping_version, "long_actions_v1")
+
+    def test_update_deployment_replaces_editable_fields(self) -> None:
+        register_trader_model(
+            self.session_factory,
+            model_key="short_trial36_v1",
+            display_name="Short Trial 36 V1",
+            strategy_family="canonical_short_live_execution_policy",
+            side="SHORT",
+            source_workflow_path=None,
+            promoted_checkpoint_path=None,
+            action_space=("skip", "market_entry"),
+        )
+        create_trader_deployment(
+            self.session_factory,
+            deployment_key="short_trial36_virtual_01",
+            model_key="short_trial36_v1",
+            account_key="virtual0001",
+            book_key="rl_short_trial36_virtual_01",
+            mode="virtual",
+            status="draft",
+            allowed_symbols=("SIVE",),
+            metadata={"created_from": "test"},
+        )
+
+        updated = update_trader_deployment(
+            self.session_factory,
+            deployment_key="short_trial36_virtual_01",
+            status="running",
+            allowed_symbols=("volv-b", "sive", "volv-b"),
+            risk_limits={"max_open_positions": 2},
+            metadata={"edited_by": "test"},
+        )
+
+        self.assertEqual(updated.status, "running")
+        self.assertEqual(updated.account_key, "VIRTUAL0001")
+        self.assertEqual(updated.allowed_symbols, ("VOLV-B", "SIVE"))
+        self.assertEqual(updated.risk_limits["max_open_positions"], 2)
+        self.assertEqual(updated.metadata["edited_by"], "test")
+        self.assertIsNotNone(updated.started_at)
+
+        stopped = update_trader_deployment(
+            self.session_factory,
+            deployment_key="short_trial36_virtual_01",
+            status="stopped",
+        )
+        self.assertIsNotNone(stopped.stopped_at)
+
+        restarted = update_trader_deployment(
+            self.session_factory,
+            deployment_key="short_trial36_virtual_01",
+            status="running",
+        )
+        self.assertEqual(restarted.status, "running")
+        self.assertIsNone(restarted.stopped_at)
+        self.assertIsNone(restarted.paused_at)
+
     def test_create_deployment_requires_existing_model(self) -> None:
         with self.assertRaises(TraderModelNotFoundError):
             create_trader_deployment(
@@ -113,5 +231,39 @@ class TraderRegistryTests(TestCase):
                 account_key="U25245596",
                 book_key="rl_short_trial36_live_01",
                 mode="live",
+                status="draft",
+            )
+
+    def test_create_deployment_requires_virtual_mode_to_match_virtual_account(self) -> None:
+        register_trader_model(
+            self.session_factory,
+            model_key="long_trial_v1",
+            display_name="Long Trial V1",
+            strategy_family="canonical_long_live_execution_policy",
+            side="LONG",
+            source_workflow_path=None,
+            promoted_checkpoint_path=None,
+            action_space=("skip", "market_entry"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "virtual account_key requires mode virtual"):
+            create_trader_deployment(
+                self.session_factory,
+                deployment_key="long_trial_live_bad",
+                model_key="long_trial_v1",
+                account_key="virtual0001",
+                book_key="rl_long_trial",
+                mode="live",
+                status="draft",
+            )
+
+        with self.assertRaisesRegex(ValueError, "mode virtual requires"):
+            create_trader_deployment(
+                self.session_factory,
+                deployment_key="long_trial_virtual_bad",
+                model_key="long_trial_v1",
+                account_key="U25245596",
+                book_key="rl_long_trial",
+                mode="virtual",
                 status="draft",
             )

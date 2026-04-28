@@ -19,11 +19,12 @@ from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
-from ibkr_trader.ibkr.runtime_snapshot import BrokerExecution
 from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder
 from ibkr_trader.ibkr.runtime_snapshot import BrokerPortfolioItem
 from ibkr_trader.ibkr.runtime_snapshot import BrokerPosition
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
+from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
+from ibkr_trader.virtual.accounts import is_virtual_account_key
 
 BROKER_KIND_IBKR = "IBKR"
 
@@ -85,6 +86,10 @@ def _resolve_account_key(
     )
 
 
+def _is_virtual_ledger_identity(*, broker_kind: str, account_key: str | None) -> bool:
+    return broker_kind == BROKER_KIND_VIRTUAL or is_virtual_account_key(account_key)
+
+
 def _derive_account_base_currency(
     account_values: dict[str, dict[str, str | None]],
 ) -> str | None:
@@ -103,7 +108,13 @@ def _get_or_create_broker_account(
     broker_kind: str,
     account_key: str,
     base_currency: str | None = None,
+    is_virtual: bool | None = None,
 ) -> BrokerAccountRecord:
+    resolved_is_virtual = (
+        bool(is_virtual)
+        or broker_kind == BROKER_KIND_VIRTUAL
+        or is_virtual_account_key(account_key)
+    )
     broker_account = session.execute(
         select(BrokerAccountRecord).where(
             BrokerAccountRecord.broker_kind == broker_kind,
@@ -115,11 +126,14 @@ def _get_or_create_broker_account(
             broker_kind=broker_kind,
             account_key=account_key,
             base_currency=base_currency,
+            is_virtual=resolved_is_virtual,
         )
         session.add(broker_account)
         session.flush()
     elif broker_account.base_currency is None and base_currency is not None:
         broker_account.base_currency = base_currency
+    if resolved_is_virtual and not broker_account.is_virtual:
+        broker_account.is_virtual = True
     return broker_account
 
 
@@ -476,6 +490,10 @@ def _create_reconstructed_broker_order(
         broker_account_id=broker_account.id,
         broker_kind=broker_kind,
         account_key=account_key,
+        is_virtual=_is_virtual_ledger_identity(
+            broker_kind=broker_kind,
+            account_key=account_key,
+        ),
         order_role=order_role,
         external_order_id=external_order_id,
         external_perm_id=external_perm_id,
@@ -1018,6 +1036,7 @@ def persist_broker_order_submission(
             context=f"Broker submission order {synthesized_open_order.order_id}",
         ),
         base_currency=_normalize_text(synthesized_open_order.currency),
+        is_virtual=bool(broker_submission.get("is_virtual")),
     )
     broker_order = _upsert_open_order(
         session,
@@ -1049,6 +1068,19 @@ def persist_broker_order_submission(
         payload=_serialize_for_json(broker_submission),
         note=note,
     )
+    if _is_virtual_ledger_identity(
+        broker_kind=broker_kind,
+        account_key=broker_order.account_key,
+    ):
+        from ibkr_trader.virtual.execution import persist_virtual_execution_from_submission
+
+        persist_virtual_execution_from_submission(
+            session,
+            broker_order=broker_order,
+            instruction_record=instruction_record,
+            broker_submission=broker_submission,
+            observed_at=observed_at,
+        )
     return broker_order
 
 
@@ -1154,6 +1186,10 @@ def persist_broker_order_cancellation(
             broker_account_id=broker_account.id,
             broker_kind=broker_kind,
             account_key=account_key,
+            is_virtual=_is_virtual_ledger_identity(
+                broker_kind=broker_kind,
+                account_key=account_key,
+            ),
             order_role=_infer_order_role(instruction_record.instruction_id),
             external_order_id=external_order_id,
             external_perm_id=external_perm_id,
@@ -1310,6 +1346,10 @@ def _upsert_open_order(
     payload = _serialize_for_json(asdict(open_order))
     previous_status = broker_order.status if broker_order is not None else None
     previous_payload = broker_order.raw_payload if broker_order is not None else None
+    is_virtual = _is_virtual_ledger_identity(
+        broker_kind=broker_kind,
+        account_key=account_key,
+    )
 
     if broker_order is None:
         broker_order = BrokerOrderRecord(
@@ -1317,6 +1357,7 @@ def _upsert_open_order(
             broker_account_id=broker_account.id,
             broker_kind=broker_kind,
             account_key=account_key,
+            is_virtual=is_virtual,
             order_role=_infer_order_role(open_order.order_ref),
             external_order_id=external_order_id,
             external_perm_id=external_perm_id,
@@ -1348,6 +1389,7 @@ def _upsert_open_order(
         if broker_order.instruction_id is None and instruction_record is not None:
             broker_order.instruction_id = instruction_record.id
         broker_order.broker_account_id = broker_account.id
+        broker_order.is_virtual = broker_order.is_virtual or is_virtual
         broker_order.external_perm_id = external_perm_id
         broker_order.external_client_id = (
             str(open_order.client_id) if open_order.client_id is not None else None
@@ -1453,6 +1495,10 @@ def _persist_account_snapshots(
         session.add(
             AccountSnapshotRecord(
                 broker_account_id=broker_account.id,
+                is_virtual=_is_virtual_ledger_identity(
+                    broker_kind=broker_kind,
+                    account_key=normalized_account_key,
+                ),
                 snapshot_at=captured_at,
                 source="runtime_snapshot",
                 net_liquidation=read_value("NetLiquidation"),
@@ -1642,6 +1688,10 @@ def _persist_position_snapshots(
         session.add(
             PositionSnapshotRecord(
                 broker_account_id=broker_account.id,
+                is_virtual=_is_virtual_ledger_identity(
+                    broker_kind=broker_kind,
+                    account_key=account_key,
+                ),
                 snapshot_at=captured_at,
                 source="runtime_snapshot",
                 symbol=symbol,
@@ -1789,6 +1839,10 @@ def _persist_executions(
                 broker_account_id=broker_account.id,
                 broker_kind=broker_kind,
                 account_key=account_key,
+                is_virtual=_is_virtual_ledger_identity(
+                    broker_kind=broker_kind,
+                    account_key=account_key,
+                ),
                 order_role=_infer_order_role(execution.order_ref),
                 external_order_id=external_order_id,
                 external_perm_id=external_perm_id,
@@ -1877,6 +1931,10 @@ def _persist_executions(
                 broker_account_id=broker_account.id,
                 broker_kind=broker_kind,
                 account_key=account_key,
+                is_virtual=_is_virtual_ledger_identity(
+                    broker_kind=broker_kind,
+                    account_key=account_key,
+                ),
                 external_execution_id=exec_id,
                 external_order_id=external_order_id,
                 external_perm_id=external_perm_id,

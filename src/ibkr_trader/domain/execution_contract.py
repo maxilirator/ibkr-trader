@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Mapping
+from typing import Any, Mapping
 
 
 class SecurityType(StrEnum):
@@ -35,6 +35,11 @@ class OrderType(StrEnum):
 class TimeInForce(StrEnum):
     DAY = "DAY"
     GTC = "GTC"
+
+
+class ExecutionMode(StrEnum):
+    DETERMINISTIC = "deterministic"
+    MODEL_ROUTED = "model_routed"
 
 
 class DelayedExitReference(StrEnum):
@@ -210,13 +215,44 @@ class DelayedLimitExitSpec:
 
 
 @dataclass(slots=True)
+class ExecutionWindow:
+    start_at: datetime
+    end_at: datetime
+
+    def validate(self) -> None:
+        if self.start_at.tzinfo is None:
+            raise ValueError("execution.window.start_at must include timezone information")
+        if self.end_at.tzinfo is None:
+            raise ValueError("execution.window.end_at must include timezone information")
+        if self.end_at <= self.start_at:
+            raise ValueError("execution.window.end_at must be after execution.window.start_at")
+
+
+@dataclass(slots=True)
+class ModelRoutedExecutionSpec:
+    mode: ExecutionMode
+    model_id: str
+    window: ExecutionWindow
+    model_family: str | None = None
+    model_version: str | None = None
+    model_artifact_id: str | None = None
+
+    def validate(self) -> None:
+        if self.mode is not ExecutionMode.MODEL_ROUTED:
+            raise ValueError("execution.mode must be model_routed")
+        if not self.model_id:
+            raise ValueError("execution.model_id is required")
+        self.window.validate()
+
+
+@dataclass(slots=True)
 class TraceSpec:
     reason_code: str
     execution_policy: str | None = None
     trade_date: date | None = None
     data_cutoff_date: date | None = None
     company_name: str | None = None
-    metadata: Mapping[str, str] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -226,9 +262,14 @@ class ExecutionInstruction:
     instrument: InstrumentRef
     intent: IntentSpec
     sizing: SizingSpec
-    entry: EntrySpec
-    exit: ExitSpec
+    entry: EntrySpec | None
+    exit: ExitSpec | None
     trace: TraceSpec
+    execution: ModelRoutedExecutionSpec | None = None
+
+    @property
+    def is_model_routed(self) -> bool:
+        return self.execution is not None
 
     def validate(self) -> None:
         if not self.instruction_id:
@@ -237,6 +278,17 @@ class ExecutionInstruction:
         self.instrument.validate()
         self.intent.validate()
         self.sizing.validate()
+        if self.execution is not None:
+            self.execution.validate()
+            if self.entry is not None:
+                raise ValueError("entry must be omitted for model_routed execution")
+            if self.exit is not None:
+                raise ValueError("exit must be omitted for model_routed execution")
+            return
+        if self.entry is None:
+            raise ValueError("entry must be an object")
+        if self.exit is None:
+            raise ValueError("exit must be an object")
         self.entry.validate()
         self.exit.validate()
 

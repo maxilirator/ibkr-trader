@@ -16,6 +16,7 @@ from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.orchestration.operator_reviews import (
     ACKNOWLEDGED_REVIEW_STATUS,
+    ARCHIVED_REVIEW_STATUS,
     OPEN_REVIEW_STATUS,
     RESOLVED_REVIEW_STATUS,
     OperatorReviewTargetNotFoundError,
@@ -143,6 +144,46 @@ class OperatorReviewTests(TestCase):
         self.assertEqual(resolved.status, RESOLVED_REVIEW_STATUS)
         self.assertEqual(reopened.status, OPEN_REVIEW_STATUS)
 
+    def test_broker_attention_archive_marks_event_and_reopen_restores_it(self) -> None:
+        event_id, _ = self._seed_attention_and_issue()
+
+        archived = record_broker_attention_review_action(
+            self.session_factory,
+            event_id=event_id,
+            action_type="ARCHIVE",
+            updated_by="dashboard",
+            note="Noise from an old run.",
+        )
+
+        self.assertEqual(archived.status, ARCHIVED_REVIEW_STATUS)
+        session: Session = self.session_factory()
+        try:
+            event = session.get(BrokerOrderEventRecord, event_id)
+            assert event is not None
+            self.assertIsNotNone(event.archived_at)
+            self.assertEqual(event.archived_by, "dashboard")
+            self.assertEqual(event.archive_reason, "Noise from an old run.")
+        finally:
+            session.close()
+
+        reopened = record_broker_attention_review_action(
+            self.session_factory,
+            event_id=event_id,
+            action_type="REOPEN",
+            updated_by="dashboard",
+        )
+
+        self.assertEqual(reopened.status, OPEN_REVIEW_STATUS)
+        session = self.session_factory()
+        try:
+            event = session.get(BrokerOrderEventRecord, event_id)
+            assert event is not None
+            self.assertIsNone(event.archived_at)
+            self.assertIsNone(event.archived_by)
+            self.assertIsNone(event.archive_reason)
+        finally:
+            session.close()
+
     def test_reconciliation_issue_review_actions_progress_status(self) -> None:
         _, issue_id = self._seed_attention_and_issue()
 
@@ -161,6 +202,26 @@ class OperatorReviewTests(TestCase):
 
         self.assertEqual(acknowledged.status, ACKNOWLEDGED_REVIEW_STATUS)
         self.assertEqual(resolved.status, RESOLVED_REVIEW_STATUS)
+
+    def test_reconciliation_issue_archive_marks_issue(self) -> None:
+        _, issue_id = self._seed_attention_and_issue()
+
+        archived = record_reconciliation_issue_review_action(
+            self.session_factory,
+            issue_id=issue_id,
+            action_type="ARCHIVE",
+            updated_by="dashboard",
+        )
+
+        self.assertEqual(archived.status, ARCHIVED_REVIEW_STATUS)
+        session: Session = self.session_factory()
+        try:
+            issue = session.get(ReconciliationIssueRecord, issue_id)
+            assert issue is not None
+            self.assertIsNotNone(issue.archived_at)
+            self.assertEqual(issue.archived_by, "dashboard")
+        finally:
+            session.close()
 
     def test_review_actions_reject_missing_targets(self) -> None:
         with self.assertRaises(OperatorReviewTargetNotFoundError):

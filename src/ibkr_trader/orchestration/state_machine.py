@@ -8,6 +8,7 @@ from ibkr_trader.domain.instructions import TradeInstruction
 
 class ExecutionState(StrEnum):
     RECEIVED = "RECEIVED"
+    MODEL_ROUTED_PENDING = "MODEL_ROUTED_PENDING"
     ENTRY_PENDING = "ENTRY_PENDING"
     ENTRY_SUBMITTED = "ENTRY_SUBMITTED"
     ENTRY_CANCELLED = "ENTRY_CANCELLED"

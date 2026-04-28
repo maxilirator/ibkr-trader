@@ -56,11 +56,18 @@ IBKR_DIAGNOSTIC_CLIENT_ID=7
 IBKR_STREAMING_CLIENT_ID=9
 IBKR_ACCOUNT_IDS=U25245595,U25245596
 BROKER_MONITOR_ENABLED=true
+BROKER_CONNECT_BACKOFF_INITIAL_SECONDS=5
+BROKER_CONNECT_BACKOFF_MAX_SECONDS=300
 BROKER_HEARTBEAT_INTERVAL_SECONDS=30
 BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60
+BROKER_STATUS_REFRESH_MIN_INTERVAL_SECONDS=30
+MARKET_STREAM_AUTO_RECONNECT_ENABLED=true
+MARKET_STREAM_RECONNECT_INTERVAL_SECONDS=15
 EXECUTION_RUNTIME_ENABLED=true
 EXECUTION_RUNTIME_INTERVAL_SECONDS=5
 EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60
+EXECUTION_RUNTIME_RESTART_BACKOFF_INITIAL_SECONDS=30
+EXECUTION_RUNTIME_RESTART_BACKOFF_MAX_SECONDS=300
 ```
 
 Recommended repo usage:
@@ -70,10 +77,18 @@ Recommended repo usage:
 - reserve `IBKR_STREAMING_CLIENT_ID=9` for streaming and market-data sampling
 - set `IBKR_ACCOUNT_IDS` when the colocated runtime should refresh balances and portfolio data for multiple visible accounts without using the more fragile account-summary subscription path
 - do not work around ownership problems by generating fresh client IDs during normal operation
+- keep broker backoff enabled so failed Gateway connects cool down instead of looping
+- keep market-stream auto reconnect enabled so existing subscribed symbols are restored after a Gateway recovery
+- keep dashboard-triggered broker status refresh throttled so operator pages can notice stale state without creating extra Gateway pressure
 
-When the API host is running with `EXECUTION_RUNTIME_ENABLED=true`, that same colocated process now hosts the long-lived execution loop. The runtime takes a durable Postgres lease before it starts cycling, and the dashboard can show whether the execution loop is running, degraded, blocked on startup reconciliation, or stopped.
+When the API host is running with `EXECUTION_RUNTIME_ENABLED=true`, that same colocated process now hosts the long-lived execution loop. The runtime takes a durable Postgres lease before it starts cycling, and the dashboard can show whether the execution loop is running, degraded, stale, blocked on startup reconciliation, or stopped.
 
 For Stockholm session-bound orders, the execution runtime now pre-submits exact open/close instructions ahead of the boundary. With the default `EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60`, next-session-open forced exits and exact open/close scheduled orders are sent one minute early so the broker already has them before the auction starts.
+
+If IB Gateway stops answering, the API should stay up. Managed broker sessions
+enter exponential cooldown after connection failures, the monitor skips snapshot
+refreshes when the heartbeat is already down, and the background execution
+runtime retries after a broker exception instead of silently dying.
 
 See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.
 

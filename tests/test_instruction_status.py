@@ -14,6 +14,7 @@ from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
+from ibkr_trader.orchestration.instruction_archive import archive_instruction_set
 from ibkr_trader.orchestration.instruction_status import (
     InstructionStatusNotFoundError,
     list_instruction_statuses,
@@ -247,6 +248,10 @@ class InstructionStatusTests(TestCase):
         self.assertEqual(result.events[0].event_type, "instruction_submitted")
         serialized = serialize_instruction_status(result)
         self.assertEqual(serialized["entry_avg_fill_price"], "200.00")
+        self.assertEqual(
+            serialized["payload"]["instruction"]["instruction_id"],
+            "status-aapl-1",
+        )
         self.assertEqual(serialized["events"][1]["event_type"], "entry_order_submitted")
 
     def test_read_instruction_status_can_omit_events(self) -> None:
@@ -297,6 +302,35 @@ class InstructionStatusTests(TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].instruction_id, "status-aapl-1")
+
+    def test_archive_instruction_hides_rows_from_default_status_list(self) -> None:
+        self._insert_instruction(
+            instruction_id="status-aapl-1",
+            state="COMPLETED",
+        )
+        self._insert_instruction(
+            instruction_id="status-aapl-2",
+            state="ENTRY_PENDING",
+        )
+
+        result = archive_instruction_set(
+            self.session_factory,
+            requested_by="dashboard",
+            reason="Clean dashboard.",
+            states=("COMPLETED",),
+        )
+
+        self.assertEqual(result.archived_instruction_count, 1)
+        active_results = list_instruction_statuses(self.session_factory, limit=10)
+        self.assertEqual([item.instruction_id for item in active_results], ["status-aapl-2"])
+        all_results = list_instruction_statuses(
+            self.session_factory,
+            limit=10,
+            include_archived=True,
+        )
+        archived = next(item for item in all_results if item.instruction_id == "status-aapl-1")
+        self.assertEqual(archived.archived_by, "dashboard")
+        self.assertEqual(archived.archive_reason, "Clean dashboard.")
 
     def test_instruction_status_prefers_current_broker_order_rows(self) -> None:
         self._insert_instruction(

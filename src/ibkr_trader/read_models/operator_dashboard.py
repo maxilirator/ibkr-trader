@@ -4,11 +4,14 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
+from datetime import time
+from datetime import timezone
 from decimal import Decimal
 from decimal import InvalidOperation
 from enum import Enum
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_
 from sqlalchemy import func
@@ -57,6 +60,27 @@ _RECOVERED_RETRY_STATUSES = {
     "FILLED",
 }
 
+_STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
+_MAX_ACCOUNT_DAY_PERFORMANCE_POINTS = 96
+
+
+@dataclass(slots=True)
+class OperatorAccountPerformancePoint:
+    snapshot_at: datetime
+    net_liquidation: str
+    return_pct: str
+
+
+@dataclass(slots=True)
+class OperatorAccountDayPerformance:
+    started_at: datetime | None
+    latest_at: datetime | None
+    currency: str | None
+    start_net_liquidation: str | None
+    latest_net_liquidation: str | None
+    latest_return_pct: str | None
+    points: tuple[OperatorAccountPerformancePoint, ...]
+
 
 @dataclass(slots=True)
 class OperatorAccountSnapshot:
@@ -64,6 +88,7 @@ class OperatorAccountSnapshot:
     account_key: str
     account_label: str | None
     base_currency: str | None
+    is_virtual: bool
     snapshot_at: datetime
     source: str
     currency: str | None
@@ -73,6 +98,7 @@ class OperatorAccountSnapshot:
     available_funds: str | None
     excess_liquidity: str | None
     cushion: str | None
+    day_performance: OperatorAccountDayPerformance
 
 
 @dataclass(slots=True)
@@ -80,6 +106,7 @@ class OperatorPositionSnapshot:
     broker_kind: str
     account_key: str
     account_label: str | None
+    is_virtual: bool
     snapshot_at: datetime
     source: str
     symbol: str
@@ -103,6 +130,7 @@ class OperatorOpenOrder:
     broker_kind: str
     account_key: str
     account_label: str | None
+    is_virtual: bool
     order_role: str
     external_order_id: str | None
     external_perm_id: str | None
@@ -148,6 +176,7 @@ class OperatorExecutionFill:
     broker_kind: str
     account_key: str
     account_label: str | None
+    is_virtual: bool
     executed_at: datetime
     symbol: str
     exchange: str | None
@@ -374,6 +403,135 @@ def _format_decimal(value: Decimal | None, *, places: str) -> str | None:
     if formatted in {"-0", ""}:
         return "0"
     return formatted
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _account_day_start(reference_at: datetime) -> datetime:
+    local_reference = _aware_utc(reference_at).astimezone(_STOCKHOLM_TZ)
+    local_start = datetime.combine(
+        local_reference.date(),
+        time.min,
+        tzinfo=_STOCKHOLM_TZ,
+    )
+    return local_start.astimezone(timezone.utc)
+
+
+def _downsample_account_performance_points(
+    points: tuple[OperatorAccountPerformancePoint, ...],
+    *,
+    limit: int = _MAX_ACCOUNT_DAY_PERFORMANCE_POINTS,
+) -> tuple[OperatorAccountPerformancePoint, ...]:
+    if len(points) <= limit:
+        return points
+    if limit <= 2:
+        return (points[0], points[-1])
+
+    step = (len(points) - 1) / (limit - 1)
+    selected_indexes = sorted(
+        {round(index * step) for index in range(limit)}
+    )
+    return tuple(points[index] for index in selected_indexes)
+
+
+def _build_empty_account_day_performance() -> OperatorAccountDayPerformance:
+    return OperatorAccountDayPerformance(
+        started_at=None,
+        latest_at=None,
+        currency=None,
+        start_net_liquidation=None,
+        latest_net_liquidation=None,
+        latest_return_pct=None,
+        points=(),
+    )
+
+
+def _build_account_day_performance_by_account_id(
+    session: Session,
+    *,
+    account_ids: set[int],
+    reference_at: datetime,
+) -> dict[int, OperatorAccountDayPerformance]:
+    if not account_ids:
+        return {}
+
+    day_start_at = _account_day_start(reference_at)
+    rows = session.execute(
+        select(AccountSnapshotRecord)
+        .where(
+            AccountSnapshotRecord.broker_account_id.in_(account_ids),
+            AccountSnapshotRecord.snapshot_at >= day_start_at,
+        )
+        .order_by(
+            AccountSnapshotRecord.broker_account_id.asc(),
+            AccountSnapshotRecord.snapshot_at.asc(),
+            AccountSnapshotRecord.id.asc(),
+        )
+    ).scalars()
+
+    snapshots_by_account_id: dict[int, list[AccountSnapshotRecord]] = {
+        account_id: [] for account_id in account_ids
+    }
+    for row in rows:
+        snapshots_by_account_id.setdefault(row.broker_account_id, []).append(row)
+
+    performance_by_account_id: dict[int, OperatorAccountDayPerformance] = {}
+    for account_id, snapshots in snapshots_by_account_id.items():
+        start_value: Decimal | None = None
+        start_at: datetime | None = None
+        latest_value: Decimal | None = None
+        latest_at: datetime | None = None
+        latest_currency: str | None = None
+        points: list[OperatorAccountPerformancePoint] = []
+
+        for snapshot in snapshots:
+            net_liquidation = _meaningful_decimal(snapshot.net_liquidation)
+            if net_liquidation is None:
+                continue
+            if start_value is None:
+                start_value = net_liquidation
+                start_at = snapshot.snapshot_at
+            if start_value is None or start_value == 0:
+                continue
+
+            return_pct = ((net_liquidation - start_value) / start_value) * Decimal("100")
+            latest_value = net_liquidation
+            latest_at = snapshot.snapshot_at
+            latest_currency = snapshot.currency or latest_currency
+            points.append(
+                OperatorAccountPerformancePoint(
+                    snapshot_at=snapshot.snapshot_at,
+                    net_liquidation=_format_decimal(net_liquidation, places="0.01")
+                    or str(net_liquidation),
+                    return_pct=_format_signed_decimal(return_pct, places="0.01")
+                    or "0.00",
+                )
+            )
+
+        if not points or start_value is None or latest_value is None:
+            performance_by_account_id[account_id] = _build_empty_account_day_performance()
+            continue
+
+        latest_return_pct = (
+            ((latest_value - start_value) / start_value) * Decimal("100")
+            if start_value != 0
+            else None
+        )
+        performance_by_account_id[account_id] = OperatorAccountDayPerformance(
+            started_at=start_at,
+            latest_at=latest_at,
+            currency=latest_currency,
+            start_net_liquidation=_format_decimal(start_value, places="0.01"),
+            latest_net_liquidation=_format_decimal(latest_value, places="0.01"),
+            latest_return_pct=_format_signed_decimal(latest_return_pct, places="0.01"),
+            points=_downsample_account_performance_points(tuple(points)),
+        )
+
+    return performance_by_account_id
 
 
 def _derive_order_purpose(broker_order: BrokerOrderRecord) -> str | None:
@@ -700,6 +858,11 @@ def _build_account_snapshots(
     ).all()
 
     latest_by_account_id: dict[int, OperatorAccountSnapshot] = {}
+    day_performance_by_account_id = _build_account_day_performance_by_account_id(
+        session,
+        account_ids={broker_account.id for _, broker_account in rows},
+        reference_at=utc_now(),
+    )
     for account_snapshot, broker_account in rows:
         if broker_account.id in latest_by_account_id:
             continue
@@ -708,6 +871,7 @@ def _build_account_snapshots(
             account_key=broker_account.account_key,
             account_label=broker_account.account_label,
             base_currency=broker_account.base_currency,
+            is_virtual=account_snapshot.is_virtual or broker_account.is_virtual,
             snapshot_at=account_snapshot.snapshot_at,
             source=account_snapshot.source,
             currency=account_snapshot.currency,
@@ -717,6 +881,10 @@ def _build_account_snapshots(
             available_funds=account_snapshot.available_funds,
             excess_liquidity=account_snapshot.excess_liquidity,
             cushion=account_snapshot.cushion,
+            day_performance=day_performance_by_account_id.get(
+                broker_account.id,
+                _build_empty_account_day_performance(),
+            ),
         )
 
     return tuple(
@@ -812,6 +980,7 @@ def _build_position_snapshots(
             broker_kind=broker_account.broker_kind,
             account_key=broker_account.account_key,
             account_label=broker_account.account_label,
+            is_virtual=position_snapshot.is_virtual or broker_account.is_virtual,
             snapshot_at=position_snapshot.snapshot_at,
             source=position_snapshot.source,
             symbol=position_snapshot.symbol,
@@ -898,6 +1067,7 @@ def _build_open_orders(
                 broker_kind=broker_order.broker_kind,
                 account_key=broker_order.account_key,
                 account_label=broker_account.account_label,
+                is_virtual=broker_order.is_virtual or broker_account.is_virtual,
                 order_role=broker_order.order_role,
                 external_order_id=broker_order.external_order_id,
                 external_perm_id=broker_order.external_perm_id,
@@ -974,6 +1144,7 @@ def _build_recent_fills(
             broker_kind=fill.broker_kind,
             account_key=fill.account_key,
             account_label=broker_account.account_label,
+            is_virtual=fill.is_virtual or broker_account.is_virtual,
             executed_at=fill.executed_at,
             symbol=fill.symbol,
             exchange=fill.exchange,
@@ -1039,6 +1210,7 @@ def _build_recent_broker_attention(
             BrokerAccountRecord,
             BrokerAccountRecord.id == BrokerOrderRecord.broker_account_id,
         )
+        .where(BrokerOrderEventRecord.archived_at.is_(None))
         .order_by(
             BrokerOrderEventRecord.event_at.desc(),
             BrokerOrderEventRecord.id.desc(),
@@ -1111,7 +1283,12 @@ def _build_recent_reconciliation_runs(
 ) -> tuple[OperatorReconciliationRun, ...]:
     query = select(ReconciliationRunRecord)
     if not include_clean_runs:
-        query = query.where(ReconciliationRunRecord.issue_count > 0)
+        query = query.where(
+            ReconciliationRunRecord.issue_count > 0,
+            ReconciliationRunRecord.issues.any(
+                ReconciliationIssueRecord.archived_at.is_(None)
+            ),
+        )
 
     reconciliation_runs = list(
         session.execute(
@@ -1130,7 +1307,8 @@ def _build_recent_reconciliation_runs(
             .where(
                 ReconciliationIssueRecord.reconciliation_run_id.in_(
                     [run.id for run in reconciliation_runs]
-                )
+                ),
+                ReconciliationIssueRecord.archived_at.is_(None),
             )
             .order_by(
                 ReconciliationIssueRecord.observed_at.desc(),
@@ -1161,6 +1339,12 @@ def _build_recent_reconciliation_runs(
             )
         )
 
+    visible_runs = (
+        reconciliation_runs
+        if include_clean_runs
+        else [run for run in reconciliation_runs if issues_by_run_id.get(run.id)]
+    )
+
     return tuple(
         OperatorReconciliationRun(
             run_id=run.id,
@@ -1176,7 +1360,7 @@ def _build_recent_reconciliation_runs(
             metadata_json=run.metadata_json,
             issues=tuple(issues_by_run_id.get(run.id, ())),
         )
-        for run in reconciliation_runs
+        for run in visible_runs
     )
 
 

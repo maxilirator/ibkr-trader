@@ -7,38 +7,24 @@
   export let data;
   export let form;
 
-  let operatorSnapshot = {};
-  let killSwitch = {
-    enabled: false,
-    reason: null,
-    updated_by: null,
-    last_changed_at: null
-  };
-  let accounts = [];
-  let positions = [];
-  let openOrders = [];
-  let recentFills = [];
-  let brokerAttention = [];
-  let reconciliationRuns = [];
-  let instructions = [];
-  let marketTimeZone = 'Europe/Stockholm';
-  let brokerMonitor = {
-    heartbeat: { ok: null, last_success_at: null, error: null },
-    snapshot_refresh: {
-      ok: null,
-      last_success_at: null,
-      error: null,
-      account_count: 0,
-      position_count: 0,
-      open_order_count: 0
-    }
-  };
-  let executionRuntime = null;
+  let operatorSnapshot = data.operatorSnapshot;
+  let killSwitch = operatorSnapshot.kill_switch;
+  let accounts = operatorSnapshot.accounts;
+  let positions = operatorSnapshot.positions;
+  let openOrders = operatorSnapshot.open_orders;
+  let recentFills = operatorSnapshot.recent_fills;
+  let brokerAttention = operatorSnapshot.recent_broker_attention;
+  let reconciliationRuns = operatorSnapshot.recent_reconciliation_runs;
+  let instructions = operatorSnapshot.instructions;
+  let marketTimeZone = data.health.runtime_timezone;
+  let brokerMonitor = data.health.broker_monitor;
+  let executionRuntime = data.health.execution_runtime;
+  let omxBenchmark = data.omxBenchmark;
   let endpointErrors = [];
   let warningRuns = [];
   let killSwitchResult = null;
   let startupReconcileResult = null;
-  let cancelSetResult = null;
+  let archiveResult = null;
   let instructionRowActionResult = null;
   let orderRowActionResult = null;
   let brokerAttentionActionResult = null;
@@ -53,6 +39,8 @@
   let filteredPositions = [];
   let filteredOpenOrders = [];
   let filteredRecentFills = [];
+  let rlCandidateInstructions = [];
+  let executionInstructions = [];
   let filteredInstructions = [];
   let aggregatedBrokerAttention = [];
   let filteredBrokerAttention = [];
@@ -61,7 +49,7 @@
   let visibleBrokerAttentionEventIds = [];
   let visibleReconciliationIssueIds = [];
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
-  const AUTO_REFRESH_INTERVAL_MS = 15000;
+  const AUTO_REFRESH_INTERVAL_MS = 30000;
   const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v2';
   const BUTTON_CLICK_TO_WORK_MS = 140;
   const BUTTON_SUCCESS_RESET_MS = 1600;
@@ -125,23 +113,8 @@
         exitOrder: '',
         updated: ''
       },
-      brokerAttention: {
-        account: '',
-        symbol: '',
-        eventType: '',
-        message: '',
-        count: '',
-        latestAt: ''
-      },
-      reconciliation: {
-        runKind: '',
-        stage: '',
-        severity: '',
-        message: '',
-        instruction: '',
-        count: '',
-        latestAt: ''
-      }
+      brokerAttention: {},
+      reconciliation: {}
     };
   }
 
@@ -211,45 +184,31 @@
     return `${uniqueValues.slice(0, 2).join(', ')} +${uniqueValues.length - 2} more`;
   }
 
-  $: operatorSnapshot = data.operatorSnapshot ?? {};
-  $: killSwitch = operatorSnapshot.kill_switch ?? {
-    enabled: false,
-    reason: null,
-    updated_by: null,
-    last_changed_at: null
-  };
-  $: accounts = operatorSnapshot.accounts ?? [];
-  $: positions = operatorSnapshot.positions ?? [];
-  $: openOrders = operatorSnapshot.open_orders ?? [];
-  $: recentFills = operatorSnapshot.recent_fills ?? [];
-  $: brokerAttention = operatorSnapshot.recent_broker_attention ?? [];
-  $: reconciliationRuns = operatorSnapshot.recent_reconciliation_runs ?? [];
-  $: instructions = operatorSnapshot.instructions ?? [];
-  $: marketTimeZone = data.health?.runtime_timezone ?? 'Europe/Stockholm';
-  $: brokerMonitor = data.health?.broker_monitor ?? {
-    heartbeat: { ok: null, last_success_at: null, error: null },
-    snapshot_refresh: {
-      ok: null,
-      last_success_at: null,
-      error: null,
-      account_count: 0,
-      position_count: 0,
-      open_order_count: 0
-    }
-  };
-  $: executionRuntime = data.health?.execution_runtime ?? null;
-  $: endpointErrors = Object.entries(data.errors ?? {}).filter(([, value]) => value);
-  $: warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count ?? 0) > 0);
+  $: operatorSnapshot = data.operatorSnapshot;
+  $: killSwitch = operatorSnapshot.kill_switch;
+  $: accounts = operatorSnapshot.accounts;
+  $: positions = operatorSnapshot.positions;
+  $: openOrders = operatorSnapshot.open_orders;
+  $: recentFills = operatorSnapshot.recent_fills;
+  $: brokerAttention = operatorSnapshot.recent_broker_attention;
+  $: reconciliationRuns = operatorSnapshot.recent_reconciliation_runs;
+  $: instructions = operatorSnapshot.instructions;
+  $: marketTimeZone = data.health.runtime_timezone;
+  $: brokerMonitor = data.health.broker_monitor;
+  $: executionRuntime = data.health.execution_runtime;
+  $: omxBenchmark = data.omxBenchmark;
+  $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
+  $: warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count) > 0);
   $: killSwitchResult = form?.killSwitchResult ?? null;
   $: startupReconcileResult = form?.startupReconcileResult ?? null;
-  $: cancelSetResult = form?.cancelSetResult ?? null;
+  $: archiveResult = form?.archiveResult ?? null;
   $: instructionRowActionResult = form?.instructionRowActionResult ?? null;
   $: orderRowActionResult = form?.orderRowActionResult ?? null;
   $: brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
   $: reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
   $: acknowledgeAllLogsResult = form?.acknowledgeAllLogsResult ?? null;
   $: reconciliationClearResult = form?.reconciliationClearResult ?? null;
-  $: referenceNow = new Date(operatorSnapshot.generated_at ?? data.generatedAt);
+  $: referenceNow = new Date(operatorSnapshot.generated_at);
   $: timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
     year: 'numeric',
@@ -262,15 +221,36 @@
   });
 
   function brokerConnected(role) {
-    return data.health?.broker_sessions?.[role]?.connected === true;
+    return data.health.broker_sessions[role].connected === true;
+  }
+
+  function sessionStatus(role) {
+    const session = data.health.broker_sessions[role] ?? {};
+    const heartbeat = brokerMonitor?.heartbeat ?? {};
+    if (heartbeat.is_stale) {
+      return { label: 'Stale check', className: 'warn' };
+    }
+    if (heartbeat.ok === false) {
+      return { label: 'Gateway failing', className: 'bad' };
+    }
+    if (session.connected === true) {
+      return { label: 'Connected', className: 'ok' };
+    }
+    if (session.cooldown_seconds_remaining !== null && session.cooldown_seconds_remaining !== undefined) {
+      return { label: 'Cooling down', className: 'warn' };
+    }
+    if (role === 'primary' && !session.last_error && Number(session.consecutive_failures ?? 0) === 0) {
+      return { label: 'Idle', className: 'ok' };
+    }
+    return { label: 'Disconnected', className: 'bad' };
   }
 
   function connectionLabel(role) {
-    return brokerConnected(role) ? 'Connected' : 'Disconnected';
+    return sessionStatus(role).label;
   }
 
   function classForConnection(role) {
-    return brokerConnected(role) ? 'ok' : 'bad';
+    return sessionStatus(role).className;
   }
 
   function runStatusClass(status) {
@@ -287,27 +267,31 @@
     return killSwitch.enabled ? 'Enabled' : 'Disabled';
   }
 
-  function monitorLabel(ok) {
-    if (ok === true) return 'Healthy';
-    if (ok === false) return 'Failing';
+  function monitorLabel(status) {
+    if (status?.is_stale) return 'Stale';
+    if (status?.ok === true) return 'Healthy';
+    if (status?.ok === false) return 'Failing';
     return 'Unknown';
   }
 
-  function monitorClass(ok) {
-    if (ok === true) return 'ok';
-    if (ok === false) return 'bad';
+  function monitorClass(status) {
+    if (status?.is_stale) return 'warn';
+    if (status?.ok === true) return 'ok';
+    if (status?.ok === false) return 'bad';
     return 'warn';
   }
 
   function executionRuntimeLabel() {
-    return executionRuntime?.status ?? 'Unknown';
+    return executionRuntime?.effective_status ?? executionRuntime?.status ?? 'Unknown';
   }
 
   function executionRuntimeClass() {
-    if (!executionRuntime?.status) return 'warn';
-    if (executionRuntime.status === 'RUNNING') return 'ok';
-    if (executionRuntime.status === 'DEGRADED') return 'warn';
-    if (executionRuntime.status === 'STOPPED') return 'warn';
+    const status = executionRuntime?.effective_status ?? executionRuntime?.status;
+    if (!status) return 'warn';
+    if (status === 'RUNNING') return 'ok';
+    if (status === 'DEGRADED') return 'warn';
+    if (status === 'STALE') return 'bad';
+    if (status === 'STOPPED' || status === 'DISABLED') return 'warn';
     return 'bad';
   }
 
@@ -333,33 +317,118 @@
     return timestampFormatter.format(parsed);
   }
 
+  function parseFiniteNumber(value) {
+    const parsed = Number.parseFloat(String(value ?? ''));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function formatReturnPct(value) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) return 'n/a';
+    const prefix = parsed > 0 ? '+' : '';
+    return `${prefix}${parsed.toFixed(2)}%`;
+  }
+
+  function normalizePerformancePoints(points, valueField = 'return_pct') {
+    return (points ?? [])
+      .map((point) => {
+        const timestamp = parseTimestamp(point.timestamp ?? point.snapshot_at);
+        const value = parseFiniteNumber(point[valueField]);
+        if (!timestamp || value === null) {
+          return null;
+        }
+        return {
+          timestamp,
+          value
+        };
+      })
+      .filter(Boolean);
+  }
+
+  function accountDayChart(account) {
+    const accountPoints = normalizePerformancePoints(account.day_performance?.points);
+    const benchmarkPoints = normalizePerformancePoints(omxBenchmark?.points);
+    const chartPoints = [...accountPoints, ...benchmarkPoints];
+    if (accountPoints.length < 2 || chartPoints.length < 2) {
+      return {
+        ready: false,
+        message: 'Waiting for at least two account snapshots from this trading day.'
+      };
+    }
+
+    const width = 320;
+    const height = 120;
+    const left = 12;
+    const right = 308;
+    const top = 12;
+    const bottom = 98;
+    const times = chartPoints.map((point) => point.timestamp.getTime());
+    const minTime = Math.min(...times);
+    const maxTime = Math.max(...times);
+    const yValues = chartPoints.map((point) => point.value).concat(0);
+    let minValue = Math.min(...yValues);
+    let maxValue = Math.max(...yValues);
+    if (minValue === maxValue) {
+      minValue -= 0.05;
+      maxValue += 0.05;
+    }
+    const padding = Math.max((maxValue - minValue) * 0.15, 0.05);
+    minValue -= padding;
+    maxValue += padding;
+
+    const xFor = (date) => {
+      if (maxTime === minTime) return left;
+      return left + ((date.getTime() - minTime) / (maxTime - minTime)) * (right - left);
+    };
+    const yFor = (value) => bottom - ((value - minValue) / (maxValue - minValue)) * (bottom - top);
+    const pathFor = (points) =>
+      points
+        .map((point, index) => `${index === 0 ? 'M' : 'L'} ${xFor(point.timestamp).toFixed(2)} ${yFor(point.value).toFixed(2)}`)
+        .join(' ');
+    const latestAccount = accountPoints.at(-1)?.value ?? null;
+    const latestBenchmark = benchmarkPoints.at(-1)?.value ?? null;
+
+    return {
+      ready: true,
+      accountPath: pathFor(accountPoints),
+      benchmarkPath: benchmarkPoints.length >= 2 ? pathFor(benchmarkPoints) : '',
+      zeroPath: `M ${left} ${yFor(0).toFixed(2)} L ${right} ${yFor(0).toFixed(2)}`,
+      yMin: minValue,
+      yMax: maxValue,
+      latestAccount,
+      latestBenchmark,
+      benchmarkAvailable: benchmarkPoints.length >= 2 && omxBenchmark?.status === 'ok',
+      benchmarkLabel: omxBenchmark?.symbol ?? 'OMX'
+    };
+  }
+
   function operatorReviewClass(review) {
-    const status = review?.status ?? 'OPEN';
+    const status = review.status;
     if (status !== 'OPEN') return 'neutral';
     return 'warn';
   }
 
   function operatorReviewLabel(review) {
-    const status = review?.status ?? 'OPEN';
-    return status === 'OPEN' ? 'OPEN' : 'CLEARED';
+    const status = review.status;
+    return status === 'OPEN' ? 'OPEN' : 'ARCHIVED';
   }
 
   function operatorReviewActions(review) {
-    const status = review?.status ?? 'OPEN';
+    const status = review.status;
     if (status !== 'OPEN') {
       return [];
     }
-    return [{ operation: 'ACKNOWLEDGE', label: 'Clear', className: 'inline-button neutral' }];
+    return [{ operation: 'ARCHIVE', label: 'Archive', className: 'inline-button neutral' }];
   }
 
   function operatorReviewDetail(review) {
     if (!review?.latest_action_type) {
-      return 'Not cleared yet.';
+      return 'Not archived yet.';
     }
 
     const reviewedAt = formatTimestampOrNull(review.latest_action_at) ?? 'unknown time';
     const reviewedBy = review.latest_action_by ?? 'unknown operator';
-    return `Cleared by ${reviewedBy} at ${reviewedAt}`;
+    return `Archived by ${reviewedBy} at ${reviewedAt}`;
   }
 
   function marketDirectionArrow(direction) {
@@ -548,6 +617,26 @@
     };
   }
 
+  function isRlCandidateInstruction(instruction) {
+    return (
+      instruction.state === 'MODEL_ROUTED_PENDING' ||
+      instruction.order_type === 'MODEL_ROUTED' ||
+      instruction.payload?.instruction?.execution?.mode === 'model_routed'
+    );
+  }
+
+  function rlCandidateModelId(instruction) {
+    return (
+      instruction.payload?.instruction?.execution?.model_id ??
+      instruction.payload?.instruction?.model ??
+      'n/a'
+    );
+  }
+
+  function rlCandidateWindowDisplay(instruction) {
+    return `${formatTimestamp(instruction.submit_at)} to ${formatTimestamp(instruction.expire_at)}`;
+  }
+
   function instructionGuidance(instruction) {
     const windowState = instructionWindowState(instruction);
 
@@ -632,7 +721,7 @@
   }
 
   function isOpenReview(review) {
-    return (review?.status ?? 'OPEN') === 'OPEN';
+    return review.status === 'OPEN';
   }
 
   function groupBrokerAttentionRows(rows) {
@@ -697,7 +786,7 @@
     const groupedRows = new Map();
 
     for (const run of runs) {
-      for (const issue of run.issues ?? []) {
+      for (const issue of run.issues) {
         if (!isOpenReview(issue.operator_review)) {
           continue;
         }
@@ -865,7 +954,13 @@
     matchesFilterValue(`${fill.commission ?? 'n/a'} ${fill.commission_currency ?? ''}`, dashboardFilters.recentFills.fee)
   );
 
-  $: filteredInstructions = instructions.filter((instruction) => {
+  $: rlCandidateInstructions = instructions.filter((instruction) =>
+    isRlCandidateInstruction(instruction)
+  );
+  $: executionInstructions = instructions.filter(
+    (instruction) => !isRlCandidateInstruction(instruction)
+  );
+  $: filteredInstructions = executionInstructions.filter((instruction) => {
     const lifecycle = instructionWindowState(instruction);
     return (
       matchesFilterValue(instruction.instruction_id, dashboardFilters.instructions.instruction) &&
@@ -880,28 +975,13 @@
   });
 
   $: aggregatedBrokerAttention = groupBrokerAttentionRows(brokerAttention);
-  $: filteredBrokerAttention = aggregatedBrokerAttention.filter((group) =>
-    matchesFilterValue(group.accountLabel ?? group.accountKey, dashboardFilters.brokerAttention.account) &&
-    matchesFilterValue(group.symbol, dashboardFilters.brokerAttention.symbol) &&
-    matchesFilterValue(group.eventType, dashboardFilters.brokerAttention.eventType) &&
-    matchesFilterValue(group.message, dashboardFilters.brokerAttention.message) &&
-    matchesFilterValue(`${group.count}x`, dashboardFilters.brokerAttention.count) &&
-    matchesFilterValue(formatTimestamp(group.latestAt), dashboardFilters.brokerAttention.latestAt)
-  );
+  $: filteredBrokerAttention = aggregatedBrokerAttention;
   $: visibleBrokerAttentionEventIds = uniqueIds(
     filteredBrokerAttention.flatMap((group) => group.eventIds)
   );
 
   $: aggregatedReconciliation = groupReconciliationRuns(reconciliationRuns);
-  $: filteredReconciliation = aggregatedReconciliation.filter((group) =>
-    matchesFilterValue(group.runKind, dashboardFilters.reconciliation.runKind) &&
-    matchesFilterValue(group.stage, dashboardFilters.reconciliation.stage) &&
-    matchesFilterValue(group.severity, dashboardFilters.reconciliation.severity) &&
-    matchesFilterValue(group.message, dashboardFilters.reconciliation.message) &&
-    matchesFilterValue(group.instructionId ?? 'n/a', dashboardFilters.reconciliation.instruction) &&
-    matchesFilterValue(`${group.count}x`, dashboardFilters.reconciliation.count) &&
-    matchesFilterValue(formatTimestamp(group.latestAt), dashboardFilters.reconciliation.latestAt)
-  );
+  $: filteredReconciliation = aggregatedReconciliation;
   $: visibleReconciliationIssueIds = uniqueIds(
     filteredReconciliation.flatMap((group) => group.issueIds)
   );
@@ -945,34 +1025,40 @@
     <article class="stat-card">
       <span>Primary Broker Session</span>
       <strong class={classForConnection('primary')}>{connectionLabel('primary')}</strong>
-      <small>Client ID {data.health?.broker_sessions?.primary?.client_id ?? 'n/a'}</small>
+      <small>Client ID {data.health.broker_sessions.primary.client_id}, on demand</small>
     </article>
 
     <article class="stat-card">
       <span>Diagnostic Session</span>
       <strong class={classForConnection('diagnostic')}>{connectionLabel('diagnostic')}</strong>
-      <small>Client ID {data.health?.broker_sessions?.diagnostic?.client_id ?? 'n/a'}</small>
+      <small>Client ID {data.health.broker_sessions.diagnostic.client_id}</small>
     </article>
 
     <article class="stat-card">
       <span>Gateway Heartbeat</span>
-      <strong class={monitorClass(brokerMonitor.heartbeat?.ok)}>
-        {monitorLabel(brokerMonitor.heartbeat?.ok)}
+      <strong class={monitorClass(brokerMonitor.heartbeat)}>
+        {monitorLabel(brokerMonitor.heartbeat)}
       </strong>
       <small>
-        {formatTimestampOrNull(brokerMonitor.heartbeat?.last_success_at) ??
-          brokerMonitor.heartbeat?.error ??
-          'No heartbeat has completed yet.'}
+        {#if brokerMonitor.heartbeat?.is_stale}
+          Last check {formatTimestampOrNull(brokerMonitor.heartbeat?.last_attempt_at) ?? 'never'}
+        {:else}
+          {formatTimestampOrNull(brokerMonitor.heartbeat?.last_success_at) ??
+            brokerMonitor.heartbeat?.error ??
+            'No heartbeat has completed yet.'}
+        {/if}
       </small>
     </article>
 
     <article class="stat-card">
       <span>Snapshot Refresh</span>
-      <strong class={monitorClass(brokerMonitor.snapshot_refresh?.ok)}>
-        {monitorLabel(brokerMonitor.snapshot_refresh?.ok)}
+      <strong class={monitorClass(brokerMonitor.snapshot_refresh)}>
+        {monitorLabel(brokerMonitor.snapshot_refresh)}
       </strong>
       <small>
-        {#if brokerMonitor.snapshot_refresh?.ok === true}
+        {#if brokerMonitor.snapshot_refresh?.is_stale}
+          Last check {formatTimestampOrNull(brokerMonitor.snapshot_refresh?.last_attempt_at) ?? 'never'}
+        {:else if brokerMonitor.snapshot_refresh?.ok === true}
           {brokerMonitor.snapshot_refresh.account_count} accounts ·
           {brokerMonitor.snapshot_refresh.position_count} positions ·
           {brokerMonitor.snapshot_refresh.open_order_count} open orders
@@ -986,9 +1072,13 @@
       <span>Execution Runtime</span>
       <strong class={executionRuntimeClass()}>{executionRuntimeLabel()}</strong>
       <small>
-        {formatTimestampOrNull(executionRuntime?.last_successful_cycle_at) ??
-          executionRuntime?.last_error ??
-          'No execution-runtime status has been persisted yet.'}
+        {#if executionRuntime?.is_stale}
+          Last heartbeat {formatTimestampOrNull(executionRuntime?.heartbeat_at) ?? 'never'}
+        {:else}
+          {formatTimestampOrNull(executionRuntime?.last_successful_cycle_at) ??
+            executionRuntime?.last_error ??
+            'No execution-runtime status has been persisted yet.'}
+        {/if}
       </small>
     </article>
 
@@ -1017,9 +1107,15 @@
     </article>
 
     <article class="stat-card">
-      <span>Instruction Queue</span>
-      <strong>{instructions.length}</strong>
-      <small>Most recent persisted instructions</small>
+      <span>RL Candidates</span>
+      <strong>{rlCandidateInstructions.length}</strong>
+      <small>Names waiting for bar-by-bar model decisions</small>
+    </article>
+
+    <article class="stat-card">
+      <span>Execution Queue</span>
+      <strong>{executionInstructions.length}</strong>
+      <small>Translated orders owned by the trader runtime</small>
     </article>
 
     <article class="stat-card">
@@ -1140,69 +1236,34 @@
     <section class="panel control-panel">
       <div class="panel-head">
         <div>
-          <h2>Cancel Instruction Set</h2>
+          <h2>Archive Dashboard Rows</h2>
           <p>
-            Cancel matching entry instructions through the durable control plane. Existing
-            positions are left alone.
+            Hide expired RL candidates and terminal instruction rows from the default dashboard while keeping
+            their audit history in the API.
           </p>
         </div>
       </div>
 
-      {#if cancelSetResult}
-        <p class={`action-feedback ${cancelSetResult.ok ? 'ok' : 'bad'}`}>
-          {cancelSetResult.message}
+      {#if archiveResult}
+        <p class={`action-feedback ${archiveResult.ok ? 'ok' : 'bad'}`}>
+          {archiveResult.message}
         </p>
       {/if}
 
       <form
         method="POST"
-        action="?/cancelInstructionSet"
+        action="?/archiveDashboardNoise"
         class="control-form"
-        use:enhance={enhanceDashboardAction('cancel-instruction-set')}
+        use:enhance={enhanceDashboardAction('archive-dashboard-noise')}
       >
-        <div class="form-grid">
-          <label>
-            <span>Batch ID</span>
-            <input name="batch_id" type="text" placeholder="live_ops_20260419" />
-          </label>
-
-          <label>
-            <span>Account Key</span>
-            <input name="account_key" type="text" placeholder="U25245596" />
-          </label>
-
-          <label>
-            <span>Book Key</span>
-            <input name="book_key" type="text" placeholder="long_risk_book" />
-          </label>
-
-          <label class="full-width">
-            <span>Instruction IDs</span>
-            <textarea
-              name="instruction_ids"
-              rows="3"
-              placeholder="One or more instruction IDs, separated by commas, spaces, or new lines"
-            ></textarea>
-          </label>
-
-          <label class="full-width">
-            <span>Reason</span>
-            <textarea
-              name="reason"
-              rows="3"
-              placeholder="Why are we cancelling this instruction set?"
-            ></textarea>
-          </label>
-        </div>
-
         <div class="form-actions">
           <button
-            class={`action-button ${buttonStateClass('cancel-instruction-set')}`}
+            class={`action-button ${buttonStateClass('archive-dashboard-noise')}`}
             type="submit"
-            data-action-key="cancel-instruction-set"
-            disabled={buttonIsBusy('cancel-instruction-set')}
+            data-action-key="archive-dashboard-noise"
+            disabled={buttonIsBusy('archive-dashboard-noise')}
           >
-            {buttonLabel('cancel-instruction-set', 'Cancel Matching Entries')}
+            {buttonLabel('archive-dashboard-noise', 'Archive Old Rows')}
           </button>
         </div>
       </form>
@@ -1258,7 +1319,12 @@
           <article class="account-card">
             <div class="account-title">
               <h3>{account.account_label ?? account.account_key}</h3>
-              <span class="pill neutral">{account.account_key}</span>
+              <div class="pill-row compact">
+                <span class="pill neutral">{account.account_key}</span>
+                {#if account.is_virtual}
+                  <span class="pill warn">Virtual</span>
+                {/if}
+              </div>
             </div>
             <dl>
               <div><dt>Snapshot</dt><dd>{formatTimestamp(account.snapshot_at)}</dd></div>
@@ -1269,6 +1335,45 @@
               <div><dt>Excess liquidity</dt><dd>{account.excess_liquidity ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
               <div><dt>Cushion</dt><dd>{account.cushion ?? 'n/a'}</dd></div>
             </dl>
+
+            {#if true}
+              {@const chart = accountDayChart(account)}
+              <div class="account-chart">
+                <div class="account-chart-head">
+                  <div>
+                    <span>Today vs OMX</span>
+                    <strong>{formatReturnPct(account.day_performance?.latest_return_pct)}</strong>
+                  </div>
+                  <small>
+                    {#if chart.ready && chart.benchmarkAvailable}
+                      OMX {formatReturnPct(chart.latestBenchmark)}
+                    {:else if chart.ready}
+                      OMX benchmark unavailable
+                    {:else}
+                      {chart.message}
+                    {/if}
+                  </small>
+                </div>
+
+                {#if chart.ready}
+                  <svg class="performance-chart" viewBox="0 0 320 120" role="img" aria-label={`Trading day performance for ${account.account_key} versus OMX`}>
+                    <path class="chart-zero" d={chart.zeroPath}></path>
+                    <path class="chart-line account-line" d={chart.accountPath}></path>
+                    {#if chart.benchmarkPath}
+                      <path class="chart-line benchmark-line" d={chart.benchmarkPath}></path>
+                    {/if}
+                  </svg>
+                  <div class="chart-legend">
+                    <span><i class="account-dot"></i>Account {formatReturnPct(chart.latestAccount)}</span>
+                    <span class:subtle={!chart.benchmarkAvailable}>
+                      <i class="benchmark-dot"></i>{chart.benchmarkLabel} {formatReturnPct(chart.latestBenchmark)}
+                    </span>
+                  </div>
+                {:else}
+                  <p class="chart-empty">{chart.message}</p>
+                {/if}
+              </div>
+            {/if}
           </article>
         {/each}
       </div>
@@ -1283,15 +1388,7 @@
           <p>Active broker-side warnings and rejects, grouped so repeated noise collapses into one row.</p>
         </div>
         <div class="panel-tools">
-          <span class="subtle">{filteredBrokerAttention.length} groups visible</span>
-          <button
-            class="inline-button neutral"
-            type="button"
-            on:click={() => resetFilterSection('brokerAttention')}
-            disabled={!sectionHasActiveFilters('brokerAttention')}
-          >
-            Clear Filters
-          </button>
+          <span class="subtle">{filteredBrokerAttention.length} active groups</span>
           <form
             method="POST"
             action="?/acknowledgeAllLogs"
@@ -1306,7 +1403,7 @@
               data-action-key="clear-all-visible-logs"
               disabled={buttonIsBusy('clear-all-visible-logs') || (visibleBrokerAttentionEventIds.length === 0 && visibleReconciliationIssueIds.length === 0)}
             >
-              {buttonLabel('clear-all-visible-logs', 'Clear All Visible')}
+              {buttonLabel('clear-all-visible-logs', 'Archive All Visible')}
             </button>
           </form>
         </div>
@@ -1321,14 +1418,6 @@
           {brokerAttentionActionResult.message}
         </p>
       {/if}
-      <div class="list-filter-grid">
-        <label><span>Account</span><input bind:value={dashboardFilters.brokerAttention.account} placeholder="Filter" /></label>
-        <label><span>Symbol</span><input bind:value={dashboardFilters.brokerAttention.symbol} placeholder="Filter" /></label>
-        <label><span>Event</span><input bind:value={dashboardFilters.brokerAttention.eventType} placeholder="Filter" /></label>
-        <label><span>Message</span><input bind:value={dashboardFilters.brokerAttention.message} placeholder="Filter" /></label>
-        <label><span>Count</span><input bind:value={dashboardFilters.brokerAttention.count} placeholder="e.g. 10x" /></label>
-        <label><span>Latest</span><input bind:value={dashboardFilters.brokerAttention.latestAt} placeholder="Filter" /></label>
-      </div>
       {#if filteredBrokerAttention.length === 0}
         <p class="empty">No active broker attention items are visible.</p>
       {:else}
@@ -1362,14 +1451,14 @@
                   use:enhance={enhanceDashboardAction(`broker-attention-${attention.key}`)}
                 >
                   <input type="hidden" name="event_ids" value={attention.eventIdsCsv} />
-                  <input type="hidden" name="operation" value="ACKNOWLEDGE" />
+                  <input type="hidden" name="operation" value="ARCHIVE" />
                   <button
                     class={`inline-button neutral ${buttonStateClass(`broker-attention-${attention.key}`)}`}
                     type="submit"
                     data-action-key={`broker-attention-${attention.key}`}
                     disabled={buttonIsBusy(`broker-attention-${attention.key}`)}
                   >
-                    {buttonLabel(`broker-attention-${attention.key}`, 'Clear')}
+                    {buttonLabel(`broker-attention-${attention.key}`, 'Archive')}
                   </button>
                 </form>
               </div>
@@ -1386,15 +1475,7 @@
           <p>Active reconciliation warnings grouped across recent runs so repeated issues collapse cleanly.</p>
         </div>
         <div class="panel-tools">
-          <span class="subtle">{filteredReconciliation.length} groups visible</span>
-          <button
-            class="inline-button neutral"
-            type="button"
-            on:click={() => resetFilterSection('reconciliation')}
-            disabled={!sectionHasActiveFilters('reconciliation')}
-          >
-            Clear Filters
-          </button>
+          <span class="subtle">{filteredReconciliation.length} active groups</span>
           <form
             method="POST"
             action="?/acknowledgeVisibleReconciliation"
@@ -1408,7 +1489,7 @@
               data-action-key="clear-visible-reconciliation"
               disabled={buttonIsBusy('clear-visible-reconciliation') || visibleReconciliationIssueIds.length === 0}
             >
-              {buttonLabel('clear-visible-reconciliation', 'Clear Visible')}
+              {buttonLabel('clear-visible-reconciliation', 'Archive Visible')}
             </button>
           </form>
         </div>
@@ -1423,15 +1504,6 @@
           {reconciliationIssueActionResult.message}
         </p>
       {/if}
-      <div class="list-filter-grid">
-        <label><span>Run Kind</span><input bind:value={dashboardFilters.reconciliation.runKind} placeholder="Filter" /></label>
-        <label><span>Stage</span><input bind:value={dashboardFilters.reconciliation.stage} placeholder="Filter" /></label>
-        <label><span>Severity</span><input bind:value={dashboardFilters.reconciliation.severity} placeholder="Filter" /></label>
-        <label><span>Message</span><input bind:value={dashboardFilters.reconciliation.message} placeholder="Filter" /></label>
-        <label><span>Instruction</span><input bind:value={dashboardFilters.reconciliation.instruction} placeholder="Filter" /></label>
-        <label><span>Count</span><input bind:value={dashboardFilters.reconciliation.count} placeholder="e.g. 10x" /></label>
-        <label><span>Latest</span><input bind:value={dashboardFilters.reconciliation.latestAt} placeholder="Filter" /></label>
-      </div>
       {#if filteredReconciliation.length === 0}
         <p class="empty">No active reconciliation warnings are visible.</p>
       {:else}
@@ -1470,14 +1542,14 @@
                       use:enhance={enhanceDashboardAction(`reconciliation-${run.key}`)}
                     >
                       <input type="hidden" name="issue_ids" value={run.issueIdsCsv} />
-                      <input type="hidden" name="operation" value="ACKNOWLEDGE" />
+                      <input type="hidden" name="operation" value="ARCHIVE" />
                       <button
                         class={`inline-button neutral ${buttonStateClass(`reconciliation-${run.key}`)}`}
                         type="submit"
                         data-action-key={`reconciliation-${run.key}`}
                         disabled={buttonIsBusy(`reconciliation-${run.key}`)}
                       >
-                        {buttonLabel(`reconciliation-${run.key}`, 'Clear')}
+                        {buttonLabel(`reconciliation-${run.key}`, 'Archive')}
                       </button>
                     </form>
                   </div>
@@ -1540,7 +1612,10 @@
           <tbody>
             {#each filteredPositions as position}
               <tr>
-                <td>{position.account_label ?? position.account_key}</td>
+                <td>
+                  {position.account_label ?? position.account_key}
+                  {#if position.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                </td>
                 <td>{position.local_symbol ?? position.symbol}</td>
                 <td>{position.primary_exchange ?? position.exchange}</td>
                 <td>{position.currency}</td>
@@ -1624,7 +1699,10 @@
           <tbody>
             {#each filteredOpenOrders as order}
               <tr>
-                <td>{order.account_label ?? order.account_key}</td>
+                <td>
+                  {order.account_label ?? order.account_key}
+                  {#if order.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                </td>
                 <td>{order.local_symbol ?? order.symbol}</td>
                 <td>{order.order_role}</td>
                 <td>{order.order_purpose ?? 'n/a'}</td>
@@ -1743,7 +1821,10 @@
             {#each filteredRecentFills as fill}
               <tr>
                 <td>{formatTimestamp(fill.executed_at)}</td>
-                <td>{fill.account_label ?? fill.account_key}</td>
+                <td>
+                  {fill.account_label ?? fill.account_key}
+                  {#if fill.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                </td>
                 <td>{fill.symbol}</td>
                 <td>{fill.side ?? 'n/a'}</td>
                 <td>{fill.quantity}</td>
@@ -1757,14 +1838,62 @@
     {/if}
   </section>
 
+  <section class="panel" id="rl-candidates">
+    <div class="panel-head">
+      <div>
+        <h2>RL Candidate Feed</h2>
+        <p>Names queued for stream bars, model decisions, and later action translation.</p>
+      </div>
+      <div class="panel-tools">
+        <span class="subtle">{rlCandidateInstructions.length} active</span>
+      </div>
+    </div>
+    {#if rlCandidateInstructions.length === 0}
+      <p class="empty">No RL candidates are currently waiting for model decisions.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Candidate</th>
+              <th>Symbol</th>
+              <th>Model</th>
+              <th>Account / Book</th>
+              <th>Side</th>
+              <th>Window</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each rlCandidateInstructions as instruction}
+              <tr>
+                <td class="mono">{instruction.instruction_id}</td>
+                <td>{instruction.symbol}</td>
+                <td>{rlCandidateModelId(instruction)}</td>
+                <td>
+                  {instruction.account_key}
+                  {#if instruction.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                  <small class="row-detail">{instruction.book_key}</small>
+                </td>
+                <td>{instruction.side}</td>
+                <td>{rlCandidateWindowDisplay(instruction)}</td>
+                <td>{formatTimestamp(instruction.updated_at)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+
   <section class="panel" id="instructions">
     <div class="panel-head">
       <div>
-        <h2>Recent Instructions</h2>
-        <p>Most recently updated persisted instructions from the control plane.</p>
+        <h2>Execution Instructions</h2>
+        <p>Translated instructions that can be submitted, cancelled, filled, or reconciled.</p>
       </div>
       <div class="panel-tools">
-        <span class="subtle">{filteredInstructions.length} of {instructions.length} visible</span>
+        <span class="subtle">{filteredInstructions.length} of {executionInstructions.length} visible</span>
         <button
           class="inline-button neutral"
           type="button"
@@ -1780,8 +1909,8 @@
         {instructionRowActionResult.message}
       </p>
     {/if}
-    {#if instructions.length === 0}
-      <p class="empty">No persisted instructions were found.</p>
+    {#if executionInstructions.length === 0}
+      <p class="empty">No translated execution instructions were found.</p>
     {:else}
       <div class="table-wrap">
         <table>
@@ -2125,6 +2254,110 @@
     padding: 1rem;
   }
 
+  .account-chart {
+    margin-top: 0.95rem;
+    border-top: 1px solid var(--border);
+    padding-top: 0.8rem;
+    display: grid;
+    gap: 0.55rem;
+  }
+
+  .account-chart-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: start;
+  }
+
+  .account-chart-head span {
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.2rem;
+  }
+
+  .account-chart-head strong {
+    font-size: 1.15rem;
+  }
+
+  .account-chart-head small,
+  .chart-empty,
+  .chart-legend {
+    color: var(--text-muted);
+  }
+
+  .performance-chart {
+    width: 100%;
+    height: auto;
+    min-height: 7.5rem;
+    border: 1px solid var(--border);
+    border-radius: 0.85rem;
+    background: color-mix(in oklab, var(--surface-strong) 82%, transparent);
+  }
+
+  .chart-zero {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
+  }
+
+  .chart-line {
+    fill: none;
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .account-line {
+    stroke: var(--accent);
+  }
+
+  .benchmark-line {
+    stroke: var(--warn);
+  }
+
+  .chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    font-size: 0.82rem;
+  }
+
+  .chart-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .chart-legend i {
+    width: 0.62rem;
+    height: 0.62rem;
+    border-radius: 999px;
+    display: inline-block;
+  }
+
+  .account-dot {
+    background: var(--accent);
+  }
+
+  .benchmark-dot {
+    background: var(--warn);
+  }
+
+  .chart-empty {
+    margin: 0;
+    min-height: 7.5rem;
+    border: 1px dashed var(--border);
+    border-radius: 0.85rem;
+    display: grid;
+    place-items: center;
+    text-align: center;
+    padding: 0.85rem;
+  }
+
   .account-title,
   .reconciliation-topline {
     display: flex;
@@ -2224,6 +2457,25 @@
     border-color: var(--border-strong);
   }
 
+  .pill-row.compact {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    justify-content: flex-end;
+  }
+
+  .mini-badge {
+    display: inline-flex;
+    margin-left: 0.35rem;
+    padding: 0.08rem 0.35rem;
+    border: 1px solid var(--warn);
+    border-radius: 999px;
+    color: var(--warn);
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
   .attention-list,
   .issue-list,
   .reconciliation-list {
@@ -2263,36 +2515,6 @@
 
   .reconciliation-card {
     padding: 1rem;
-  }
-
-  .list-filter-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 0.75rem;
-    margin-bottom: 0.95rem;
-  }
-
-  .list-filter-grid label {
-    display: grid;
-    gap: 0.35rem;
-  }
-
-  .list-filter-grid span {
-    font-size: 0.76rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-muted);
-  }
-
-  .list-filter-grid input {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid var(--border);
-    border-radius: 0.75rem;
-    padding: 0.62rem 0.72rem;
-    font: inherit;
-    color: var(--text-primary);
-    background: var(--surface-strong);
   }
 
   .issue-list {

@@ -69,6 +69,11 @@ def _build_next_session_exit_preview(
     expire_at_runtime: datetime,
     session_calendar_path: Path | None,
 ) -> NextSessionExitPreview:
+    if instruction.exit is None:
+        return NextSessionExitPreview(
+            requested=False,
+            status=NextSessionExitStatus.NOT_REQUESTED,
+        )
     if not instruction.exit.force_exit_next_session_open:
         return NextSessionExitPreview(
             requested=False,
@@ -159,10 +164,21 @@ def build_instruction_runtime_schedule(
     instruction.validate()
     runtime_zone = resolve_runtime_timezone(runtime_timezone)
 
-    submit_at_utc = instruction.entry.submit_at.astimezone(timezone.utc)
-    expire_at_utc = instruction.entry.expire_at.astimezone(timezone.utc)
-    submit_at_runtime = instruction.entry.submit_at.astimezone(runtime_zone)
-    expire_at_runtime = instruction.entry.expire_at.astimezone(runtime_zone)
+    if instruction.is_model_routed:
+        if instruction.execution is None:
+            raise ValueError("execution is required for model-routed instructions")
+        submit_at = instruction.execution.window.start_at
+        expire_at = instruction.execution.window.end_at
+    else:
+        if instruction.entry is None:
+            raise ValueError("entry must be an object")
+        submit_at = instruction.entry.submit_at
+        expire_at = instruction.entry.expire_at
+
+    submit_at_utc = submit_at.astimezone(timezone.utc)
+    expire_at_utc = expire_at.astimezone(timezone.utc)
+    submit_at_runtime = submit_at.astimezone(runtime_zone)
+    expire_at_runtime = expire_at.astimezone(runtime_zone)
 
     return InstructionRuntimeSchedule(
         instruction_id=instruction.instruction_id,

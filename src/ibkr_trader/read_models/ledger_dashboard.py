@@ -8,6 +8,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import and_
 from sqlalchemy import func
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -34,6 +35,7 @@ class LedgerFocusInstruction:
     state: str
     account_key: str
     book_key: str
+    is_virtual: bool
     symbol: str
     exchange: str
     currency: str
@@ -64,6 +66,7 @@ class LedgerInstructionEvent:
     instruction_id: str
     symbol: str
     account_key: str
+    is_virtual: bool
     batch_id: str
     event_type: str
     source: str
@@ -80,6 +83,7 @@ class LedgerBrokerOrderEvent:
     broker_order_id: int
     instruction_id: str | None
     account_key: str
+    is_virtual: bool
     symbol: str
     order_role: str
     external_order_id: str | None
@@ -99,6 +103,7 @@ class LedgerExecutionFill:
     instruction_id: str | None
     broker_order_id: int | None
     account_key: str
+    is_virtual: bool
     symbol: str
     side: str | None
     quantity: str
@@ -217,6 +222,7 @@ def _read_focus_instruction(
         state=record.state,
         account_key=record.account_key,
         book_key=record.book_key,
+        is_virtual=record.is_virtual,
         symbol=record.symbol,
         exchange=record.exchange,
         currency=record.currency,
@@ -266,9 +272,12 @@ def _build_summary(
         else None
     )
     reconciliation_clause = (
-        ReconciliationIssueRecord.instruction_id == focus_record.instruction_id
+        and_(
+            ReconciliationIssueRecord.instruction_id == focus_record.instruction_id,
+            ReconciliationIssueRecord.archived_at.is_(None),
+        )
         if focus_record is not None
-        else None
+        else ReconciliationIssueRecord.archived_at.is_(None)
     )
 
     broker_order_event_statement = select(func.count()).select_from(BrokerOrderEventRecord).join(
@@ -324,6 +333,7 @@ def _build_instruction_events(
             instruction_id=instruction.instruction_id,
             symbol=instruction.symbol,
             account_key=instruction.account_key,
+            is_virtual=instruction.is_virtual,
             batch_id=instruction.batch_id,
             event_type=event.event_type,
             source=event.source,
@@ -360,6 +370,7 @@ def _build_broker_order_events(
             broker_order_id=order.id,
             instruction_id=instruction.instruction_id if instruction is not None else None,
             account_key=order.account_key,
+            is_virtual=order.is_virtual,
             symbol=order.symbol,
             order_role=order.order_role,
             external_order_id=order.external_order_id,
@@ -398,6 +409,7 @@ def _build_recent_fills(
             instruction_id=instruction.instruction_id if instruction is not None else None,
             broker_order_id=fill.broker_order_id,
             account_key=fill.account_key,
+            is_virtual=fill.is_virtual,
             symbol=fill.symbol,
             side=fill.side,
             quantity=fill.quantity,
@@ -524,6 +536,7 @@ def _build_reconciliation_issues(
             ReconciliationRunRecord,
             ReconciliationRunRecord.id == ReconciliationIssueRecord.reconciliation_run_id,
         )
+        .where(ReconciliationIssueRecord.archived_at.is_(None))
         .order_by(
             ReconciliationIssueRecord.observed_at.desc(),
             ReconciliationIssueRecord.id.desc(),

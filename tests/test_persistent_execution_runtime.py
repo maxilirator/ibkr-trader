@@ -15,6 +15,7 @@ from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.orchestration.runtime_service_state import read_runtime_service_status
 from ibkr_trader.orchestration.runtime_worker import RuntimeCycleIssue
 from ibkr_trader.orchestration.runtime_worker import RuntimeCycleResult
+from ibkr_trader.orchestration.runtime_worker import BackgroundExecutionRuntimeService
 from ibkr_trader.orchestration.runtime_worker import run_persistent_execution_runtime
 
 
@@ -152,3 +153,30 @@ class PersistentExecutionRuntimeTests(TestCase):
         status = read_runtime_service_status(self.session_factory)
         self.assertEqual(status.status, "STARTUP_BLOCKED")
         self.assertIsNone(status.owner_token)
+
+    def test_background_runtime_retries_after_unhandled_broker_failure(self) -> None:
+        self.app_config.execution_runtime_restart_backoff_initial_seconds = 0
+        self.app_config.execution_runtime_restart_backoff_max_seconds = 0
+        fake_sessions = _FakeCanonicalSyncSessions()
+        service = BackgroundExecutionRuntimeService(
+            self.session_factory,
+            self.app_config,
+            fake_sessions,
+        )
+        calls = 0
+
+        def fake_run_persistent(*args: object, **kwargs: object) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ConnectionError("gateway down")
+            service._stop_event.set()
+            return 0
+
+        with patch(
+            "ibkr_trader.orchestration.runtime_worker.run_persistent_execution_runtime",
+            side_effect=fake_run_persistent,
+        ):
+            service._run()
+
+        self.assertEqual(calls, 2)

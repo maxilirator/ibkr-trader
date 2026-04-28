@@ -25,11 +25,13 @@ RECONCILIATION_ISSUE_TARGET_KIND = "RECONCILIATION_ISSUE"
 
 ACKNOWLEDGE_ACTION = "ACKNOWLEDGE"
 RESOLVE_ACTION = "RESOLVE"
+ARCHIVE_ACTION = "ARCHIVE"
 REOPEN_ACTION = "REOPEN"
 
 OPEN_REVIEW_STATUS = "OPEN"
 ACKNOWLEDGED_REVIEW_STATUS = "ACKNOWLEDGED"
 RESOLVED_REVIEW_STATUS = "RESOLVED"
+ARCHIVED_REVIEW_STATUS = "ARCHIVED"
 
 
 class OperatorReviewTargetNotFoundError(LookupError):
@@ -82,9 +84,14 @@ def _normalize_broker_message_text(message: Any) -> str | None:
 
 def normalize_operator_review_action_type(raw_value: str) -> str:
     normalized = raw_value.strip().upper()
-    if normalized not in {ACKNOWLEDGE_ACTION, RESOLVE_ACTION, REOPEN_ACTION}:
+    if normalized not in {
+        ACKNOWLEDGE_ACTION,
+        RESOLVE_ACTION,
+        ARCHIVE_ACTION,
+        REOPEN_ACTION,
+    }:
         raise ValueError(
-            "action must be one of ACKNOWLEDGE, RESOLVE, or REOPEN"
+            "action must be one of ACKNOWLEDGE, RESOLVE, ARCHIVE, or REOPEN"
         )
     return normalized
 
@@ -94,6 +101,8 @@ def operator_review_status_from_action_type(action_type: str | None) -> str:
         return ACKNOWLEDGED_REVIEW_STATUS
     if action_type == RESOLVE_ACTION:
         return RESOLVED_REVIEW_STATUS
+    if action_type == ARCHIVE_ACTION:
+        return ARCHIVED_REVIEW_STATUS
     return OPEN_REVIEW_STATUS
 
 
@@ -182,13 +191,15 @@ def _record_review_action(
     note: str | None,
     source: str,
     payload: dict[str, Any],
+    event_at: datetime | None = None,
 ) -> OperatorReviewStatus:
+    action_at = event_at or utc_now()
     event = OperatorReviewActionRecord(
         target_kind=target_kind,
         target_id=target_id,
         action_type=action_type,
         source=source,
-        event_at=utc_now(),
+        event_at=action_at,
         updated_by=updated_by,
         note=note,
         payload=payload,
@@ -232,6 +243,16 @@ def record_broker_attention_review_action(
                 f"Broker order event {event_id} is not an operator attention item."
             )
 
+        action_at = utc_now()
+        if normalized_action_type == ARCHIVE_ACTION:
+            broker_order_event.archived_at = action_at
+            broker_order_event.archived_by = normalized_updated_by
+            broker_order_event.archive_reason = normalized_note
+        elif normalized_action_type == REOPEN_ACTION:
+            broker_order_event.archived_at = None
+            broker_order_event.archived_by = None
+            broker_order_event.archive_reason = None
+
         return _record_review_action(
             session,
             target_kind=BROKER_ATTENTION_TARGET_KIND,
@@ -240,6 +261,7 @@ def record_broker_attention_review_action(
             updated_by=normalized_updated_by,
             note=normalized_note,
             source=source,
+            event_at=action_at,
             payload={
                 "broker_order_id": broker_order.id,
                 "account_key": broker_order.account_key,
@@ -272,6 +294,16 @@ def record_reconciliation_issue_review_action(
                 f"Reconciliation issue {issue_id} was not found."
             )
 
+        action_at = utc_now()
+        if normalized_action_type == ARCHIVE_ACTION:
+            issue.archived_at = action_at
+            issue.archived_by = normalized_updated_by
+            issue.archive_reason = normalized_note
+        elif normalized_action_type == REOPEN_ACTION:
+            issue.archived_at = None
+            issue.archived_by = None
+            issue.archive_reason = None
+
         return _record_review_action(
             session,
             target_kind=RECONCILIATION_ISSUE_TARGET_KIND,
@@ -280,6 +312,7 @@ def record_reconciliation_issue_review_action(
             updated_by=normalized_updated_by,
             note=normalized_note,
             source=source,
+            event_at=action_at,
             payload={
                 "instruction_id": issue.instruction_id,
                 "stage": issue.stage,

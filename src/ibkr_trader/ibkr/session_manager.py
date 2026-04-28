@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from collections import deque
 from threading import RLock
 from typing import Any, Callable, Iterator
@@ -54,6 +54,9 @@ class ManagedSessionStatus:
     client_id: int
     connected: bool
     last_error: str | None
+    consecutive_failures: int
+    cooldown_until: datetime | None
+    cooldown_seconds_remaining: int | None
     metrics: ManagedSessionMetrics
 
 
@@ -150,6 +153,7 @@ class BrokerActivityTracker:
 
 def serialize_managed_session_status(status: ManagedSessionStatus) -> dict[str, Any]:
     payload = asdict(status)
+    payload["cooldown_until"] = _serialize_datetime(status.cooldown_until)
     payload["metrics"]["last_connect_attempt_at"] = _serialize_datetime(
         status.metrics.last_connect_attempt_at
     )
@@ -174,15 +178,24 @@ class ManagedSyncSession:
         wrapper_cls: type[Any] | None = None,
         default_timeout: int = 30,
         activity_tracker: BrokerActivityTracker | None = None,
+        initial_connect_backoff_seconds: float = 5.0,
+        max_connect_backoff_seconds: float = 300.0,
     ) -> None:
         self.role = role
         self.config = config
         self._wrapper_cls = wrapper_cls
         self._default_timeout = default_timeout
         self._activity_tracker = activity_tracker
+        self._initial_connect_backoff_seconds = max(0.0, initial_connect_backoff_seconds)
+        self._max_connect_backoff_seconds = max(
+            self._initial_connect_backoff_seconds,
+            max_connect_backoff_seconds,
+        )
         self._lock = RLock()
         self._app: Any | None = None
         self._last_error: str | None = None
+        self._consecutive_failures = 0
+        self._cooldown_until: datetime | None = None
         self._connect_attempt_count = 0
         self._connect_success_count = 0
         self._disconnect_count = 0
@@ -210,6 +223,42 @@ class ManagedSyncSession:
     def _record_connect_success_locked(self) -> None:
         self._connect_success_count += 1
         self._last_connect_success_at = _utc_now()
+        self._consecutive_failures = 0
+        self._cooldown_until = None
+
+    def _record_gateway_failure_locked(self, error: str) -> None:
+        self._last_error = error
+        self._consecutive_failures += 1
+        if self._initial_connect_backoff_seconds <= 0:
+            self._cooldown_until = None
+            return
+        delay = min(
+            self._max_connect_backoff_seconds,
+            self._initial_connect_backoff_seconds
+            * (2 ** max(0, self._consecutive_failures - 1)),
+        )
+        self._cooldown_until = _utc_now() + timedelta(seconds=delay)
+
+    def _cooldown_seconds_remaining_locked(self, *, now: datetime) -> int | None:
+        if self._cooldown_until is None:
+            return None
+        remaining = int((self._cooldown_until - now).total_seconds())
+        return max(0, remaining)
+
+    def _raise_if_cooling_down_locked(self, *, ignore_cooldown: bool = False) -> None:
+        if ignore_cooldown:
+            return
+        if self._cooldown_until is None:
+            return
+        now = _utc_now()
+        if self._cooldown_until <= now:
+            return
+        retry_at = self._cooldown_until.isoformat()
+        raise ConnectionError(
+            f"Managed IBKR session '{self.role}' is cooling down after "
+            f"{self._consecutive_failures} failed broker attempt(s); next retry at "
+            f"{retry_at}. Last error: {self._last_error}"
+        )
 
     def _record_disconnect_locked(self) -> None:
         now = _utc_now()
@@ -238,11 +287,12 @@ class ManagedSyncSession:
         finally:
             self._record_disconnect_locked()
 
-    def _ensure_connected_locked(self) -> None:
+    def _ensure_connected_locked(self, *, ignore_cooldown: bool = False) -> None:
         if self._app is not None and _is_connected(self._app):
             self._last_error = None
             return
 
+        self._raise_if_cooling_down_locked(ignore_cooldown=ignore_cooldown)
         self._record_connect_attempt_locked()
         self._disconnect_locked()
         app = self._build_app()
@@ -251,11 +301,17 @@ class ManagedSyncSession:
             port=self.config.port,
             client_id=self.config.client_id,
         ):
-            self._last_error = (
+            failure_reason = getattr(app, "last_connect_failure_reason", None)
+            error = str(failure_reason).strip() if failure_reason else (
                 f"Failed to connect to IBKR at {self.config.host}:{self.config.port} "
                 f"with client_id={self.config.client_id}."
             )
-            raise ConnectionError(self._last_error)
+            try:
+                app.disconnect_and_stop()
+            except Exception:
+                pass
+            self._record_gateway_failure_locked(error)
+            raise ConnectionError(error)
 
         self._app = app
         self._record_connect_success_locked()
@@ -266,25 +322,29 @@ class ManagedSyncSession:
             try:
                 self._ensure_connected_locked()
             except Exception as exc:
-                self._last_error = str(exc)
+                if "cooling down" not in str(exc):
+                    self._last_error = str(exc)
             return self.status()
 
     def disconnect(self) -> None:
         with self._lock:
             self._disconnect_locked()
 
-    def status(self) -> ManagedSessionStatus:
-        with self._lock:
-            now = _utc_now()
-            self._prune_times_locked(self._connect_attempt_times, now=now)
-            self._prune_times_locked(self._checkout_times, now=now)
+    def status(self, *, blocking: bool = True) -> ManagedSessionStatus:
+        acquired = self._lock.acquire(blocking=blocking)
+        if not acquired:
             return ManagedSessionStatus(
                 role=self.role,
                 host=self.config.host,
                 port=self.config.port,
                 client_id=self.config.client_id,
-                connected=self._app is not None and _is_connected(self._app),
-                last_error=self._last_error,
+                connected=False,
+                last_error="Session status is unavailable because the session lock is busy.",
+                consecutive_failures=self._consecutive_failures,
+                cooldown_until=self._cooldown_until,
+                cooldown_seconds_remaining=self._cooldown_seconds_remaining_locked(
+                    now=_utc_now()
+                ),
                 metrics=ManagedSessionMetrics(
                     connect_attempt_count=self._connect_attempt_count,
                     connect_success_count=self._connect_success_count,
@@ -300,12 +360,50 @@ class ManagedSyncSession:
                 ),
             )
 
+        try:
+            now = _utc_now()
+            self._prune_times_locked(self._connect_attempt_times, now=now)
+            self._prune_times_locked(self._checkout_times, now=now)
+            return ManagedSessionStatus(
+                role=self.role,
+                host=self.config.host,
+                port=self.config.port,
+                client_id=self.config.client_id,
+                connected=self._app is not None and _is_connected(self._app),
+                last_error=self._last_error,
+                consecutive_failures=self._consecutive_failures,
+                cooldown_until=self._cooldown_until,
+                cooldown_seconds_remaining=self._cooldown_seconds_remaining_locked(
+                    now=now
+                ),
+                metrics=ManagedSessionMetrics(
+                    connect_attempt_count=self._connect_attempt_count,
+                    connect_success_count=self._connect_success_count,
+                    disconnect_count=self._disconnect_count,
+                    checkout_count=self._checkout_count,
+                    failed_checkout_count=self._failed_checkout_count,
+                    connect_attempts_last_60_seconds=len(self._connect_attempt_times),
+                    checkouts_last_60_seconds=len(self._checkout_times),
+                    last_connect_attempt_at=self._last_connect_attempt_at,
+                    last_connect_success_at=self._last_connect_success_at,
+                    last_disconnect_at=self._last_disconnect_at,
+                    last_checkout_at=self._last_checkout_at,
+                ),
+            )
+        finally:
+            self._lock.release()
+
     @contextmanager
-    def checkout(self, *, operation_name: str = "unspecified") -> Iterator[Any]:
+    def checkout(
+        self,
+        *,
+        operation_name: str = "unspecified",
+        ignore_cooldown: bool = False,
+    ) -> Iterator[Any]:
         started_at = _utc_now()
         with self._lock:
             try:
-                self._ensure_connected_locked()
+                self._ensure_connected_locked(ignore_cooldown=ignore_cooldown)
                 self._record_checkout_locked()
                 app = self._app
                 if app is None:
@@ -316,7 +414,21 @@ class ManagedSyncSession:
                     raise ConnectionError(message)
             except Exception as exc:
                 self._failed_checkout_count += 1
-                self._last_error = str(exc)
+                previous_last_error = self._last_error
+                is_cooldown_error = (
+                    isinstance(exc, ConnectionError)
+                    and "cooling down" in str(exc)
+                )
+                if not is_cooldown_error:
+                    self._last_error = str(exc)
+                should_open_cooldown = (
+                    isinstance(exc, (ConnectionError, TimeoutError))
+                    and not is_cooldown_error
+                    and previous_last_error != str(exc)
+                )
+                if should_open_cooldown:
+                    self._record_gateway_failure_locked(str(exc))
+                    self._disconnect_locked()
                 if self._activity_tracker is not None:
                     self._activity_tracker.record(
                         role=self.role,
@@ -357,8 +469,17 @@ class ManagedSyncSession:
                 if not _is_connected(app):
                     self._disconnect_locked()
 
-    def execute(self, operation_name: str, operation: Callable[[Any], Any]) -> Any:
-        with self.checkout(operation_name=operation_name) as app:
+    def execute(
+        self,
+        operation_name: str,
+        operation: Callable[[Any], Any],
+        *,
+        ignore_cooldown: bool = False,
+    ) -> Any:
+        with self.checkout(
+            operation_name=operation_name,
+            ignore_cooldown=ignore_cooldown,
+        ) as app:
             return operation(app)
 
     def drain_broker_callback_events(self) -> list[dict[str, Any]]:
@@ -388,6 +509,8 @@ class CanonicalSyncSessions:
         *,
         wrapper_cls: type[Any] | None = None,
         default_timeout: int = 30,
+        initial_connect_backoff_seconds: float = 5.0,
+        max_connect_backoff_seconds: float = 300.0,
     ) -> None:
         self.activity_tracker = BrokerActivityTracker()
         self.primary = ManagedSyncSession(
@@ -396,6 +519,8 @@ class CanonicalSyncSessions:
             wrapper_cls=wrapper_cls,
             default_timeout=default_timeout,
             activity_tracker=self.activity_tracker,
+            initial_connect_backoff_seconds=initial_connect_backoff_seconds,
+            max_connect_backoff_seconds=max_connect_backoff_seconds,
         )
         self.diagnostic = ManagedSyncSession(
             "diagnostic",
@@ -403,6 +528,8 @@ class CanonicalSyncSessions:
             wrapper_cls=wrapper_cls,
             default_timeout=default_timeout,
             activity_tracker=self.activity_tracker,
+            initial_connect_backoff_seconds=initial_connect_backoff_seconds,
+            max_connect_backoff_seconds=max_connect_backoff_seconds,
         )
 
     def warmup(self) -> dict[str, dict[str, Any]]:
@@ -415,10 +542,14 @@ class CanonicalSyncSessions:
         self.primary.disconnect()
         self.diagnostic.disconnect()
 
-    def status_snapshot(self) -> dict[str, dict[str, Any]]:
+    def status_snapshot(self, *, blocking: bool = True) -> dict[str, dict[str, Any]]:
         return {
-            "primary": serialize_managed_session_status(self.primary.status()),
-            "diagnostic": serialize_managed_session_status(self.diagnostic.status()),
+            "primary": serialize_managed_session_status(
+                self.primary.status(blocking=blocking)
+            ),
+            "diagnostic": serialize_managed_session_status(
+                self.diagnostic.status(blocking=blocking)
+            ),
         }
 
     def telemetry_snapshot(self, *, recent_limit: int = 20) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
 from datetime import time
+import math
 from pathlib import Path
 import re
 import time as runtime_time
@@ -21,6 +22,16 @@ DEFAULT_STOCKHOLM_INTRADAY_TYPES = (
     "ASK",
     "ADJUSTED_LAST",
 )
+
+ContractDetailsCacheKey = tuple[
+    str,
+    str,
+    str,
+    str,
+    str | None,
+    str | None,
+    str | None,
+]
 
 
 @dataclass(slots=True)
@@ -44,6 +55,7 @@ class StockholmIntradayBackfillQuery:
     symbols: tuple[str, ...] | None = None
     include_remapped: bool = False
     sleep_seconds: float = 0.05
+    max_runtime_seconds: float | None = 55.0
 
     def validate(self) -> None:
         if not self.bar_size:
@@ -56,6 +68,11 @@ class StockholmIntradayBackfillQuery:
             raise ValueError("max_symbols must be at most 100")
         if self.sleep_seconds < 0:
             raise ValueError("sleep_seconds must be non-negative")
+        if self.max_runtime_seconds is not None:
+            if self.max_runtime_seconds <= 0:
+                raise ValueError("max_runtime_seconds must be positive when provided")
+            if self.max_runtime_seconds > 3600:
+                raise ValueError("max_runtime_seconds must be at most 3600")
 
 
 def _load_current_stockholm_universe(path: Path) -> list[str]:
@@ -265,6 +282,24 @@ def _build_historical_query(
     )
 
 
+def _call_timeout(
+    *,
+    base_timeout: int,
+    deadline_at: float | None,
+) -> int | None:
+    if deadline_at is None:
+        return base_timeout
+
+    remaining_seconds = deadline_at - runtime_time.monotonic()
+    if remaining_seconds <= 0:
+        return None
+    return max(1, min(base_timeout, math.ceil(remaining_seconds)))
+
+
+def _series_is_unsupported_for_dated_intraday_backfill(series_name: str) -> bool:
+    return series_name.upper() == "ADJUSTED_LAST"
+
+
 def collect_stockholm_intraday_backfill(
     config: IbkrConnectionConfig,
     query: StockholmIntradayBackfillQuery,
@@ -275,6 +310,12 @@ def collect_stockholm_intraday_backfill(
     app: Any | None = None,
 ) -> dict[str, Any]:
     query.validate()
+    started_monotonic = runtime_time.monotonic()
+    deadline_at = (
+        started_monotonic + query.max_runtime_seconds
+        if query.max_runtime_seconds is not None
+        else None
+    )
     universe = _load_current_stockholm_universe(instruments_path)
     identity_map = _load_stockholm_identity_map(identity_path)
     page_slugs, next_cursor = _build_symbol_page(
@@ -285,7 +326,18 @@ def collect_stockholm_intraday_backfill(
     )
 
     entries: list[dict[str, Any]] = []
+    contract_details_cache: dict[ContractDetailsCacheKey, list[Any]] = {}
+    budget_exhausted = False
+    last_complete_cursor = query.start_after
     for index, slug in enumerate(page_slugs):
+        first_call_timeout = _call_timeout(
+            base_timeout=timeout,
+            deadline_at=deadline_at,
+        )
+        if first_call_timeout is None:
+            budget_exhausted = True
+            break
+
         identity = identity_map.get(slug)
         entry: dict[str, Any] = {
             "slug": slug,
@@ -301,7 +353,37 @@ def collect_stockholm_intraday_backfill(
             "series": {},
         }
 
-        first_series = query.what_to_show[0]
+        requested_series = list(query.what_to_show)
+        unsupported_series = [
+            series_name
+            for series_name in requested_series
+            if _series_is_unsupported_for_dated_intraday_backfill(series_name)
+        ]
+        fetchable_series = [
+            series_name
+            for series_name in requested_series
+            if not _series_is_unsupported_for_dated_intraday_backfill(series_name)
+        ]
+        for series_name in unsupported_series:
+            entry["series"][series_name] = {
+                "status": "unsupported",
+                "detail": (
+                    "IBKR does not support explicit dated intraday requests for "
+                    "ADJUSTED_LAST. Request raw intraday bars here and apply "
+                    "adjustment factors downstream."
+                ),
+            }
+
+        if not fetchable_series:
+            entry["status"] = "error"
+            entry["detail"] = "No supported intraday series were requested."
+            entries.append(entry)
+            last_complete_cursor = slug
+            if query.sleep_seconds > 0:
+                runtime_time.sleep(query.sleep_seconds)
+            continue
+
+        first_series = fetchable_series[0]
         first_query = _build_historical_query(
             slug,
             identity,
@@ -314,13 +396,15 @@ def collect_stockholm_intraday_backfill(
             first_response = read_historical_bars(
                 config,
                 first_query,
-                timeout=timeout,
+                timeout=first_call_timeout,
                 app=app,
+                contract_details_cache=contract_details_cache,
             )
         except LookupError as exc:
             entry["status"] = "lookup_error"
             entry["detail"] = str(exc)
             entries.append(entry)
+            last_complete_cursor = slug
             if query.sleep_seconds > 0:
                 runtime_time.sleep(query.sleep_seconds)
             continue
@@ -328,6 +412,7 @@ def collect_stockholm_intraday_backfill(
             entry["status"] = "timeout"
             entry["detail"] = str(exc)
             entries.append(entry)
+            last_complete_cursor = slug
             if query.sleep_seconds > 0:
                 runtime_time.sleep(query.sleep_seconds)
             continue
@@ -335,6 +420,7 @@ def collect_stockholm_intraday_backfill(
             entry["status"] = "error"
             entry["detail"] = f"{type(exc).__name__}: {exc}"
             entries.append(entry)
+            last_complete_cursor = slug
             if query.sleep_seconds > 0:
                 runtime_time.sleep(query.sleep_seconds)
             continue
@@ -351,6 +437,7 @@ def collect_stockholm_intraday_backfill(
             entry["status"] = "skipped_remapped"
             entry["detail"] = "Resolved at IBKR but requires explicit remap approval."
             entries.append(entry)
+            last_complete_cursor = slug
             if query.sleep_seconds > 0:
                 runtime_time.sleep(query.sleep_seconds)
             continue
@@ -363,7 +450,31 @@ def collect_stockholm_intraday_backfill(
         }
         entry["status"] = "ok"
 
-        for series_name in query.what_to_show[1:]:
+        symbol_completed = True
+        for series_index, series_name in enumerate(fetchable_series[1:], start=1):
+            series_call_timeout = _call_timeout(
+                base_timeout=timeout,
+                deadline_at=deadline_at,
+            )
+            if series_call_timeout is None:
+                budget_exhausted = True
+                symbol_completed = False
+                entry["status"] = "partial"
+                entry["detail"] = (
+                    "max_runtime_seconds budget exhausted before all requested "
+                    "series were collected for this symbol."
+                )
+                entry["series"][series_name] = {
+                    "status": "not_requested",
+                    "detail": "max_runtime_seconds budget exhausted.",
+                }
+                for remaining_series_name in fetchable_series[series_index + 1 :]:
+                    entry["series"][remaining_series_name] = {
+                        "status": "not_requested",
+                        "detail": "max_runtime_seconds budget exhausted.",
+                    }
+                break
+
             series_query = _build_historical_query(
                 slug,
                 identity,
@@ -376,8 +487,9 @@ def collect_stockholm_intraday_backfill(
                 series_response = read_historical_bars(
                     config,
                     series_query,
-                    timeout=timeout,
+                    timeout=series_call_timeout,
                     app=app,
+                    contract_details_cache=contract_details_cache,
                 )
                 entry["series"][series_name] = {
                     "status": "ok",
@@ -402,8 +514,18 @@ def collect_stockholm_intraday_backfill(
                 }
 
         entries.append(entry)
+        if symbol_completed:
+            last_complete_cursor = slug
+        else:
+            budget_exhausted = True
+            break
         if query.sleep_seconds > 0 and index < len(page_slugs) - 1:
             runtime_time.sleep(query.sleep_seconds)
+
+    elapsed_seconds = runtime_time.monotonic() - started_monotonic
+    response_next_cursor = next_cursor
+    if budget_exhausted:
+        response_next_cursor = last_complete_cursor
 
     return {
         "query": {
@@ -416,22 +538,38 @@ def collect_stockholm_intraday_backfill(
             "symbols": list(query.symbols) if query.symbols is not None else None,
             "include_remapped": query.include_remapped,
             "sleep_seconds": query.sleep_seconds,
+            "max_runtime_seconds": query.max_runtime_seconds,
         },
         "universe": {
             "stockholm_instruments_path": str(instruments_path),
             "stockholm_identity_path": str(identity_path),
             "current_universe_size": len(universe),
             "page_size": len(page_slugs),
-            "next_cursor": next_cursor,
+            "next_cursor": response_next_cursor,
+            "requested_page_next_cursor": next_cursor,
         },
         "summary": {
             "requested_symbol_count": len(page_slugs),
+            "processed_symbol_count": len(entries),
             "ok_count": sum(1 for entry in entries if entry["status"] == "ok"),
             "lookup_error_count": sum(1 for entry in entries if entry["status"] == "lookup_error"),
             "timeout_count": sum(1 for entry in entries if entry["status"] == "timeout"),
             "error_count": sum(1 for entry in entries if entry["status"] == "error"),
+            "partial_count": sum(1 for entry in entries if entry["status"] == "partial"),
             "skipped_remapped_count": sum(
                 1 for entry in entries if entry["status"] == "skipped_remapped"
+            ),
+            "unsupported_series_count": sum(
+                1
+                for entry in entries
+                for series in entry["series"].values()
+                if series["status"] == "unsupported"
+            ),
+            "not_requested_series_count": sum(
+                1
+                for entry in entries
+                for series in entry["series"].values()
+                if series["status"] == "not_requested"
             ),
             "resolves_cleanly_count": sum(
                 1 for entry in entries if entry["classification"] == "resolves_cleanly"
@@ -441,6 +579,8 @@ def collect_stockholm_intraday_backfill(
                 for entry in entries
                 if entry["classification"] == "resolves_suspiciously_remapped"
             ),
+            "budget_exhausted": budget_exhausted,
+            "elapsed_seconds": round(elapsed_seconds, 3),
         },
         "entries": entries,
     }

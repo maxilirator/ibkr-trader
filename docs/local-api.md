@@ -44,7 +44,12 @@ This is a strong starting point, but it is not the final security model for a pr
 
 ### `GET /healthz`
 
-Returns basic process status and local-only configuration.
+Returns basic process status, broker session state, broker heartbeat freshness,
+snapshot-refresh freshness, and execution-runtime lease state. By default the
+endpoint may start one non-blocking broker-monitor refresh if the cached broker
+evidence is older than `BROKER_STATUS_REFRESH_MIN_INTERVAL_SECONDS`.
+
+Use `GET /healthz?refresh_broker_status=false` for a pure cached read.
 
 ### `POST /v1/ibkr/probe`
 
@@ -102,6 +107,65 @@ Example request body:
   "tags": ["NetLiquidation", "BuyingPower", "AvailableFunds", "ExcessLiquidity"]
 }
 ```
+
+### Virtual Trading Endpoints
+
+Virtual trading is the local execution path for accounts whose key starts with
+`virtual`, for example `virtual0001`. The API normalizes the key to
+`VIRTUAL0001`, writes ledger rows with `is_virtual=true`, and does not send
+virtual orders or market-data reads to IB Gateway.
+
+Implemented endpoints:
+
+- `POST /v1/virtual/accounts`
+- `POST /v1/virtual/market-watch`
+- `GET /v1/virtual/market-watch`
+
+Create or refresh a virtual account:
+
+```json
+{
+  "account_key": "virtual0001",
+  "base_currency": "SEK",
+  "account_label": "RL virtual sandbox"
+}
+```
+
+Publish a virtual market-watch quote:
+
+```json
+{
+  "account_key": "virtual0001",
+  "observed_at": "2026-04-27T09:01:00Z",
+  "symbol": "SIVE",
+  "security_type": "STK",
+  "exchange": "XSTO",
+  "currency": "SEK",
+  "bid_price": "10.00",
+  "ask_price": "10.00",
+  "last_price": "10.00",
+  "source": "rl_virtual_market_watch"
+}
+```
+
+`POST /v1/virtual/market-watch` publishes prices into the virtual adapter. It is
+not an instruction preflight endpoint. Use `POST /v1/instructions/validate`
+before `POST /v1/instructions/submit` when checking candidate orders.
+
+Quote submission also evaluates open virtual orders for the same account and
+instrument. Matching orders fill locally, use `quantity="1"`, record a fixed
+`49 SEK` commission, and update virtual account and position snapshots.
+
+Use the normal instruction endpoints with `account.account_key="virtual0001"` to
+schedule and run virtual trades:
+
+- `POST /v1/instructions/submit`
+- `POST /v1/instructions/{instruction_id}/submit-entry`
+- `POST /v1/instructions/{instruction_id}/cancel-entry`
+- `POST /v1/runtime/run-once`
+
+See [Virtual Trading](virtual-trading.md) for the full contract and an end-to-end
+smoke sequence.
 
 ### `GET /v1/broker/runtime-snapshot`
 
@@ -167,16 +231,17 @@ Important current behavior:
   - `lookup_error` / `timeout` / `error`
 - suspicious remaps are skipped by default unless `include_remapped=true`
 
-Recommended nightly request body:
+Recommended production request body for the fast nightly page:
 
 ```json
 {
   "as_of_date": "2026-04-24",
   "bar_size": "1 min",
-  "what_to_show": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
+  "what_to_show": ["TRADES"],
   "use_rth": true,
   "max_symbols": 25,
-  "sleep_seconds": 0.05
+  "sleep_seconds": 0.05,
+  "max_runtime_seconds": 55
 }
 ```
 
@@ -185,6 +250,15 @@ Useful paging fields:
 - `max_symbols`: how many Stockholm names to fetch in this batch
 - `start_after`: optional cursor from the previous response
 - `symbols`: optional explicit slug list instead of paging the whole universe
+- `max_runtime_seconds`: optional wall-clock budget for the HTTP response. The
+  endpoint returns a partial page with `budget_exhausted=true` before holding a
+  caller open indefinitely.
+
+For optional quote series such as `MIDPOINT`, `BID`, and `ASK`, use a smaller
+page or run a second pass after the raw trade bars have landed. `ADJUSTED_LAST`
+is not requested by this dated intraday endpoint because IBKR rejects explicit
+end-date intraday requests for that series; apply adjustment factors downstream
+from a separate corporate-action or adjusted-close source.
 
 Example response shape:
 
@@ -197,28 +271,36 @@ Example response shape:
   "query": {
     "as_of_date": "2026-04-24",
     "bar_size": "1 min",
-    "what_to_show": ["TRADES", "MIDPOINT", "BID", "ASK", "ADJUSTED_LAST"],
+    "what_to_show": ["TRADES"],
     "use_rth": true,
     "max_symbols": 25,
     "start_after": null,
     "symbols": null,
     "include_remapped": false,
-    "sleep_seconds": 0.05
+    "sleep_seconds": 0.05,
+    "max_runtime_seconds": 55
   },
   "universe": {
     "current_universe_size": 955,
     "page_size": 25,
-    "next_cursor": "volcar-b"
+    "next_cursor": "volcar-b",
+    "requested_page_next_cursor": "volcar-b"
   },
   "summary": {
     "requested_symbol_count": 25,
+    "processed_symbol_count": 25,
     "ok_count": 24,
     "lookup_error_count": 1,
     "timeout_count": 0,
     "error_count": 0,
+    "partial_count": 0,
     "skipped_remapped_count": 0,
+    "unsupported_series_count": 0,
+    "not_requested_series_count": 0,
     "resolves_cleanly_count": 24,
-    "resolves_suspiciously_remapped_count": 0
+    "resolves_suspiciously_remapped_count": 0,
+    "budget_exhausted": false,
+    "elapsed_seconds": 18.42
   },
   "entries": [
     {
@@ -266,6 +348,51 @@ Important current behavior:
 - this is a timed sample endpoint, not a long-lived socket relay yet
 - it is intended as the first raw-data primitive for the future parquet ingestion service
 - if IBKR rejects the requested tick-by-tick stream, the endpoint returns the broker error directly
+
+### `POST /v1/market-data/stream/subscribe`
+
+Starts or updates the persistent IBKR market-data stream used by the RL runner.
+This is the production path for active candidate names: subscribe once, keep the
+socket open, and build observations from the in-memory 1-minute bar buffer.
+
+Example:
+
+```bash
+curl -sS -X POST "$API/v1/market-data/stream/subscribe" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbols": ["AXFO", "AZN", "TELIA"],
+    "exchange": "SMART",
+    "primary_exchange": "SFB",
+    "currency": "SEK",
+    "market_data_type": "LIVE",
+    "replace": true
+  }'
+```
+
+Use `replace=true` for a fresh morning candidate list. Use `replace=false` to
+add names without dropping existing subscriptions. The service keeps top of
+book, last price, and 1-minute OHLC bars from live last-price ticks.
+For Stockholm symbols, the API enriches canonical dash symbols such as `ERIC-B`
+with ticker alias and ISIN from `XSTO_IDENTITY_PATH` before opening the IBKR
+subscription, while snapshots still use the canonical dash symbol keys.
+
+### `GET /v1/market-data/stream/snapshot`
+
+Returns the current stream state without touching IBKR.
+
+```bash
+curl -sS "$API/v1/market-data/stream/snapshot?symbols=AXFO,AZN&bar_limit=20"
+```
+
+`POST /v1/rl/observations/build` reads this same buffer by default when
+`source_bars` is omitted. For 40-name RL runs, use this stream path instead of
+polling historical bars every minute.
+
+### `POST /v1/market-data/stream/stop`
+
+Cancels active stream subscriptions and disconnects the dedicated streaming
+client session.
 
 ### `POST /v1/market-data/shortability-snapshot`
 
@@ -406,7 +533,13 @@ The API now includes an early RL trader control surface.
 Current registry endpoints:
 
 - `POST /v1/rl/models/register`
+- `POST /v1/rl/models/upsert`
+- `PUT /v1/rl/models/{model_key}`
 - `POST /v1/rl/deployments`
+- `PATCH /v1/rl/deployments/{deployment_key}`
+- `GET /v1/rl/candidates`
+- `POST /v1/rl/observations/build`
+- `POST /v1/rl/actions/translate`
 - `POST /v1/rl/actions/log`
 - `POST /v1/rl/deployments/{deployment_key}/heartbeat`
 - `GET /v1/read/rl-dashboard`
@@ -414,16 +547,34 @@ Current registry endpoints:
 Purpose:
 
 - register promoted RL model metadata and artifact lineage
+- update promoted RL model metadata when the upstream promotion contract changes
 - bind one deployment to one real broker account and one internal book
+- expose model-routed candidate names for bar-by-bar RL evaluation
+- build model-facing observations from the market-data stream
+- translate safe RL actions into normal execution instructions
 - log append-only model actions before or after execution translation
 - expose heartbeat and recent action visibility to the dashboard
 
 Important current behavior:
 
-- these endpoints do **not** submit broker orders directly yet
-- the RL layer is currently a durable registry and operator view
+- registry endpoints do not submit broker orders directly
+- `/v1/rl/actions/translate` can persist translated entry instructions and can
+  execute owned RL cancel/exit actions when `submit=true`
+- the RL layer is a durable registry, operator view, and side-aware action
+  bridge into the normal execution path
 - action logging already validates that an action belongs to the registered model action space
 - deployments are explicitly account-bound through `account_key`
+- deployments may use `mode="virtual"` with a `virtual...` account key for local
+  RL execution testing
+- registry payloads must be explicit; the API does not infer model side,
+  deployment mode/status, action status, action timestamp, or heartbeat timestamp
+- `/v1/rl/models/register` is create-only and returns conflict for existing
+  model keys
+- `/v1/rl/models/upsert` and `PUT /v1/rl/models/{model_key}` create or replace
+  the registered metadata for a model key
+- `PATCH /v1/rl/deployments/{deployment_key}` updates editable deployment
+  fields such as `allowed_symbols`, `status`, `risk_limits`,
+  `action_constraints`, and `metadata` without recreating the deployment
 
 Example model registration body:
 
@@ -473,26 +624,45 @@ Example deployment body:
 }
 ```
 
+Virtual deployment example:
+
+```json
+{
+  "deployment_key": "short_trial36_virtual_01",
+  "model_key": "short_trial36_v1",
+  "account_key": "virtual0001",
+  "book_key": "rl_short_trial36_virtual_01",
+  "mode": "virtual",
+  "status": "running",
+  "allowed_symbols": ["SIVE", "VOLV-B"]
+}
+```
+
+Deployment update example:
+
+```json
+{
+  "allowed_symbols": ["SIVE", "VOLV-B", "ERIC-B"],
+  "risk_limits": {
+    "max_open_positions": 3
+  },
+  "metadata": {
+    "operator_note": "controlled first virtual run"
+  }
+}
+```
+
 Example RL dashboard response shape:
 
 ```json
 {
   "accepted": true,
-  "recommended_short_action_space": [
-    "skip",
-    "wait",
-    "market_entry",
-    "cancel_entry",
-    "exit_market",
-    "clear_exit",
-    "entry_prevclose_88bp",
-    "exit_tp_180bp"
-  ],
   "rl_dashboard": {
     "summary": {
       "model_count": 1,
       "deployment_count": 1,
       "live_deployment_count": 1,
+      "virtual_deployment_count": 0,
       "running_deployment_count": 1,
       "stale_heartbeat_count": 0,
       "recent_action_count": 5
@@ -520,6 +690,37 @@ Important current behavior:
 
 - this endpoint does **not** place a broker order yet
 - it is a durable control-plane submit, not a live execution submit
+- virtual account instructions are persisted with `is_virtual=true` and are
+  later submitted through the virtual adapter
+
+### `GET /v1/instructions`
+
+Lists persisted instruction statuses. Archived rows are hidden by default.
+
+Useful query parameters:
+
+- `limit=100`
+- `state=ENTRY_PENDING`
+- `model_routed=true|false`
+- `include_archived=true|false`
+
+### `POST /v1/instructions/archive-set`
+
+Archives matching instruction rows from the default dashboard view without
+deleting audit history or lifecycle events.
+
+Useful selectors include:
+
+- `instruction_ids`
+- `states`
+- `batch_id`
+- `account_key`
+- `book_key`
+- `source_system`
+- `model_routed`
+- `expire_before`
+
+Active execution states are skipped unless `include_active=true`.
 
 ### `GET /v1/instructions/{instruction_id}`
 
@@ -596,6 +797,8 @@ Important current behavior:
 - when `instruction_ids` is provided, the cycle only touches that selected set
 - it now retries transient IBKR client-id reuse / reconnect churn a small number of times before failing the cycle
 - a persistent runtime-owned IBKR connection is still the next step
+- when the selected work is virtual-only, the cycle skips IBKR snapshot fetches
+  and performs order and fill evaluation against virtual market-watch quotes
 
 ### `POST /v1/instructions/schedule-preview`
 

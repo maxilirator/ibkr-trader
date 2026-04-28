@@ -79,6 +79,11 @@ from ibkr_trader.orchestration.runtime_service_state import (
     serialize_runtime_service_status,
 )
 from ibkr_trader.orchestration.state_machine import ExecutionState
+from ibkr_trader.virtual.accounts import is_virtual_account_key
+from ibkr_trader.virtual.execution import cancel_virtual_order
+from ibkr_trader.virtual.execution import has_real_broker_work
+from ibkr_trader.virtual.execution import read_virtual_market_price
+from ibkr_trader.virtual.execution import submit_virtual_exit_order
 
 DEFAULT_BROKER_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 DEFAULT_SUBMISSION_LEAD_TIME = timedelta(seconds=60)
@@ -1106,6 +1111,20 @@ def _broker_order_has_matching_execution_fill(
     return row is not None
 
 
+def _is_virtual_broker_order_id(
+    session_factory: sessionmaker[Session],
+    *,
+    order_id: int,
+) -> bool:
+    with session_scope(session_factory) as session:
+        row = session.execute(
+            select(BrokerOrderRecord.is_virtual).where(
+                BrokerOrderRecord.external_order_id == str(order_id)
+            )
+        ).scalar_one_or_none()
+    return bool(row)
+
+
 def _remaining_position_quantity(
     record: InstructionRecord,
     exit_fill: ExecutionAggregate,
@@ -1132,12 +1151,18 @@ def _cancel_broker_order_and_persist(
         order_id,
         timeout=timeout,
     )
+    broker_kind = str(broker_cancellation.get("broker_kind") or BROKER_KIND_IBKR)
+    fallback_account_key = (
+        str(broker_cancellation["account"])
+        if broker_cancellation.get("account") not in (None, "")
+        else broker_config.account_id
+    )
     persist_broker_order_cancellation_result(
         session_factory,
-        broker_kind=BROKER_KIND_IBKR,
+        broker_kind=broker_kind,
         broker_cancellation=broker_cancellation,
         observed_at=utc_now(),
-        fallback_account_key=broker_config.account_id,
+        fallback_account_key=fallback_account_key,
         event_type=event_type,
         note=note,
     )
@@ -1282,7 +1307,24 @@ def _record_entry_fill_and_optional_exit(
         if not protective_exits:
             return entry_action, ()
 
-        runtime_exit_submitter = exit_submitter or submit_exit_order_from_instruction
+        runtime_exit_submitter = exit_submitter
+        if runtime_exit_submitter is None:
+            if is_virtual_account_key(instruction.account.account_key):
+                def _submit_virtual_exit(
+                    broker_config: IbkrConnectionConfig,
+                    runtime_instruction: ExecutionInstruction,
+                    **kwargs: Any,
+                ) -> dict[str, Any]:
+                    return submit_virtual_exit_order(
+                        session_factory,
+                        broker_config,
+                        runtime_instruction,
+                        **kwargs,
+                    )
+
+                runtime_exit_submitter = _submit_virtual_exit
+            else:
+                runtime_exit_submitter = submit_exit_order_from_instruction
         oca_group = (
             f"{instruction_id}:exit:oca"
             if len(protective_exits) > 1
@@ -1303,6 +1345,12 @@ def _record_entry_fill_and_optional_exit(
                 timeout=timeout,
             )
             broker_status = broker_submission["broker_order_status"]
+            broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
+            fallback_account_key = (
+                str(broker_submission["account"])
+                if broker_submission.get("account") not in (None, "")
+                else broker_config.account_id
+            )
             if index == 0:
                 record.exit_order_id = int(broker_status["orderId"])
                 record.exit_perm_id = int(broker_status["permId"])
@@ -1313,11 +1361,11 @@ def _record_entry_fill_and_optional_exit(
             event_at = utc_now()
             persist_broker_order_submission(
                 session,
-                broker_kind=BROKER_KIND_IBKR,
+                broker_kind=broker_kind,
                 instruction_record=record,
                 broker_submission=broker_submission,
                 observed_at=event_at,
-                fallback_account_key=broker_config.account_id,
+                fallback_account_key=fallback_account_key,
                 order_role="EXIT",
                 event_type=exit_spec["event_type"],
                 note=exit_spec["note"],
@@ -1432,7 +1480,24 @@ def _submit_delayed_limit_exit(
             instruction,
             market_price=market_price,
         )
-        runtime_exit_submitter = exit_submitter or submit_exit_order_from_instruction
+        runtime_exit_submitter = exit_submitter
+        if runtime_exit_submitter is None:
+            if is_virtual_account_key(instruction.account.account_key):
+                def _submit_virtual_exit(
+                    broker_config: IbkrConnectionConfig,
+                    runtime_instruction: ExecutionInstruction,
+                    **kwargs: Any,
+                ) -> dict[str, Any]:
+                    return submit_virtual_exit_order(
+                        session_factory,
+                        broker_config,
+                        runtime_instruction,
+                        **kwargs,
+                    )
+
+                runtime_exit_submitter = _submit_virtual_exit
+            else:
+                runtime_exit_submitter = submit_exit_order_from_instruction
         broker_submission = runtime_exit_submitter(
             broker_config,
             instruction,
@@ -1443,6 +1508,12 @@ def _submit_delayed_limit_exit(
             limit_price=limit_price,
         )
         broker_status = broker_submission["broker_order_status"]
+        broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
+        fallback_account_key = (
+            str(broker_submission["account"])
+            if broker_submission.get("account") not in (None, "")
+            else broker_config.account_id
+        )
         previous_state = record.state
         record.exit_order_id = int(broker_status["orderId"])
         record.exit_perm_id = int(broker_status["permId"])
@@ -1453,11 +1524,11 @@ def _submit_delayed_limit_exit(
         event_at = utc_now()
         persist_broker_order_submission(
             session,
-            broker_kind=BROKER_KIND_IBKR,
+            broker_kind=broker_kind,
             instruction_record=record,
             broker_submission=broker_submission,
             observed_at=event_at,
-            fallback_account_key=broker_config.account_id,
+            fallback_account_key=fallback_account_key,
             order_role="EXIT",
             event_type="delayed_limit_exit_submitted",
             note="Submitted delayed limit exit anchored to live market at trigger time.",
@@ -1510,7 +1581,24 @@ def _submit_forced_exit(
             .with_for_update()
         ).scalar_one()
         instruction = _instruction_payload(record)
-        runtime_exit_submitter = exit_submitter or submit_exit_order_from_instruction
+        runtime_exit_submitter = exit_submitter
+        if runtime_exit_submitter is None:
+            if is_virtual_account_key(instruction.account.account_key):
+                def _submit_virtual_exit(
+                    broker_config: IbkrConnectionConfig,
+                    runtime_instruction: ExecutionInstruction,
+                    **kwargs: Any,
+                ) -> dict[str, Any]:
+                    return submit_virtual_exit_order(
+                        session_factory,
+                        broker_config,
+                        runtime_instruction,
+                        **kwargs,
+                    )
+
+                runtime_exit_submitter = _submit_virtual_exit
+            else:
+                runtime_exit_submitter = submit_exit_order_from_instruction
         broker_submission = runtime_exit_submitter(
             broker_config,
             instruction,
@@ -1520,6 +1608,12 @@ def _submit_forced_exit(
             timeout=timeout,
         )
         broker_status = broker_submission["broker_order_status"]
+        broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
+        fallback_account_key = (
+            str(broker_submission["account"])
+            if broker_submission.get("account") not in (None, "")
+            else broker_config.account_id
+        )
         previous_state = record.state
         record.exit_order_id = int(broker_status["orderId"])
         record.exit_perm_id = int(broker_status["permId"])
@@ -1530,11 +1624,11 @@ def _submit_forced_exit(
         event_at = utc_now()
         persist_broker_order_submission(
             session,
-            broker_kind=BROKER_KIND_IBKR,
+            broker_kind=broker_kind,
             instruction_record=record,
             broker_submission=broker_submission,
             observed_at=event_at,
-            fallback_account_key=broker_config.account_id,
+            fallback_account_key=fallback_account_key,
             order_role="EXIT",
             event_type="forced_exit_submitted",
             note="Submitted forced market exit at the next session open.",
@@ -1766,7 +1860,27 @@ def run_runtime_cycle(
 ) -> RuntimeCycleResult:
     cycle_started_at = now.astimezone(timezone.utc) if now is not None else utc_now()
     runtime_snapshot_fetch = broker_snapshot_fetcher or fetch_broker_runtime_snapshot
-    runtime_order_canceler = broker_order_canceler or cancel_broker_order
+    if broker_order_canceler is None:
+        def runtime_order_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, Any]:
+            if _is_virtual_broker_order_id(session_factory, order_id=order_id):
+                return cancel_virtual_order(
+                    session_factory,
+                    broker_config,
+                    order_id,
+                    timeout=timeout,
+                )
+            return cancel_broker_order(
+                broker_config,
+                order_id,
+                timeout=timeout,
+            )
+    else:
+        runtime_order_canceler = broker_order_canceler
     due_instruction_count = 0
     active_instruction_count = 0
     snapshot: BrokerRuntimeSnapshot | None = None
@@ -1878,52 +1992,61 @@ def run_runtime_cycle(
             issues=issues,
         )
 
-    try:
-        snapshot = _run_with_broker_retries(
-            lambda: runtime_snapshot_fetch(
+    if has_real_broker_work(session_factory, instruction_ids=instruction_ids):
+        try:
+            snapshot = _run_with_broker_retries(
+                lambda: runtime_snapshot_fetch(
+                    broker_config,
+                    timeout=timeout,
+                ),
+                retry_delays=broker_retry_delays,
+                sleep_fn=sleep_fn,
+            )
+        except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+            _append_issue(
+                issues,
+                instruction_id=None,
+                stage="broker_snapshot",
+                message=str(exc),
+            )
+            if broker_callback_fetcher is not None:
+                try:
+                    _persist_drained_broker_callbacks(
+                        session_factory,
+                        broker_config=broker_config,
+                        callback_events=broker_callback_fetcher(),
+                    )
+                except Exception as callback_exc:  # pragma: no cover - broad by design for runtime safety
+                    _append_issue(
+                        issues,
+                        instruction_id=None,
+                        stage="broker_callbacks_post_cycle",
+                        message=str(callback_exc),
+                    )
+            return _finalize_runtime_cycle_result(
+                session_factory,
                 broker_config,
-                timeout=timeout,
-            ),
-            retry_delays=broker_retry_delays,
-            sleep_fn=sleep_fn,
-        )
-    except Exception as exc:  # pragma: no cover - broad by design for runtime safety
-        _append_issue(
-            issues,
-            instruction_id=None,
-            stage="broker_snapshot",
-            message=str(exc),
-        )
-        if broker_callback_fetcher is not None:
-            try:
-                _persist_drained_broker_callbacks(
-                    session_factory,
-                    broker_config=broker_config,
-                    callback_events=broker_callback_fetcher(),
-                )
-            except Exception as callback_exc:  # pragma: no cover - broad by design for runtime safety
-                _append_issue(
-                    issues,
-                    instruction_id=None,
-                    stage="broker_callbacks_post_cycle",
-                    message=str(callback_exc),
-                )
-        return _finalize_runtime_cycle_result(
-            session_factory,
-            broker_config,
-            run_kind=run_kind,
-            runtime_timezone=runtime_timezone,
-            cycle_started_at=cycle_started_at,
-            submit_due_entries=submit_due_entries,
-            due_instruction_count=due_instruction_count,
-            active_instruction_count=active_instruction_count,
-            snapshot=snapshot,
-            submitted_entries=submitted_entries,
-            cancelled_entries=cancelled_entries,
-            filled_entries=filled_entries,
-            submitted_exits=submitted_exits,
-            completed_instructions=completed_instructions,
-            issues=issues,
+                run_kind=run_kind,
+                runtime_timezone=runtime_timezone,
+                cycle_started_at=cycle_started_at,
+                submit_due_entries=submit_due_entries,
+                due_instruction_count=due_instruction_count,
+                active_instruction_count=active_instruction_count,
+                snapshot=snapshot,
+                submitted_entries=submitted_entries,
+                cancelled_entries=cancelled_entries,
+                filled_entries=filled_entries,
+                submitted_exits=submitted_exits,
+                completed_instructions=completed_instructions,
+                issues=issues,
+            )
+    else:
+        snapshot = BrokerRuntimeSnapshot(
+            open_orders={},
+            executions=(),
+            portfolio=(),
+            positions=(),
+            account_values={},
         )
 
     try:
@@ -2254,12 +2377,31 @@ def run_runtime_cycle(
                     and remaining_quantity > 0
                     and not exit_open
                 ):
-                    if market_price_reader is None:
+                    runtime_market_price_reader = market_price_reader
+                    if (
+                        runtime_market_price_reader is None
+                        and is_virtual_account_key(instruction.account.account_key)
+                    ):
+                        def _read_virtual_market_price(
+                            _broker_config: IbkrConnectionConfig,
+                            runtime_instruction: ExecutionInstruction,
+                            *,
+                            at: datetime,
+                            timeout: int = 10,
+                        ) -> dict[str, Any]:
+                            del at, timeout
+                            return read_virtual_market_price(
+                                session_factory,
+                                runtime_instruction,
+                            )
+
+                        runtime_market_price_reader = _read_virtual_market_price
+                    if runtime_market_price_reader is None:
                         raise ValueError(
                             "Delayed limit exits require a market_price_reader."
                         )
                     market_reference = _run_with_broker_retries(
-                        lambda: market_price_reader(
+                        lambda: runtime_market_price_reader(
                             broker_config,
                             instruction,
                             at=cycle_started_at,
@@ -2461,6 +2603,7 @@ class RuntimeBrokerOperations:
 
 def _build_runtime_broker_operations(
     broker_sessions: CanonicalSyncSessions,
+    session_factory: sessionmaker[Session] | None = None,
 ) -> RuntimeBrokerOperations:
     def submit_entry_with_primary(
         broker_config: IbkrConnectionConfig,
@@ -2468,6 +2611,17 @@ def _build_runtime_broker_operations(
         *,
         timeout: int = 10,
     ) -> dict[str, Any]:
+        if session_factory is not None and is_virtual_account_key(
+            instruction.account.account_key
+        ):
+            from ibkr_trader.virtual.execution import submit_virtual_entry_order
+
+            return submit_virtual_entry_order(
+                session_factory,
+                broker_config,
+                instruction,
+                timeout=timeout,
+            )
         return broker_sessions.primary.execute(
             "runtime_entry_submit",
             lambda broker_app: submit_order_from_instruction(
@@ -2491,6 +2645,22 @@ def _build_runtime_broker_operations(
         oca_group: str | None = None,
         oca_type: int | None = None,
     ) -> dict[str, Any]:
+        if session_factory is not None and is_virtual_account_key(
+            instruction.account.account_key
+        ):
+            return submit_virtual_exit_order(
+                session_factory,
+                broker_config,
+                instruction,
+                quantity=quantity,
+                order_type=order_type,
+                order_ref=order_ref,
+                timeout=timeout,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                oca_group=oca_group,
+                oca_type=oca_type,
+            )
         return broker_sessions.primary.execute(
             "runtime_exit_submit",
             lambda broker_app: submit_exit_order_from_instruction(
@@ -2515,6 +2685,10 @@ def _build_runtime_broker_operations(
         at: datetime,
         timeout: int = 10,
     ) -> dict[str, Any]:
+        if session_factory is not None and is_virtual_account_key(
+            instruction.account.account_key
+        ):
+            return read_virtual_market_price(session_factory, instruction)
         return broker_sessions.primary.execute(
             "runtime_market_reference",
             lambda broker_app: read_latest_trade_price(
@@ -2536,6 +2710,14 @@ def _build_runtime_broker_operations(
         *,
         timeout: int = 10,
     ) -> BrokerRuntimeSnapshot:
+        if session_factory is not None and not has_real_broker_work(session_factory):
+            return BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            )
         return broker_sessions.primary.execute(
             "runtime_snapshot",
             lambda broker_app: fetch_broker_runtime_snapshot(
@@ -2554,6 +2736,14 @@ def _build_runtime_broker_operations(
         *,
         timeout: int = 10,
     ) -> BrokerRuntimeSnapshot:
+        if session_factory is not None and not has_real_broker_work(session_factory):
+            return BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            )
         return broker_sessions.primary.execute(
             "runtime_reconciliation_snapshot",
             lambda broker_app: fetch_broker_runtime_snapshot(
@@ -2576,6 +2766,16 @@ def _build_runtime_broker_operations(
         *,
         timeout: int = 10,
     ) -> dict[str, Any]:
+        if session_factory is not None and _is_virtual_broker_order_id(
+            session_factory,
+            order_id=order_id,
+        ):
+            return cancel_virtual_order(
+                session_factory,
+                broker_config,
+                order_id,
+                timeout=timeout,
+            )
         return broker_sessions.primary.execute(
             "runtime_cancel",
             lambda broker_app: cancel_broker_order(
@@ -2623,7 +2823,7 @@ def run_persistent_execution_runtime(
     owner_token = uuid.uuid4().hex
     owner_label, hostname, pid = _runtime_owner_label()
     broker_config = app_config.ibkr.primary_session()
-    broker_ops = _build_runtime_broker_operations(broker_sessions)
+    broker_ops = _build_runtime_broker_operations(broker_sessions, session_factory)
     submission_lead_time = timedelta(
         seconds=app_config.execution_runtime_submission_lead_seconds
     )
@@ -2811,23 +3011,43 @@ class BackgroundExecutionRuntimeService:
         )
 
     def _run(self) -> None:
-        try:
-            run_persistent_execution_runtime(
-                self._session_factory,
-                self._app_config,
-                self._broker_sessions,
-                interval_seconds=self._app_config.execution_runtime_interval_seconds,
-                timeout=self._app_config.execution_runtime_timeout_seconds,
-                allow_startup_issues=self._app_config.execution_runtime_allow_startup_issues,
-                lease_seconds=self._app_config.execution_runtime_lease_seconds,
-                stop_event=self._stop_event,
-                emit_results=False,
-                shutdown_sessions_on_exit=False,
-            )
-        except RuntimeServiceLeaseError:
-            return
-        except Exception:
-            return
+        restart_delay = max(
+            0.0,
+            self._app_config.execution_runtime_restart_backoff_initial_seconds,
+        )
+        max_restart_delay = max(
+            restart_delay,
+            self._app_config.execution_runtime_restart_backoff_max_seconds,
+        )
+        while not self._stop_event.is_set():
+            try:
+                exit_code = run_persistent_execution_runtime(
+                    self._session_factory,
+                    self._app_config,
+                    self._broker_sessions,
+                    interval_seconds=self._app_config.execution_runtime_interval_seconds,
+                    timeout=self._app_config.execution_runtime_timeout_seconds,
+                    allow_startup_issues=self._app_config.execution_runtime_allow_startup_issues,
+                    lease_seconds=self._app_config.execution_runtime_lease_seconds,
+                    stop_event=self._stop_event,
+                    emit_results=False,
+                    shutdown_sessions_on_exit=False,
+                )
+            except RuntimeServiceLeaseError:
+                if self._stop_event.wait(restart_delay):
+                    return
+                continue
+            except Exception:
+                if self._stop_event.wait(restart_delay):
+                    return
+                restart_delay = min(max_restart_delay, restart_delay * 2)
+                continue
+
+            if self._stop_event.is_set() or exit_code == 0:
+                return
+            if self._stop_event.wait(restart_delay):
+                return
+            restart_delay = min(max_restart_delay, restart_delay * 2)
 
 
 def build_parser() -> argparse.ArgumentParser:

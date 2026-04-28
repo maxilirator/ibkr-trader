@@ -8,6 +8,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
@@ -44,6 +45,7 @@ class InstructionStatus:
     batch_id: str
     account_key: str
     book_key: str
+    is_virtual: bool
     symbol: str
     exchange: str
     currency: str
@@ -70,9 +72,13 @@ class InstructionStatus:
     exit_filled_quantity: str | None
     exit_avg_fill_price: str | None
     exit_filled_at: datetime | None
+    archived_at: datetime | None
+    archived_by: str | None
+    archive_reason: str | None
     activity_at: datetime
     entry_order_display: str | None
     exit_order_display: str | None
+    payload: dict[str, Any]
     events: tuple[InstructionEventStatus, ...]
 
 
@@ -377,6 +383,7 @@ def _build_instruction_status(
         batch_id=record.batch_id,
         account_key=record.account_key,
         book_key=record.book_key,
+        is_virtual=record.is_virtual,
         symbol=record.symbol,
         exchange=record.exchange,
         currency=record.currency,
@@ -449,6 +456,9 @@ def _build_instruction_status(
         exit_filled_quantity=record.exit_filled_quantity,
         exit_avg_fill_price=record.exit_avg_fill_price,
         exit_filled_at=record.exit_filled_at,
+        archived_at=record.archived_at,
+        archived_by=record.archived_by,
+        archive_reason=record.archive_reason,
         activity_at=activity_at,
         entry_order_display=derived_entry_order_display
         or _display_for_orders(
@@ -461,6 +471,7 @@ def _build_instruction_status(
             else None
         ),
         exit_order_display=resolved_exit_order_display,
+        payload=record.payload,
         events=events,
     )
 
@@ -470,10 +481,26 @@ def list_instruction_statuses(
     *,
     limit: int = 100,
     state: str | None = None,
+    include_archived: bool = False,
+    model_routed: bool | None = None,
 ) -> tuple[InstructionStatus, ...]:
     statement = select(InstructionRecord)
     if state is not None:
         statement = statement.where(InstructionRecord.state == state)
+    if not include_archived:
+        statement = statement.where(InstructionRecord.archived_at.is_(None))
+    if model_routed is True:
+        statement = statement.where(
+            or_(
+                InstructionRecord.state == "MODEL_ROUTED_PENDING",
+                InstructionRecord.order_type == "MODEL_ROUTED",
+            )
+        )
+    elif model_routed is False:
+        statement = statement.where(
+            InstructionRecord.state != "MODEL_ROUTED_PENDING",
+            InstructionRecord.order_type != "MODEL_ROUTED",
+        )
     statement = statement.order_by(
         InstructionRecord.id.desc(),
     )
