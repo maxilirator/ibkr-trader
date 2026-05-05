@@ -2303,47 +2303,86 @@ def _persist_order_error_callback_event(
             external_perm_id=None,
         )
         if instruction_record is None:
-            raise ValueError(
-                f"Order-error callback for order '{external_order_id}' "
-                "could not be matched to a durable broker_order or instruction row."
+            reconstruction_account_key = _resolve_account_key(
+                None,
+                default_account_key=default_account_key,
+                context=f"Order-error callback for order '{external_order_id}'",
             )
-        reconstruction_account_key = _resolve_account_key(
-            None,
-            default_account_key=default_account_key,
-            context=f"Order-error callback for order '{external_order_id}'",
-        )
-        if _matches_instruction_exit_identity(
-            instruction_record,
-            external_order_id=external_order_id,
-            external_perm_id=None,
-        ):
-            broker_order = _reconstruct_exit_broker_order_from_instruction(
+            broker_account = _get_or_create_broker_account(
                 session,
                 broker_kind=broker_kind,
-                instruction_record=instruction_record,
                 account_key=reconstruction_account_key,
+            )
+            broker_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind=broker_kind,
+                account_key=reconstruction_account_key,
+                order_role="BROKER_NATIVE",
                 external_order_id=external_order_id,
                 external_perm_id=None,
                 external_client_id=None,
+                order_ref=None,
+                symbol="UNKNOWN",
+                exchange="UNKNOWN",
+                currency="UNKNOWN",
+                security_type="UNKNOWN",
+                side="UNKNOWN",
+                order_type="UNKNOWN",
                 status="ERROR",
-                observed_at=event_at,
-                raw_payload={"order_error_callback": _serialize_for_json(error_payload)},
-                metadata_json={"reconstructed_from_instruction": True},
+                submitted_at=None,
+                last_status_at=event_at,
+                raw_payload={
+                    "order_error_callback": _serialize_for_json(error_payload)
+                },
+                metadata_json={
+                    "unmatched_callback": True,
+                    "reconstructed_from_broker_error": True,
+                },
             )
+            session.add(broker_order)
+            session.flush()
         else:
-            broker_order = _reconstruct_entry_broker_order_from_instruction(
-                session,
-                broker_kind=broker_kind,
-                instruction_record=instruction_record,
-                account_key=reconstruction_account_key,
+            reconstruction_account_key = _resolve_account_key(
+                None,
+                default_account_key=default_account_key,
+                context=f"Order-error callback for order '{external_order_id}'",
+            )
+            if _matches_instruction_exit_identity(
+                instruction_record,
                 external_order_id=external_order_id,
                 external_perm_id=None,
-                external_client_id=None,
-                status="ERROR",
-                observed_at=event_at,
-                raw_payload={"order_error_callback": _serialize_for_json(error_payload)},
-                metadata_json={"reconstructed_from_instruction": True},
-            )
+            ):
+                broker_order = _reconstruct_exit_broker_order_from_instruction(
+                    session,
+                    broker_kind=broker_kind,
+                    instruction_record=instruction_record,
+                    account_key=reconstruction_account_key,
+                    external_order_id=external_order_id,
+                    external_perm_id=None,
+                    external_client_id=None,
+                    status="ERROR",
+                    observed_at=event_at,
+                    raw_payload={
+                        "order_error_callback": _serialize_for_json(error_payload)
+                    },
+                    metadata_json={"reconstructed_from_instruction": True},
+                )
+            else:
+                broker_order = _reconstruct_entry_broker_order_from_instruction(
+                    session,
+                    broker_kind=broker_kind,
+                    instruction_record=instruction_record,
+                    account_key=reconstruction_account_key,
+                    external_order_id=external_order_id,
+                    external_perm_id=None,
+                    external_client_id=None,
+                    status="ERROR",
+                    observed_at=event_at,
+                    raw_payload={
+                        "order_error_callback": _serialize_for_json(error_payload)
+                    },
+                    metadata_json={"reconstructed_from_instruction": True},
+                )
 
     metadata = dict(broker_order.metadata_json)
     metadata["last_order_error_callback"] = _serialize_for_json(error_payload)

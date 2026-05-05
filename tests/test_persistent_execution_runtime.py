@@ -12,10 +12,13 @@ from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
+from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.orchestration.runtime_service_state import read_runtime_service_status
+from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.runtime_worker import RuntimeCycleIssue
 from ibkr_trader.orchestration.runtime_worker import RuntimeCycleResult
 from ibkr_trader.orchestration.runtime_worker import BackgroundExecutionRuntimeService
+from ibkr_trader.orchestration.runtime_worker import _build_runtime_broker_operations
 from ibkr_trader.orchestration.runtime_worker import run_persistent_execution_runtime
 
 
@@ -42,6 +45,14 @@ class _FakeBrokerRole:
         return []
 
 
+class _FailingBrokerRole:
+    def execute(self, operation_name: str, operation: object) -> object:  # pragma: no cover - safety only
+        raise AssertionError(f"Unexpected broker execute call in test: {operation_name}")
+
+    def drain_broker_callback_events(self) -> list[dict[str, object]]:
+        raise AssertionError("Virtual-only runtime must not drain live broker callbacks")
+
+
 class _FakeCanonicalSyncSessions:
     def __init__(self) -> None:
         self.primary = _FakeBrokerRole()
@@ -53,6 +64,12 @@ class _FakeCanonicalSyncSessions:
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+
+
+class _FailingCallbackCanonicalSyncSessions(_FakeCanonicalSyncSessions):
+    def __init__(self) -> None:
+        super().__init__()
+        self.primary = _FailingBrokerRole()
 
 
 class PersistentExecutionRuntimeTests(TestCase):
@@ -154,6 +171,66 @@ class PersistentExecutionRuntimeTests(TestCase):
         self.assertEqual(status.status, "STARTUP_BLOCKED")
         self.assertIsNone(status.owner_token)
 
+    def test_persistent_runtime_continues_for_virtual_work_when_broker_startup_fails(self) -> None:
+        fake_sessions = _FakeCanonicalSyncSessions()
+        startup_issues = (
+            RuntimeCycleIssue(
+                instruction_id=None,
+                stage="broker_snapshot",
+                message="gateway down",
+            ),
+        )
+        with self.session_factory() as session:
+            session.add(
+                InstructionRecord(
+                    instruction_id="virtual-startup-work-1",
+                    schema_version="2026-04-10",
+                    source_system="q-training",
+                    batch_id="batch-1",
+                    account_key="virtualrl01",
+                    book_key="rl_virtual_long",
+                    is_virtual=True,
+                    symbol="AXFO",
+                    exchange="SMART",
+                    currency="SEK",
+                    state=ExecutionState.ENTRY_PENDING.value,
+                    submit_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                    expire_at=datetime(2026, 4, 19, 15, 30, tzinfo=timezone.utc),
+                    order_type="LIMIT",
+                    side="BUY",
+                    payload={},
+                )
+            )
+            session.commit()
+
+        call_order: list[str] = []
+        with (
+            patch(
+                "ibkr_trader.orchestration.runtime_worker.run_startup_reconciliation",
+                side_effect=lambda *args, **kwargs: call_order.append("startup")
+                or _runtime_result(issues=startup_issues),
+            ),
+            patch(
+                "ibkr_trader.orchestration.runtime_worker.run_runtime_cycle",
+                side_effect=lambda *args, **kwargs: call_order.append("runtime")
+                or _runtime_result(),
+            ),
+        ):
+            exit_code = run_persistent_execution_runtime(
+                self.session_factory,
+                self.app_config,
+                fake_sessions,
+                interval_seconds=5.0,
+                timeout=10,
+                once=True,
+                emit_results=False,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(call_order, ["startup", "runtime"])
+        status = read_runtime_service_status(self.session_factory)
+        self.assertEqual(status.status, "STOPPED")
+
     def test_background_runtime_retries_after_unhandled_broker_failure(self) -> None:
         self.app_config.execution_runtime_restart_backoff_initial_seconds = 0
         self.app_config.execution_runtime_restart_backoff_max_seconds = 0
@@ -180,3 +257,11 @@ class PersistentExecutionRuntimeTests(TestCase):
             service._run()
 
         self.assertEqual(calls, 2)
+
+    def test_virtual_only_runtime_operations_do_not_drain_live_broker_callbacks(self) -> None:
+        operations = _build_runtime_broker_operations(
+            _FailingCallbackCanonicalSyncSessions(),
+            self.session_factory,
+        )
+
+        self.assertEqual(operations.drain_callbacks(), [])

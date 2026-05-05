@@ -483,12 +483,15 @@ def list_instruction_statuses(
     state: str | None = None,
     include_archived: bool = False,
     model_routed: bool | None = None,
+    expire_after: datetime | None = None,
 ) -> tuple[InstructionStatus, ...]:
     statement = select(InstructionRecord)
     if state is not None:
         statement = statement.where(InstructionRecord.state == state)
     if not include_archived:
         statement = statement.where(InstructionRecord.archived_at.is_(None))
+    if expire_after is not None:
+        statement = statement.where(InstructionRecord.expire_at > expire_after)
     if model_routed is True:
         statement = statement.where(
             or_(

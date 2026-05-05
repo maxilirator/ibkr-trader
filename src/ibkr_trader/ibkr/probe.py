@@ -4,10 +4,9 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from ibkr_trader.config import AppConfig, IbkrConnectionConfig
-from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.sync_wrapper import (
     load_response_timeout_class as _load_response_timeout_class,
 )
@@ -47,7 +46,13 @@ def probe_gateway(
     response_timeout_cls: type[Exception] | None = None,
     app: SyncWrapperProtocol | None = None,
 ) -> GatewayProbeResult:
-    timeout_cls = response_timeout_cls or _load_response_timeout_class()
+    timeout_cls = response_timeout_cls
+    if timeout_cls is None:
+        timeout_cls = (
+            TimeoutError
+            if sync_wrapper_cls is not None or app is not None
+            else _load_response_timeout_class()
+        )
     runtime_app = app
     owns_connection = runtime_app is None
     if runtime_app is None:

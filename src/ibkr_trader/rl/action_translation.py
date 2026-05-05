@@ -164,6 +164,21 @@ def translate_rl_action(
             note="entry_prevclose action name must use entry_prevclose_<signed_bp>bp",
         )
 
+    if normalized_state == ENTRY_PENDING and (
+        action_name == "market_entry" or entry_match is not None
+    ):
+        return RLActionTranslation(
+            deployment_key=deployment_key,
+            action_name=action_name,
+            action_status=ACTION_STATUS_LOGGED,
+            state_before=state_before,
+            state_after=ENTRY_PENDING,
+            note=(
+                "Entry action observed while an entry is already pending; "
+                "maintaining the existing pending entry without submitting a duplicate."
+            ),
+        )
+
     if normalized_state == ENTRY_PENDING and action_name == "cancel_entry":
         return RLActionTranslation(
             deployment_key=deployment_key,

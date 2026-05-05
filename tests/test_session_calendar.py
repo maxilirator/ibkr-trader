@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from ibkr_trader.orchestration.session_calendar import find_session_for_date
 from ibkr_trader.orchestration.session_calendar import find_next_session_open
 from ibkr_trader.orchestration.session_calendar import load_session_calendar
 
@@ -55,6 +57,38 @@ class SessionCalendarTests(unittest.TestCase):
         self.assertEqual(resolution.open_at.isoformat(), "2026-04-13T09:00:00+02:00")
         self.assertEqual(resolution.close_at.isoformat(), "2026-04-13T17:30:00+02:00")
         self.assertEqual(resolution.session_kind, "regular")
+
+    def test_find_session_for_date_matches_parquet_date_columns(self) -> None:
+        try:
+            import duckdb
+        except ModuleNotFoundError:
+            self.skipTest("duckdb is required for parquet session-calendar tests")
+
+        with TemporaryDirectory() as temp_dir:
+            parquet_path = Path(temp_dir) / "day_sessions.parquet"
+            duckdb.execute(
+                """
+                COPY (
+                    SELECT
+                        DATE '2026-04-30' AS session_date,
+                        'Europe/Stockholm' AS timezone,
+                        '09:00' AS open_time,
+                        '13:00' AS close_time,
+                        'override' AS session_kind
+                )
+                TO ? (FORMAT PARQUET)
+                """,
+                [str(parquet_path)],
+            )
+
+            resolution = find_session_for_date(
+                date(2026, 4, 30),
+                session_calendar_path=parquet_path,
+            )
+
+        self.assertIsNotNone(resolution)
+        assert resolution is not None
+        self.assertEqual(resolution.close_at.isoformat(), "2026-04-30T13:00:00+02:00")
 
 
 if __name__ == "__main__":

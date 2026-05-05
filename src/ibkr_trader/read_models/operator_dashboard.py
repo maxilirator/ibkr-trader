@@ -330,6 +330,66 @@ def _is_auto_recovered_entry_reject(
     )
 
 
+def _broker_order_oca_group(broker_order: BrokerOrderRecord) -> str | None:
+    for payload in (broker_order.metadata_json, broker_order.raw_payload):
+        if not isinstance(payload, dict):
+            continue
+        raw_value = payload.get("oca_group") or payload.get("ocaGroup")
+        if raw_value in (None, ""):
+            continue
+        normalized = str(raw_value).strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _is_order_cancelled_error(payload: dict[str, Any]) -> bool:
+    if str(payload.get("errorCode") or "").strip() != "202":
+        return False
+    message = str(
+        payload.get("errorString") or payload.get("errorMsg") or payload.get("message") or ""
+    ).lower()
+    return "order canceled" in message or "order cancelled" in message
+
+
+def _is_expected_oca_sibling_cancel(
+    session: Session,
+    *,
+    broker_order_event: BrokerOrderEventRecord,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    if broker_order_event.event_type != "order_error_callback":
+        return False
+    if broker_order.order_role != "EXIT":
+        return False
+    if broker_order.instruction_id is None:
+        return False
+    payload = broker_order_event.payload if isinstance(broker_order_event.payload, dict) else {}
+    if not _is_order_cancelled_error(payload):
+        return False
+    if _normalize_order_status(broker_order_event.status_after) != "CANCELLED":
+        return False
+
+    oca_group = _broker_order_oca_group(broker_order)
+    if oca_group is None:
+        return False
+
+    sibling_orders = session.execute(
+        select(BrokerOrderRecord).where(
+            BrokerOrderRecord.instruction_id == broker_order.instruction_id,
+            BrokerOrderRecord.order_role == "EXIT",
+            BrokerOrderRecord.id != broker_order.id,
+        )
+    ).scalars()
+
+    for sibling_order in sibling_orders:
+        if _broker_order_oca_group(sibling_order) != oca_group:
+            continue
+        if _normalize_order_status(sibling_order.status) == "FILLED":
+            return True
+    return False
+
+
 def _serialize_for_json(payload: Any) -> Any:
     if isinstance(payload, Enum):
         return payload.value
@@ -361,6 +421,13 @@ def _normalize_order_status(status: str | None) -> str | None:
     if not normalized:
         return None
     return normalized.upper()
+
+
+def _open_order_status_clause():
+    return or_(
+        BrokerOrderRecord.status.is_(None),
+        func.upper(BrokerOrderRecord.status).not_in(_CLOSED_ORDER_STATUSES),
+    )
 
 
 def _is_non_zero_quantity(value: str | None) -> bool:
@@ -694,11 +761,11 @@ def _latest_matching_position_quantity(
     return None
 
 
-def _has_matching_execution_fill(
+def _matching_execution_fill_quantity(
     session: Session,
     *,
     broker_order: BrokerOrderRecord,
-) -> bool:
+) -> Decimal:
     lineage_clauses = []
     if broker_order.external_perm_id not in (None, ""):
         lineage_clauses.append(
@@ -710,7 +777,7 @@ def _has_matching_execution_fill(
         )
     if broker_order.order_ref not in (None, ""):
         lineage_clauses.append(ExecutionFillRecord.order_ref == broker_order.order_ref)
-    if broker_order.instruction_id is not None and (
+    if not lineage_clauses and broker_order.instruction_id is not None and (
         broker_order.order_role or ""
     ).strip().upper() == "EXIT":
         lineage_clauses.append(
@@ -722,17 +789,34 @@ def _has_matching_execution_fill(
         )
 
     if not lineage_clauses:
-        return False
+        return Decimal("0")
 
-    row = session.execute(
-        select(ExecutionFillRecord.id)
+    rows = session.execute(
+        select(ExecutionFillRecord.quantity)
         .where(
             ExecutionFillRecord.broker_account_id == broker_order.broker_account_id,
             or_(*lineage_clauses),
         )
-        .limit(1)
-    ).first()
-    return row is not None
+    ).scalars()
+    filled_quantity = Decimal("0")
+    for quantity in rows:
+        parsed_quantity = _meaningful_decimal(quantity)
+        if parsed_quantity is None:
+            continue
+        filled_quantity += abs(parsed_quantity)
+    return filled_quantity
+
+
+def _is_fully_filled_order(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    total_quantity = _meaningful_decimal(broker_order.total_quantity)
+    if total_quantity is None or total_quantity <= 0:
+        return False
+    filled_quantity = _matching_execution_fill_quantity(session, broker_order=broker_order)
+    return filled_quantity >= abs(total_quantity)
 
 
 def _is_effectively_closed_open_order(
@@ -740,12 +824,12 @@ def _is_effectively_closed_open_order(
     *,
     broker_order: BrokerOrderRecord,
 ) -> bool:
+    if _is_fully_filled_order(session, broker_order=broker_order):
+        return True
+
     normalized_role = (broker_order.order_role or "").strip().upper()
     if normalized_role != "EXIT":
         return False
-
-    if _has_matching_execution_fill(session, broker_order=broker_order):
-        return True
 
     latest_position_quantity = _latest_matching_position_quantity(
         session,
@@ -1022,12 +1106,13 @@ def _build_open_orders(
             BrokerAccountRecord,
             BrokerAccountRecord.id == BrokerOrderRecord.broker_account_id,
         )
+        .where(_open_order_status_clause())
         .order_by(
             BrokerOrderRecord.last_status_at.desc(),
             BrokerOrderRecord.updated_at.desc(),
             BrokerOrderRecord.id.desc(),
         )
-        .limit(max(limit * 4, limit))
+        .limit(max(limit * 8, limit))
     ).all()
 
     open_orders: list[OperatorOpenOrder] = []
@@ -1224,6 +1309,12 @@ def _build_recent_broker_attention(
         if message is None:
             continue
         if _is_auto_recovered_entry_reject(
+            session,
+            broker_order_event=broker_order_event,
+            broker_order=broker_order,
+        ):
+            continue
+        if _is_expected_oca_sibling_cancel(
             session,
             broker_order_event=broker_order_event,
             broker_order=broker_order,

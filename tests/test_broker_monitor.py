@@ -3,10 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import UTC
 from datetime import datetime
+from decimal import Decimal
 from time import sleep
 
 from ibkr_trader.api.broker_monitor import BrokerMonitorService
 from ibkr_trader.ibkr.probe import GatewayProbeResult
+from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder
+from ibkr_trader.ibkr.runtime_snapshot import BrokerPortfolioItem
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 
 
@@ -14,9 +17,36 @@ class BrokerMonitorTests(unittest.TestCase):
     def test_run_cycle_records_heartbeat_and_snapshot_success(self) -> None:
         persisted: list[tuple[BrokerRuntimeSnapshot, datetime]] = []
         snapshot = BrokerRuntimeSnapshot(
-            open_orders={},
+            open_orders={
+                42: BrokerOpenOrder(
+                    order_id=42,
+                    perm_id=9001,
+                    client_id=0,
+                    status="Submitted",
+                    order_ref="instr-001",
+                    action="BUY",
+                    total_quantity=Decimal("10"),
+                    symbol="HTRO",
+                )
+            },
             executions=(),
-            portfolio=(),
+            portfolio=(
+                BrokerPortfolioItem(
+                    account="U25245596",
+                    symbol="HTRO",
+                    local_symbol="HTRO",
+                    security_type="STK",
+                    exchange="SMART",
+                    primary_exchange="SFB",
+                    currency="SEK",
+                    position=Decimal("518"),
+                    market_price=Decimal("33.98"),
+                    market_value=Decimal("17601.64"),
+                    average_cost=Decimal("33.98"),
+                    unrealized_pnl=Decimal("0"),
+                    realized_pnl=Decimal("0"),
+                ),
+            ),
             positions=(),
             account_values={
                 "U25245596": {
@@ -50,6 +80,8 @@ class BrokerMonitorTests(unittest.TestCase):
         )
         self.assertTrue(status.snapshot_refresh.ok)
         self.assertEqual(status.snapshot_refresh.account_count, 1)
+        self.assertEqual(status.snapshot_refresh.position_count, 1)
+        self.assertEqual(status.snapshot_refresh.open_order_count, 1)
         self.assertFalse(status.heartbeat.is_stale)
         self.assertFalse(status.snapshot_refresh.is_stale)
         self.assertIsNotNone(status.heartbeat.last_attempt_age_seconds)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import BigInteger
 from sqlalchemy import Boolean
 from sqlalchemy import DateTime
 from sqlalchemy import ForeignKey
@@ -238,16 +239,16 @@ class InstructionRecord(TimestampMixin, Base):
     expire_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     order_type: Mapped[str] = mapped_column(String(16), nullable=False)
     side: Mapped[str] = mapped_column(String(8), nullable=False)
-    broker_order_id: Mapped[int | None] = mapped_column(Integer)
-    broker_perm_id: Mapped[int | None] = mapped_column(Integer)
+    broker_order_id: Mapped[int | None] = mapped_column(BigInteger)
+    broker_perm_id: Mapped[int | None] = mapped_column(BigInteger)
     broker_client_id: Mapped[int | None] = mapped_column(Integer)
     broker_order_status: Mapped[str | None] = mapped_column(String(32))
     entry_submitted_quantity: Mapped[str | None] = mapped_column(String(64))
     entry_filled_quantity: Mapped[str | None] = mapped_column(String(64))
     entry_avg_fill_price: Mapped[str | None] = mapped_column(String(64))
     entry_filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    exit_order_id: Mapped[int | None] = mapped_column(Integer)
-    exit_perm_id: Mapped[int | None] = mapped_column(Integer)
+    exit_order_id: Mapped[int | None] = mapped_column(BigInteger)
+    exit_perm_id: Mapped[int | None] = mapped_column(BigInteger)
     exit_client_id: Mapped[int | None] = mapped_column(Integer)
     exit_order_status: Mapped[str | None] = mapped_column(String(32))
     exit_submitted_quantity: Mapped[str | None] = mapped_column(String(64))
@@ -472,7 +473,7 @@ class BrokerOrderRecord(TimestampMixin, Base):
     external_order_id: Mapped[str | None] = mapped_column(String(64))
     external_perm_id: Mapped[str | None] = mapped_column(String(64))
     external_client_id: Mapped[str | None] = mapped_column(String(64))
-    order_ref: Mapped[str | None] = mapped_column(String(128))
+    order_ref: Mapped[str | None] = mapped_column(String(512))
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     exchange: Mapped[str] = mapped_column(String(32), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
@@ -569,7 +570,7 @@ class ExecutionFillRecord(TimestampMixin, Base):
     external_execution_id: Mapped[str] = mapped_column(String(128), nullable=False)
     external_order_id: Mapped[str | None] = mapped_column(String(64))
     external_perm_id: Mapped[str | None] = mapped_column(String(64))
-    order_ref: Mapped[str | None] = mapped_column(String(128))
+    order_ref: Mapped[str | None] = mapped_column(String(512))
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     exchange: Mapped[str | None] = mapped_column(String(32))
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
@@ -682,6 +683,43 @@ class VirtualMarketQuoteRecord(TimestampMixin, Base):
     source: Mapped[str | None] = mapped_column(String(64))
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class MarketStreamBarRecord(TimestampMixin, Base):
+    """Durable 1-minute market-stream bars used to rebuild intraday RL state."""
+
+    __tablename__ = "market_stream_bar"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "exchange",
+            "currency",
+            "security_type",
+            "started_at",
+            "source",
+            name="uq_market_stream_bar_identity",
+        ),
+        Index("ix_market_stream_bar_symbol_started_at", "symbol", "started_at"),
+        Index("ix_market_stream_bar_started_at", "started_at"),
+        Index("ix_market_stream_bar_instrument", "symbol", "exchange", "currency"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    security_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    primary_exchange: Mapped[str | None] = mapped_column(String(32))
+    local_symbol: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    open_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    high_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    low_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    close_price: Mapped[str] = mapped_column(String(64), nullable=False)
+    volume: Mapped[str | None] = mapped_column(String(64))
+    bar_count: Mapped[str | None] = mapped_column(String(64))
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class ReconciliationRunRecord(TimestampMixin, Base):

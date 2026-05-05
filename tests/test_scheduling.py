@@ -8,6 +8,7 @@ from unittest import TestCase
 from ibkr_trader.api.server import parse_execution_batch_payload
 from ibkr_trader.orchestration.scheduling import NextSessionExitStatus
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
+from ibkr_trader.orchestration.scheduling import resolve_effective_entry_expire_at
 from ibkr_trader.orchestration.scheduling import resolve_scheduled_submission_due_at
 from ibkr_trader.orchestration.scheduling import resolve_runtime_timezone
 
@@ -190,6 +191,32 @@ class SchedulingTests(TestCase):
             )
 
         self.assertEqual(due_at.isoformat(), "2026-04-10T15:29:00+00:00")
+
+    def test_resolve_effective_entry_expire_at_caps_to_stockholm_session_close(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            parquet_path = Path(temp_dir) / "day_sessions.parquet"
+            parquet_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-30,Europe/Stockholm,09:00,13:00,override,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            batch_payload = _sample_batch()
+            batch_payload["instructions"][0]["entry"]["submit_at"] = "2026-04-30T09:25:00+02:00"
+            batch_payload["instructions"][0]["entry"]["expire_at"] = "2026-04-30T17:30:00+02:00"
+            batch = parse_execution_batch_payload(batch_payload)
+            instruction = batch.instructions[0]
+
+            expire_at = resolve_effective_entry_expire_at(
+                instruction,
+                session_calendar_path=parquet_path,
+            )
+
+        self.assertEqual(expire_at.isoformat(), "2026-04-30T13:00:00+02:00")
 
 
 if __name__ == "__main__":

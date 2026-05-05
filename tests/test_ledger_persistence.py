@@ -613,6 +613,48 @@ class BrokerLedgerPersistenceTests(TestCase):
         finally:
             session.close()
 
+    def test_persist_broker_callback_events_keeps_unmatched_order_error(
+        self,
+    ) -> None:
+        persist_broker_callback_events(
+            self.session_factory,
+            [
+                {
+                    "event_type": "order_error",
+                    "event_at": datetime(2026, 4, 19, 8, 32, tzinfo=timezone.utc),
+                    "error": {
+                        "orderId": 4833,
+                        "errorTime": 0,
+                        "errorCode": 401,
+                        "errorString": "OCA Group",
+                        "advancedOrderRejectJson": None,
+                    },
+                },
+            ],
+            broker_kind=BROKER_KIND_IBKR,
+            default_account_key="U25245596",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(select(BrokerOrderRecord)).scalar_one()
+            broker_order_events = session.execute(
+                select(BrokerOrderEventRecord).order_by(BrokerOrderEventRecord.id)
+            ).scalars().all()
+
+            self.assertEqual(broker_order.account_key, "U25245596")
+            self.assertEqual(broker_order.order_role, "BROKER_NATIVE")
+            self.assertEqual(broker_order.external_order_id, "4833")
+            self.assertEqual(broker_order.status, "ERROR")
+            self.assertTrue(broker_order.metadata_json["unmatched_callback"])
+            self.assertEqual(
+                [event.event_type for event in broker_order_events],
+                ["order_error_callback"],
+            )
+            self.assertEqual(broker_order_events[0].payload["errorCode"], 401)
+        finally:
+            session.close()
+
     def test_persist_broker_callback_events_reconstructs_exit_order_from_instruction_event(self) -> None:
         session = self.session_factory()
         try:

@@ -8,12 +8,19 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_QTRAINING_ROOT = Path("/home/mattias/dev/q-training-bucket-booster")
+DEFAULT_RL_MODEL_BUNDLE_ROOT = Path("/home/mattias/ibkr-trader/var/rl-models")
 DEFAULT_SHARED_VIRTUAL_ACCOUNT = "VIRTUALRL01"
+MODEL_BUNDLE_SCHEMA_VERSION = "rl_model_bundle_v1"
 
 
 @dataclass(frozen=True, slots=True)
 class PromotedRLModelArtifact:
+    """Trader-local, deployed RL model bundle.
+
+    Research paths are lineage only. Runtime files must live inside the bundle
+    directory beside the manifest.
+    """
+
     model_key: str
     display_name: str
     strategy_family: str
@@ -22,11 +29,11 @@ class PromotedRLModelArtifact:
     model_family: str
     model_version: str
     model_artifact_id: str
-    source_workflow_path: Path
+    bundle_dir: Path
+    manifest_path: Path
     promoted_checkpoint_path: Path
     summary_path: Path
     static_feature_cols_path: Path
-    candidate_tape_path: Path
     deployment_key: str
     book_key: str
     action_space: tuple[str, ...]
@@ -34,6 +41,8 @@ class PromotedRLModelArtifact:
     state_machine_version: str
     entry_action_name: str
     take_profit_action_name: str
+    observation_contract: dict[str, Any]
+    lineage: dict[str, Any]
 
     @property
     def side_upper(self) -> str:
@@ -44,86 +53,21 @@ class PromotedRLModelArtifact:
         return self.side_upper
 
 
-def qtraining_root() -> Path:
-    return Path(os.environ.get("QTRAINING_ROOT", str(DEFAULT_QTRAINING_ROOT))).expanduser()
+def rl_model_bundle_root() -> Path:
+    return Path(
+        os.environ.get("RL_MODEL_BUNDLE_ROOT", str(DEFAULT_RL_MODEL_BUNDLE_ROOT))
+    ).expanduser()
 
 
 def promoted_rl_models(root: Path | None = None) -> tuple[PromotedRLModelArtifact, ...]:
-    base = root or qtraining_root()
-    return (
-        PromotedRLModelArtifact(
-            model_key="long_trial_106_v1",
-            display_name="Long Trial 106 V1",
-            strategy_family="canonical_long_live_execution_policy",
-            strategy_id="long_trial_106",
-            side="LONG",
-            model_family="canonical_long_live_execution_policy",
-            model_version="v1",
-            model_artifact_id="trial_106_seed240",
-            source_workflow_path=base
-            / "workflows/canonical/long_research/v1/execution_policy_long_trial106_v1.yaml",
-            promoted_checkpoint_path=base
-            / "artifacts/analysis/long_trial_106_ex_long_true_rl_dqn_w128_oracle_notrade_dualseed_extension_v1/continuation/true_rl_dqn_w128_seed240/best_dqn_state.pt",
-            summary_path=base
-            / "artifacts/analysis/long_trial_106_ex_long_true_rl_dqn_w128_oracle_notrade_dualseed_extension_v1/continuation/true_rl_dqn_w128_seed240/summary.json",
-            static_feature_cols_path=base
-            / "artifacts/analysis/long_trial_106_ex_long_true_rl_dqn_w128_oracle_notrade_dualseed_extension_v1/continuation/true_rl_dqn_w128_seed240/static_feature_cols.csv",
-            candidate_tape_path=base
-            / "artifacts/analysis/long_trial_104_ex_long_true_rl_input_materialize_ranker_v1/lockbox_candidate_tape.parquet",
-            deployment_key="long_trial_106_virtual_shared_01",
-            book_key="rl_shared_long_trial_106_virtual_01",
-            action_space=(
-                "skip",
-                "wait",
-                "market_entry",
-                "cancel_entry",
-                "exit_market",
-                "clear_exit",
-                "entry_prevclose_-50bp",
-                "exit_tp_200bp",
-            ),
-            execution_mapping_version="long_actions_v1",
-            state_machine_version="long_symbol_state_v1",
-            entry_action_name="entry_prevclose_-50bp",
-            take_profit_action_name="exit_tp_200bp",
-        ),
-        PromotedRLModelArtifact(
-            model_key="short_trial36_v1",
-            display_name="Short Trial 36 V1",
-            strategy_family="canonical_short_live_execution_policy",
-            strategy_id="short_trial_36",
-            side="SHORT",
-            model_family="canonical_short_live_execution_policy",
-            model_version="v1",
-            model_artifact_id="trial_36_seed140",
-            source_workflow_path=base
-            / "workflows/canonical/short_live/v1/execution_policy_short_trial36_v1.yaml",
-            promoted_checkpoint_path=base
-            / "artifacts/analysis/short_trial_36_ex_short_true_rl_dqn_w128_volnorm_market_context_triseed_v1/continuation/true_rl_dqn_w128_seed140/best_dqn_state.pt",
-            summary_path=base
-            / "artifacts/analysis/short_trial_36_ex_short_true_rl_dqn_w128_volnorm_market_context_triseed_v1/continuation/true_rl_dqn_w128_seed140/summary.json",
-            static_feature_cols_path=base
-            / "artifacts/analysis/short_trial_36_ex_short_true_rl_dqn_w128_volnorm_market_context_triseed_v1/continuation/true_rl_dqn_w128_seed140/static_feature_cols.csv",
-            candidate_tape_path=base
-            / "artifacts/analysis/short_trial_14_replay_tape_ibkr_shortable_v1/lockbox_candidate_tape.parquet",
-            deployment_key="short_trial_36_virtual_shared_01",
-            book_key="rl_shared_short_trial_36_virtual_01",
-            action_space=(
-                "skip",
-                "wait",
-                "market_entry",
-                "cancel_entry",
-                "exit_market",
-                "clear_exit",
-                "entry_prevclose_88bp",
-                "exit_tp_180bp",
-            ),
-            execution_mapping_version="short_actions_v1",
-            state_machine_version="short_symbol_state_v1",
-            entry_action_name="entry_prevclose_88bp",
-            take_profit_action_name="exit_tp_180bp",
-        ),
-    )
+    base = root or rl_model_bundle_root()
+    manifest_paths = _discover_bundle_manifests(base)
+    if not manifest_paths:
+        raise FileNotFoundError(
+            f"no RL model bundle manifests found under {base}; expected "
+            "<root>/<model_key>/manifest.json or <root>/<model_key>/<artifact_id>/manifest.json"
+        )
+    return tuple(load_model_bundle_manifest(path) for path in manifest_paths)
 
 
 def promoted_rl_model_by_key(
@@ -133,9 +77,79 @@ def promoted_rl_model_by_key(
 ) -> PromotedRLModelArtifact:
     normalized = model_key.strip().lower()
     for artifact in promoted_rl_models(root):
-        if artifact.model_key == normalized:
+        if artifact.model_key.lower() == normalized:
             return artifact
     raise KeyError(f"unknown promoted RL model: {model_key}")
+
+
+def load_model_bundle_manifest(path: Path) -> PromotedRLModelArtifact:
+    manifest_path = path.expanduser().resolve()
+    payload = json.loads(manifest_path.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{manifest_path} must contain a JSON object")
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version and schema_version != MODEL_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(
+            f"{manifest_path} schema_version={schema_version!r} is not supported"
+        )
+
+    bundle_dir = manifest_path.parent
+    files = _mapping(payload.get("files"), "files")
+    deployment = dict(payload.get("deployment") or {})
+    observation_contract = _default_observation_contract(
+        static_feature_policy="instruction_payload_required"
+    )
+    observation_contract.update(dict(payload.get("observation_contract") or {}))
+    observation_contract["static_feature_policy"] = "instruction_payload_required"
+    observation_contract["static_feature_source"] = "instruction.trace.metadata.static_features"
+    observation_contract.setdefault("market_data_source", "trader_market_stream")
+
+    lineage = dict(payload.get("lineage") or {})
+    if lineage:
+        lineage["non_runtime"] = True
+
+    return PromotedRLModelArtifact(
+        model_key=_required_str(payload, "model_key"),
+        display_name=_required_str(payload, "display_name"),
+        strategy_family=_required_str(payload, "strategy_family"),
+        strategy_id=_required_str(payload, "strategy_id"),
+        side=_required_str(payload, "side").upper(),
+        model_family=_required_str(payload, "model_family"),
+        model_version=_required_str(payload, "model_version"),
+        model_artifact_id=_required_str(payload, "model_artifact_id"),
+        bundle_dir=bundle_dir,
+        manifest_path=manifest_path,
+        promoted_checkpoint_path=_resolve_bundle_file(
+            bundle_dir,
+            _required_str(files, "checkpoint"),
+            field_name="files.checkpoint",
+        ),
+        summary_path=_resolve_bundle_file(
+            bundle_dir,
+            _required_str(files, "summary"),
+            field_name="files.summary",
+        ),
+        static_feature_cols_path=_resolve_bundle_file(
+            bundle_dir,
+            _required_str(files, "static_feature_cols"),
+            field_name="files.static_feature_cols",
+        ),
+        deployment_key=str(
+            deployment.get("deployment_key")
+            or f"{_required_str(payload, 'model_key')}_virtual_shared_01"
+        ),
+        book_key=str(
+            deployment.get("book_key")
+            or f"rl_shared_{_required_str(payload, 'model_key')}_virtual_01"
+        ),
+        action_space=tuple(_required_str_list(payload, "action_space")),
+        execution_mapping_version=_required_str(payload, "execution_mapping_version"),
+        state_machine_version=_required_str(payload, "state_machine_version"),
+        entry_action_name=_required_str(payload, "entry_action_name"),
+        take_profit_action_name=_required_str(payload, "take_profit_action_name"),
+        observation_contract=observation_contract,
+        lineage=lineage,
+    )
 
 
 def read_static_feature_names(path: Path) -> tuple[str, ...]:
@@ -162,11 +176,10 @@ def validate_promoted_artifact(
     artifact: PromotedRLModelArtifact,
 ) -> dict[str, Any]:
     required_paths = {
-        "source_workflow_path": artifact.source_workflow_path,
+        "manifest_path": artifact.manifest_path,
         "promoted_checkpoint_path": artifact.promoted_checkpoint_path,
         "summary_path": artifact.summary_path,
         "static_feature_cols_path": artifact.static_feature_cols_path,
-        "candidate_tape_path": artifact.candidate_tape_path,
     }
     missing = {
         name: str(path)
@@ -174,7 +187,7 @@ def validate_promoted_artifact(
         if not path.exists()
     }
     if missing:
-        raise FileNotFoundError(f"missing promoted RL artifact files: {missing}")
+        raise FileNotFoundError(f"missing deployed RL model bundle files: {missing}")
 
     summary = read_model_summary(artifact.summary_path)
     summary_actions = tuple(str(action) for action in summary.get("action_names", ()))
@@ -209,53 +222,42 @@ def model_observation_contract(
     artifact: PromotedRLModelArtifact,
 ) -> dict[str, Any]:
     validation = validate_promoted_artifact(artifact)
-    return {
-        "bar_family": "phase1_intraday_ohlc_v1",
-        "bar_interval": "5m",
-        "update_cadence": "1m",
-        "decision_cadence": "5m",
-        "intraday_fetch_config": str(qtraining_root() / "configs/intraday_fetch.yaml"),
-        "session_timezone": "Europe/Stockholm",
-        "session_open_local": "09:00",
-        "session_close_local": "17:30",
-        "price_inputs": ["open", "high", "low", "close"],
-        "growing_day_prefix": True,
-        "include_market_context": True,
-        "include_vol_normalized_intraday_state": True,
-        "vol_normalization_floor": 0.000001,
-        "feature_schema_version": f"{artifact.model_key}_phase1_live_v1",
-        "static_feature_count": validation["static_feature_count"],
-        "source_market_data_contract": {
-            "bar_family": "stockholm_intraday_1m_v1",
-            "required_series": ["TRADES"],
-            "adapter": "ibkr_1m_trades_to_phase1_5m_ohlc_v1",
-        },
-    }
+    contract = dict(artifact.observation_contract)
+    contract["static_feature_count"] = validation["static_feature_count"]
+    contract["static_feature_policy"] = "instruction_payload_required"
+    contract["static_feature_source"] = "instruction.trace.metadata.static_features"
+    return contract
 
 
 def model_registry_payload(artifact: PromotedRLModelArtifact) -> dict[str, Any]:
     validation = validate_promoted_artifact(artifact)
+    metadata: dict[str, Any] = {
+        "strategy_id": artifact.strategy_id,
+        "model_family": artifact.model_family,
+        "model_version": artifact.model_version,
+        "model_artifact_id": artifact.model_artifact_id,
+        "runtime_artifact_root": str(artifact.bundle_dir.parent),
+        "bundle_dir": str(artifact.bundle_dir),
+        "manifest_path": str(artifact.manifest_path),
+        "summary_path": str(artifact.summary_path),
+        "static_feature_cols_path": str(artifact.static_feature_cols_path),
+        "static_feature_count": validation["static_feature_count"],
+        "static_feature_source": "instruction.trace.metadata.static_features",
+        "runner": "scripts/run_rl_agents.py",
+    }
+    if artifact.lineage:
+        metadata["lineage"] = artifact.lineage
     return {
         "model_key": artifact.model_key,
         "display_name": artifact.display_name,
         "strategy_family": artifact.strategy_family,
         "side": artifact.side_upper,
-        "source_workflow_path": str(artifact.source_workflow_path),
+        "source_workflow_path": None,
         "promoted_checkpoint_path": str(artifact.promoted_checkpoint_path),
         "action_space": list(artifact.action_space),
         "observation_contract": model_observation_contract(artifact),
         "execution_mapping_version": artifact.execution_mapping_version,
-        "metadata": {
-            "strategy_id": artifact.strategy_id,
-            "model_family": artifact.model_family,
-            "model_version": artifact.model_version,
-            "model_artifact_id": artifact.model_artifact_id,
-            "summary_path": str(artifact.summary_path),
-            "static_feature_cols_path": str(artifact.static_feature_cols_path),
-            "candidate_tape_path": str(artifact.candidate_tape_path),
-            "static_feature_count": validation["static_feature_count"],
-            "runner": "scripts/run_rl_agents.py",
-        },
+        "metadata": metadata,
     }
 
 
@@ -267,14 +269,13 @@ def deployment_registry_payload(
     status: str = "running",
     allowed_symbols: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "deployment_key": artifact.deployment_key,
         "model_key": artifact.model_key,
         "account_key": account_key.upper(),
         "book_key": artifact.book_key,
         "mode": mode.lower(),
         "status": status.lower(),
-        "allowed_symbols": [symbol.upper() for symbol in allowed_symbols],
         "risk_limits": {
             "max_notional_per_name_sek": 1000,
         },
@@ -289,8 +290,12 @@ def deployment_registry_payload(
             "shared_capital_account": True,
             "runner": "scripts/run_rl_agents.py",
             "model_artifact_id": artifact.model_artifact_id,
+            "daily_universe_source": "model_routed_candidates",
         },
     }
+    if allowed_symbols:
+        payload["allowed_symbols"] = [symbol.upper() for symbol in allowed_symbols]
+    return payload
 
 
 def promoted_artifact_summary(
@@ -302,18 +307,92 @@ def promoted_artifact_summary(
     }
 
 
+def _discover_bundle_manifests(root: Path) -> tuple[Path, ...]:
+    if not root.exists():
+        return ()
+    direct = set(root.glob("*/manifest.json"))
+    versioned = set(root.glob("*/*/manifest.json"))
+    return tuple(sorted(direct | versioned))
+
+
+def _resolve_bundle_file(
+    bundle_dir: Path,
+    value: str,
+    *,
+    field_name: str,
+) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        raise ValueError(
+            f"{field_name} must be relative to the deployed model bundle, got {value!r}"
+        )
+    return (bundle_dir / candidate).resolve()
+
+
+def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be an object")
+    return value
+
+
+def _required_str(payload: Mapping[str, Any], field_name: str) -> str:
+    raw_value = payload.get(field_name)
+    if raw_value is None:
+        raise ValueError(f"{field_name} is required")
+    value = str(raw_value).strip()
+    if not value:
+        raise ValueError(f"{field_name} must be non-empty")
+    return value
+
+
+def _required_str_list(payload: Mapping[str, Any], field_name: str) -> tuple[str, ...]:
+    raw_value = payload.get(field_name)
+    if not isinstance(raw_value, list) or not raw_value:
+        raise ValueError(f"{field_name} must be a non-empty array")
+    values = tuple(str(item).strip() for item in raw_value)
+    if any(not value for value in values):
+        raise ValueError(f"{field_name} must contain non-empty strings")
+    return values
+
+
+def _default_observation_contract(*, static_feature_policy: str) -> dict[str, Any]:
+    return {
+        "bar_family": "phase1_intraday_ohlc_v1",
+        "bar_interval": "5m",
+        "update_cadence": "1m",
+        "decision_cadence": "5m",
+        "session_timezone": "Europe/Stockholm",
+        "session_open_local": "09:00",
+        "session_close_local": "17:30",
+        "price_inputs": ["open", "high", "low", "close"],
+        "growing_day_prefix": True,
+        "include_market_context": True,
+        "include_vol_normalized_intraday_state": True,
+        "vol_normalization_floor": 0.000001,
+        "market_data_source": "trader_market_stream",
+        "static_feature_policy": static_feature_policy,
+        "source_market_data_contract": {
+            "bar_family": "stockholm_intraday_1m_v1",
+            "required_series": ["TRADES"],
+            "adapter": "ibkr_1m_trades_to_phase1_5m_ohlc_v1",
+        },
+    }
+
+
 __all__ = [
-    "DEFAULT_QTRAINING_ROOT",
+    "DEFAULT_RL_MODEL_BUNDLE_ROOT",
     "DEFAULT_SHARED_VIRTUAL_ACCOUNT",
+    "MODEL_BUNDLE_SCHEMA_VERSION",
     "PromotedRLModelArtifact",
     "deployment_registry_payload",
+    "load_model_bundle_manifest",
     "model_observation_contract",
     "model_registry_payload",
     "promoted_artifact_summary",
     "promoted_rl_model_by_key",
     "promoted_rl_models",
-    "qtraining_root",
     "read_model_summary",
     "read_static_feature_names",
+    "rl_model_bundle_root",
     "validate_promoted_artifact",
 ]

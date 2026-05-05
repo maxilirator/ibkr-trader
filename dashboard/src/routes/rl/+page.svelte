@@ -14,6 +14,7 @@
   let summary = rlDashboard.summary;
   let models = rlDashboard.models;
   let deployments = rlDashboard.deployments;
+  let candidates = rlDashboard.candidates ?? [];
   let recentActions = rlDashboard.recent_actions;
   let endpointErrors = [];
   let refreshInFlight = false;
@@ -23,6 +24,7 @@
   $: summary = rlDashboard.summary;
   $: models = rlDashboard.models;
   $: deployments = rlDashboard.deployments;
+  $: candidates = rlDashboard.candidates ?? [];
   $: recentActions = rlDashboard.recent_actions;
   $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
 
@@ -108,6 +110,20 @@
     return (symbols ?? []).join('\n');
   }
 
+  function candidateModelId(candidate) {
+    return candidate.model_id ?? candidate.trace?.model_id ?? 'n/a';
+  }
+
+  function candidateWindow(candidate) {
+    const window = candidate.execution_window ?? {};
+    return `${formatTimestamp(window.start_at)} to ${formatTimestamp(window.end_at)}`;
+  }
+
+  function candidateTargetNotional(candidate) {
+    const notional = candidate.sizing?.target_notional;
+    return notional ? `${notional} ${candidate.currency ?? ''}`.trim() : 'n/a';
+  }
+
   async function refreshNow() {
     refreshInFlight = true;
     try {
@@ -178,6 +194,18 @@
     <article class="summary-card">
       <span>Running</span>
       <strong>{summary.running_deployment_count}</strong>
+    </article>
+    <article class="summary-card">
+      <span>Candidates</span>
+      <strong>{summary.candidate_count ?? candidates.length}</strong>
+    </article>
+    <article class="summary-card">
+      <span>Bar-Ready</span>
+      <strong>{summary.bar_ready_candidate_count ?? 0}</strong>
+    </article>
+    <article class="summary-card">
+      <span>Backfilled</span>
+      <strong>{summary.backfilled_symbol_count ?? 0}</strong>
     </article>
     <article class="summary-card">
       <span>Stale Heartbeats</span>
@@ -302,6 +330,57 @@
   <section class="panel">
     <div class="panel-header">
       <div>
+        <h2>Candidate Feed</h2>
+        <p>
+          Model-routed names waiting for the runner to process bar by bar.
+          {summary.bar_ready_candidate_count ?? 0} have live or rebuilt bars in the latest heartbeat.
+        </p>
+      </div>
+    </div>
+
+    {#if candidates.length === 0}
+      <p class="empty-state">No model-routed candidates are currently loaded.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Queued</th>
+              <th>Symbol</th>
+              <th>Model</th>
+              <th>Account / Book</th>
+              <th>Side</th>
+              <th>Target</th>
+              <th>Window</th>
+              <th>Candidate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each candidates as candidate}
+              <tr>
+                <td>{formatTimestamp(candidate.updated_at)}</td>
+                <td>{candidate.symbol}</td>
+                <td>{candidateModelId(candidate)}</td>
+                <td>
+                  {candidate.account_key}
+                  {#if candidate.is_virtual}<span class="mini-badge">Virtual</span>{/if}
+                  <div class="muted">{candidate.book_key}</div>
+                </td>
+                <td>{candidate.side}</td>
+                <td>{candidateTargetNotional(candidate)}</td>
+                <td>{candidateWindow(candidate)}</td>
+                <td class="mono">{candidate.instruction_id}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header">
+      <div>
         <h2>Models</h2>
         <p>Registry view of promoted workflow lineage and expected observation contract.</p>
       </div>
@@ -388,6 +467,8 @@
 
 <style>
   .page-shell {
+    width: 100%;
+    box-sizing: border-box;
     padding: 1.4rem;
     display: grid;
     gap: 1.2rem;

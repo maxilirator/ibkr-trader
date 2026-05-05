@@ -11,6 +11,7 @@ from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
 from ibkr_trader.orchestration.session_calendar import find_matching_session_boundary
 from ibkr_trader.orchestration.session_calendar import find_next_session_open
+from ibkr_trader.orchestration.session_calendar import find_session_for_date
 
 
 _STOCKHOLM_EXCHANGE_CODES = {"XSTO", "SFB"}
@@ -153,6 +154,51 @@ def resolve_scheduled_submission_due_at(
 
     due_at = resolution.boundary_at.astimezone(timezone.utc) - submission_lead_time
     return due_at if due_at < scheduled_at_utc else scheduled_at_utc
+
+
+def resolve_effective_entry_expire_at(
+    instruction: ExecutionInstruction,
+    *,
+    session_calendar_path: Path | None,
+) -> datetime:
+    if instruction.entry is None:
+        raise ValueError("entry must be an object")
+
+    return resolve_effective_entry_expire_at_for_schedule(
+        instruction,
+        submit_at=instruction.entry.submit_at,
+        expire_at=instruction.entry.expire_at,
+        session_calendar_path=session_calendar_path,
+    )
+
+
+def resolve_effective_entry_expire_at_for_schedule(
+    instruction: ExecutionInstruction,
+    *,
+    submit_at: datetime,
+    expire_at: datetime,
+    session_calendar_path: Path | None,
+) -> datetime:
+    if submit_at.tzinfo is None:
+        submit_at = submit_at.replace(tzinfo=timezone.utc)
+    if expire_at.tzinfo is None:
+        expire_at = expire_at.replace(tzinfo=timezone.utc)
+    if session_calendar_path is None or not uses_stockholm_session_calendar(instruction):
+        return expire_at
+
+    session_date = submit_at.astimezone(ZoneInfo("Europe/Stockholm")).date()
+    try:
+        session = find_session_for_date(
+            session_date,
+            session_calendar_path=session_calendar_path,
+        )
+    except (FileNotFoundError, ValueError):
+        return expire_at
+    if session is None:
+        return expire_at
+
+    session_close = session.close_at
+    return session_close if session_close < expire_at else expire_at
 
 
 def build_instruction_runtime_schedule(

@@ -84,7 +84,9 @@ def _load_rows_from_parquet(path: Path) -> tuple[SessionCalendarRow, ...]:
     return tuple(
         SessionCalendarRow(
             session_date=(
-                row[0]
+                row[0].date()
+                if isinstance(row[0], datetime)
+                else row[0]
                 if isinstance(row[0], date)
                 else date.fromisoformat(str(row[0]))
             ),
@@ -142,6 +144,24 @@ def find_next_session_open(
             source_path=row.source_path,
         )
 
+    return None
+
+
+def find_session_for_date(
+    session_date: date,
+    *,
+    session_calendar_path: Path,
+) -> SessionOpenResolution | None:
+    for row in load_session_calendar(session_calendar_path):
+        if row.session_date != session_date:
+            continue
+        return SessionOpenResolution(
+            open_at=row.open_at(),
+            close_at=row.close_at(),
+            session_kind=row.session_kind,
+            timezone_name=row.timezone_name,
+            source_path=row.source_path,
+        )
     return None
 
 

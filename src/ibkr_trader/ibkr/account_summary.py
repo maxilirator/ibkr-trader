@@ -4,7 +4,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.ibkr.contracts import _extract_broker_error_message
-from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.sync_wrapper import (
     load_response_timeout_class as _load_response_timeout_class,
 )

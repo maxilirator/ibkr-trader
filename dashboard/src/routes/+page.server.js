@@ -9,6 +9,8 @@ import {
   readJson
 } from '$lib/server/trader-api';
 
+const RECONCILIATION_RUN_READ_LIMIT = 120;
+
 function readOptionalField(formData, fieldName) {
   const value = formData.get(fieldName);
   if (value === null) {
@@ -39,22 +41,180 @@ function operatorSnapshotUrl(apiBaseUrl) {
   return (
     `${apiBaseUrl}/v1/read/operator-snapshot` +
     '?instruction_limit=50&candidate_limit=40' +
-    '&candidate_reason_code=rl_model_routed_selected_candidate' +
-    '&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=12'
+    `&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=${RECONCILIATION_RUN_READ_LIMIT}`
   );
 }
 
 function omxBenchmarkSnapshotUrl(apiBaseUrl) {
   const params = new URLSearchParams({
-    symbols: 'OMXS30,OMX,XACT-OMXS30',
+    symbols: 'OMXS30',
     bar_limit: '390'
   });
   return `${apiBaseUrl}/v1/market-data/stream/snapshot?${params.toString()}`;
 }
 
+function omxBenchmarkSubscribeUrl(apiBaseUrl) {
+  return `${apiBaseUrl}/v1/market-data/stream/subscribe`;
+}
+
+function omxBenchmarkHistoricalUrl(apiBaseUrl) {
+  return `${apiBaseUrl}/v1/market-data/historical-bars`;
+}
+
+function omxBenchmarkSubscribePayload() {
+  return {
+    replace: false,
+    contracts: [
+      {
+        symbol: 'OMXS30',
+        security_type: 'IND',
+        exchange: 'OMS',
+        currency: 'SEK',
+        primary_exchange: ''
+      }
+    ]
+  };
+}
+
+function omxBenchmarkHistoricalPayload() {
+  return {
+    symbol: 'OMXS30',
+    security_type: 'IND',
+    exchange: 'OMS',
+    currency: 'SEK',
+    duration: '1 D',
+    bar_size: '5 mins',
+    what_to_show: 'TRADES',
+    use_rth: true
+  };
+}
+
 function parseFiniteNumber(value) {
   const parsed = Number.parseFloat(String(value ?? ''));
-  return Number.isFinite(parsed) ? parsed : null;
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  // IBKR uses very large sentinel values for unavailable index bid/ask fields.
+  return Math.abs(parsed) < 1e12 ? parsed : null;
+}
+
+function stockholmDstStartUtc(year) {
+  const lastDay = new Date(Date.UTC(year, 2, 31));
+  const lastSunday = 31 - lastDay.getUTCDay();
+  return Date.UTC(year, 2, lastSunday, 1, 0, 0);
+}
+
+function stockholmDstEndUtc(year) {
+  const lastDay = new Date(Date.UTC(year, 9, 31));
+  const lastSunday = 31 - lastDay.getUTCDay();
+  return Date.UTC(year, 9, lastSunday, 1, 0, 0);
+}
+
+function stockholmOffsetHours(year, month, day, hour, minute, second) {
+  const standardUtc = Date.UTC(year, month - 1, day, hour - 1, minute, second);
+  return standardUtc >= stockholmDstStartUtc(year) && standardUtc < stockholmDstEndUtc(year)
+    ? 2
+    : 1;
+}
+
+function normalizeBarTimestamp(value) {
+  if (!value) {
+    return null;
+  }
+  const raw = String(value).trim();
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString();
+  }
+
+  const match = raw.match(
+    /^(\d{4})(\d{2})(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\s+([A-Z]+))?$/
+  );
+  if (!match) {
+    return null;
+  }
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, zoneText] =
+    match;
+  const year = Number.parseInt(yearText, 10);
+  const month = Number.parseInt(monthText, 10);
+  const day = Number.parseInt(dayText, 10);
+  const hour = Number.parseInt(hourText, 10);
+  const minute = Number.parseInt(minuteText, 10);
+  const second = Number.parseInt(secondText, 10);
+  const zone = String(zoneText ?? 'MET').toUpperCase();
+  const offsetHours =
+    zone === 'CET'
+      ? 1
+      : zone === 'CEST'
+        ? 2
+        : stockholmOffsetHours(year, month, day, hour, minute, second);
+  return new Date(
+    Date.UTC(year, month - 1, day, hour - offsetHours, minute, second)
+  ).toISOString();
+}
+
+function benchmarkPointFromQuote(quote) {
+  const latest = parseFiniteNumber(quote?.last_price);
+  const previousClose = parseFiniteNumber(quote?.close_price);
+  const latestTimestamp = quote?.last_trade_at ?? quote?.updated_at;
+  if (latest === null || previousClose === null || !latestTimestamp || previousClose === 0) {
+    return null;
+  }
+
+  const end = new Date(latestTimestamp);
+  if (Number.isNaN(end.getTime())) {
+    return null;
+  }
+  const start = new Date(end.getTime() - 60_000);
+  return [
+    {
+      timestamp: start.toISOString(),
+      value: previousClose,
+      return_pct: 0
+    },
+    {
+      timestamp: end.toISOString(),
+      value: latest,
+      return_pct: ((latest - previousClose) / previousClose) * 100
+    }
+  ];
+}
+
+function buildOmxBenchmarkFromBars(rawBars, { source = 'stream' } = {}) {
+  const validBars = (Array.isArray(rawBars) ? rawBars : [])
+    .map((bar) => ({
+      timestamp: normalizeBarTimestamp(bar.timestamp),
+      value: parseFiniteNumber(bar.close)
+    }))
+    .filter((bar) => bar.timestamp && bar.value !== null);
+  const first = validBars.find((bar) => bar.value !== 0);
+  if (!first) {
+    return null;
+  }
+
+  const points = validBars.map((bar) => ({
+    timestamp: bar.timestamp,
+    value: bar.value,
+    return_pct: ((bar.value - first.value) / first.value) * 100
+  }));
+  const latest = points.at(-1);
+  return {
+    label: 'OMX',
+    symbol: 'OMXS30',
+    status: points.length > 1 ? 'ok' : 'insufficient_data',
+    error: null,
+    latest_return_pct: latest ? latest.return_pct : null,
+    points,
+    source
+  };
+}
+
+function buildOmxBenchmarkFromHistorical(result) {
+  if (!result.ok) {
+    return null;
+  }
+  const bars = result.body?.bars ?? result.body?.historical_bars?.bars ?? [];
+  return buildOmxBenchmarkFromBars(bars, { source: 'historical_bars' });
 }
 
 function buildOmxBenchmark(result) {
@@ -75,35 +235,76 @@ function buildOmxBenchmark(result) {
   }
 
   const barsBySymbol = result.body?.stream?.bars_by_symbol ?? {};
-  for (const symbol of ['OMXS30', 'OMX', 'XACT-OMXS30']) {
-    const bars = Array.isArray(barsBySymbol[symbol]) ? barsBySymbol[symbol] : [];
-    const validBars = bars
-      .map((bar) => ({
-        timestamp: bar.timestamp,
-        value: parseFiniteNumber(bar.close)
-      }))
-      .filter((bar) => bar.timestamp && bar.value !== null);
-    const first = validBars.find((bar) => bar.value !== 0);
-    if (!first) {
-      continue;
+  for (const symbol of ['OMXS30']) {
+    const benchmark = buildOmxBenchmarkFromBars(barsBySymbol[symbol], {
+      source: 'market_stream'
+    });
+    if (benchmark) {
+      return benchmark;
     }
+  }
 
-    const points = validBars.map((bar) => ({
-      timestamp: bar.timestamp,
-      value: bar.value,
-      return_pct: ((bar.value - first.value) / first.value) * 100
-    }));
-    const latest = points.at(-1);
+  const quotes = result.body?.stream?.quotes ?? [];
+  const quote = Array.isArray(quotes)
+    ? quotes.find((item) => item?.symbol === 'OMXS30')
+    : null;
+  const quotePoints = benchmarkPointFromQuote(quote);
+  if (quotePoints) {
+    const latest = quotePoints.at(-1);
     return {
       ...fallback,
-      symbol,
-      status: points.length > 1 ? 'ok' : 'insufficient_data',
+      symbol: 'OMXS30',
+      label: 'OMX',
+      status: 'ok',
       latest_return_pct: latest ? latest.return_pct : null,
-      points
+      points: quotePoints
     };
   }
 
   return fallback;
+}
+
+async function postJsonWithTimeout(fetch, url, body, timeoutMs) {
+  return readJson(fetch, url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(body),
+    timeoutMs
+  });
+}
+
+let omxBenchmarkCache = {
+  fetchedAt: 0,
+  value: null
+};
+
+async function readOmxBenchmark(fetch, apiBaseUrl) {
+  const now = Date.now();
+  if (omxBenchmarkCache.value && now - omxBenchmarkCache.fetchedAt < 60_000) {
+    return omxBenchmarkCache.value;
+  }
+
+  const streamResult = await readJson(fetch, omxBenchmarkSnapshotUrl(apiBaseUrl), {
+    timeoutMs: 2500
+  });
+  const streamBenchmark = buildOmxBenchmark(streamResult);
+  if (streamBenchmark.status === 'ok' && streamBenchmark.points.length >= 30) {
+    omxBenchmarkCache = { fetchedAt: now, value: streamBenchmark };
+    return streamBenchmark;
+  }
+
+  const historicalResult = await postJsonWithTimeout(
+    fetch,
+    omxBenchmarkHistoricalUrl(apiBaseUrl),
+    omxBenchmarkHistoricalPayload(),
+    8000
+  );
+  const historicalBenchmark = buildOmxBenchmarkFromHistorical(historicalResult);
+  const benchmark = historicalBenchmark ?? streamBenchmark;
+  omxBenchmarkCache = { fetchedAt: now, value: benchmark };
+  return benchmark;
 }
 
 function requireResponseBody(result, endpointName) {
@@ -155,18 +356,20 @@ export async function load({ fetch }) {
   const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
   const healthUrl = `${apiBaseUrl}/healthz`;
 
-  const [health, operatorSnapshot, omxBenchmarkSnapshot] = await Promise.all([
+  const [health, operatorSnapshot, omxBenchmarkSubscribe] = await Promise.all([
     readJson(fetch, healthUrl, { timeoutMs: 2500 }),
     readJson(fetch, operatorSnapshotUrl(apiBaseUrl)),
-    readJson(fetch, omxBenchmarkSnapshotUrl(apiBaseUrl), { timeoutMs: 1200 })
+    postJson(fetch, omxBenchmarkSubscribeUrl(apiBaseUrl), omxBenchmarkSubscribePayload())
   ]);
+  const omxBenchmark = await readOmxBenchmark(fetch, apiBaseUrl);
 
   return {
     generatedAt: new Date().toISOString(),
     apiBaseUrl,
     errors: buildEndpointErrorMap({
       health,
-      operatorSnapshot
+      operatorSnapshot,
+      omxBenchmarkSubscribe
     }),
     health: health.ok
       ? requireResponseBody(health, 'healthz')
@@ -176,11 +379,44 @@ export async function load({ fetch }) {
       'operator_snapshot',
       'Operator snapshot'
     ),
-    omxBenchmark: buildOmxBenchmark(omxBenchmarkSnapshot)
+    omxBenchmark
   };
 }
 
 export const actions = {
+  async archiveAllReconciliation({ fetch }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const result = await postJson(
+      fetch,
+      `${apiBaseUrl}/v1/reconciliation-issues/archive-open`,
+      {
+        action: 'ARCHIVE',
+        updated_by: 'dashboard',
+        note: 'Operator dashboard archive all reconciliation warnings.'
+      }
+    );
+    if (!result.ok) {
+      return fail(result.status || 500, {
+        reconciliationClearResult: {
+          ok: false,
+          message: result.error
+        }
+      });
+    }
+
+    const archivedCount =
+      result.body?.reconciliation_issue_archive?.archived_issue_count ?? 0;
+    return {
+      reconciliationClearResult: {
+        ok: true,
+        message:
+          archivedCount === 0
+            ? 'No reconciliation issues needed archiving.'
+            : `Archived ${archivedCount} reconciliation issues.`
+      }
+    };
+  },
+
   async acknowledgeVisibleReconciliation({ fetch, request }) {
     const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
     const formData = await request.formData();

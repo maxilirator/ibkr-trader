@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime
 from datetime import timezone
 
+from sqlalchemy import BigInteger
 from sqlalchemy import inspect
 from sqlalchemy import select
 
@@ -63,6 +64,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "instruction_event",
                 "instruction_set_cancellation",
                 "instrument",
+                "market_stream_bar",
                 "operator_control",
                 "operator_control_event",
                 "operator_review_action",
@@ -92,6 +94,15 @@ class DatabaseSchemaTests(unittest.TestCase):
         broker_order_event_columns = {
             column["name"] for column in inspector.get_columns("broker_order_event")
         }
+        broker_order_columns = {
+            column["name"]: column for column in inspector.get_columns("broker_order")
+        }
+        execution_fill_columns = {
+            column["name"]: column for column in inspector.get_columns("execution_fill")
+        }
+        instruction_columns_by_name = {
+            column["name"]: column for column in inspector.get_columns("instruction")
+        }
         reconciliation_issue_columns = {
             column["name"] for column in inspector.get_columns("reconciliation_issue")
         }
@@ -105,6 +116,24 @@ class DatabaseSchemaTests(unittest.TestCase):
                 reconciliation_issue_columns
             )
         )
+        self.assertEqual(
+            getattr(broker_order_columns["order_ref"]["type"], "length", None),
+            512,
+        )
+        self.assertEqual(
+            getattr(execution_fill_columns["order_ref"]["type"], "length", None),
+            512,
+        )
+        for column_name in (
+            "broker_order_id",
+            "broker_perm_id",
+            "exit_order_id",
+            "exit_perm_id",
+        ):
+            self.assertIsInstance(
+                instruction_columns_by_name[column_name]["type"],
+                BigInteger,
+            )
 
     def test_instruction_event_relationship_round_trips(self) -> None:
         session = self.session_factory()

@@ -12,6 +12,7 @@ from scripts.submit_rl_candidate_lists import CandidateBatchConfig
 from scripts.submit_rl_candidate_lists import build_candidate_payload
 from scripts.submit_rl_candidate_lists import load_identity_map
 from scripts.submit_rl_candidate_lists import load_selected_rows
+from scripts.submit_rl_candidate_lists import resolve_capital_plan
 
 
 def test_load_selected_rows_uses_latest_selected_sorted_by_score() -> None:
@@ -148,6 +149,10 @@ def test_build_candidate_payload_creates_per_symbol_model_routed_instructions() 
     assert instruction["intent"] == {"side": "SELL", "position_side": "SHORT"}
     assert instruction["execution"]["mode"] == "model_routed"
     assert instruction["execution"]["model_id"] == "short_trial36_v1"
+    assert instruction["sizing"] == {
+        "mode": "target_notional",
+        "target_notional": "1000",
+    }
     assert instruction["trace"]["metadata"]["static_features"] == {
         "schema_version": "rl_static_features_v1",
         "model_key": "short_trial36_v1",
@@ -169,7 +174,6 @@ def test_build_candidate_payload_applies_run_suffix_to_ids() -> None:
         book_key="rl_shared_long_trial_106_virtual_01",
         candidate_tape_path=Path("/tmp/candidate_tape.parquet"),
     )
-
     payload = build_candidate_payload(
         config,
         pd.DataFrame(
@@ -199,3 +203,80 @@ def test_build_candidate_payload_applies_run_suffix_to_ids() -> None:
         payload["instructions"][0]["instruction_id"]
         == "2026-04-29-VIRTUALRL01-rl-long-AXFO-model-routed-prep-2-01"
     )
+
+
+def test_resolve_capital_plan_divides_side_budget_across_dynamic_candidate_count() -> None:
+    target_notional, capital_plan = resolve_capital_plan(
+        side="LONG",
+        account_key="virtualrl01",
+        candidate_count=15,
+        default_target_notional="1000",
+        account_equity_reference="200000",
+        long_allocation_pct="0.90",
+        short_allocation_pct="0.80",
+        long_budget="100000",
+        short_budget="100000",
+        max_notional_per_name=None,
+    )
+
+    assert target_notional == "6666"
+    assert capital_plan == {
+        "schema_version": "rl_capital_plan_v2",
+        "allocation_method": "gross_budget_equal_weight",
+        "account_key": "VIRTUALRL01",
+        "account_currency": "SEK",
+        "account_equity_reference": "200000",
+        "capital_base": "net_liquidation_value",
+        "strategy_key": "bucket_booster_long",
+        "strategy_side": "LONG",
+        "book_allocation_pct": None,
+        "max_book_gross_account_pct": "0.90",
+        "strategy_gross_budget": "100000",
+        "candidate_count": 15,
+        "per_name_target_notional": "6666",
+        "max_notional_per_name": None,
+        "min_order_notional": "1000",
+        "rounding": "whole_shares_down",
+        "require_shortable": False,
+        "require_borrow_rate_available": False,
+        "short_sale_proceeds_reinvested": False,
+        "allocation_guard": {
+            "schema_version": "rl_allocation_guard_v1",
+            "account_key": "VIRTUALRL01",
+            "capital_base": "net_liquidation_value",
+            "max_long_gross_account_pct": "0.90",
+            "max_short_gross_account_pct": "0.80",
+            "max_total_gross_account_pct": "1.70",
+            "max_abs_net_exposure_account_pct": "0.25",
+            "min_excess_liquidity_buffer_pct": "0.20",
+            "block_if_margin_preflight_fails": True,
+            "block_if_projected_maintenance_margin_exceeded": True,
+        },
+    }
+
+
+def test_resolve_capital_plan_uses_account_pct_as_side_gross_exposure() -> None:
+    target_notional, capital_plan = resolve_capital_plan(
+        side="SHORT",
+        account_key="virtualrl01",
+        candidate_count=20,
+        default_target_notional="1000",
+        account_equity_reference="100000",
+        long_allocation_pct="0.90",
+        short_allocation_pct="0.80",
+        long_budget=None,
+        short_budget=None,
+        max_notional_per_name=None,
+    )
+
+    assert target_notional == "4000"
+    assert capital_plan["allocation_method"] == "account_pct_gross_exposure_equal_weight"
+    assert capital_plan["strategy_key"] == "bucket_booster_short"
+    assert capital_plan["book_allocation_pct"] == "0.8"
+    assert capital_plan["max_book_gross_account_pct"] == "0.80"
+    assert capital_plan["strategy_gross_budget"] == "80000"
+    assert capital_plan["per_name_target_notional"] == "4000"
+    assert capital_plan["require_shortable"] is True
+    assert capital_plan["require_borrow_rate_available"] is True
+    assert capital_plan["short_sale_proceeds_reinvested"] is False
+    assert capital_plan["allocation_guard"]["max_total_gross_account_pct"] == "1.70"

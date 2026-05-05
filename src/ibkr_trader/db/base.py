@@ -96,6 +96,40 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
                 f"ALTER TABLE {table_name} ADD COLUMN archive_reason TEXT"
             )
 
+    def widen_varchar_if_short(
+        table_name: str,
+        column_name: str,
+        min_length: int,
+    ) -> None:
+        if engine.dialect.name != "postgresql" or table_name not in table_names:
+            return
+        table_columns = {
+            column["name"]: column for column in inspector.get_columns(table_name)
+        }
+        column = table_columns.get(column_name)
+        if column is None:
+            return
+        current_length = getattr(column["type"], "length", None)
+        if current_length is not None and current_length < min_length:
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ALTER COLUMN {column_name} "
+                f"TYPE VARCHAR({min_length})"
+            )
+
+    def promote_integer_to_bigint(table_name: str, column_name: str) -> None:
+        if engine.dialect.name != "postgresql" or table_name not in table_names:
+            return
+        table_columns = {
+            column["name"]: column for column in inspector.get_columns(table_name)
+        }
+        column = table_columns.get(column_name)
+        if column is None:
+            return
+        if str(column["type"]).upper() == "INTEGER":
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT"
+            )
+
     add_boolean_if_missing("trader_deployment", "is_virtual")
     add_boolean_if_missing("instruction", "is_virtual")
     add_boolean_if_missing("broker_account", "is_virtual")
@@ -105,14 +139,20 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
     add_boolean_if_missing("position_snapshot", "is_virtual")
     add_archive_columns_if_missing("broker_order_event")
     add_archive_columns_if_missing("reconciliation_issue")
+    widen_varchar_if_short("broker_order", "order_ref", 512)
+    widen_varchar_if_short("execution_fill", "order_ref", 512)
+    promote_integer_to_bigint("instruction", "broker_order_id")
+    promote_integer_to_bigint("instruction", "broker_perm_id")
+    promote_integer_to_bigint("instruction", "exit_order_id")
+    promote_integer_to_bigint("instruction", "exit_perm_id")
 
     if "broker_order_id" not in existing_columns:
         upgrade_statements.append(
-            "ALTER TABLE instruction ADD COLUMN broker_order_id INTEGER"
+            "ALTER TABLE instruction ADD COLUMN broker_order_id BIGINT"
         )
     if "broker_perm_id" not in existing_columns:
         upgrade_statements.append(
-            "ALTER TABLE instruction ADD COLUMN broker_perm_id INTEGER"
+            "ALTER TABLE instruction ADD COLUMN broker_perm_id BIGINT"
         )
     if "broker_client_id" not in existing_columns:
         upgrade_statements.append(
@@ -140,11 +180,11 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
         )
     if "exit_order_id" not in existing_columns:
         upgrade_statements.append(
-            "ALTER TABLE instruction ADD COLUMN exit_order_id INTEGER"
+            "ALTER TABLE instruction ADD COLUMN exit_order_id BIGINT"
         )
     if "exit_perm_id" not in existing_columns:
         upgrade_statements.append(
-            "ALTER TABLE instruction ADD COLUMN exit_perm_id INTEGER"
+            "ALTER TABLE instruction ADD COLUMN exit_perm_id BIGINT"
         )
     if "exit_client_id" not in existing_columns:
         upgrade_statements.append(

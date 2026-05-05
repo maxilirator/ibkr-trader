@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -11,17 +11,21 @@ from datetime import date
 from datetime import datetime
 from datetime import time
 from datetime import timezone
+from decimal import Decimal
+from decimal import ROUND_DOWN
 from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from ibkr_trader.rl.model_artifacts import promoted_rl_models
 from ibkr_trader.rl.model_artifacts import read_static_feature_names
 
 
 IDENTITY_PATH = Path("/home/mattias/dev/q-data/xsto/meta/instrument_identity.parquet")
+CANDIDATE_SOURCE_ROOT = Path(
+    os.environ.get("RL_CANDIDATE_SOURCE_ROOT", "/home/mattias/dev/q-training")
+).expanduser()
 STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
 
 
@@ -36,33 +40,86 @@ class CandidateBatchConfig:
     book_key: str
     candidate_tape_path: Path
     static_feature_cols_path: Path | None = None
+    strategy_key: str | None = None
 
 
-CONFIGS: tuple[CandidateBatchConfig, ...] = tuple(
+CONFIGS: tuple[CandidateBatchConfig, ...] = (
     CandidateBatchConfig(
-        side=artifact.side_upper,
-        strategy_id=artifact.strategy_id,
-        model_key=artifact.model_key,
-        model_family=artifact.model_family,
-        model_artifact_id=artifact.model_artifact_id,
-        deployment_key=artifact.deployment_key,
-        book_key=artifact.book_key,
-        candidate_tape_path=artifact.candidate_tape_path,
-        static_feature_cols_path=artifact.static_feature_cols_path,
-    )
-    for artifact in promoted_rl_models()
+        side="LONG",
+        strategy_id="long_trial_106",
+        model_key="long_trial_106_v1",
+        model_family="canonical_long_live_execution_policy",
+        model_artifact_id="trial_106_seed240",
+        deployment_key="long_trial_106_virtual_shared_01",
+        book_key="rl_shared_long_trial_106_virtual_01",
+        candidate_tape_path=CANDIDATE_SOURCE_ROOT
+        / "artifacts/analysis/long_trial_104_ex_long_true_rl_input_materialize_ranker_v1/lockbox_candidate_tape.parquet",
+        static_feature_cols_path=CANDIDATE_SOURCE_ROOT
+        / "artifacts/analysis/long_trial_106_ex_long_true_rl_dqn_w128_oracle_notrade_dualseed_extension_v1/continuation/true_rl_dqn_w128_seed240/static_feature_cols.csv",
+        strategy_key="bucket_booster_long",
+    ),
+    CandidateBatchConfig(
+        side="SHORT",
+        strategy_id="short_trial_36",
+        model_key="short_trial36_v1",
+        model_family="canonical_short_live_execution_policy",
+        model_artifact_id="trial_36_seed140",
+        deployment_key="short_trial_36_virtual_shared_01",
+        book_key="rl_shared_short_trial_36_virtual_01",
+        candidate_tape_path=CANDIDATE_SOURCE_ROOT
+        / "artifacts/analysis/short_trial_14_replay_tape_ibkr_shortable_v1/lockbox_candidate_tape.parquet",
+        static_feature_cols_path=CANDIDATE_SOURCE_ROOT
+        / "artifacts/analysis/short_trial_36_ex_short_true_rl_dqn_w128_volnorm_market_context_triseed_v1/continuation/true_rl_dqn_w128_seed140/static_feature_cols.csv",
+        strategy_key="bucket_booster_short",
+    ),
 )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Submit selected bucket RL names as model-routed trader candidates."
+        description="Submit selected RL names as model-routed trader candidates."
     )
     parser.add_argument("--api-base", default="http://quant.geisler.se:8000")
     parser.add_argument("--account-key", default="VIRTUALRL01")
     parser.add_argument("--trade-date", default=_today_stockholm().isoformat())
     parser.add_argument("--candidate-date", default="latest")
     parser.add_argument("--target-notional", default="1000")
+    parser.add_argument(
+        "--account-equity-reference",
+        default=None,
+        help="Account SEK net liquidation value used for allocation percentage sizing.",
+    )
+    parser.add_argument(
+        "--long-allocation-pct",
+        default="0.90",
+        help="Long bucket gross exposure as a fraction of account NLV.",
+    )
+    parser.add_argument(
+        "--short-allocation-pct",
+        default="0.80",
+        help="Short bucket gross exposure as a fraction of account NLV.",
+    )
+    parser.add_argument(
+        "--long-budget",
+        default=None,
+        help="Optional gross SEK budget to divide across that day's long candidates.",
+    )
+    parser.add_argument(
+        "--short-budget",
+        default=None,
+        help="Optional gross SEK budget to divide across that day's short candidates.",
+    )
+    parser.add_argument(
+        "--max-notional-per-name",
+        default=None,
+        help="Optional SEK cap applied after dividing a side budget by candidate count.",
+    )
+    parser.add_argument("--min-order-notional", default="1000")
+    parser.add_argument("--max-long-gross-account-pct", default="0.90")
+    parser.add_argument("--max-short-gross-account-pct", default="0.80")
+    parser.add_argument("--max-total-gross-account-pct", default="1.70")
+    parser.add_argument("--max-abs-net-exposure-account-pct", default="0.25")
+    parser.add_argument("--min-excess-liquidity-buffer-pct", default="0.20")
     parser.add_argument("--start-local", default="09:00")
     parser.add_argument("--end-local", default="17:30")
     parser.add_argument(
@@ -104,6 +161,24 @@ def main() -> int:
             candidate_date=args.candidate_date,
             limit=limit,
         )
+        target_notional, capital_plan = resolve_capital_plan(
+            side=config.side,
+            account_key=args.account_key,
+            candidate_count=len(rows),
+            default_target_notional=str(args.target_notional),
+            account_equity_reference=args.account_equity_reference,
+            long_allocation_pct=args.long_allocation_pct,
+            short_allocation_pct=args.short_allocation_pct,
+            long_budget=args.long_budget,
+            short_budget=args.short_budget,
+            max_notional_per_name=args.max_notional_per_name,
+            min_order_notional=args.min_order_notional,
+            max_long_gross_account_pct=args.max_long_gross_account_pct,
+            max_short_gross_account_pct=args.max_short_gross_account_pct,
+            max_total_gross_account_pct=args.max_total_gross_account_pct,
+            max_abs_net_exposure_account_pct=args.max_abs_net_exposure_account_pct,
+            min_excess_liquidity_buffer_pct=args.min_excess_liquidity_buffer_pct,
+        )
         payload = build_candidate_payload(
             config,
             rows,
@@ -111,7 +186,8 @@ def main() -> int:
             account_key=args.account_key,
             trade_date=trade_date,
             candidate_date=candidate_date,
-            target_notional=str(args.target_notional),
+            target_notional=target_notional,
+            capital_plan=capital_plan,
             start_at=start_at,
             end_at=end_at,
             generated_at=generated_at,
@@ -243,11 +319,12 @@ def build_candidate_payload(
     start_at: datetime,
     end_at: datetime,
     generated_at: datetime,
+    capital_plan: Mapping[str, Any] | None = None,
     run_suffix: str = "",
 ) -> dict[str, Any]:
     batch_suffix = f"-{run_suffix}" if run_suffix else ""
     source = {
-        "system": "q-training-bucket",
+        "system": "q-training",
         "batch_id": (
             f"rl-{config.side.lower()}-{trade_date.isoformat()}-"
             f"selected-{candidate_date}{batch_suffix}"
@@ -269,6 +346,7 @@ def build_candidate_payload(
             trade_date=trade_date,
             candidate_date=candidate_date,
             target_notional=target_notional,
+            capital_plan=capital_plan,
             start_at=start_at,
             end_at=end_at,
             ordinal=ordinal,
@@ -295,6 +373,7 @@ def build_candidate_instruction(
     start_at: datetime,
     end_at: datetime,
     ordinal: int,
+    capital_plan: Mapping[str, Any] | None = None,
     run_suffix: str = "",
 ) -> dict[str, Any]:
     symbol = str(row["instrument"]).strip().upper()
@@ -313,13 +392,15 @@ def build_candidate_instruction(
     trace_metadata = {
         "source": "lockbox_candidate_tape",
         "candidate_date": candidate_date,
-        "candidate_tape": str(config.candidate_tape_path),
+        "candidate_tape_lineage_path": str(config.candidate_tape_path),
         "selected": str(row.get("selected")),
         "score_column": _score_column(pd.DataFrame([row])),
     }
     static_features = static_feature_metadata(config, row)
     if static_features is not None:
         trace_metadata["static_features"] = static_features
+    if capital_plan is not None:
+        trace_metadata["capital_plan"] = dict(capital_plan)
 
     return {
         "instruction_id": (
@@ -348,7 +429,6 @@ def build_candidate_instruction(
         "sizing": {
             "mode": "target_notional",
             "target_notional": target_notional,
-            "funding_basis": "cash",
         },
         "execution": {
             "mode": "model_routed",
@@ -369,6 +449,135 @@ def build_candidate_instruction(
             "metadata": trace_metadata,
         },
     }
+
+
+def resolve_capital_plan(
+    *,
+    side: str,
+    account_key: str,
+    candidate_count: int,
+    default_target_notional: str,
+    account_equity_reference: str | None,
+    long_allocation_pct: str | None = None,
+    short_allocation_pct: str | None = None,
+    long_budget: str | None,
+    short_budget: str | None,
+    max_notional_per_name: str | None,
+    min_order_notional: str | None = "1000",
+    max_long_gross_account_pct: str = "0.90",
+    max_short_gross_account_pct: str = "0.80",
+    max_total_gross_account_pct: str = "1.70",
+    max_abs_net_exposure_account_pct: str = "0.25",
+    min_excess_liquidity_buffer_pct: str = "0.20",
+) -> tuple[str, dict[str, Any]]:
+    normalized_side = side.upper()
+    side_budget = long_budget if normalized_side == "LONG" else short_budget
+    side_allocation_pct = (
+        long_allocation_pct if normalized_side == "LONG" else short_allocation_pct
+    )
+    max_book_gross_account_pct = (
+        max_long_gross_account_pct
+        if normalized_side == "LONG"
+        else max_short_gross_account_pct
+    )
+    target_notional = _clean_decimal_string(Decimal(str(default_target_notional)))
+    strategy_gross_budget = None
+    book_allocation_pct = None
+    allocation_method = "fixed_per_name"
+
+    if side_budget not in (None, ""):
+        if candidate_count <= 0:
+            raise ValueError(f"{normalized_side} capital budget requires candidates")
+        allocation_method = "gross_budget_equal_weight"
+        strategy_gross_budget = Decimal(str(side_budget))
+        if strategy_gross_budget <= 0:
+            raise ValueError(f"{normalized_side} strategy budget must be positive")
+    elif (
+        account_equity_reference not in (None, "")
+        and side_allocation_pct not in (None, "")
+    ):
+        if candidate_count <= 0:
+            raise ValueError(f"{normalized_side} allocation percentage requires candidates")
+        allocation_method = "account_pct_gross_exposure_equal_weight"
+        account_equity = Decimal(str(account_equity_reference))
+        if account_equity <= 0:
+            raise ValueError("account_equity_reference must be positive")
+        book_allocation_pct_decimal = Decimal(str(side_allocation_pct))
+        if book_allocation_pct_decimal <= 0:
+            raise ValueError(f"{normalized_side} allocation percentage must be positive")
+        strategy_gross_budget = account_equity * book_allocation_pct_decimal
+        book_allocation_pct = _clean_decimal_string(book_allocation_pct_decimal)
+
+    if strategy_gross_budget is not None:
+        per_name = (strategy_gross_budget / Decimal(candidate_count)).quantize(
+            Decimal("1"),
+            rounding=ROUND_DOWN,
+        )
+        if max_notional_per_name not in (None, ""):
+            cap = Decimal(str(max_notional_per_name))
+            if cap <= 0:
+                raise ValueError("max_notional_per_name must be positive")
+            per_name = min(per_name, cap)
+        if min_order_notional not in (None, ""):
+            minimum = Decimal(str(min_order_notional))
+            if minimum <= 0:
+                raise ValueError("min_order_notional must be positive")
+            if per_name < minimum:
+                raise ValueError(
+                    f"{normalized_side} per-name target notional {per_name} "
+                    f"is below min_order_notional {minimum}"
+                )
+        if per_name <= 0:
+            raise ValueError(f"{normalized_side} per-name target notional rounded to zero")
+        target_notional = _clean_decimal_string(per_name)
+
+    capital_plan = {
+        "schema_version": "rl_capital_plan_v2",
+        "allocation_method": allocation_method,
+        "account_key": account_key.upper(),
+        "account_currency": "SEK",
+        "account_equity_reference": account_equity_reference,
+        "capital_base": "net_liquidation_value",
+        "strategy_key": (
+            "bucket_booster_long" if normalized_side == "LONG" else "bucket_booster_short"
+        ),
+        "strategy_side": normalized_side,
+        "book_allocation_pct": book_allocation_pct,
+        "max_book_gross_account_pct": max_book_gross_account_pct,
+        "strategy_gross_budget": (
+            _clean_decimal_string(strategy_gross_budget)
+            if strategy_gross_budget is not None
+            else None
+        ),
+        "candidate_count": candidate_count,
+        "per_name_target_notional": target_notional,
+        "max_notional_per_name": max_notional_per_name,
+        "min_order_notional": min_order_notional,
+        "rounding": "whole_shares_down",
+        "require_shortable": normalized_side == "SHORT",
+        "require_borrow_rate_available": normalized_side == "SHORT",
+        "short_sale_proceeds_reinvested": False,
+        "allocation_guard": {
+            "schema_version": "rl_allocation_guard_v1",
+            "account_key": account_key.upper(),
+            "capital_base": "net_liquidation_value",
+            "max_long_gross_account_pct": max_long_gross_account_pct,
+            "max_short_gross_account_pct": max_short_gross_account_pct,
+            "max_total_gross_account_pct": max_total_gross_account_pct,
+            "max_abs_net_exposure_account_pct": max_abs_net_exposure_account_pct,
+            "min_excess_liquidity_buffer_pct": min_excess_liquidity_buffer_pct,
+            "block_if_margin_preflight_fails": True,
+            "block_if_projected_maintenance_margin_exceeded": True,
+        },
+    }
+    return target_notional, capital_plan
+
+
+def _clean_decimal_string(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        return str(normalized.quantize(Decimal("1")))
+    return format(normalized, "f")
 
 
 def static_feature_metadata(

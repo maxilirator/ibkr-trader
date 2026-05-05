@@ -48,12 +48,15 @@
   let filteredReconciliation = [];
   let visibleBrokerAttentionEventIds = [];
   let visibleReconciliationIssueIds = [];
+  let stateSync = null;
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
+  const positionOwningInstructionStates = new Set(['POSITION_OPEN', 'EXIT_PENDING']);
   const AUTO_REFRESH_INTERVAL_MS = 30000;
   const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v2';
   const BUTTON_CLICK_TO_WORK_MS = 140;
   const BUTTON_SUCCESS_RESET_MS = 1600;
   const BUTTON_ERROR_RESET_MS = 2200;
+  const RECONCILIATION_GROUP_DISPLAY_LIMIT = 12;
   let timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
     year: 'numeric',
@@ -76,7 +79,8 @@
         averageCost: '',
         marketPrice: '',
         marketValue: '',
-        unrealizedPnl: ''
+        unrealizedPnl: '',
+        exitPlan: ''
       },
       openOrders: {
         account: '',
@@ -317,9 +321,217 @@
     return timestampFormatter.format(parsed);
   }
 
+  function ageSeconds(value) {
+    const parsed = parseTimestamp(value);
+    if (!parsed) return null;
+    return Math.max(0, Math.round((referenceNow.getTime() - parsed.getTime()) / 1000));
+  }
+
+  function formatAge(value) {
+    const seconds = ageSeconds(value);
+    if (seconds === null) return 'no timestamp';
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    const remainder = minutes % 60;
+    return remainder > 0 ? `${hours}h ${remainder}m ago` : `${hours}h ago`;
+  }
+
+  function latestTimestamp(rows, fields) {
+    const fieldNames = Array.isArray(fields) ? fields : [fields];
+    let latest = null;
+    for (const row of rows ?? []) {
+      for (const fieldName of fieldNames) {
+        const parsed = parseTimestamp(row?.[fieldName]);
+        if (!parsed) continue;
+        if (!latest || parsed.getTime() > latest.getTime()) {
+          latest = parsed;
+        }
+      }
+    }
+    return latest ? latest.toISOString() : null;
+  }
+
+  function freshnessClass(value, maxAgeSeconds = 180) {
+    const seconds = ageSeconds(value);
+    if (seconds === null) return 'bad';
+    if (seconds <= maxAgeSeconds) return 'ok';
+    if (seconds <= maxAgeSeconds * 4) return 'warn';
+    return 'bad';
+  }
+
+  function compactCount(value) {
+    return Number.isFinite(Number(value)) ? String(value) : 'n/a';
+  }
+
+  function normalizedSymbol(value) {
+    return String(value ?? '').trim().toUpperCase().replace(/\s+/g, '-').replace(/[._]/g, '-');
+  }
+
+  function instrumentKeys(row) {
+    const account = String(row?.account_key ?? '').trim().toUpperCase();
+    const symbols = [
+      normalizedSymbol(row?.symbol),
+      normalizedSymbol(row?.local_symbol),
+      normalizedSymbol(row?.primary_exchange ? `${row.primary_exchange}:${row.symbol}` : null)
+    ].filter(Boolean);
+    return symbols.map((symbol) => `${account}|${symbol}`);
+  }
+
+  function buildStateSyncSummary() {
+    const snapshotRefresh = brokerMonitor?.snapshot_refresh ?? {};
+    const brokerSnapshotAt = snapshotRefresh.captured_at ?? snapshotRefresh.last_success_at ?? null;
+    const brokerSnapshotHealthy = snapshotRefresh.ok === true && snapshotRefresh.is_stale !== true;
+    const livePositions = positions.filter((position) => !position.is_virtual);
+    const liveOpenOrders = openOrders.filter((order) => !order.is_virtual);
+    const positionKeys = new Set(positions.flatMap((position) => instrumentKeys(position)));
+    const visibleInstructionIds = new Set(executionInstructions.map((instruction) => instruction.record_id));
+    const activePositionInstructions = executionInstructions.filter((instruction) =>
+      positionOwningInstructionStates.has(instruction.state)
+    );
+    const instructionsWithoutPosition = activePositionInstructions.filter((instruction) => {
+      const keys = instrumentKeys(instruction);
+      return keys.length > 0 && !keys.some((key) => positionKeys.has(key));
+    });
+    const openOrdersWithoutVisibleInstruction = openOrders.filter(
+      (order) => order.instruction_record_id && !visibleInstructionIds.has(order.instruction_record_id)
+    );
+    const brokerOpenOrderCount = Number(snapshotRefresh.open_order_count ?? 0);
+    const brokerPositionCount = Number(snapshotRefresh.position_count ?? 0);
+    const countMismatchWarnings = [];
+
+    if (!brokerSnapshotHealthy) {
+      countMismatchWarnings.push({
+        className: 'bad',
+        text:
+          snapshotRefresh.error ??
+          'Broker snapshot refresh is stale or has not completed, so holdings and open-order counts may lag broker state.'
+      });
+    }
+
+    if (brokerSnapshotHealthy && brokerOpenOrderCount !== liveOpenOrders.length) {
+      countMismatchWarnings.push({
+        className: 'warn',
+        text: `Broker snapshot reports ${brokerOpenOrderCount} live open orders, while durable live open-order rows show ${liveOpenOrders.length}.`
+      });
+    }
+
+    if (brokerSnapshotHealthy && brokerPositionCount !== livePositions.length) {
+      countMismatchWarnings.push({
+        className: 'warn',
+        text: `Broker snapshot reports ${brokerPositionCount} live positions, while durable live holding rows show ${livePositions.length}.`
+      });
+    }
+
+    if (instructionsWithoutPosition.length > 0) {
+      countMismatchWarnings.push({
+        className: 'warn',
+        text: `${instructionsWithoutPosition.length} active position instruction(s) are visible without a matching holding snapshot.`
+      });
+    }
+
+    if (openOrdersWithoutVisibleInstruction.length > 0) {
+      countMismatchWarnings.push({
+        className: 'warn',
+        text: `${openOrdersWithoutVisibleInstruction.length} open order(s) are linked to instructions outside the visible instruction slice.`
+      });
+    }
+
+    if (omxBenchmark?.status !== 'ok') {
+      countMismatchWarnings.push({
+        className: 'warn',
+        text: `OMX benchmark is ${omxBenchmark?.status ?? 'unavailable'}; account charts will show the account line without a trusted index comparison.`
+      });
+    }
+
+    const latestAccountsAt = latestTimestamp(accounts, 'snapshot_at');
+    const latestPositionsAt = latestTimestamp(positions, 'snapshot_at');
+    const latestOrdersAt = latestTimestamp(openOrders, ['last_status_at', 'submitted_at']);
+    const latestFillsAt = latestTimestamp(recentFills, 'executed_at');
+    const latestInstructionsAt = latestTimestamp(executionInstructions, ['activity_at', 'updated_at']);
+    const latestCandidatesAt = latestTimestamp(rlCandidateInstructions, ['activity_at', 'updated_at']);
+    const latestOmxAt = latestTimestamp(omxBenchmark?.points, 'timestamp');
+
+    return {
+      className:
+        countMismatchWarnings.some((warning) => warning.className === 'bad')
+          ? 'bad'
+          : countMismatchWarnings.length > 0
+            ? 'warn'
+            : 'ok',
+      label:
+        countMismatchWarnings.some((warning) => warning.className === 'bad')
+          ? 'Needs attention'
+          : countMismatchWarnings.length > 0
+            ? 'Check sync'
+            : 'In sync',
+      warnings: countMismatchWarnings,
+      items: [
+        {
+          label: 'Broker Snapshot',
+          countLabel: `${compactCount(snapshotRefresh.position_count)} live positions · ${compactCount(snapshotRefresh.open_order_count)} live orders`,
+          at: brokerSnapshotAt,
+          className: brokerSnapshotHealthy ? freshnessClass(brokerSnapshotAt, 180) : 'bad',
+          source: 'IBKR monitor'
+        },
+        {
+          label: 'Accounts',
+          countLabel: `${accounts.length} rows`,
+          at: latestAccountsAt,
+          className: freshnessClass(latestAccountsAt, 180),
+          source: 'account snapshots'
+        },
+        {
+          label: 'Holdings',
+          countLabel: `${positions.length} rows · ${livePositions.length} live`,
+          at: latestPositionsAt,
+          className: freshnessClass(latestPositionsAt, 180),
+          source: 'position snapshots'
+        },
+        {
+          label: 'Open Orders',
+          countLabel: `${openOrders.length} rows · ${liveOpenOrders.length} live`,
+          at: latestOrdersAt,
+          className: freshnessClass(latestOrdersAt, 180),
+          source: 'broker-order ledger'
+        },
+        {
+          label: 'Fills',
+          countLabel: `${recentFills.length} rows`,
+          at: latestFillsAt,
+          className: recentFills.length === 0 ? 'neutral' : freshnessClass(latestFillsAt, 3600),
+          source: 'execution fills'
+        },
+        {
+          label: 'Instructions',
+          countLabel: `${executionInstructions.length} rows`,
+          at: latestInstructionsAt,
+          className: executionInstructions.length === 0 ? 'neutral' : freshnessClass(latestInstructionsAt, 300),
+          source: 'runtime queue'
+        },
+        {
+          label: 'RL Candidates',
+          countLabel: `${rlCandidateInstructions.length} active source rows`,
+          at: latestCandidatesAt,
+          className: rlCandidateInstructions.length === 0 ? 'neutral' : 'ok',
+          source: 'daily model-routed list'
+        },
+        {
+          label: omxBenchmark?.label ?? 'OMX',
+          countLabel: formatReturnPct(omxBenchmark?.latest_return_pct),
+          at: latestOmxAt,
+          className: omxBenchmark?.status === 'ok' ? freshnessClass(latestOmxAt, 300) : 'warn',
+          source: omxBenchmark?.symbol ?? 'benchmark stream'
+        }
+      ]
+    };
+  }
+
   function parseFiniteNumber(value) {
     const parsed = Number.parseFloat(String(value ?? ''));
-    return Number.isFinite(parsed) ? parsed : null;
+    if (!Number.isFinite(parsed)) return null;
+    return Math.abs(parsed) < 1e12 ? parsed : null;
   }
 
   function formatReturnPct(value) {
@@ -327,6 +539,19 @@
     if (parsed === null) return 'n/a';
     const prefix = parsed > 0 ? '+' : '';
     return `${prefix}${parsed.toFixed(2)}%`;
+  }
+
+  function formatSignedNumber(value, digits = 2) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) return 'n/a';
+    const prefix = parsed > 0 ? '+' : '';
+    return `${prefix}${parsed.toFixed(digits)}`;
+  }
+
+  function formatAbsoluteNumber(value, digits = 2) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) return 'n/a';
+    return Math.abs(parsed).toFixed(digits);
   }
 
   function normalizePerformancePoints(points, valueField = 'return_pct') {
@@ -445,13 +670,23 @@
   }
 
   function orderSpreadLabel(order) {
-    if (!order.price_spread) {
+    const spread = parseFiniteNumber(order.price_spread);
+    const spreadPct = parseFiniteNumber(order.price_spread_pct);
+    if (spread === null) {
       return 'n/a';
     }
 
-    const pctSuffix = order.price_spread_pct ? ` (${order.price_spread_pct}%)` : '';
-    const referencePrefix = order.spread_reference ? `${order.spread_reference} ` : '';
-    return `${referencePrefix}${order.price_spread}${pctSuffix}`;
+    const direction = spread > 0 ? 'above mkt' : spread < 0 ? 'below mkt' : 'at mkt';
+    const pctSuffix = spreadPct !== null ? ` (${formatSignedNumber(spreadPct)}%)` : '';
+    return `${formatAbsoluteNumber(spread)} ${direction}${pctSuffix}`;
+  }
+
+  function orderTriggerDetail(order) {
+    if (!order.working_price) {
+      return null;
+    }
+    const reference = order.working_price_reference ?? order.spread_reference ?? 'trigger';
+    return `${reference} ${order.working_price}`;
   }
 
   function orderFillSpreadLabel(order) {
@@ -639,6 +874,7 @@
 
   function instructionGuidance(instruction) {
     const windowState = instructionWindowState(instruction);
+    const forceNextOpen = instructionForcesNextOpenExit(instruction);
 
     if (instruction.state === 'ENTRY_PENDING') {
       if (windowState.isScheduled) {
@@ -658,10 +894,16 @@
     }
 
     if (instruction.state === 'POSITION_OPEN') {
+      if (forceNextOpen) {
+        return 'Entry filled. Next-session-open forced market exit is armed; runtime owns the close.';
+      }
       return 'Entry filled. Runtime is now responsible for exit management.';
     }
 
     if (instruction.state === 'EXIT_PENDING') {
+      if (forceNextOpen) {
+        return 'Exit workflow is active. Next-session-open forced market exit is armed even if an older protective exit row was cancelled.';
+      }
       return 'Exit workflow is active and still awaiting completion.';
     }
 
@@ -718,6 +960,66 @@
       instruction.exit_order_display ??
       `${instruction.exit_order_id ?? 'n/a'} / ${instruction.exit_order_status ?? 'n/a'}`
     );
+  }
+
+  function instructionForcesNextOpenExit(instruction) {
+    return instruction?.payload?.instruction?.exit?.force_exit_next_session_open === true;
+  }
+
+  function positionInstructionMatches(position, instruction) {
+    if (!position || !instruction) return false;
+    if (!positionOwningInstructionStates.has(instruction.state)) return false;
+    if (String(position.account_key ?? '').toUpperCase() !== String(instruction.account_key ?? '').toUpperCase()) {
+      return false;
+    }
+    return normalizedSymbol(position.local_symbol ?? position.symbol) === normalizedSymbol(instruction.symbol);
+  }
+
+  function activeInstructionsForPosition(position, instructionRows = executionInstructions) {
+    return instructionRows
+      .filter((instruction) => positionInstructionMatches(position, instruction))
+      .sort((left, right) => {
+        const leftAt = parseTimestamp(left.activity_at ?? left.updated_at)?.getTime() ?? 0;
+        const rightAt = parseTimestamp(right.activity_at ?? right.updated_at)?.getTime() ?? 0;
+        return rightAt - leftAt;
+      });
+  }
+
+  function positionExitPlan(position, instructionRows = executionInstructions) {
+    const owningInstructions = activeInstructionsForPosition(position, instructionRows);
+    const primaryInstruction = owningInstructions[0];
+    if (!primaryInstruction) {
+      return {
+        label: 'No owner',
+        className: 'bad',
+        detail: 'No active execution instruction owns this holding.',
+        instructionId: null
+      };
+    }
+    if (instructionForcesNextOpenExit(primaryInstruction)) {
+      return {
+        label: 'Next open armed',
+        className: 'ok',
+        detail: `${primaryInstruction.state}; runtime will submit the forced market exit when due.`,
+        instructionId: primaryInstruction.instruction_id
+      };
+    }
+    return {
+      label: 'No next-open flag',
+      className: 'warn',
+      detail: `${primaryInstruction.state}; this instruction does not request force_exit_next_session_open.`,
+      instructionId: primaryInstruction.instruction_id
+    };
+  }
+
+  function positionExitPlanSearchText(position, instructionRows = executionInstructions) {
+    const exitPlan = positionExitPlan(position, instructionRows);
+    return [
+      exitPlan.label,
+      exitPlan.className,
+      exitPlan.detail,
+      exitPlan.instructionId
+    ].filter(Boolean).join(' ');
   }
 
   function isOpenReview(review) {
@@ -924,7 +1226,8 @@
     matchesFilterValue(position.average_cost ?? 'n/a', dashboardFilters.positions.averageCost) &&
     matchesFilterValue(position.market_price ?? 'n/a', dashboardFilters.positions.marketPrice) &&
     matchesFilterValue(position.market_value ?? 'n/a', dashboardFilters.positions.marketValue) &&
-    matchesFilterValue(position.unrealized_pnl ?? 'n/a', dashboardFilters.positions.unrealizedPnl)
+    matchesFilterValue(position.unrealized_pnl ?? 'n/a', dashboardFilters.positions.unrealizedPnl) &&
+    matchesFilterValue(positionExitPlanSearchText(position, executionInstructions), dashboardFilters.positions.exitPlan)
   );
 
   $: filteredOpenOrders = openOrders.filter((order) =>
@@ -981,10 +1284,11 @@
   );
 
   $: aggregatedReconciliation = groupReconciliationRuns(reconciliationRuns);
-  $: filteredReconciliation = aggregatedReconciliation;
+  $: filteredReconciliation = aggregatedReconciliation.slice(0, RECONCILIATION_GROUP_DISPLAY_LIMIT);
   $: visibleReconciliationIssueIds = uniqueIds(
     filteredReconciliation.flatMap((group) => group.issueIds)
   );
+  $: stateSync = buildStateSyncSummary();
 </script>
 
 <svelte:head>
@@ -1109,7 +1413,7 @@
     <article class="stat-card">
       <span>RL Candidates</span>
       <strong>{rlCandidateInstructions.length}</strong>
-      <small>Names waiting for bar-by-bar model decisions</small>
+      <small>Daily source names retained for bar-by-bar RL decisions</small>
     </article>
 
     <article class="stat-card">
@@ -1130,6 +1434,40 @@
       <small>Recent runs with issues</small>
     </article>
   </section>
+
+  {#if stateSync}
+    <section class={`panel sync-panel ${stateSync.className === 'bad' ? 'danger' : ''}`} id="state-sync">
+      <div class="panel-head">
+        <div>
+          <h2>State Sync</h2>
+          <p>Shows which source each dashboard section came from and whether the broker snapshot agrees with the persisted ledger rows.</p>
+        </div>
+        <span class={`pill ${stateSync.className}`}>{stateSync.label}</span>
+      </div>
+
+      <div class="sync-grid">
+        {#each stateSync.items as item}
+          <div class="sync-item">
+            <div class="sync-item-head">
+              <strong>{item.label}</strong>
+              <span class={`status-dot ${item.className}`}></span>
+            </div>
+            <span>{item.countLabel}</span>
+            <small>{item.source}</small>
+            <small>{item.at ? `${formatAge(item.at)} · ${formatTimestamp(item.at)}` : 'No timestamp available'}</small>
+          </div>
+        {/each}
+      </div>
+
+      {#if stateSync.warnings.length > 0}
+        <ul class="sync-warning-list">
+          {#each stateSync.warnings as warning}
+            <li class={warning.className}>{warning.text}</li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+  {/if}
 
   {#if endpointErrors.length > 0}
     <section class="panel danger">
@@ -1475,21 +1813,22 @@
           <p>Active reconciliation warnings grouped across recent runs so repeated issues collapse cleanly.</p>
         </div>
         <div class="panel-tools">
-          <span class="subtle">{filteredReconciliation.length} active groups</span>
+          <span class="subtle">
+            {filteredReconciliation.length} of {aggregatedReconciliation.length} active groups
+          </span>
           <form
             method="POST"
-            action="?/acknowledgeVisibleReconciliation"
+            action="?/archiveAllReconciliation"
             class="inline-action-form"
-            use:enhance={enhanceDashboardAction('clear-visible-reconciliation')}
+            use:enhance={enhanceDashboardAction('archive-all-reconciliation')}
           >
-            <input type="hidden" name="issue_ids" value={visibleReconciliationIssueIds.join(',')} />
             <button
-              class={`inline-button neutral ${buttonStateClass('clear-visible-reconciliation')}`}
+              class={`inline-button neutral ${buttonStateClass('archive-all-reconciliation')}`}
               type="submit"
-              data-action-key="clear-visible-reconciliation"
-              disabled={buttonIsBusy('clear-visible-reconciliation') || visibleReconciliationIssueIds.length === 0}
+              data-action-key="archive-all-reconciliation"
+              disabled={buttonIsBusy('archive-all-reconciliation') || aggregatedReconciliation.length === 0}
             >
-              {buttonLabel('clear-visible-reconciliation', 'Archive Visible')}
+              {buttonLabel('archive-all-reconciliation', 'Archive All')}
             </button>
           </form>
         </div>
@@ -1596,6 +1935,7 @@
               <th>Market Price</th>
               <th>Market Value</th>
               <th>Unrealized PnL</th>
+              <th>Exit Plan</th>
             </tr>
             <tr class="filter-row">
               <th><input bind:value={dashboardFilters.positions.account} placeholder="Filter" /></th>
@@ -1607,10 +1947,12 @@
               <th><input bind:value={dashboardFilters.positions.marketPrice} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.positions.marketValue} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.positions.unrealizedPnl} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.positions.exitPlan} placeholder="Filter" /></th>
             </tr>
           </thead>
           <tbody>
             {#each filteredPositions as position}
+              {@const exitPlan = positionExitPlan(position, executionInstructions)}
               <tr>
                 <td>
                   {position.account_label ?? position.account_key}
@@ -1624,6 +1966,13 @@
                 <td>{position.market_price ?? 'n/a'}</td>
                 <td>{position.market_value ?? 'n/a'}</td>
                 <td>{position.unrealized_pnl ?? 'n/a'}</td>
+                <td>
+                  <span class={`pill ${exitPlan.className}`}>{exitPlan.label}</span>
+                  <small class="row-detail">{exitPlan.detail}</small>
+                  {#if exitPlan.instructionId}
+                    <small class="row-detail mono">{exitPlan.instructionId}</small>
+                  {/if}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -1673,7 +2022,7 @@
               <th>Stop</th>
               <th>Vs Fill</th>
               <th>Market</th>
-              <th>Vs Mkt</th>
+              <th>Trigger Gap</th>
               <th>Status</th>
               <th>Warning</th>
               <th>Action</th>
@@ -1741,7 +2090,12 @@
                     <span class="subtle">n/a</span>
                   {/if}
                 </td>
-                <td>{orderSpreadLabel(order)}</td>
+                <td>
+                  <div>{orderSpreadLabel(order)}</div>
+                  {#if orderTriggerDetail(order)}
+                    <small class="row-detail">{orderTriggerDetail(order)}</small>
+                  {/if}
+                </td>
                 <td>{order.status}</td>
                 <td>{order.reject_reason ?? order.warning_text ?? 'n/a'}</td>
                 <td>
@@ -1842,14 +2196,14 @@
     <div class="panel-head">
       <div>
         <h2>RL Candidate Feed</h2>
-        <p>Names queued for stream bars, model decisions, and later action translation.</p>
+        <p>Daily source names whose model decision window is still scheduled or open.</p>
       </div>
       <div class="panel-tools">
-        <span class="subtle">{rlCandidateInstructions.length} active</span>
+        <span class="subtle">{rlCandidateInstructions.length} active source rows</span>
       </div>
     </div>
     {#if rlCandidateInstructions.length === 0}
-      <p class="empty">No RL candidates are currently waiting for model decisions.</p>
+      <p class="empty">No active model-routed RL candidates are currently loaded.</p>
     {:else}
       <div class="table-wrap">
         <table>
@@ -1861,7 +2215,7 @@
               <th>Account / Book</th>
               <th>Side</th>
               <th>Window</th>
-              <th>Updated</th>
+              <th>Queued</th>
             </tr>
           </thead>
           <tbody>
@@ -2014,6 +2368,8 @@
     --ok: #0e7a49;
     --warn: #b36a11;
     --bad: #b43333;
+    --account-line: #1769aa;
+    --benchmark-line: #c06a00;
     --danger-bg: rgba(180, 51, 51, 0.08);
     --danger-border: rgba(180, 51, 51, 0.24);
     --table-row-hover: rgba(29, 34, 40, 0.03);
@@ -2036,6 +2392,8 @@
       --ok: #59d58f;
       --warn: #f0b04f;
       --bad: #ff8c8c;
+      --account-line: #76b7ff;
+      --benchmark-line: #f5a623;
       --danger-bg: rgba(255, 140, 140, 0.08);
       --danger-border: rgba(255, 140, 140, 0.22);
       --table-row-hover: rgba(179, 194, 204, 0.06);
@@ -2052,8 +2410,8 @@
   }
 
   .page {
-    max-width: 1380px;
-    margin: 0 auto;
+    width: 100%;
+    box-sizing: border-box;
     padding: 2rem 1.25rem 4rem;
   }
 
@@ -2177,7 +2535,8 @@
   }
 
   .stat-card small,
-  .subtle {
+  .subtle,
+  .neutral {
     color: var(--text-muted);
   }
 
@@ -2191,6 +2550,81 @@
 
   .bad {
     color: var(--bad);
+  }
+
+  .sync-panel {
+    border-color: var(--border-strong);
+  }
+
+  .sync-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 0.85rem;
+    overflow: hidden;
+    background: var(--surface-strong);
+  }
+
+  .sync-item {
+    min-height: 7.25rem;
+    display: grid;
+    align-content: start;
+    gap: 0.28rem;
+    padding: 0.85rem;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sync-item-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .sync-item span,
+  .sync-item small {
+    color: var(--text-muted);
+  }
+
+  .status-dot {
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 999px;
+    background: var(--text-muted);
+    flex: 0 0 auto;
+  }
+
+  .status-dot.ok {
+    background: var(--ok);
+  }
+
+  .status-dot.warn {
+    background: var(--warn);
+  }
+
+  .status-dot.bad {
+    background: var(--bad);
+  }
+
+  .sync-warning-list {
+    list-style: none;
+    margin: 0.85rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.45rem;
+  }
+
+  .sync-warning-list li {
+    border-left: 0.25rem solid var(--warn);
+    padding: 0.5rem 0.65rem;
+    background: var(--surface-strong);
+    color: var(--text-secondary);
+  }
+
+  .sync-warning-list li.bad {
+    border-left-color: var(--bad);
   }
 
   .panel {
@@ -2312,11 +2746,12 @@
   }
 
   .account-line {
-    stroke: var(--accent);
+    stroke: var(--account-line);
   }
 
   .benchmark-line {
-    stroke: var(--warn);
+    stroke: var(--benchmark-line);
+    stroke-dasharray: 5 4;
   }
 
   .chart-legend {
@@ -2340,11 +2775,11 @@
   }
 
   .account-dot {
-    background: var(--accent);
+    background: var(--account-line);
   }
 
   .benchmark-dot {
-    background: var(--warn);
+    background: var(--benchmark-line);
   }
 
   .chart-empty {

@@ -209,9 +209,11 @@ Minimal account fragment:
 }
 ```
 
-Virtual execution currently ignores requested quantity and fills `quantity="1"`
-when the virtual market-watch price crosses the order condition. Each virtual
-fill uses a fixed commission of `49 SEK`.
+Virtual execution uses the same sizing fields as normal execution. A
+`target_quantity` must be whole shares. A `target_notional` is converted into a
+whole-share quantity by dividing by the entry limit price, or by the current
+virtual market price for market orders, and rounding down. Each virtual fill
+uses a fixed commission of `49 SEK`.
 
 See [Virtual Trading](virtual-trading.md) for the full API contract and smoke
 test sequence.
@@ -253,8 +255,7 @@ Example instruction:
   },
   "sizing": {
     "mode": "target_notional",
-    "target_notional": "1000",
-    "funding_basis": "cash"
+    "target_notional": "6666"
   },
   "execution": {
     "mode": "model_routed",
@@ -290,6 +291,146 @@ For RL candidates, `trace.metadata.static_features` is the preferred per-name
 static feature vector. `feature_names` must be in the exact order expected by
 the promoted model's `static_feature_cols.csv`, `values` must be finite numbers,
 and `normalized` must be `true`.
+
+### RL Sizing And Capital Allocation
+
+RL bucket-booster sizing is side-exposure based. Long and short candidates may
+share the same broker account, but they have separate book-level exposure
+budgets and one shared account-level margin guard.
+
+For the current API, every model-routed candidate still carries the final
+per-name execution exposure as `sizing.mode="target_notional"`. The sizing
+policy and shared guard are also persisted under `trace.metadata.capital_plan`
+so the runner, dashboard, and audit path can explain how that per-name amount
+was produced.
+
+Long bucket example:
+
+```json
+{
+  "strategy_key": "bucket_booster_long",
+  "sizing_policy": {
+    "capital_base": "net_liquidation_value",
+    "book_allocation_pct": "0.90",
+    "per_name_method": "equal_weight",
+    "max_book_gross_account_pct": "0.90",
+    "min_order_notional": "1000",
+    "rounding": "whole_shares_down"
+  }
+}
+```
+
+Short bucket example:
+
+```json
+{
+  "strategy_key": "bucket_booster_short",
+  "sizing_policy": {
+    "capital_base": "net_liquidation_value",
+    "book_allocation_pct": "0.80",
+    "per_name_method": "equal_weight",
+    "max_book_gross_account_pct": "0.80",
+    "min_order_notional": "1000",
+    "rounding": "whole_shares_down",
+    "require_shortable": true,
+    "require_borrow_rate_available": true
+  }
+}
+```
+
+Shared account guard:
+
+```json
+{
+  "account_key": "VIRTUALRL01",
+  "allocation_guard": {
+    "capital_base": "net_liquidation_value",
+    "max_long_gross_account_pct": "0.90",
+    "max_short_gross_account_pct": "0.80",
+    "max_total_gross_account_pct": "1.70",
+    "max_abs_net_exposure_account_pct": "0.25",
+    "min_excess_liquidity_buffer_pct": "0.20",
+    "block_if_margin_preflight_fails": true,
+    "block_if_projected_maintenance_margin_exceeded": true
+  }
+}
+```
+
+Concrete per-candidate payload shape:
+
+```json
+{
+  "sizing": {
+    "mode": "target_notional",
+    "target_notional": "6000"
+  },
+  "trace": {
+    "metadata": {
+      "capital_plan": {
+        "schema_version": "rl_capital_plan_v2",
+        "allocation_method": "account_pct_gross_exposure_equal_weight",
+        "account_key": "VIRTUALRL01",
+        "account_currency": "SEK",
+        "account_equity_reference": "100000",
+        "capital_base": "net_liquidation_value",
+        "strategy_key": "bucket_booster_long",
+        "strategy_side": "LONG",
+        "book_allocation_pct": "0.90",
+        "max_book_gross_account_pct": "0.90",
+        "strategy_gross_budget": "90000",
+        "candidate_count": 15,
+        "per_name_target_notional": "6000",
+        "min_order_notional": "1000",
+        "rounding": "whole_shares_down",
+        "require_shortable": false,
+        "require_borrow_rate_available": false,
+        "short_sale_proceeds_reinvested": false,
+        "allocation_guard": {
+          "schema_version": "rl_allocation_guard_v1",
+          "account_key": "VIRTUALRL01",
+          "capital_base": "net_liquidation_value",
+          "max_long_gross_account_pct": "0.90",
+          "max_short_gross_account_pct": "0.80",
+          "max_total_gross_account_pct": "1.70",
+          "max_abs_net_exposure_account_pct": "0.25",
+          "min_excess_liquidity_buffer_pct": "0.20",
+          "block_if_margin_preflight_fails": true,
+          "block_if_projected_maintenance_margin_exceeded": true
+        }
+      }
+    }
+  }
+}
+```
+
+Payload-maker rule for each morning batch:
+
+- read the trader API account snapshot and use `net_liquidation_value` as the
+  capital base
+- choose one book allocation for the long strategy and one for the short
+  strategy
+- long `book_allocation_pct` means long gross exposure as a percentage of NLV
+- short `book_allocation_pct` means short gross exposure as a percentage of
+  NLV, not cash spent
+- divide each strategy's gross exposure budget by that strategy's actual
+  candidate count for the day
+- write the resulting amount into each candidate's `sizing.target_notional`
+- cap the amount by deployment risk limits such as `max_notional_per_name_sek`
+- omit or mark candidates whose notional would round below one share or below
+  `min_order_notional`
+
+Example with `100000 SEK` NLV:
+
+- long allocation `0.90` gives `90000 SEK` long gross exposure
+- short allocation `0.80` gives `80000 SEK` short gross exposure
+- 15 long candidates get `6000 SEK` per candidate
+- 20 short candidates get `4000 SEK` short exposure per candidate
+- total gross may reach `170000 SEK` only if both sides fill
+
+Short candidates are gross exposure allocations. Do not add expected short-sale
+proceeds back into account cash, long buying power, or the next candidate's
+budget. Shorts still consume margin capacity, require shortability/borrow
+checks, and must pass the shared account margin guard before live submission.
 
 `GET /v1/rl/candidates` is the preferred RL-agent view. `GET /v1/instructions`
 and `GET /v1/instructions/{instruction_id}` still include the persisted payload
@@ -382,7 +523,11 @@ Not allowed:
 - multiple sizing targets in the same instruction
 - account-level and book-level sizing targets that disagree
 
-If the portfolio construction layer needs richer intermediate math, keep that upstream and emit one final execution sizing decision.
+For model-routed RL candidates, `trace.metadata.capital_plan` may explain the
+book-level allocation math, but `sizing.target_notional` is still the resolved
+per-name exposure the runner will copy into any generated execution
+instruction. If the portfolio construction layer needs richer intermediate
+math, keep that upstream and emit one final execution sizing decision.
 
 ## Currency semantics
 

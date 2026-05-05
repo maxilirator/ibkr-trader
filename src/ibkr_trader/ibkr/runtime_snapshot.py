@@ -4,6 +4,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
@@ -237,7 +238,7 @@ def _build_runtime_execution_filter(config: IbkrConnectionConfig) -> Any:
     try:
         from ibapi.execution import ExecutionFilter
     except ModuleNotFoundError:
-        return None
+        ExecutionFilter = SimpleNamespace
 
     execution_filter = ExecutionFilter()
     configured_account_ids = _configured_snapshot_account_ids(config)

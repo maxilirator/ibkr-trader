@@ -384,8 +384,8 @@ class OrderExecutionTests(TestCase):
                     {
                         "errorCode": 399,
                         "errorString": (
-                            "Order Message: BUY 10 AAPL Warning: Your order will not be placed "
-                            "at the exchange until 2026-04-11 09:30:00 US/Eastern."
+                            "Order Message: BUY 10 AAPL Warning: Price is outside "
+                            "the current NBBO."
                         ),
                     }
                 ]
@@ -404,6 +404,54 @@ class OrderExecutionTests(TestCase):
 
         self.assertEqual(result["broker_order_status"]["status"], "Submitted")
         self.assertIn("IBKR order warning [399]", " ".join(result["warnings"]))
+
+    def test_submit_order_from_batch_cancels_deferred_next_session_warning(self) -> None:
+        class _DeferredWarningWrapper(_FakeOrderExecutionSyncWrapper):
+            cancelled_order_ids: list[int] = []
+
+            def place_order_sync(
+                self,
+                contract: object,
+                order: object,
+                timeout: int | None = None,
+            ) -> dict[str, object]:
+                result = super().place_order_sync(contract, order, timeout)
+                self.errors[int(result["orderId"])] = [
+                    {
+                        "errorCode": 399,
+                        "errorString": (
+                            "Order Message: BUY 10 AAPL Warning: Your order will not be placed "
+                            "at the exchange until 2026-04-13 09:30:00 US/Eastern."
+                        ),
+                    }
+                ]
+                return result
+
+            def cancel_order_sync(
+                self,
+                order_id: int,
+                orderCancel: object | None = None,
+                timeout: int = 3,
+            ) -> dict[str, object]:
+                self.cancelled_order_ids.append(order_id)
+                return super().cancel_order_sync(order_id, orderCancel, timeout)
+
+        batch = parse_execution_batch_payload(_base_payload())
+
+        with self.assertRaisesRegex(
+            LookupError,
+            "deferred exchange activation beyond the entry trade date",
+        ):
+            submit_order_from_batch(
+                self.config,
+                batch,
+                sync_wrapper_cls=_DeferredWarningWrapper,
+                response_timeout_cls=TimeoutError,
+                contract_cls=_FakeContract,
+                order_cls=_FakeOrder,
+            )
+
+        self.assertEqual(_DeferredWarningWrapper.cancelled_order_ids, [17])
 
     def test_submit_order_from_batch_blocks_long_fraction_sizing_without_cash(self) -> None:
         class _NoCashWrapper(_FakeOrderExecutionSyncWrapper):

@@ -4,6 +4,8 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
+from decimal import Decimal
+from decimal import InvalidOperation
 from threading import Event
 from threading import Lock
 from threading import RLock
@@ -41,6 +43,21 @@ def _serialize_for_json(payload: Any) -> Any:
     if isinstance(payload, dict):
         return {key: _serialize_for_json(value) for key, value in payload.items()}
     return payload
+
+
+def _is_non_zero_decimal(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        return Decimal(str(value)) != 0
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _snapshot_position_count(snapshot: BrokerRuntimeSnapshot) -> int:
+    if snapshot.positions:
+        return len(snapshot.positions)
+    return sum(1 for item in snapshot.portfolio if _is_non_zero_decimal(item.position))
 
 
 @dataclass(slots=True)
@@ -330,7 +347,7 @@ class BrokerMonitorService:
             self._status.snapshot_refresh.captured_at = attempted_at
             self._status.snapshot_refresh.account_count = len(snapshot.account_values)
             self._status.snapshot_refresh.portfolio_count = len(snapshot.portfolio)
-            self._status.snapshot_refresh.position_count = len(snapshot.positions)
+            self._status.snapshot_refresh.position_count = _snapshot_position_count(snapshot)
             self._status.snapshot_refresh.open_order_count = len(snapshot.open_orders)
             self._status.snapshot_refresh.execution_count = len(snapshot.executions)
             self._status.snapshot_refresh.error = None

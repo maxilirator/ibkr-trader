@@ -31,6 +31,11 @@ from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 _ORDER_CANCEL_NOT_FOUND_CODE = 10147
 _NON_FATAL_ORDER_WARNING_CODES = {399}
+_DEFERRED_EXCHANGE_WARNING_RE = re.compile(
+    r"will\s+not\s+be\s+placed\s+at\s+the\s+exchange\s+until\s+"
+    r"(?P<date>\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
 
 
 @runtime_checkable
@@ -261,6 +266,33 @@ def _require_single_instruction(batch: ExecutionInstructionBatch) -> ExecutionIn
     if len(batch.instructions) != 1:
         raise ValueError("Paper order submit currently supports exactly one instruction.")
     return batch.instructions[0]
+
+
+def _is_unacceptable_deferred_entry_warning(
+    warning_text: str,
+    instruction: ExecutionInstruction,
+) -> bool:
+    match = _DEFERRED_EXCHANGE_WARNING_RE.search(warning_text)
+    if match is None:
+        return False
+    warning_date = match.group("date")
+    entry_date = instruction.entry.submit_at.date().isoformat()
+    return warning_date != entry_date
+
+
+def _cancel_after_unacceptable_entry_warning(
+    app: OrderExecutionSyncWrapperProtocol,
+    *,
+    order_status: dict[str, Any],
+    timeout: int,
+) -> None:
+    order_id = order_status.get("orderId")
+    if order_id in (None, ""):
+        return
+    app.cancel_order_sync(
+        int(order_id),
+        timeout=max(1, min(timeout, 5)),
+    )
 
 
 def _normalize_quantity_for_stock(
@@ -747,6 +779,28 @@ def submit_order_from_instruction(
                 error_code = immediate_error.get("errorCode")
                 error_string = immediate_error.get("errorString") or "Unknown broker error."
                 if error_code in _NON_FATAL_ORDER_WARNING_CODES:
+                    if _is_unacceptable_deferred_entry_warning(
+                        error_string,
+                        instruction,
+                    ):
+                        try:
+                            _cancel_after_unacceptable_entry_warning(
+                                runtime_app,
+                                order_status=order_status,
+                                timeout=timeout,
+                            )
+                        except Exception as cancel_exc:
+                            raise LookupError(
+                                "IBKR accepted the order but deferred exchange "
+                                "activation beyond the entry trade date, and the "
+                                f"automatic cancel failed: {cancel_exc}; "
+                                f"original warning [{error_code}]: {error_string}"
+                            ) from cancel_exc
+                        raise LookupError(
+                            "IBKR accepted the order but deferred exchange activation "
+                            "beyond the entry trade date; the order was cancelled. "
+                            f"Original warning [{error_code}]: {error_string}"
+                        )
                     broker_warnings.append(
                         f"IBKR order warning [{error_code}]: {error_string}"
                     )

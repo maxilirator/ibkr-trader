@@ -90,6 +90,11 @@ enter exponential cooldown after connection failures, the monitor skips snapshot
 refreshes when the heartbeat is already down, and the background execution
 runtime retries after a broker exception instead of silently dying.
 
+If the Gateway JVM stays alive but the API socket stops completing the
+`nextValidId` handshake, systemd will not see a process failure. Use the
+watchdog below to restart Gateway automatically after repeated failed broker
+probes.
+
 See [docs/client-id-policy.md](/home/mattias/dev/ibkr-trader/docs/client-id-policy.md) for the canonical policy.
 
 ## Session-bound Gateway service
@@ -190,6 +195,59 @@ journalctl -u ibgateway-ibc.service -n 200 --no-pager
 
 This is the recommended path on `quant.geisler.se` if `systemctl --user` is not
 reliably available.
+
+### Automatic API-deadlock recovery
+
+The failure mode to recover is:
+
+- IB Gateway is visibly open
+- port `4002` accepts TCP connections
+- the trader API is alive
+- `POST /v1/ibkr/probe` fails repeatedly because Gateway does not return
+  `nextValidId`
+
+That means the Gateway API server is wedged even though systemd still sees the
+Java process as running. Install the root-owned watchdog timer:
+
+```bash
+install -m 0755 /home/mattias/ibkr-trader/ops/scripts/ibgateway_api_watchdog.sh \
+  /usr/local/sbin/ibgateway_api_watchdog.sh
+cp /home/mattias/ibkr-trader/ops/systemd/ibgateway-api-watchdog.service \
+  /etc/systemd/system/
+cp /home/mattias/ibkr-trader/ops/systemd/ibgateway-api-watchdog.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ibgateway-api-watchdog.timer
+```
+
+The watchdog is intentionally conservative:
+
+- it first verifies the trader API health endpoint is reachable
+- it uses the same official probe endpoint the dashboard trusts
+- it restarts `ibgateway-ibc.service` only after three consecutive probe
+  failures
+- it writes recent Gateway log context to
+  `/run/ibgateway-api-watchdog.last-journal`
+- it resets its failure counter after a successful probe or restart
+
+Tune the timer or threshold by editing
+`/etc/systemd/system/ibgateway-api-watchdog.service`:
+
+```ini
+Environment=TRADER_API_BASE_URL=http://127.0.0.1:8000
+Environment=GATEWAY_SERVICE=ibgateway-ibc.service
+Environment=FAILURE_THRESHOLD=3
+Environment=CURL_TIMEOUT_SECONDS=20
+```
+
+Useful checks:
+
+```bash
+systemctl list-timers ibgateway-api-watchdog.timer
+systemctl status ibgateway-api-watchdog.service --no-pager
+journalctl -u ibgateway-api-watchdog.service -n 100 --no-pager
+cat /run/ibgateway-api-watchdog.last-journal
+```
 
 ### Operational notes
 

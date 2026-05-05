@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the IB Gateway API watchdog periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=ibgateway-api-watchdog.service
+
+[Install]
+WantedBy=timers.target

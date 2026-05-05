@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -23,6 +24,7 @@ from typing import Any
 from typing import Callable
 
 from sqlalchemy import and_
+from sqlalchemy import func
 from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -64,6 +66,7 @@ from ibkr_trader.orchestration.operator_controls import read_kill_switch_state
 from ibkr_trader.orchestration.scheduling import (
     NextSessionExitStatus,
     build_instruction_runtime_schedule,
+    resolve_effective_entry_expire_at_for_schedule,
     resolve_scheduled_submission_due_at,
 )
 from ibkr_trader.orchestration.runtime_service_state import (
@@ -87,6 +90,7 @@ from ibkr_trader.virtual.execution import submit_virtual_exit_order
 
 DEFAULT_BROKER_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 DEFAULT_SUBMISSION_LEAD_TIME = timedelta(seconds=60)
+PROTECTIVE_EXIT_RETRY_COOLDOWN = timedelta(minutes=15)
 _CLOSED_BROKER_ORDER_STATUSES = {
     "API_CANCELLED",
     "CANCELLED",
@@ -256,6 +260,435 @@ def _record_runtime_note(
                 note=note,
             )
         )
+
+
+def _protective_exit_oca_group(instruction_id: str) -> str:
+    digest = hashlib.blake2s(
+        instruction_id.encode("utf-8"),
+        digest_size=8,
+    ).hexdigest().upper()
+    return f"OCA{digest}"
+
+
+def _build_protective_exit_specs(
+    *,
+    instruction_id: str,
+    instruction: ExecutionInstruction,
+    entry_average_price: Decimal | None,
+) -> list[dict[str, Any]]:
+    if (
+        instruction.exit.take_profit_pct is not None
+        or instruction.exit.stop_loss_pct is not None
+        or instruction.exit.catastrophic_stop_loss_pct is not None
+    ) and entry_average_price is None:
+        raise ValueError(
+            f"Instruction '{instruction_id}' has fills but no average fill price."
+        )
+
+    protective_exits: list[dict[str, Any]] = []
+    if instruction.exit.stop_loss_pct is not None:
+        protective_exits.append(
+            {
+                "event_type": "stop_loss_exit_submitted",
+                "action": "stop_loss_exit_submitted",
+                "order_ref": f"{instruction_id}:exit:stop_loss",
+                "order_type": "STOP",
+                "limit_price": None,
+                "stop_price": _compute_stop_price(
+                    instruction,
+                    entry_average_price,
+                    stop_loss_pct=instruction.exit.stop_loss_pct,
+                ),
+                "note": "Submitted stop-loss exit order after entry fill.",
+                "protective_role": "stop_loss",
+            }
+        )
+
+    if instruction.exit.catastrophic_stop_loss_pct is not None:
+        protective_exits.append(
+            {
+                "event_type": "catastrophic_stop_exit_submitted",
+                "action": "catastrophic_stop_exit_submitted",
+                "order_ref": f"{instruction_id}:exit:catastrophic_stop",
+                "order_type": "STOP",
+                "limit_price": None,
+                "stop_price": _compute_stop_price(
+                    instruction,
+                    entry_average_price,
+                    stop_loss_pct=instruction.exit.catastrophic_stop_loss_pct,
+                ),
+                "note": "Submitted catastrophic stop-loss exit order after entry fill.",
+                "protective_role": "catastrophic_stop",
+            }
+        )
+
+    if instruction.exit.take_profit_pct is not None:
+        protective_exits.append(
+            {
+                "event_type": "take_profit_exit_submitted",
+                "action": "take_profit_exit_submitted",
+                "order_ref": f"{instruction_id}:exit:take_profit",
+                "order_type": OrderType.LIMIT,
+                "limit_price": _compute_take_profit_price(
+                    instruction,
+                    entry_average_price,
+                ),
+                "stop_price": None,
+                "note": "Submitted take-profit exit order after entry fill.",
+                "protective_role": "take_profit",
+            }
+        )
+
+    return protective_exits
+
+
+def _runtime_exit_submitter(
+    session_factory: sessionmaker[Session],
+    instruction: ExecutionInstruction,
+    exit_submitter: Callable[..., dict[str, Any]] | None,
+) -> Callable[..., dict[str, Any]]:
+    if exit_submitter is not None:
+        return exit_submitter
+    if is_virtual_account_key(instruction.account.account_key):
+        def _submit_virtual_exit(
+            broker_config: IbkrConnectionConfig,
+            runtime_instruction: ExecutionInstruction,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            return submit_virtual_exit_order(
+                session_factory,
+                broker_config,
+                runtime_instruction,
+                **kwargs,
+            )
+
+        return _submit_virtual_exit
+    return submit_exit_order_from_instruction
+
+
+def _record_protective_exit_submit_failed(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    error: Exception,
+    exit_spec: dict[str, Any],
+    oca_group: str | None,
+    oca_type: int | None,
+    fallback_without_oca: bool = False,
+) -> None:
+    _record_runtime_note(
+        session_factory,
+        instruction_id=instruction_id,
+        event_type="protective_exit_submit_failed",
+        note=(
+            "Entry fill was reconciled, but the protective exit order "
+            "could not be submitted."
+        ),
+        payload={
+            "error": str(error),
+            "fallback_without_oca": fallback_without_oca,
+            "exit_spec": {
+                "order_ref": exit_spec["order_ref"],
+                "order_type": exit_spec["order_type"],
+                "limit_price": exit_spec["limit_price"],
+                "stop_price": exit_spec["stop_price"],
+                "oca_group": oca_group,
+                "oca_type": oca_type,
+            },
+        },
+    )
+
+
+def _persist_protective_exit_submission(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    entry_quantity: Decimal,
+    exit_spec: dict[str, Any],
+    broker_submission: dict[str, Any],
+    broker_config: IbkrConnectionConfig,
+    fallback_without_oca: bool = False,
+) -> RuntimeCycleAction:
+    broker_status = broker_submission["broker_order_status"]
+    broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
+    fallback_account_key = (
+        str(broker_submission["account"])
+        if broker_submission.get("account") not in (None, "")
+        else broker_config.account_id
+    )
+    event_type = str(exit_spec["event_type"])
+    action = str(exit_spec["action"])
+    note = str(exit_spec["note"])
+    if fallback_without_oca:
+        event_type = f"{event_type}_without_oca_fallback"
+        action = f"{action}_without_oca_fallback"
+        note = f"{note} OCA grouping was rejected, so only this stop was submitted."
+
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one()
+        if record.exit_order_id is None:
+            record.exit_order_id = int(broker_status["orderId"])
+            record.exit_perm_id = int(broker_status["permId"])
+            record.exit_client_id = int(broker_status["clientId"])
+            record.exit_order_status = str(broker_status["status"])
+            record.exit_submitted_quantity = str(entry_quantity)
+
+        event_at = utc_now()
+        persist_broker_order_submission(
+            session,
+            broker_kind=broker_kind,
+            instruction_record=record,
+            broker_submission=broker_submission,
+            observed_at=event_at,
+            fallback_account_key=fallback_account_key,
+            order_role="EXIT",
+            event_type=event_type,
+            note=note,
+        )
+        state_before_exit = record.state
+        record.state = ExecutionState.EXIT_PENDING.value
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type=event_type,
+                source="runtime_cycle",
+                event_at=event_at,
+                state_before=state_before_exit,
+                state_after=record.state,
+                payload={"broker_submission": broker_submission},
+                note=note,
+            )
+        )
+    submitted_order = broker_submission.get("order", {})
+    submitted_oca_group = (
+        submitted_order.get("oca_group") if isinstance(submitted_order, dict) else None
+    )
+    return RuntimeCycleAction(
+        instruction_id=instruction_id,
+        action=action,
+        state=ExecutionState.EXIT_PENDING.value,
+        detail={
+            "broker_order_id": int(broker_status["orderId"]),
+            "broker_order_status": str(broker_status["status"]),
+            "exit_submitted_quantity": str(entry_quantity),
+            "limit_price": (
+                str(exit_spec["limit_price"])
+                if exit_spec["limit_price"] is not None
+                else None
+            ),
+            "stop_price": (
+                str(exit_spec["stop_price"])
+                if exit_spec["stop_price"] is not None
+                else None
+            ),
+            "oca_group": submitted_oca_group,
+            "fallback_without_oca": fallback_without_oca,
+        },
+    )
+
+
+def _submit_protective_exits(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    *,
+    instruction_id: str,
+    instruction: ExecutionInstruction,
+    entry_quantity: Decimal,
+    protective_exits: list[dict[str, Any]],
+    timeout: int,
+    exit_submitter: Callable[..., dict[str, Any]] | None,
+) -> tuple[RuntimeCycleAction, ...]:
+    if not protective_exits:
+        return ()
+
+    runtime_submitter = _runtime_exit_submitter(
+        session_factory,
+        instruction,
+        exit_submitter,
+    )
+    oca_group = (
+        _protective_exit_oca_group(instruction_id)
+        if len(protective_exits) > 1
+        else None
+    )
+    oca_type = 1 if oca_group is not None else None
+    submitted_exits: list[RuntimeCycleAction] = []
+
+    for exit_spec in protective_exits:
+        try:
+            broker_submission = runtime_submitter(
+                broker_config,
+                instruction,
+                quantity=entry_quantity,
+                order_type=exit_spec["order_type"],
+                limit_price=exit_spec["limit_price"],
+                stop_price=exit_spec["stop_price"],
+                order_ref=exit_spec["order_ref"],
+                oca_group=oca_group,
+                oca_type=oca_type,
+                timeout=timeout,
+            )
+        except Exception as exc:  # pragma: no cover - broker safety path
+            _record_protective_exit_submit_failed(
+                session_factory,
+                instruction_id=instruction_id,
+                error=exc,
+                exit_spec=exit_spec,
+                oca_group=oca_group,
+                oca_type=oca_type,
+            )
+            if exit_spec["stop_price"] is None or oca_group is None:
+                continue
+            try:
+                fallback_submission = runtime_submitter(
+                    broker_config,
+                    instruction,
+                    quantity=entry_quantity,
+                    order_type=exit_spec["order_type"],
+                    limit_price=exit_spec["limit_price"],
+                    stop_price=exit_spec["stop_price"],
+                    order_ref=exit_spec["order_ref"],
+                    oca_group=None,
+                    oca_type=None,
+                    timeout=timeout,
+                )
+            except Exception as fallback_exc:  # pragma: no cover - broker safety path
+                _record_protective_exit_submit_failed(
+                    session_factory,
+                    instruction_id=instruction_id,
+                    error=fallback_exc,
+                    exit_spec=exit_spec,
+                    oca_group=None,
+                    oca_type=None,
+                    fallback_without_oca=True,
+                )
+                continue
+
+            submitted_exits.append(
+                _persist_protective_exit_submission(
+                    session_factory,
+                    instruction_id=instruction_id,
+                    entry_quantity=entry_quantity,
+                    exit_spec=exit_spec,
+                    broker_submission=fallback_submission,
+                    broker_config=broker_config,
+                    fallback_without_oca=True,
+                )
+            )
+            break
+
+        submitted_exits.append(
+            _persist_protective_exit_submission(
+                session_factory,
+                instruction_id=instruction_id,
+                entry_quantity=entry_quantity,
+                exit_spec=exit_spec,
+                broker_submission=broker_submission,
+                broker_config=broker_config,
+            )
+        )
+
+    return tuple(submitted_exits)
+
+
+def _protective_exit_retry_on_cooldown(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    oca_group: str | None,
+    cycle_at: datetime,
+) -> bool:
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord.id).where(
+                InstructionRecord.instruction_id == instruction_id
+            )
+        ).scalar_one_or_none()
+        if record is None:
+            return False
+        events = list(
+            session.execute(
+                select(InstructionEventRecord)
+                .where(
+                    InstructionEventRecord.instruction_id == record,
+                    InstructionEventRecord.event_type == "protective_exit_submit_failed",
+                )
+                .order_by(InstructionEventRecord.event_at.desc())
+            ).scalars()
+        )
+
+    for event in events:
+        payload = event.payload or {}
+        exit_spec = payload.get("exit_spec")
+        if not isinstance(exit_spec, dict):
+            continue
+        if exit_spec.get("oca_group") != oca_group:
+            continue
+        event_at = _ensure_utc(event.event_at)
+        if event_at is None:
+            return True
+        return cycle_at.astimezone(timezone.utc) - event_at < PROTECTIVE_EXIT_RETRY_COOLDOWN
+    return False
+
+
+def _submit_missing_protective_exits(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    instruction_id: str,
+    *,
+    quantity: Decimal,
+    cycle_at: datetime,
+    timeout: int,
+    exit_submitter: Callable[..., dict[str, Any]] | None,
+) -> tuple[RuntimeCycleAction, ...]:
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one()
+        if record.state != ExecutionState.POSITION_OPEN.value:
+            return ()
+        instruction = _instruction_payload(record)
+        entry_average_price = _parse_decimal(record.entry_avg_fill_price)
+        if entry_average_price <= 0:
+            return ()
+        protective_exits = _build_protective_exit_specs(
+            instruction_id=instruction_id,
+            instruction=instruction,
+            entry_average_price=entry_average_price,
+        )
+
+    if not protective_exits:
+        return ()
+
+    oca_group = (
+        _protective_exit_oca_group(instruction_id)
+        if len(protective_exits) > 1
+        else None
+    )
+    if _protective_exit_retry_on_cooldown(
+        session_factory,
+        instruction_id=instruction_id,
+        oca_group=oca_group,
+        cycle_at=cycle_at,
+    ):
+        return ()
+
+    return _submit_protective_exits(
+        session_factory,
+        broker_config,
+        instruction_id=instruction_id,
+        instruction=instruction,
+        entry_quantity=quantity,
+        protective_exits=protective_exits,
+        timeout=timeout,
+        exit_submitter=exit_submitter,
+    )
 
 
 def _build_runtime_cycle_result(
@@ -455,6 +888,69 @@ def _fetch_instruction_ids(
         )
 
 
+def _fetch_instruction_account_keys(
+    session_factory: sessionmaker[Session],
+    instruction_ids: list[str],
+) -> dict[str, str]:
+    if not instruction_ids:
+        return {}
+    with session_scope(session_factory) as session:
+        rows = session.execute(
+            select(InstructionRecord.instruction_id, InstructionRecord.account_key).where(
+                InstructionRecord.instruction_id.in_(instruction_ids)
+            )
+        ).all()
+    return {instruction_id: account_key for instruction_id, account_key in rows}
+
+
+def _split_instruction_ids_by_virtual(
+    session_factory: sessionmaker[Session],
+    instruction_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    if not instruction_ids:
+        return [], []
+    with session_scope(session_factory) as session:
+        rows = session.execute(
+            select(InstructionRecord.instruction_id, InstructionRecord.is_virtual).where(
+                InstructionRecord.instruction_id.in_(instruction_ids)
+            )
+        ).all()
+    virtual_ids: list[str] = []
+    real_ids: list[str] = []
+    virtual_by_instruction = {
+        instruction_id: bool(is_virtual)
+        for instruction_id, is_virtual in rows
+    }
+    for instruction_id in instruction_ids:
+        if virtual_by_instruction.get(instruction_id):
+            virtual_ids.append(instruction_id)
+        else:
+            real_ids.append(instruction_id)
+    return virtual_ids, real_ids
+
+
+def _has_virtual_runtime_work(
+    session_factory: sessionmaker[Session],
+) -> bool:
+    with session_scope(session_factory) as session:
+        row = session.execute(
+            select(InstructionRecord.id)
+            .where(
+                InstructionRecord.is_virtual.is_(True),
+                InstructionRecord.state.in_(
+                    (
+                        ExecutionState.ENTRY_PENDING.value,
+                        ExecutionState.ENTRY_SUBMITTED.value,
+                        ExecutionState.POSITION_OPEN.value,
+                        ExecutionState.EXIT_PENDING.value,
+                    )
+                ),
+            )
+            .limit(1)
+        ).first()
+    return row is not None
+
+
 def _is_entry_submission_due(
     record: InstructionRecord,
     *,
@@ -523,13 +1019,26 @@ def _is_pending_entry_expired(
     *,
     instruction_id: str,
     cycle_at: datetime,
+    session_calendar_path: Path,
 ) -> bool:
     with session_scope(session_factory) as session:
-        expire_at = session.execute(
-            select(InstructionRecord.expire_at).where(
+        record = session.execute(
+            select(InstructionRecord).where(
                 InstructionRecord.instruction_id == instruction_id
             )
         ).scalar_one_or_none()
+    if record is None:
+        return False
+    try:
+        instruction = _instruction_payload(record)
+        expire_at = resolve_effective_entry_expire_at_for_schedule(
+            instruction,
+            submit_at=_ensure_utc(record.submit_at) or record.submit_at,
+            expire_at=_ensure_utc(record.expire_at) or record.expire_at,
+            session_calendar_path=session_calendar_path,
+        )
+    except Exception:
+        expire_at = record.expire_at
     normalized_expire_at = _ensure_utc(expire_at)
     if normalized_expire_at is None:
         return False
@@ -1063,7 +1572,12 @@ def _has_persisted_open_forced_exit_order(
                 BrokerOrderRecord.instruction_id == record.id,
                 BrokerOrderRecord.order_role == "EXIT",
                 BrokerOrderRecord.order_ref == f"{record.instruction_id}:exit:forced",
-                BrokerOrderRecord.status.not_in(_CLOSED_BROKER_ORDER_STATUSES),
+                or_(
+                    BrokerOrderRecord.status.is_(None),
+                    func.upper(BrokerOrderRecord.status).not_in(
+                        _CLOSED_BROKER_ORDER_STATUSES
+                    ),
+                ),
             )
         ).first()
     return forced_exit_order is not None
@@ -1241,174 +1755,29 @@ def _record_entry_fill_and_optional_exit(
             },
         )
 
-        protective_exits: list[dict[str, Any]] = []
-        if instruction.exit.take_profit_pct is not None:
-            if entry_fill.average_price is None:
-                raise ValueError(
-                    f"Instruction '{instruction_id}' has fills but no average fill price."
-                )
-            protective_exits.append(
-                {
-                    "event_type": "take_profit_exit_submitted",
-                    "action": "take_profit_exit_submitted",
-                    "order_ref": f"{instruction_id}:exit:take_profit",
-                    "order_type": OrderType.LIMIT,
-                    "limit_price": _compute_take_profit_price(
-                        instruction,
-                        entry_fill.average_price,
-                    ),
-                    "stop_price": None,
-                    "note": "Submitted take-profit exit order after entry fill.",
-                }
-            )
-
-        if instruction.exit.stop_loss_pct is not None:
-            if entry_fill.average_price is None:
-                raise ValueError(
-                    f"Instruction '{instruction_id}' has fills but no average fill price."
-                )
-            protective_exits.append(
-                {
-                    "event_type": "stop_loss_exit_submitted",
-                    "action": "stop_loss_exit_submitted",
-                    "order_ref": f"{instruction_id}:exit:stop_loss",
-                    "order_type": "STOP",
-                    "limit_price": None,
-                    "stop_price": _compute_stop_price(
-                        instruction,
-                        entry_fill.average_price,
-                        stop_loss_pct=instruction.exit.stop_loss_pct,
-                    ),
-                    "note": "Submitted stop-loss exit order after entry fill.",
-                }
-            )
-
-        if instruction.exit.catastrophic_stop_loss_pct is not None:
-            if entry_fill.average_price is None:
-                raise ValueError(
-                    f"Instruction '{instruction_id}' has fills but no average fill price."
-                )
-            protective_exits.append(
-                {
-                    "event_type": "catastrophic_stop_exit_submitted",
-                    "action": "catastrophic_stop_exit_submitted",
-                    "order_ref": f"{instruction_id}:exit:catastrophic_stop",
-                    "order_type": "STOP",
-                    "limit_price": None,
-                    "stop_price": _compute_stop_price(
-                        instruction,
-                        entry_fill.average_price,
-                        stop_loss_pct=instruction.exit.catastrophic_stop_loss_pct,
-                    ),
-                    "note": "Submitted catastrophic stop-loss exit order after entry fill.",
-                }
-            )
+        protective_exits = _build_protective_exit_specs(
+            instruction_id=instruction_id,
+            instruction=instruction,
+            entry_average_price=entry_fill.average_price,
+        )
 
         if not protective_exits:
             return entry_action, ()
 
-        runtime_exit_submitter = exit_submitter
-        if runtime_exit_submitter is None:
-            if is_virtual_account_key(instruction.account.account_key):
-                def _submit_virtual_exit(
-                    broker_config: IbkrConnectionConfig,
-                    runtime_instruction: ExecutionInstruction,
-                    **kwargs: Any,
-                ) -> dict[str, Any]:
-                    return submit_virtual_exit_order(
-                        session_factory,
-                        broker_config,
-                        runtime_instruction,
-                        **kwargs,
-                    )
-
-                runtime_exit_submitter = _submit_virtual_exit
-            else:
-                runtime_exit_submitter = submit_exit_order_from_instruction
-        oca_group = (
-            f"{instruction_id}:exit:oca"
-            if len(protective_exits) > 1
-            else None
+    submitted_exits = list(
+        _submit_protective_exits(
+            session_factory,
+            broker_config,
+            instruction_id=instruction_id,
+            instruction=instruction,
+            entry_quantity=entry_fill.quantity,
+            protective_exits=protective_exits,
+            timeout=timeout,
+            exit_submitter=exit_submitter,
         )
+    )
 
-        for index, exit_spec in enumerate(protective_exits):
-            broker_submission = runtime_exit_submitter(
-                broker_config,
-                instruction,
-                quantity=entry_fill.quantity,
-                order_type=exit_spec["order_type"],
-                limit_price=exit_spec["limit_price"],
-                stop_price=exit_spec["stop_price"],
-                order_ref=exit_spec["order_ref"],
-                oca_group=oca_group,
-                oca_type=1 if oca_group is not None else None,
-                timeout=timeout,
-            )
-            broker_status = broker_submission["broker_order_status"]
-            broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
-            fallback_account_key = (
-                str(broker_submission["account"])
-                if broker_submission.get("account") not in (None, "")
-                else broker_config.account_id
-            )
-            if index == 0:
-                record.exit_order_id = int(broker_status["orderId"])
-                record.exit_perm_id = int(broker_status["permId"])
-                record.exit_client_id = int(broker_status["clientId"])
-                record.exit_order_status = str(broker_status["status"])
-                record.exit_submitted_quantity = str(entry_fill.quantity)
-
-            event_at = utc_now()
-            persist_broker_order_submission(
-                session,
-                broker_kind=broker_kind,
-                instruction_record=record,
-                broker_submission=broker_submission,
-                observed_at=event_at,
-                fallback_account_key=fallback_account_key,
-                order_role="EXIT",
-                event_type=exit_spec["event_type"],
-                note=exit_spec["note"],
-            )
-            state_before_exit = record.state
-            record.state = ExecutionState.EXIT_PENDING.value
-            session.add(
-                InstructionEventRecord(
-                    instruction_id=record.id,
-                    event_type=exit_spec["event_type"],
-                    source="runtime_cycle",
-                    event_at=event_at,
-                    state_before=state_before_exit,
-                    state_after=record.state,
-                    payload={"broker_submission": broker_submission},
-                    note=exit_spec["note"],
-                )
-            )
-            submitted_exits.append(
-                RuntimeCycleAction(
-                    instruction_id=instruction_id,
-                    action=exit_spec["action"],
-                    state=record.state,
-                    detail={
-                        "broker_order_id": int(broker_status["orderId"]),
-                        "broker_order_status": str(broker_status["status"]),
-                        "exit_submitted_quantity": str(entry_fill.quantity),
-                        "limit_price": (
-                            str(exit_spec["limit_price"])
-                            if exit_spec["limit_price"] is not None
-                            else None
-                        ),
-                        "stop_price": (
-                            str(exit_spec["stop_price"])
-                            if exit_spec["stop_price"] is not None
-                            else None
-                        ),
-                        "oca_group": oca_group,
-                    },
-                )
-            )
-
-        return entry_action, tuple(submitted_exits)
+    return entry_action, tuple(submitted_exits)
 
 
 def _mark_unfilled_entry_cancelled(
@@ -1743,6 +2112,7 @@ def _submit_due_pending_entries(
     *,
     due_instruction_ids: list[str],
     cycle_started_at: datetime,
+    session_calendar_path: Path,
     timeout: int,
     kill_switch_enabled: bool,
     entry_submitter: Callable[..., Any] | None,
@@ -1769,9 +2139,10 @@ def _submit_due_pending_entries(
 
     for instruction_id in due_instruction_ids:
         if _is_pending_entry_expired(
-            session_factory,
-            instruction_id=instruction_id,
-            cycle_at=cycle_started_at,
+                session_factory,
+                instruction_id=instruction_id,
+                cycle_at=cycle_started_at,
+                session_calendar_path=session_calendar_path,
         ):
             cancelled_entries.append(
                 _mark_pending_entry_cancelled(
@@ -1854,6 +2225,7 @@ def run_runtime_cycle(
     broker_snapshot_fetcher: Callable[..., BrokerRuntimeSnapshot] | None = None,
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
+    virtual_market_sync: Callable[[datetime], Any] | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
     submission_lead_time: timedelta = DEFAULT_SUBMISSION_LEAD_TIME,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -1890,6 +2262,7 @@ def run_runtime_cycle(
     submitted_exits: list[RuntimeCycleAction] = []
     completed_instructions: list[RuntimeCycleAction] = []
     issues: list[RuntimeCycleIssue] = []
+    broker_snapshot_unavailable = False
 
     if broker_callback_fetcher is not None:
         try:
@@ -1923,6 +2296,17 @@ def run_runtime_cycle(
                 issues=issues,
             )
 
+    if virtual_market_sync is not None:
+        try:
+            virtual_market_sync(cycle_started_at)
+        except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+            _append_issue(
+                issues,
+                instruction_id=None,
+                stage="virtual_market_sync",
+                message=str(exc),
+            )
+
     kill_switch_state = read_kill_switch_state(session_factory)
     kill_switch_enabled = kill_switch_state.enabled
     due_instruction_ids = _fetch_due_entry_instruction_ids(
@@ -1951,6 +2335,7 @@ def run_runtime_cycle(
                 broker_config,
                 due_instruction_ids=due_instruction_ids,
                 cycle_started_at=cycle_started_at,
+                session_calendar_path=session_calendar_path,
                 timeout=timeout,
                 kill_switch_enabled=kill_switch_enabled,
                 entry_submitter=entry_submitter,
@@ -2003,6 +2388,7 @@ def run_runtime_cycle(
                 sleep_fn=sleep_fn,
             )
         except Exception as exc:  # pragma: no cover - broad by design for runtime safety
+            broker_snapshot_unavailable = True
             _append_issue(
                 issues,
                 instruction_id=None,
@@ -2023,22 +2409,12 @@ def run_runtime_cycle(
                         stage="broker_callbacks_post_cycle",
                         message=str(callback_exc),
                     )
-            return _finalize_runtime_cycle_result(
-                session_factory,
-                broker_config,
-                run_kind=run_kind,
-                runtime_timezone=runtime_timezone,
-                cycle_started_at=cycle_started_at,
-                submit_due_entries=submit_due_entries,
-                due_instruction_count=due_instruction_count,
-                active_instruction_count=active_instruction_count,
-                snapshot=snapshot,
-                submitted_entries=submitted_entries,
-                cancelled_entries=cancelled_entries,
-                filled_entries=filled_entries,
-                submitted_exits=submitted_exits,
-                completed_instructions=completed_instructions,
-                issues=issues,
+            snapshot = BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
             )
     else:
         snapshot = BrokerRuntimeSnapshot(
@@ -2117,10 +2493,13 @@ def run_runtime_cycle(
         order_role="ENTRY",
     )
     blocking_due_exit_instruction_ids: list[str] = []
+    blocking_due_exit_account_keys: set[str] = set()
 
     for instruction_id in active_instruction_ids:
         record = records_by_instruction_id.get(instruction_id)
         if record is None:
+            continue
+        if broker_snapshot_unavailable and not record.is_virtual:
             continue
 
         try:
@@ -2184,7 +2563,16 @@ def run_runtime_cycle(
                 sorted(set(exit_open_order_ids) | set(persisted_exit_open_order_ids))
             )
             exit_open = bool(combined_exit_open_order_ids)
-            expire_at = _ensure_utc(record.expire_at) or record.expire_at
+            try:
+                effective_expire_at = resolve_effective_entry_expire_at_for_schedule(
+                    instruction,
+                    submit_at=_ensure_utc(record.submit_at) or record.submit_at,
+                    expire_at=_ensure_utc(record.expire_at) or record.expire_at,
+                    session_calendar_path=session_calendar_path,
+                )
+            except Exception:
+                effective_expire_at = record.expire_at
+            expire_at = _ensure_utc(effective_expire_at) or effective_expire_at
 
             if record.state == ExecutionState.ENTRY_SUBMITTED.value:
                 if kill_switch_enabled:
@@ -2368,6 +2756,28 @@ def run_runtime_cycle(
                     continue
 
                 if (
+                    record.state == ExecutionState.POSITION_OPEN.value
+                    and remaining_quantity > 0
+                    and not exit_open
+                ):
+                    repaired_exits = _run_with_broker_retries(
+                        lambda: _submit_missing_protective_exits(
+                            session_factory,
+                            broker_config,
+                            instruction_id,
+                            quantity=remaining_quantity,
+                            cycle_at=cycle_started_at,
+                            timeout=timeout,
+                            exit_submitter=exit_submitter,
+                        ),
+                        retry_delays=broker_retry_delays,
+                        sleep_fn=sleep_fn,
+                    )
+                    if repaired_exits:
+                        submitted_exits.extend(repaired_exits)
+                        continue
+
+                if (
                     _is_delayed_limit_exit_due(
                         instruction,
                         cycle_at=cycle_started_at,
@@ -2440,6 +2850,7 @@ def run_runtime_cycle(
                     continue
 
                 blocking_due_exit_instruction_ids.append(instruction_id)
+                blocking_due_exit_account_keys.add(record.account_key)
                 if _has_persisted_open_forced_exit_order(
                     session_factory,
                     record=record,
@@ -2495,17 +2906,43 @@ def run_runtime_cycle(
     if submit_due_entries:
         # Active exit workflows take priority over fresh entries so we do not
         # size or submit new risk before urgent carry-over positions are handled.
-        if blocking_due_exit_instruction_ids and due_instruction_ids:
-            # This is expected sequencing, not a new runtime fault. Keep entries
-            # pending quietly while the carry-over exit is active; otherwise a
-            # due entry can flood the reconciliation log every runtime cycle.
-            pass
-        else:
+        # The gate is account-scoped: a virtual account cleanup issue must not
+        # prevent an unrelated live account from submitting its own due entry.
+        due_instruction_ids_to_submit = due_instruction_ids
+        if blocking_due_exit_account_keys and due_instruction_ids:
+            due_account_keys = _fetch_instruction_account_keys(
+                session_factory,
+                due_instruction_ids,
+            )
+            due_instruction_ids_to_submit = [
+                instruction_id
+                for instruction_id in due_instruction_ids
+                if due_account_keys.get(instruction_id) not in blocking_due_exit_account_keys
+            ]
+        if broker_snapshot_unavailable and due_instruction_ids_to_submit:
+            due_instruction_ids_to_submit, skipped_real_due_instruction_ids = (
+                _split_instruction_ids_by_virtual(
+                    session_factory,
+                    due_instruction_ids_to_submit,
+                )
+            )
+            if skipped_real_due_instruction_ids:
+                _append_issue(
+                    issues,
+                    instruction_id=None,
+                    stage="entry_submit",
+                    message=(
+                        "Skipped real broker due entries because the broker snapshot "
+                        "was unavailable; virtual due entries were still processed."
+                    ),
+                )
+        if due_instruction_ids_to_submit:
             _submit_due_pending_entries(
                 session_factory,
                 broker_config,
-                due_instruction_ids=due_instruction_ids,
+                due_instruction_ids=due_instruction_ids_to_submit,
                 cycle_started_at=cycle_started_at,
+                session_calendar_path=session_calendar_path,
                 timeout=timeout,
                 kill_switch_enabled=kill_switch_enabled,
                 entry_submitter=entry_submitter,
@@ -2563,6 +3000,7 @@ def run_startup_reconciliation(
     broker_snapshot_fetcher: Callable[..., BrokerRuntimeSnapshot] | None = None,
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
+    virtual_market_sync: Callable[[datetime], Any] | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
     submission_lead_time: timedelta = DEFAULT_SUBMISSION_LEAD_TIME,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -2584,6 +3022,7 @@ def run_startup_reconciliation(
         broker_snapshot_fetcher=broker_snapshot_fetcher,
         broker_callback_fetcher=broker_callback_fetcher,
         broker_order_canceler=broker_order_canceler,
+        virtual_market_sync=virtual_market_sync,
         broker_retry_delays=broker_retry_delays,
         submission_lead_time=submission_lead_time,
         sleep_fn=sleep_fn,
@@ -2758,6 +3197,8 @@ def _build_runtime_broker_operations(
         )
 
     def drain_callbacks_with_primary() -> list[dict[str, Any]]:
+        if session_factory is not None and not has_real_broker_work(session_factory):
+            return []
         return broker_sessions.primary.drain_broker_callback_events()
 
     def cancel_order_with_primary(
@@ -2818,6 +3259,7 @@ def run_persistent_execution_runtime(
     stop_event: Event | None = None,
     emit_results: bool = True,
     shutdown_sessions_on_exit: bool = True,
+    virtual_market_sync: Callable[[datetime], Any] | None = None,
 ) -> int:
     runtime_stop_event = stop_event or Event()
     owner_token = uuid.uuid4().hex
@@ -2869,6 +3311,7 @@ def run_persistent_execution_runtime(
                 broker_snapshot_fetcher=broker_ops.fetch_reconciliation_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
+                virtual_market_sync=virtual_market_sync,
                 submission_lead_time=submission_lead_time,
             )
             record_runtime_cycle_completed(
@@ -2880,7 +3323,11 @@ def run_persistent_execution_runtime(
             )
             if emit_results:
                 _emit_runtime_cycle_result(startup_result)
-            if startup_result.issues and not allow_startup_issues:
+            if (
+                startup_result.issues
+                and not allow_startup_issues
+                and not _has_virtual_runtime_work(session_factory)
+            ):
                 mark_runtime_service_startup_blocked(
                     session_factory,
                     runtime_key=runtime_key,
@@ -2896,6 +3343,15 @@ def run_persistent_execution_runtime(
                     file=sys.stderr,
                 )
                 return 2
+            if startup_result.issues and not allow_startup_issues:
+                print(
+                    (
+                        "Startup reconciliation reported issues; continuing the "
+                        "runtime loop for virtual work. Real broker mutations remain "
+                        "blocked until broker state is readable."
+                    ),
+                    file=sys.stderr,
+                )
 
         while True:
             if runtime_stop_event.is_set():
@@ -2922,6 +3378,7 @@ def run_persistent_execution_runtime(
                 broker_snapshot_fetcher=broker_ops.fetch_snapshot,
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
+                virtual_market_sync=virtual_market_sync,
                 submission_lead_time=submission_lead_time,
             )
             record_runtime_cycle_completed(
@@ -2977,10 +3434,12 @@ class BackgroundExecutionRuntimeService:
         session_factory: sessionmaker[Session],
         app_config: AppConfig,
         broker_sessions: CanonicalSyncSessions,
+        virtual_market_sync: Callable[[datetime], Any] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._app_config = app_config
         self._broker_sessions = broker_sessions
+        self._virtual_market_sync = virtual_market_sync
         self._stop_event = Event()
         self._thread: Thread | None = None
 
@@ -3032,6 +3491,7 @@ class BackgroundExecutionRuntimeService:
                     stop_event=self._stop_event,
                     emit_results=False,
                     shutdown_sessions_on_exit=False,
+                    virtual_market_sync=self._virtual_market_sync,
                 )
             except RuntimeServiceLeaseError:
                 if self._stop_event.wait(restart_delay):

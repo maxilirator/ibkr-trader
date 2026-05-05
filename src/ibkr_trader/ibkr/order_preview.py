@@ -694,7 +694,7 @@ def preview_execution_batch(
                         price_warnings.append(
                             "Entry limit price was normalized to the nearest valid IBKR tick increment."
                         )
-            except timeout_cls as exc:
+            except timeout_cls:
                 broker_error = _extract_broker_error_message(runtime_app)
                 contract_error = (
                     f"IBKR rejected the contract lookup: {broker_error}"

@@ -125,9 +125,9 @@ source .venv/bin/activate
 pip install -e ".[server,db,dev,rl]"
 ```
 
-The promoted DQN runner also needs PyTorch. Use the q-training environment if
-it already has the right Torch build, or install a host-appropriate CPU/GPU
-Torch wheel separately. The API-only server does not need Torch.
+The promoted DQN runner also needs PyTorch. Install a host-appropriate CPU/GPU
+Torch wheel in the trader runtime environment. The API-only server does not
+need Torch.
 
 ### 2. Configure `.env`
 
@@ -149,6 +149,7 @@ API_HOST=0.0.0.0
 API_PORT=8000
 API_REQUIRE_LOOPBACK_ONLY=false
 EXECUTION_RUNTIME_ENABLED=false
+RL_MODEL_BUNDLE_ROOT=/home/mattias/ibkr-trader/var/rl-models
 ```
 
 For real IBKR execution, also set:
@@ -228,63 +229,64 @@ curl -sS -X POST "$API/v1/virtual/market-watch" \
   }'
 ```
 
-### 6. Register Or Update The Promoted Model
+### 6. Install And Register The Deployed Model Bundles
 
-This creates or replaces durable model metadata. It does not load the model into
-memory.
+The trader server must not read models or candidate tapes from a research
+checkout. It loads immutable model bundles from local trader storage:
 
-Use `POST /v1/rl/models/register` only when the model key must be new. Use
-`POST /v1/rl/models/upsert` when a promoted artifact or observation contract
-needs to refresh an existing model key.
-
-```bash
-curl -sS -X POST "$API/v1/rl/models/upsert" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_key": "short_trial36_v1",
-    "display_name": "Short Trial 36 V1",
-    "strategy_family": "canonical_short_live_execution_policy",
-    "side": "SHORT",
-    "source_workflow_path": "/path/from/bucket/repo/workflow.yaml",
-    "promoted_checkpoint_path": "/path/from/bucket/repo/best_checkpoint.pt",
-    "action_space": [
-      "skip",
-      "wait",
-      "market_entry",
-      "cancel_entry",
-      "exit_market",
-      "clear_exit",
-      "entry_prevclose_88bp",
-      "exit_tp_180bp"
-    ],
-    "observation_contract": {
-      "bar_family": "phase1_intraday_ohlc_v1",
-      "bar_interval": "5m",
-      "intraday_fetch_config": "/home/mattias/dev/q-training-bucket-booster/configs/intraday_fetch.yaml",
-      "session_timezone": "Europe/Stockholm",
-      "session_open_local": "09:00",
-      "session_close_local": "17:30",
-      "price_inputs": ["open", "high", "low", "close"],
-      "growing_day_prefix": true,
-      "include_market_context": true,
-      "include_vol_normalized_intraday_state": true,
-      "vol_normalization_floor": 0.000001,
-      "feature_schema_version": "short_live_v1",
-      "source_market_data_contract": {
-        "bar_family": "stockholm_intraday_1m_v1",
-        "required_series": ["TRADES"],
-        "adapter": "ibkr_1m_trades_to_phase1_5m_ohlc_v1"
-      }
-    },
-    "execution_mapping_version": "short_actions_v1"
-  }'
+```text
+/home/mattias/ibkr-trader/var/rl-models/
+  long_trial_106_v1/
+    trial_106_seed240/
+      manifest.json
+      best_dqn_state.pt
+      summary.json
+      static_feature_cols.csv
+  short_trial36_v1/
+    trial_36_seed140/
+      manifest.json
+      best_dqn_state.pt
+      summary.json
+      static_feature_cols.csv
 ```
 
-Long-side promoted models use the same base contract, but with the long action
-space and mapping version:
+`manifest.json` uses relative file names only. Research paths may be included
+inside `lineage` metadata, but those paths are non-runtime provenance and must
+not be used by the trading server.
+
+Register the currently deployed local bundles with:
+
+```bash
+RL_MODEL_BUNDLE_ROOT=/home/mattias/ibkr-trader/var/rl-models \
+  python scripts/bootstrap_rl_registry.py --api-base "$API"
+```
+
+The registry payload sets `promoted_checkpoint_path` to the trader-local
+checkpoint file. It keeps research workflow/source paths only under
+`metadata.lineage.non_runtime=true`.
+
+Bundle manifest shape:
 
 ```json
 {
+  "schema_version": "rl_model_bundle_v1",
+  "model_key": "long_trial_106_v1",
+  "display_name": "Long Trial 106 V1",
+  "strategy_family": "canonical_long_live_execution_policy",
+  "strategy_id": "long_trial_106",
+  "side": "LONG",
+  "model_family": "canonical_long_live_execution_policy",
+  "model_version": "v1",
+  "model_artifact_id": "trial_106_seed240",
+  "files": {
+    "checkpoint": "best_dqn_state.pt",
+    "summary": "summary.json",
+    "static_feature_cols": "static_feature_cols.csv"
+  },
+  "deployment": {
+    "deployment_key": "long_trial_106_virtual_shared_01",
+    "book_key": "rl_shared_long_trial_106_virtual_01"
+  },
   "action_space": [
     "skip",
     "wait",
@@ -295,16 +297,25 @@ space and mapping version:
     "entry_prevclose_-50bp",
     "exit_tp_200bp"
   ],
-  "execution_mapping_version": "long_actions_v1"
+  "execution_mapping_version": "long_actions_v1",
+  "state_machine_version": "long_symbol_state_v1",
+  "entry_action_name": "entry_prevclose_-50bp",
+  "take_profit_action_name": "exit_tp_200bp",
+  "observation_contract": {
+    "feature_schema_version": "long_trial_106_v1_phase1_live_v1"
+  },
+  "lineage": {
+    "source_workflow_path": "/research/path/only/not/runtime"
+  }
 }
 ```
 
 ### 7. Create A Deployment
 
 A deployment binds one registered model to one account and one internal book.
-For a paired long/short RL setup that shares capital or short-sale proceeds,
-use the same `account_key` for both deployments and keep separate `book_key`
-values for attribution, limits, and dashboard filtering.
+For a paired long/short RL setup that shares one broker account, use the same
+`account_key` for both deployments and keep separate `book_key` values for
+attribution, side exposure limits, and dashboard filtering.
 
 Virtual deployment:
 
@@ -578,6 +589,46 @@ Each instruction still needs the normal `instruction_id`, `instrument`,
 `intent`, `sizing`, and `trace` fields. The full model-routed example is in
 [instruction-contract.md](instruction-contract.md).
 
+### Candidate Sizing
+
+The payload maker sends the resolved per-name exposure for each candidate, and
+it also records the strategy sizing policy that produced that number. Long and
+short bucket-booster strategies can share the same account, but they must use
+separate side-exposure budgets and one shared account-level margin guard.
+
+Use:
+
+- long `book_allocation_pct`: long gross exposure as a percentage of account
+  net liquidation value
+- short `book_allocation_pct`: short gross exposure as a percentage of account
+  net liquidation value, not cash spent
+- `max_book_gross_account_pct`: side-specific cap for the current strategy
+- `allocation_guard`: shared account-level gross/net/margin guard
+
+Example for a `100000 SEK` account:
+
+- long `book_allocation_pct = 0.90` gives `90000 SEK` long exposure
+- short `book_allocation_pct = 0.80` gives `80000 SEK` short exposure
+- total gross may reach `170000 SEK` only if both sides fill
+- short proceeds are not reinvested into long budget or reused to enlarge the
+  short book
+
+Then:
+
+- divide the long exposure budget by that day's long candidate count
+- divide the short exposure budget by that day's short candidate count
+- cap each name by deployment risk limits
+- send the final capped value as each candidate's `target_notional`
+
+Example: if the long model gets 15 names, send `6000 SEK` per long candidate.
+If the short model gets 20 names, send `4000 SEK` per short candidate.
+
+Short candidates are gross short exposure. Shorts still consume margin
+capacity, require shortability/borrow checks before live submission, and must
+pass the shared account guard after projected long and short orders. The
+virtual simulator also does not increase cash from short sale proceeds; only
+commissions reduce the virtual account cash snapshot.
+
 ## How Actions Become Orders
 
 The runner should map actions like this after a completed model decision bar:
@@ -768,20 +819,25 @@ Do not move from virtual to live until these are true:
 
 The repo now has a promoted-model runner path:
 
-- `src/ibkr_trader/rl/model_artifacts.py` is the single source of truth for the
-  q-training long and short artifacts
+- `src/ibkr_trader/rl/model_artifacts.py` discovers trader-local model bundle
+  manifests under `RL_MODEL_BUNDLE_ROOT`
 - `scripts/bootstrap_rl_registry.py` creates or updates the shared virtual
   account, model registry rows, and the two shared virtual deployments
 - `scripts/submit_rl_candidate_lists.py` submits the promoted lockbox names as
   `MODEL_ROUTED_PENDING` candidates
 - the number of submitted RL candidates is not fixed; each overnight booster
   run submits every row marked `selected=true` for that side and trade date
-- `scripts/run_rl_agents.py` loads the promoted DQN checkpoints, polls
+- expired `MODEL_ROUTED_PENDING` source candidates are archived during the next
+  RL candidate/dashboard read so the candidate feed reflects the current day
+- archiving expired source candidates does not archive generated entries, open
+  positions, protective exits, or forced next-open exits; those remain normal
+  instruction rows owned by the runtime
+- `scripts/run_rl_agents.py` loads deployed local DQN checkpoints, polls
   `/v1/rl/candidates`, subscribes active symbols to the market stream, hydrates
-  static features from the q-training candidate tapes, backfills and caches
-  prior-session volatility/history overrides, runs inference only on new
-  completed 5-minute bars, logs actions, and submits translated virtual
-  entries/cancels/exits when `--execute-virtual` is set
+  static features from each instruction's `trace.metadata.static_features`,
+  backfills and caches prior-session volatility/history overrides, runs
+  inference only on new completed 5-minute bars, logs actions, and submits
+  translated virtual entries/cancels/exits when `--execute-virtual` is set
 
 Runner start shape:
 

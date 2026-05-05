@@ -13,10 +13,11 @@ This is the morning checklist for making the long and short RL agents real.
 - completed-5-minute-bar decision gating
 - history and trailing-volatility feature payloads
 - upstream static feature payload slot
-- promoted q-training artifact registry in `src/ibkr_trader/rl/model_artifacts.py`
+- trader-local deployed model bundle registry in `src/ibkr_trader/rl/model_artifacts.py`
 - registry bootstrap script: `scripts/bootstrap_rl_registry.py`
 - candidate-list submitter: `scripts/submit_rl_candidate_lists.py`
 - promoted DQN runner: `scripts/run_rl_agents.py`
+- readiness checker: `scripts/check_operational_readiness.py`
 - side-aware entry translation:
   - long `entry_prevclose_-50bp` -> `BUY/LONG` limit at previous close minus `0.50%`
   - short `entry_prevclose_88bp` -> `SELL/SHORT` limit at previous close plus `0.88%`
@@ -36,16 +37,19 @@ The promoted runner is `scripts/run_rl_agents.py`. It is designed to:
 - poll `GET /v1/rl/candidates`
 - treat the returned candidate set as the daily dynamic universe; do not assume
   fixed long/short counts
-- load static candidate features from the promoted q-training candidate tapes
+- require static candidate features from each model-routed instruction payload
 - backfill prior 1-minute bars once per model/name/trade day and cache the
   previous-session/trailing-volatility override
 - subscribe active names with `POST /v1/market-data/stream/subscribe`
 - call `POST /v1/rl/observations/build` every minute from the stream buffer
 - infer only when `model_decision.ready=true` and the `decision_id` is new
-- load the exact bucket checkpoint and action space
+- load the exact trader-local bundle checkpoint and action space
 - call `POST /v1/rl/actions/translate` for entries, owned cancels, and owned exits
 - write heartbeat with `last_bar_at` and `last_action_at`
 - recover per-deployment symbol state after restart
+- bind candidates to deployment rows by `model_key`, `account_key`, `book_key`,
+  and `mode`, so virtual, paper, and live deployments of the same model do not
+  share state by accident
 
 Install the runner data dependencies with:
 
@@ -53,10 +57,21 @@ Install the runner data dependencies with:
 uv sync --extra server --extra db --extra rl
 ```
 
-The DQN loader also needs PyTorch. Use the existing q-training environment if it
-already has the right Torch build, or install a CPU/GPU Torch wheel that matches
+The DQN loader also needs PyTorch. Install a CPU/GPU Torch wheel that matches
 the host. Avoid accidentally pulling a large CUDA build into the API-only
 environment.
+
+Run a readiness check before the overnight/morning handoff:
+
+```bash
+uv run python scripts/check_operational_readiness.py \
+  --api-base http://quant.geisler.se:8000 \
+  --skip-local-model-bundles
+```
+
+Run the same command on the trading server without `--skip-local-model-bundles`
+so it also verifies the trader-local bundle files. The command exits non-zero
+when it finds a blocker.
 
 Cancel/exit ownership is intentionally strict: the API mutates broker state only
 when the action matches exactly one active RL-generated instruction tagged with
@@ -65,7 +80,7 @@ a conflict response, not a best-effort cancel.
 
 ## Important Model Input Truth
 
-The model does not consume raw 1-minute bars. It expects the bucket `phase1`
+The model does not consume raw 1-minute bars. It expects the promoted `phase1`
 contract:
 
 - subscribe to active names once and update source bars from the stream
@@ -78,6 +93,11 @@ contract:
 
 If static features are missing, the runner should not call the DQN. This repo
 will mark `features.static_features_ready=false`.
+
+The trading server must not read candidate tapes or model files from a research
+checkout. Research paths are allowed only in lineage metadata; runtime model
+files come from `RL_MODEL_BUNDLE_ROOT`, and per-name static features come from
+Quant API instructions.
 
 ## Safe Morning Virtual Test
 
@@ -107,6 +127,18 @@ should only change:
 - operator kill-switch posture
 
 Do not change the action mapping or feature contract when switching modes.
+The runner defaults to `--account-mode virtual`. Use `--account-mode live` only
+after live deployment rows exist. Actual paper/live order submission also
+requires `--execute-broker`; virtual submission uses `--execute-virtual`.
+
+## Candidate Lifecycle
+
+`MODEL_ROUTED_PENDING` rows are not broker orders. They are the daily model
+universe. During the trading window they should remain visible because the
+runner revisits each symbol bar by bar. After the window closes, expired source
+candidates are archived before the next overnight payload lands. Open generated
+instructions, positions, protective exits, and next-open exits stay visible
+until they are cancelled, filled, exited, or otherwise resolved.
 
 ## Gateway Resilience
 

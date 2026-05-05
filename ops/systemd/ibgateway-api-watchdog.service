@@ -1,0 +1,13 @@
+[Unit]
+Description=Restart IB Gateway when the IBKR API handshake is wedged
+Documentation=file:/home/mattias/ibkr-trader/docs/ib-gateway-setup.md
+After=network-online.target ibgateway-ibc.service
+Wants=network-online.target ibgateway-ibc.service
+
+[Service]
+Type=oneshot
+Environment=TRADER_API_BASE_URL=http://127.0.0.1:8000
+Environment=GATEWAY_SERVICE=ibgateway-ibc.service
+Environment=FAILURE_THRESHOLD=3
+Environment=CURL_TIMEOUT_SECONDS=20
+ExecStart=/usr/local/sbin/ibgateway_api_watchdog.sh

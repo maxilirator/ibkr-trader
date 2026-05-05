@@ -3,17 +3,21 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, time
 from datetime import timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
+from sqlalchemy import func
 from sqlalchemy import or_
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 try:
     from fastapi import Request as FastAPIRequest
@@ -27,8 +31,10 @@ from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
+from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import InstructionRecord
+from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
@@ -51,6 +57,10 @@ from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.market_stream import MarketStreamContract
+from ibkr_trader.ibkr.market_stream_store import list_market_stream_bars
+from ibkr_trader.ibkr.market_stream_store import merge_bar_lists
+from ibkr_trader.ibkr.market_stream_store import persist_market_stream_bars
+from ibkr_trader.ibkr.market_stream_store import persist_market_stream_snapshot_bars
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
@@ -105,9 +115,15 @@ from ibkr_trader.orchestration.operator_controls import (
 )
 from ibkr_trader.orchestration.operator_reviews import (
     OperatorReviewTargetNotFoundError,
+    archive_open_reconciliation_issues,
     record_broker_attention_review_action,
     record_reconciliation_issue_review_action,
+    serialize_reconciliation_issue_archive_result,
     serialize_operator_review_status,
+)
+from ibkr_trader.orchestration.rl_candidate_rollover import (
+    archive_expired_rl_candidates,
+    serialize_rl_candidate_rollover_result,
 )
 from ibkr_trader.orchestration.runtime_service_state import (
     EXECUTION_RUNTIME_KEY,
@@ -161,8 +177,12 @@ from ibkr_trader.virtual.execution import cancel_virtual_order
 from ibkr_trader.virtual.execution import ensure_virtual_account_record
 from ibkr_trader.virtual.execution import list_virtual_market_quotes
 from ibkr_trader.virtual.execution import record_virtual_market_quote
+from ibkr_trader.virtual.execution import record_virtual_market_quotes_from_stream_snapshot
 from ibkr_trader.virtual.execution import submit_virtual_entry_order
 from ibkr_trader.virtual.execution import submit_virtual_exit_order
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ApiDependencyError(RuntimeError):
@@ -263,8 +283,8 @@ def should_include_background_execution_recovery(
                 BrokerOrderRecord.is_virtual.is_(False),
                 or_(
                     BrokerOrderRecord.status.is_(None),
-                    BrokerOrderRecord.status.not_in(
-                        tuple(_BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES)
+                    func.upper(BrokerOrderRecord.status).not_in(
+                        _BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES
                     ),
                 )
             )
@@ -666,6 +686,7 @@ def parse_rl_action_translate_payload(payload: Mapping[str, Any]) -> dict[str, A
     )
     if decision_id == "":
         decision_id = None
+    model_diagnostics = _parse_json_object_field(payload, "model_diagnostics")
     return {
         "deployment_key": _parse_required_string(
             payload,
@@ -687,6 +708,7 @@ def parse_rl_action_translate_payload(payload: Mapping[str, Any]) -> dict[str, A
         "decision_id": decision_id,
         "submit": bool(payload.get("submit", False)),
         "log_action": bool(payload.get("log_action", False)),
+        "model_diagnostics": model_diagnostics,
     }
 
 
@@ -783,6 +805,98 @@ def parse_rl_observation_build_payload(payload: Mapping[str, Any]) -> dict[str, 
         "include_source_bars": bool(payload.get("include_source_bars", False)),
         "fetch": dict(raw_fetch),
     }
+
+
+def _session_open_for_as_of(as_of: datetime, timezone_name: str) -> datetime:
+    timezone = ZoneInfo(timezone_name)
+    local_as_of = as_of.astimezone(timezone) if as_of.tzinfo else as_of.replace(tzinfo=timezone)
+    return datetime.combine(local_as_of.date(), time(9, 0), tzinfo=timezone)
+
+
+def _stream_symbols_from_snapshot(stream_snapshot: Mapping[str, Any]) -> list[str]:
+    raw_symbols = stream_snapshot.get("desired_symbols")
+    if isinstance(raw_symbols, list):
+        return sorted({str(symbol).strip().upper() for symbol in raw_symbols if str(symbol).strip()})
+    bars_by_symbol = stream_snapshot.get("bars_by_symbol")
+    if isinstance(bars_by_symbol, Mapping):
+        return sorted(str(symbol).strip().upper() for symbol in bars_by_symbol if str(symbol).strip())
+    return []
+
+
+def _merge_persisted_stream_bars(
+    session_factory: Any,
+    *,
+    stream_snapshot: dict[str, Any],
+    symbols: list[str],
+    bar_limit: int,
+    as_of: datetime,
+    timezone_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        persist_result = persist_market_stream_snapshot_bars(
+            session_factory,
+            stream_snapshot=stream_snapshot,
+        )
+    except SQLAlchemyError as exc:
+        persist_result = {
+            "available": False,
+            "error": str(exc),
+            "inserted_count": 0,
+            "updated_count": 0,
+            "skipped_count": 0,
+            "symbol_count": 0,
+            "symbols": [],
+            "source": "ibkr_live_market_stream_1m",
+        }
+    requested_symbols = symbols or _stream_symbols_from_snapshot(stream_snapshot)
+    if not requested_symbols:
+        stream_snapshot["persistent_bar_store"] = persist_result
+        return stream_snapshot, {}
+
+    try:
+        stored_bars = list_market_stream_bars(
+            session_factory,
+            symbols=requested_symbols,
+            started_at=_session_open_for_as_of(as_of, timezone_name),
+            ended_at=as_of,
+            limit_per_symbol=bar_limit,
+        )
+    except SQLAlchemyError as exc:
+        stored_bars = {}
+        persist_result = {
+            **persist_result,
+            "available": False,
+            "read_error": str(exc),
+        }
+    bars_by_symbol = dict(stream_snapshot.get("bars_by_symbol") or {})
+    merged_symbol_count = 0
+    for symbol in requested_symbols:
+        merged = merge_bar_lists(
+            stored_bars.get(symbol, []),
+            bars_by_symbol.get(symbol, []),
+            limit=bar_limit,
+        )
+        if merged:
+            bars_by_symbol[symbol] = merged
+            merged_symbol_count += 1
+    stream_snapshot["bars_by_symbol"] = bars_by_symbol
+    stream_snapshot["persistent_bar_store"] = {
+        **persist_result,
+        "merged_symbol_count": merged_symbol_count,
+    }
+    return stream_snapshot, stored_bars
+
+
+def _ibkr_historical_exchange(
+    *,
+    exchange: Any,
+    primary_exchange: Any,
+) -> tuple[str, str | None]:
+    raw_exchange = str(exchange or "").strip().upper()
+    raw_primary = str(primary_exchange or "").strip().upper()
+    if raw_exchange in {"", "XSTO", "STO", "STOCKHOLM"}:
+        return "SMART", raw_primary or "SFB"
+    return raw_exchange, raw_primary or None
 
 
 def parse_virtual_account_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1101,6 +1215,16 @@ def _identity_lookup_key(symbol: str) -> str:
     return symbol.strip().upper()
 
 
+def _identity_lookup_candidates(symbol: str) -> tuple[str, ...]:
+    normalized = _identity_lookup_key(symbol)
+    candidates = [normalized]
+    if " " in normalized:
+        candidates.append(normalized.replace(" ", "-"))
+    if "-" in normalized:
+        candidates.append(normalized.replace("-", " "))
+    return tuple(dict.fromkeys(candidates))
+
+
 def _identity_value(identity: Any, field_name: str) -> str | None:
     if identity is None:
         return None
@@ -1123,7 +1247,18 @@ def _market_stream_contract_for_symbol(
     stockholm_identity_map: Mapping[str, Any] | None,
 ) -> MarketStreamContract:
     normalized_symbol = symbol.strip().upper()
-    identity = (stockholm_identity_map or {}).get(_identity_lookup_key(normalized_symbol))
+    identity = None
+    identity_map = stockholm_identity_map or {}
+    for candidate in _identity_lookup_candidates(normalized_symbol):
+        identity = identity_map.get(candidate)
+        if identity is not None:
+            break
+    if identity is None:
+        for candidate_identity in identity_map.values():
+            ticker_alias = _identity_value(candidate_identity, "ticker_alias")
+            if ticker_alias is not None and ticker_alias.upper() == normalized_symbol:
+                identity = candidate_identity
+                break
     enriched_local_symbol = local_symbol or _identity_value(identity, "ticker_alias")
     enriched_isin = isin or _identity_value(identity, "isin")
     return MarketStreamContract(
@@ -1228,6 +1363,655 @@ def parse_market_stream_symbols(raw_value: str | None) -> list[str] | None:
         if item.strip()
     ]
     return sorted(set(symbols)) or None
+
+
+def market_stream_contracts_for_open_orders(
+    open_orders: Mapping[Any, Any],
+) -> list[MarketStreamContract]:
+    """Build additive market-data subscriptions for currently open broker orders."""
+
+    contracts_by_key: dict[str, MarketStreamContract] = {}
+    for open_order in open_orders.values():
+        status = str(getattr(open_order, "status", "") or "").strip().upper()
+        completed_status = (
+            str(getattr(open_order, "completed_status", "") or "").strip().upper()
+        )
+        if (
+            status in _BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES
+            or completed_status in _BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES
+        ):
+            continue
+
+        symbol = str(
+            getattr(open_order, "symbol", None)
+            or getattr(open_order, "local_symbol", None)
+            or ""
+        ).strip().upper()
+        if not symbol:
+            continue
+
+        security_type = str(
+            getattr(open_order, "security_type", None) or "STK"
+        ).strip().upper()
+        raw_exchange = str(getattr(open_order, "exchange", None) or "").strip().upper()
+        exchange = raw_exchange or "SMART"
+        raw_primary_exchange = getattr(open_order, "primary_exchange", None)
+        primary_exchange = (
+            str(raw_primary_exchange).strip().upper()
+            if raw_primary_exchange not in (None, "")
+            else None
+        )
+        if security_type == "STK":
+            exchange = "SMART"
+            if not primary_exchange or primary_exchange == "SMART":
+                primary_exchange = "SFB"
+        currency = str(getattr(open_order, "currency", None) or "SEK").strip().upper()
+        local_symbol = getattr(open_order, "local_symbol", None)
+        local_symbol = (
+            str(local_symbol).strip() if local_symbol not in (None, "") else None
+        )
+
+        contract = MarketStreamContract(
+            symbol=symbol,
+            exchange=exchange,
+            currency=currency,
+            security_type=security_type,
+            primary_exchange=primary_exchange,
+            local_symbol=local_symbol,
+        )
+        contracts_by_key[contract.key] = contract
+
+    return sorted(contracts_by_key.values(), key=lambda contract: contract.symbol)
+
+
+def _market_stream_contract_from_instrument_fields(
+    *,
+    symbol: str,
+    security_type: str | None,
+    exchange: str | None,
+    currency: str | None,
+    primary_exchange: str | None,
+    local_symbol: str | None,
+) -> MarketStreamContract | None:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return None
+    normalized_security_type = str(security_type or "STK").strip().upper()
+    normalized_exchange = str(exchange or "SMART").strip().upper() or "SMART"
+    normalized_primary_exchange = (
+        str(primary_exchange).strip().upper()
+        if primary_exchange not in (None, "")
+        else None
+    )
+    if normalized_security_type == "STK":
+        normalized_exchange = "SMART"
+        if not normalized_primary_exchange or normalized_primary_exchange == "SMART":
+            normalized_primary_exchange = "SFB"
+    return MarketStreamContract(
+        symbol=normalized_symbol,
+        exchange=normalized_exchange,
+        currency=str(currency or "SEK").strip().upper(),
+        security_type=normalized_security_type,
+        primary_exchange=normalized_primary_exchange,
+        local_symbol=(
+            str(local_symbol).strip()
+            if local_symbol not in (None, "")
+            else None
+        ),
+    )
+
+
+def market_stream_contracts_for_runtime_holdings(
+    snapshot: Any,
+) -> list[MarketStreamContract]:
+    """Build additive subscriptions for live holdings seen in broker snapshots."""
+
+    contracts_by_key: dict[str, MarketStreamContract] = {}
+    for source_name in ("portfolio", "positions"):
+        for holding in getattr(snapshot, source_name, ()) or ():
+            quantity = getattr(holding, "position", None)
+            if quantity is None:
+                continue
+            try:
+                if Decimal(str(quantity)) == 0:
+                    continue
+            except Exception:
+                continue
+            contract = _market_stream_contract_from_instrument_fields(
+                symbol=(
+                    str(getattr(holding, "symbol", None) or "")
+                    or str(getattr(holding, "local_symbol", None) or "")
+                ),
+                security_type=getattr(holding, "security_type", None),
+                exchange=getattr(holding, "exchange", None),
+                currency=getattr(holding, "currency", None),
+                primary_exchange=getattr(holding, "primary_exchange", None),
+                local_symbol=getattr(holding, "local_symbol", None),
+            )
+            if contract is not None:
+                contracts_by_key[contract.key] = contract
+    return sorted(contracts_by_key.values(), key=lambda contract: contract.symbol)
+
+
+def market_stream_contracts_for_current_holdings(
+    session_factory: Any,
+    *,
+    virtual_only: bool = False,
+) -> list[MarketStreamContract]:
+    """Build additive subscriptions for latest persisted non-zero holdings."""
+
+    contracts_by_key: dict[str, MarketStreamContract] = {}
+    with session_scope(session_factory) as session:
+        statement = (
+            select(PositionSnapshotRecord, BrokerAccountRecord)
+            .join(
+                BrokerAccountRecord,
+                BrokerAccountRecord.id == PositionSnapshotRecord.broker_account_id,
+            )
+            .order_by(
+                BrokerAccountRecord.account_key.asc(),
+                PositionSnapshotRecord.symbol.asc(),
+                PositionSnapshotRecord.currency.asc(),
+                PositionSnapshotRecord.security_type.asc(),
+                PositionSnapshotRecord.snapshot_at.desc(),
+                PositionSnapshotRecord.id.desc(),
+            )
+        )
+        if virtual_only:
+            statement = statement.where(
+                PositionSnapshotRecord.is_virtual.is_(True),
+                BrokerAccountRecord.broker_kind == BROKER_KIND_VIRTUAL,
+            )
+        rows = session.execute(statement).all()
+
+        seen_keys: set[tuple[int, str, str, str, str | None]] = set()
+        for position, broker_account in rows:
+            identity = (
+                broker_account.id,
+                position.symbol,
+                position.currency,
+                position.security_type,
+                position.local_symbol,
+            )
+            if identity in seen_keys:
+                continue
+            seen_keys.add(identity)
+            try:
+                quantity = Decimal(str(position.quantity))
+            except Exception:
+                continue
+            if quantity == 0:
+                continue
+
+            contract = _market_stream_contract_from_instrument_fields(
+                symbol=position.symbol,
+                security_type=position.security_type,
+                exchange=position.exchange,
+                currency=position.currency,
+                primary_exchange=position.primary_exchange,
+                local_symbol=position.local_symbol,
+            )
+            if contract is not None:
+                contracts_by_key[contract.key] = contract
+
+    return sorted(contracts_by_key.values(), key=lambda contract: contract.symbol)
+
+
+def market_stream_contracts_for_open_virtual_positions(
+    session_factory: Any,
+) -> list[MarketStreamContract]:
+    """Build additive subscriptions for virtual holdings that need mark-to-market."""
+
+    return market_stream_contracts_for_current_holdings(
+        session_factory,
+        virtual_only=True,
+    )
+
+
+def subscribe_open_order_market_streams(
+    market_stream_service: Any,
+    snapshot: Any,
+    session_factory: Any | None = None,
+) -> list[str]:
+    contracts = market_stream_contracts_for_open_orders(
+        getattr(snapshot, "open_orders", {}) or {}
+    )
+    contracts_by_key = {contract.key: contract for contract in contracts}
+    for contract in market_stream_contracts_for_runtime_holdings(snapshot):
+        contracts_by_key[contract.key] = contract
+    if session_factory is not None:
+        for contract in market_stream_contracts_for_current_holdings(
+            session_factory,
+        ):
+            contracts_by_key[contract.key] = contract
+    contracts = sorted(
+        contracts_by_key.values(),
+        key=lambda contract: contract.symbol,
+    )
+    if not contracts:
+        return []
+    market_stream_service.subscribe_many(
+        contracts,
+        replace=False,
+        market_data_type=None,
+    )
+    return [contract.symbol for contract in contracts]
+
+
+def _stream_payload(stream_snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
+    nested = stream_snapshot.get("stream")
+    return nested if isinstance(nested, Mapping) else stream_snapshot
+
+
+def _operator_stream_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    if not parsed.is_finite() or parsed <= 0 or abs(parsed) >= Decimal("1e12"):
+        return None
+    return parsed
+
+
+def _operator_any_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    return parsed if parsed.is_finite() and abs(parsed) < Decimal("1e12") else None
+
+
+def _operator_plain_decimal(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        return "0"
+    return text
+
+
+def _operator_signed_decimal(value: Decimal | None, *, places: str = "0.01") -> str | None:
+    if value is None:
+        return None
+    quantized = value.quantize(Decimal(places))
+    prefix = "+" if quantized > 0 else ""
+    return f"{prefix}{quantized}"
+
+
+def _parse_operator_stream_time(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return parse_datetime(str(value))
+    except Exception:
+        return None
+
+
+def _operator_stream_symbol_keys(symbol: Any) -> set[str]:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return set()
+    keys = {normalized}
+    if "-" in normalized:
+        keys.add(normalized.replace("-", " "))
+    if " " in normalized:
+        keys.add(normalized.replace(" ", "-"))
+    return keys
+
+
+def _operator_stream_quote_price(quote: Mapping[str, Any]) -> Decimal | None:
+    bid = _operator_stream_decimal(quote.get("bid_price"))
+    ask = _operator_stream_decimal(quote.get("ask_price"))
+    midpoint = None
+    if bid is not None and ask is not None:
+        midpoint = (bid + ask) / Decimal("2")
+    for value in (
+        quote.get("last_price"),
+        midpoint,
+        quote.get("midpoint_price"),
+        quote.get("close_price"),
+        bid,
+        ask,
+    ):
+        parsed = value if isinstance(value, Decimal) else _operator_stream_decimal(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _operator_stream_marks_by_symbol(
+    stream_snapshot: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    stream = _stream_payload(stream_snapshot)
+    quotes_by_symbol: dict[str, Mapping[str, Any]] = {}
+    raw_quotes = stream.get("quotes")
+    if isinstance(raw_quotes, list):
+        for quote in raw_quotes:
+            if not isinstance(quote, Mapping):
+                continue
+            for key in _operator_stream_symbol_keys(quote.get("symbol")):
+                quotes_by_symbol[key] = quote
+
+    bars_by_symbol = stream.get("bars_by_symbol")
+    if not isinstance(bars_by_symbol, Mapping):
+        bars_by_symbol = {}
+
+    all_keys = set(quotes_by_symbol)
+    for symbol in bars_by_symbol:
+        all_keys.update(_operator_stream_symbol_keys(symbol))
+
+    marks: dict[str, dict[str, Any]] = {}
+    for key in all_keys:
+        quote = quotes_by_symbol.get(key)
+        bars = bars_by_symbol.get(key)
+        if not isinstance(bars, list):
+            for candidate in _operator_stream_symbol_keys(key):
+                candidate_bars = bars_by_symbol.get(candidate)
+                if isinstance(candidate_bars, list):
+                    bars = candidate_bars
+                    break
+        bars = bars if isinstance(bars, list) else []
+        latest_bar = bars[-1] if bars and isinstance(bars[-1], Mapping) else None
+        previous_bar = bars[-2] if len(bars) >= 2 and isinstance(bars[-2], Mapping) else None
+
+        price = _operator_stream_quote_price(quote) if quote is not None else None
+        source = "quote"
+        observed_at = (
+            _parse_operator_stream_time(
+                quote.get("last_trade_at") or quote.get("updated_at")
+            )
+            if quote is not None
+            else None
+        )
+        if price is None and latest_bar is not None:
+            price = _operator_stream_decimal(latest_bar.get("close"))
+            observed_at = _parse_operator_stream_time(latest_bar.get("timestamp"))
+            source = "bar"
+        elif observed_at is None and latest_bar is not None:
+            observed_at = _parse_operator_stream_time(latest_bar.get("timestamp"))
+        if price is None:
+            continue
+
+        previous_price = (
+            _operator_stream_decimal(previous_bar.get("close"))
+            if previous_bar is not None
+            else None
+        )
+        if previous_price is None and quote is not None:
+            previous_price = _operator_stream_decimal(quote.get("close_price"))
+        direction = None
+        if previous_price is not None:
+            if price > previous_price:
+                direction = "UP"
+            elif price < previous_price:
+                direction = "DOWN"
+            else:
+                direction = "UNCHANGED"
+
+        canonical_symbol = (
+            str(quote.get("symbol")).strip().upper()
+            if quote is not None and quote.get("symbol") not in (None, "")
+            else key
+        )
+        mark = {
+            "symbol": canonical_symbol,
+            "price": price,
+            "previous_price": previous_price,
+            "observed_at": observed_at,
+            "source": source,
+            "direction": direction,
+        }
+        for candidate in _operator_stream_symbol_keys(key):
+            marks[candidate] = mark
+        for candidate in _operator_stream_symbol_keys(canonical_symbol):
+            marks[candidate] = mark
+    return marks
+
+
+def _operator_row_symbol(row: Mapping[str, Any]) -> str:
+    return str(row.get("symbol") or row.get("local_symbol") or "").strip().upper()
+
+
+def _operator_stream_mark_for_row(
+    marks_by_symbol: Mapping[str, dict[str, Any]],
+    row: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    for key in _operator_stream_symbol_keys(_operator_row_symbol(row)):
+        mark = marks_by_symbol.get(key)
+        if mark is not None:
+            return mark
+    return None
+
+
+def _operator_enrich_day_performance(
+    account: dict[str, Any],
+    *,
+    net_liquidation: Decimal,
+    observed_at: datetime,
+) -> None:
+    day_performance = account.get("day_performance")
+    if not isinstance(day_performance, dict):
+        return
+    start_value = _operator_stream_decimal(day_performance.get("start_net_liquidation"))
+    points = day_performance.get("points")
+    if not isinstance(points, list):
+        points = []
+        day_performance["points"] = points
+    if start_value is None and points:
+        start_value = _operator_stream_decimal(points[0].get("net_liquidation"))
+    if start_value is None or start_value == 0:
+        return
+
+    latest_return = ((net_liquidation - start_value) / start_value) * Decimal("100")
+    day_performance["latest_at"] = observed_at.isoformat()
+    day_performance["latest_net_liquidation"] = _operator_plain_decimal(net_liquidation)
+    day_performance["latest_return_pct"] = _operator_signed_decimal(latest_return)
+    point = {
+        "snapshot_at": observed_at.isoformat(),
+        "net_liquidation": _operator_plain_decimal(net_liquidation),
+        "return_pct": _operator_signed_decimal(latest_return) or "0.00",
+    }
+    latest_point_at = (
+        _parse_operator_stream_time(points[-1].get("snapshot_at"))
+        if points
+        else None
+    )
+    if latest_point_at is None or observed_at > latest_point_at:
+        points.append(point)
+    elif points:
+        points[-1] = point
+
+
+def enrich_operator_snapshot_with_market_stream(
+    snapshot_payload: dict[str, Any],
+    stream_snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    marks_by_symbol = _operator_stream_marks_by_symbol(stream_snapshot)
+    if not marks_by_symbol:
+        snapshot_payload["market_stream_overlay"] = {
+            "applied": False,
+            "reason": "no local stream marks available",
+        }
+        return snapshot_payload
+
+    account_deltas: dict[str, Decimal] = {}
+    account_latest_at: dict[str, datetime] = {}
+    virtual_accounts = {
+        account.get("account_key")
+        for account in snapshot_payload.get("accounts", [])
+        if isinstance(account, dict) and account.get("is_virtual")
+    }
+    account_position_counts: dict[str, int] = {}
+    for position in snapshot_payload.get("positions", []):
+        if not isinstance(position, dict):
+            continue
+        quantity = _operator_any_decimal(position.get("quantity"))
+        if quantity is None or quantity == 0:
+            continue
+        account_key = position.get("account_key")
+        if account_key:
+            account_position_counts[account_key] = (
+                account_position_counts.get(account_key, 0) + 1
+            )
+    account_marked_position_counts: dict[str, int] = {}
+    account_stream_market_values: dict[str, Decimal] = {}
+    marked_positions = 0
+    for position in snapshot_payload.get("positions", []):
+        if not isinstance(position, dict):
+            continue
+        quantity = _operator_any_decimal(position.get("quantity"))
+        if quantity is None:
+            continue
+        mark = _operator_stream_mark_for_row(marks_by_symbol, position)
+        if mark is None:
+            continue
+        price = mark["price"]
+        old_market_value = _operator_any_decimal(position.get("market_value"))
+        old_market_value_was_available = old_market_value is not None
+        if old_market_value is None:
+            old_market_price = _operator_stream_decimal(position.get("market_price"))
+            old_market_value = quantity * old_market_price if old_market_price is not None else Decimal("0")
+        market_value = quantity * price
+        average_cost = _operator_stream_decimal(position.get("average_cost"))
+        unrealized_pnl = (
+            quantity * (price - average_cost)
+            if average_cost is not None
+            else None
+        )
+        position["market_price"] = _operator_plain_decimal(price)
+        position["market_value"] = _operator_plain_decimal(market_value)
+        position["unrealized_pnl"] = _operator_plain_decimal(unrealized_pnl)
+        position["market_data_source"] = "market_stream"
+        if mark.get("observed_at") is not None:
+            position["market_price_at"] = mark["observed_at"].isoformat()
+            account_latest_at[position["account_key"]] = max(
+                account_latest_at.get(position["account_key"], mark["observed_at"]),
+                mark["observed_at"],
+            )
+        account_key = position["account_key"]
+        account_marked_position_counts[account_key] = (
+            account_marked_position_counts.get(account_key, 0) + 1
+        )
+        account_stream_market_values[account_key] = (
+            account_stream_market_values.get(account_key, Decimal("0"))
+            + market_value
+        )
+        can_apply_account_delta = (
+            account_key in virtual_accounts
+            or (old_market_value_was_available and old_market_value != 0)
+        )
+        if can_apply_account_delta:
+            account_deltas[account_key] = (
+                account_deltas.get(account_key, Decimal("0"))
+                + market_value
+                - old_market_value
+            )
+        marked_positions += 1
+
+    marked_orders = 0
+    for order in snapshot_payload.get("open_orders", []):
+        if not isinstance(order, dict):
+            continue
+        mark = _operator_stream_mark_for_row(marks_by_symbol, order)
+        if mark is None:
+            continue
+        price = mark["price"]
+        order["reference_market_price"] = _operator_plain_decimal(price)
+        order["reference_market_price_at"] = (
+            mark["observed_at"].isoformat() if mark.get("observed_at") is not None else None
+        )
+        order["last_market_price_direction"] = mark.get("direction")
+        working_price = (
+            _operator_stream_decimal(order.get("working_price"))
+            or _operator_stream_decimal(order.get("limit_price"))
+            or _operator_stream_decimal(order.get("stop_price"))
+        )
+        if working_price is not None:
+            spread = working_price - price
+            order["price_spread"] = _operator_signed_decimal(spread)
+            order["price_spread_pct"] = (
+                _operator_signed_decimal((spread / price) * Decimal("100"))
+                if price != 0
+                else None
+            )
+            order["spread_reference"] = order.get("working_price_reference") or (
+                "LIMIT" if order.get("limit_price") else "STOP"
+            )
+        order["market_data_source"] = "market_stream"
+        marked_orders += 1
+
+    marked_accounts = 0
+    for account in snapshot_payload.get("accounts", []):
+        if not isinstance(account, dict):
+            continue
+        account_key = account.get("account_key")
+        delta = account_deltas.get(account_key)
+        current_net = _operator_stream_decimal(account.get("net_liquidation"))
+        if current_net is None:
+            continue
+        valuation_method = "mark_delta"
+        base_net = current_net
+        stream_net = None
+        if (
+            account_key not in virtual_accounts
+            and account_position_counts.get(account_key, 0) > 0
+            and account_marked_position_counts.get(account_key)
+            == account_position_counts.get(account_key)
+        ):
+            cash_value = _operator_any_decimal(account.get("total_cash_value"))
+            if cash_value is not None:
+                stream_net = cash_value + account_stream_market_values.get(
+                    account_key,
+                    Decimal("0"),
+                )
+                delta = stream_net - current_net
+                valuation_method = "cash_plus_stream_positions"
+        if stream_net is None:
+            if delta is None:
+                continue
+            stream_net = current_net + delta
+        account["net_liquidation"] = _operator_plain_decimal(stream_net)
+        account["stream_valuation"] = {
+            "source": "market_stream",
+            "method": valuation_method,
+            "base_net_liquidation": _operator_plain_decimal(base_net),
+            "mark_delta": _operator_plain_decimal(delta),
+            "stream_position_market_value": _operator_plain_decimal(
+                account_stream_market_values.get(account_key),
+            ),
+            "marked_at": (
+                account_latest_at[account_key].isoformat()
+                if account_key in account_latest_at
+                else None
+            ),
+        }
+        if account_key in account_latest_at:
+            _operator_enrich_day_performance(
+                account,
+                net_liquidation=stream_net,
+                observed_at=account_latest_at[account_key],
+            )
+        marked_accounts += 1
+
+    stream = _stream_payload(stream_snapshot)
+    snapshot_payload["market_stream_overlay"] = {
+        "applied": marked_positions > 0 or marked_orders > 0 or marked_accounts > 0,
+        "marked_position_count": marked_positions,
+        "marked_open_order_count": marked_orders,
+        "marked_account_count": marked_accounts,
+        "running": stream.get("running"),
+        "desired_subscription_count": stream.get("desired_subscription_count"),
+        "quote_count": stream.get("quote_count"),
+    }
+    return snapshot_payload
 
 
 def parse_shortability_snapshot_payload(
@@ -1629,7 +2413,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         return fetch_runtime_snapshot_with_diagnostic(
             diagnostic_config,
             timeout=app_config.broker_snapshot_refresh_timeout_seconds,
-            include_open_orders=False,
+            include_open_orders=True,
             include_executions=include_execution_recovery,
             include_positions=False,
         )
@@ -1642,6 +2426,17 @@ def create_app(config: AppConfig | None = None) -> Any:
             captured_at=captured_at,
             default_account_key=app_config.ibkr.account_id or None,
         )
+        try:
+            subscribe_open_order_market_streams(
+                market_stream_service,
+                snapshot,
+                session_factory=session_factory,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Failed to sync market stream subscriptions for open broker orders.",
+                exc_info=True,
+            )
 
     broker_monitor = BrokerMonitorService(
         heartbeat_probe=run_diagnostic_heartbeat_probe,
@@ -1650,15 +2445,24 @@ def create_app(config: AppConfig | None = None) -> Any:
         heartbeat_interval_seconds=app_config.broker_heartbeat_interval_seconds,
         snapshot_refresh_interval_seconds=app_config.broker_snapshot_refresh_interval_seconds,
     )
-    execution_runtime = BackgroundExecutionRuntimeService(
-        session_factory,
-        app_config,
-        broker_sessions,
-    )
     market_stream_service = LiveMarketDataStreamService(
         app_config.ibkr.streaming_session(),
         initial_connect_backoff_seconds=app_config.broker_connect_backoff_initial_seconds,
         max_connect_backoff_seconds=app_config.broker_connect_backoff_max_seconds,
+    )
+
+    def sync_virtual_market_watch_from_stream(cycle_at: datetime) -> dict[str, Any]:
+        return record_virtual_market_quotes_from_stream_snapshot(
+            session_factory,
+            stream_snapshot=market_stream_service.snapshot(bar_limit=1),
+            observed_at=cycle_at,
+        )
+
+    execution_runtime = BackgroundExecutionRuntimeService(
+        session_factory,
+        app_config,
+        broker_sessions,
+        virtual_market_sync=sync_virtual_market_watch_from_stream,
     )
     market_stream_identity_map = load_stockholm_identity_map(
         app_config.stockholm_identity_path,
@@ -1993,6 +2797,14 @@ def create_app(config: AppConfig | None = None) -> Any:
         snapshot = request.app.state.market_stream_service.snapshot(
             symbols=parse_market_stream_symbols(symbols),
             bar_limit=bar_limit,
+        )
+        snapshot, _stored_bars = _merge_persisted_stream_bars(
+            session_factory,
+            stream_snapshot=snapshot,
+            symbols=parse_market_stream_symbols(symbols),
+            bar_limit=bar_limit,
+            as_of=utc_now(),
+            timezone_name=app_config.timezone,
         )
         return {
             "accepted": True,
@@ -2422,6 +3234,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         limit: int = 100,
         deployment_key: str | None = None,
         model_key: str | None = None,
+        include_expired: bool = False,
     ) -> dict[str, Any]:
         try:
             validated_limit = parse_positive_limit(
@@ -2465,10 +3278,14 @@ def create_app(config: AppConfig | None = None) -> Any:
             normalized_book_key = deployment_row.book_key.lower()
             normalized_model_key = deployment_row.model_key.lower()
 
+        if not include_expired:
+            archive_expired_rl_candidates(session_factory)
+
         candidates = list_instruction_statuses(
             session_factory,
             limit=500,
             state=ExecutionState.MODEL_ROUTED_PENDING.value,
+            expire_after=None if include_expired else utc_now(),
         )
 
         def candidate_matches(candidate: Any) -> bool:
@@ -2483,9 +3300,15 @@ def create_app(config: AppConfig | None = None) -> Any:
             ).lower()
             if normalized_model_key and candidate_model_key != normalized_model_key:
                 return False
-            if normalized_account_key and candidate.account_key.upper() != normalized_account_key:
+            if (
+                normalized_account_key
+                and candidate.account_key.upper() != normalized_account_key
+            ):
                 return False
-            if normalized_book_key and candidate.book_key.lower() != normalized_book_key:
+            if (
+                normalized_book_key
+                and candidate.book_key.lower() != normalized_book_key
+            ):
                 return False
             return True
 
@@ -2499,6 +3322,40 @@ def create_app(config: AppConfig | None = None) -> Any:
                 serialize_rl_candidate_status(candidate)
                 for candidate in matched_candidates
             ],
+        }
+
+    @app.post("/v1/rl/candidates/archive-expired")
+    def archive_expired_rl_candidate_rows(
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            requested_by = str(payload.get("requested_by", "api")).strip()
+            if not requested_by:
+                raise ValueError("requested_by must be a non-empty string")
+            reason = payload.get("reason")
+            if reason is not None:
+                reason = str(reason).strip() or None
+            cutoff = (
+                parse_datetime(payload["cutoff"], "cutoff")
+                if payload.get("cutoff") is not None
+                else None
+            )
+            limit = int(payload.get("limit", 1000))
+            result = archive_expired_rl_candidates(
+                session_factory,
+                cutoff=cutoff,
+                requested_by=requested_by,
+                reason=reason
+                or "Expired model-routed source candidate archived by API request.",
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "archived_rl_candidates": serialize_rl_candidate_rollover_result(result),
         }
 
     @app.post("/v1/rl/actions/translate")
@@ -2641,6 +3498,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                     payload={
                         "source_instruction_id": parsed["source_instruction_id"],
                         "decision_id": parsed["decision_id"],
+                        "model_diagnostics": parsed["model_diagnostics"],
                         "submitted": (
                             submitted_batch is not None
                             or action_execution is not None
@@ -2794,6 +3652,14 @@ def create_app(config: AppConfig | None = None) -> Any:
                         symbols=requested_symbols,
                         bar_limit=bar_limit,
                     )
+                    stream_snapshot, _stored_bars = _merge_persisted_stream_bars(
+                        session_factory,
+                        stream_snapshot=stream_snapshot,
+                        symbols=requested_symbols,
+                        bar_limit=bar_limit,
+                        as_of=parsed["as_of"],
+                        timezone_name=app_config.timezone,
+                    )
                     stream_bars = {
                         str(symbol).strip().upper(): bars
                         for symbol, bars in stream_snapshot["bars_by_symbol"].items()
@@ -2802,6 +3668,89 @@ def create_app(config: AppConfig | None = None) -> Any:
                     missing_stream_bars = [
                         symbol for symbol in requested_symbols if symbol not in stream_bars
                     ]
+                    if missing_stream_bars and bool(fetch.get("backfill_missing", False)):
+                        instruments = (
+                            fetch.get("instruments")
+                            if isinstance(fetch.get("instruments"), Mapping)
+                            else {}
+                        )
+                        backfilled_bars: dict[str, Any] = {}
+                        for symbol in missing_stream_bars:
+                            instrument = (
+                                instruments.get(symbol)
+                                if isinstance(instruments, Mapping)
+                                else None
+                            )
+                            if not isinstance(instrument, Mapping):
+                                instrument = {}
+                            historical_exchange, historical_primary_exchange = (
+                                _ibkr_historical_exchange(
+                                    exchange=instrument.get(
+                                        "exchange",
+                                        fetch.get("exchange", "SMART"),
+                                    ),
+                                    primary_exchange=instrument.get(
+                                        "primary_exchange",
+                                        fetch.get("primary_exchange", "SFB"),
+                                    ),
+                                )
+                            )
+                            query = HistoricalBarsQuery(
+                                symbol=symbol,
+                                security_type=str(
+                                    instrument.get(
+                                        "security_type",
+                                        fetch.get("security_type", "STK"),
+                                    )
+                                ).upper(),
+                                exchange=historical_exchange,
+                                currency=str(
+                                    instrument.get("currency", fetch.get("currency", "SEK"))
+                                ).upper(),
+                                primary_exchange=historical_primary_exchange,
+                                isin=(
+                                    str(instrument["isin"])
+                                    if instrument.get("isin") is not None
+                                    else None
+                                ),
+                                duration=str(fetch.get("backfill_duration", "1 D")),
+                                bar_size=str(fetch.get("backfill_bar_size", "1 min")),
+                                what_to_show=str(fetch.get("what_to_show", "TRADES")).upper(),
+                                use_rth=bool(fetch.get("use_rth", True)),
+                                end_at=parsed["as_of"],
+                            )
+                            result = with_diagnostic_session(
+                                "rl_observation_stream_backfill",
+                                lambda broker_app, query=query: read_historical_bars(
+                                    app_config.ibkr.diagnostic_session(),
+                                    query,
+                                    timeout=timeout,
+                                    app=broker_app,
+                                ),
+                            )
+                            symbol_bars = result.get("bars", [])
+                            if symbol_bars:
+                                backfilled_bars[symbol] = symbol_bars
+                                source_bars[symbol] = symbol_bars
+                                fetched_symbols.append(symbol)
+                        if backfilled_bars:
+                            try:
+                                persist_market_stream_bars(
+                                    session_factory,
+                                    bars_by_symbol=backfilled_bars,
+                                    instruments_by_symbol=instruments
+                                    if isinstance(instruments, Mapping)
+                                    else {},
+                                    source="ibkr_historical_backfill_1m",
+                                )
+                            except SQLAlchemyError:
+                                pass
+                            stream_bars.update(backfilled_bars)
+                            missing_stream_bars = [
+                                symbol
+                                for symbol in requested_symbols
+                                if symbol not in stream_bars
+                            ]
                     if missing_stream_bars:
                         raise ValueError(
                             "market stream has no 1-minute bars for symbols: "
@@ -2894,7 +3843,9 @@ def create_app(config: AppConfig | None = None) -> Any:
         model_limit: int = 40,
         deployment_limit: int = 40,
         action_limit: int = 120,
+        candidate_limit: int = 40,
         heartbeat_stale_after_seconds: int = 120,
+        include_expired_candidates: bool = False,
     ) -> dict[str, Any]:
         try:
             validated_model_limit = parse_positive_limit(
@@ -2912,11 +3863,18 @@ def create_app(config: AppConfig | None = None) -> Any:
                 field_name="action_limit",
                 maximum=1000,
             )
+            validated_candidate_limit = parse_positive_limit(
+                candidate_limit,
+                field_name="candidate_limit",
+                maximum=500,
+            )
             validated_stale_after_seconds = parse_positive_limit(
                 heartbeat_stale_after_seconds,
                 field_name="heartbeat_stale_after_seconds",
                 maximum=86400,
             )
+            if not include_expired_candidates:
+                archive_expired_rl_candidates(session_factory)
             snapshot = build_rl_trader_dashboard_snapshot(
                 session_factory,
                 model_limit=validated_model_limit,
@@ -2924,16 +3882,52 @@ def create_app(config: AppConfig | None = None) -> Any:
                 action_limit=validated_action_limit,
                 heartbeat_stale_after_seconds=validated_stale_after_seconds,
             )
+            rl_candidates = list_instruction_statuses(
+                session_factory,
+                limit=validated_candidate_limit,
+                state=ExecutionState.MODEL_ROUTED_PENDING.value,
+                model_routed=True,
+                expire_after=None if include_expired_candidates else utc_now(),
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        dashboard_payload = serialize_rl_trader_dashboard_snapshot(snapshot)
+        dashboard_payload["candidates"] = [
+            serialize_rl_candidate_status(candidate)
+            for candidate in rl_candidates
+        ]
+        dashboard_payload["summary"]["candidate_count"] = len(rl_candidates)
+        candidate_runtime = {
+            "queued_candidate_count": len(rl_candidates),
+            "active_candidate_count": 0,
+            "bar_ready_candidate_count": 0,
+            "backfilled_symbol_count": 0,
+        }
+        for deployment in dashboard_payload.get("deployments", []):
+            heartbeat = deployment.get("heartbeat") if isinstance(deployment, dict) else None
+            metrics = heartbeat.get("metrics") if isinstance(heartbeat, dict) else None
+            if not isinstance(metrics, dict):
+                continue
+            candidate_runtime["active_candidate_count"] += int(
+                metrics.get("active_candidate_count") or 0
+            )
+            candidate_runtime["bar_ready_candidate_count"] += int(
+                metrics.get("stream_bar_ready_candidate_count") or 0
+            )
+            candidate_runtime["backfilled_symbol_count"] += int(
+                metrics.get("backfilled_symbol_count") or 0
+            )
+        dashboard_payload["summary"].update(candidate_runtime)
+
         return {
             "accepted": True,
-            "rl_dashboard": serialize_rl_trader_dashboard_snapshot(snapshot),
+            "rl_dashboard": dashboard_payload,
         }
 
     @app.get("/v1/read/operator-snapshot")
     def get_operator_snapshot(
+        request: FastAPIRequest,
         instruction_limit: int = 50,
         candidate_limit: int = 20,
         candidate_reason_code: str | None = None,
@@ -2942,6 +3936,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         attention_limit: int = 25,
         reconciliation_run_limit: int = 20,
         include_flat_positions: bool = False,
+        include_expired_candidates: bool = False,
     ) -> dict[str, Any]:
         try:
             validated_instruction_limit = parse_positive_limit(
@@ -2974,6 +3969,8 @@ def create_app(config: AppConfig | None = None) -> Any:
                 field_name="reconciliation_run_limit",
                 maximum=200,
             )
+            if not include_expired_candidates:
+                archive_expired_rl_candidates(session_factory)
             operator_snapshot = build_operator_dashboard_snapshot(
                 session_factory,
                 include_flat_positions=include_flat_positions,
@@ -2992,6 +3989,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 limit=500,
                 state=ExecutionState.MODEL_ROUTED_PENDING.value,
                 model_routed=True,
+                expire_after=None if include_expired_candidates else utc_now(),
             )
             normalized_candidate_reason_code = (
                 candidate_reason_code.strip()
@@ -3014,13 +4012,50 @@ def create_app(config: AppConfig | None = None) -> Any:
                     if candidate_reason_code(candidate) == normalized_candidate_reason_code
                 )
             rl_candidates = rl_candidates[:validated_candidate_limit]
+            operator_snapshot_payload = serialize_operator_dashboard_snapshot(
+                operator_snapshot,
+            )
+            stream_symbols = sorted(
+                {
+                    str(row.get("symbol") or row.get("local_symbol") or "")
+                    .strip()
+                    .upper()
+                    for collection_name in ("positions", "open_orders")
+                    for row in operator_snapshot_payload.get(collection_name, [])
+                    if isinstance(row, dict)
+                    and str(row.get("symbol") or row.get("local_symbol") or "").strip()
+                }
+            )
+            if stream_symbols:
+                try:
+                    operator_stream_snapshot = (
+                        request.app.state.market_stream_service.snapshot(
+                            symbols=stream_symbols,
+                            bar_limit=2,
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - defensive UI fallback.
+                    operator_snapshot_payload["market_stream_overlay"] = {
+                        "applied": False,
+                        "error": str(exc),
+                    }
+                else:
+                    enrich_operator_snapshot_with_market_stream(
+                        operator_snapshot_payload,
+                        operator_stream_snapshot,
+                    )
+            else:
+                operator_snapshot_payload["market_stream_overlay"] = {
+                    "applied": False,
+                    "reason": "no positions or open orders",
+                }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         return {
             "accepted": True,
             "operator_snapshot": {
-                **serialize_operator_dashboard_snapshot(operator_snapshot),
+                **operator_snapshot_payload,
                 "instructions": [
                     serialize_instruction_status(instruction)
                     for instruction in (*rl_candidates, *instructions)
@@ -3163,6 +4198,29 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "operator_review": serialize_operator_review_status(result),
+        }
+
+    @app.post("/v1/reconciliation-issues/archive-open")
+    def archive_open_reconciliation_issue_rows(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            action, updated_by, note = parse_operator_review_payload(
+                {**payload, "action": payload.get("action", "ARCHIVE")}
+            )
+            if action != "ARCHIVE":
+                raise ValueError("action must be ARCHIVE for archive-open")
+            result = archive_open_reconciliation_issues(
+                session_factory,
+                updated_by=updated_by,
+                note=note,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "reconciliation_issue_archive": serialize_reconciliation_issue_archive_result(
+                result
+            ),
         }
 
     @app.post("/v1/instructions/submit")
@@ -3372,6 +4430,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 broker_snapshot_fetcher=fetch_reconciliation_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
+                virtual_market_sync=sync_virtual_market_watch_from_stream,
                 submission_lead_time=timedelta(
                     seconds=app_config.execution_runtime_submission_lead_seconds
                 ),
@@ -3411,6 +4470,7 @@ def create_app(config: AppConfig | None = None) -> Any:
                 broker_snapshot_fetcher=fetch_reconciliation_runtime_snapshot_with_primary,
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
+                virtual_market_sync=sync_virtual_market_watch_from_stream,
                 submission_lead_time=timedelta(
                     seconds=app_config.execution_runtime_submission_lead_seconds
                 ),

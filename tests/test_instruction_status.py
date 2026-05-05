@@ -88,6 +88,7 @@ class InstructionStatusTests(TestCase):
         instruction_id: str = "status-aapl-1",
         state: str = "EXIT_PENDING",
         updated_at: datetime | None = None,
+        expire_at: datetime | None = None,
     ) -> None:
         session = self.session_factory()
         try:
@@ -103,7 +104,7 @@ class InstructionStatusTests(TestCase):
                 currency="USD",
                 state=state,
                 submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
-                expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+                expire_at=expire_at or datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
                 order_type="LIMIT",
                 side="BUY",
                 broker_order_id=11,
@@ -331,6 +332,31 @@ class InstructionStatusTests(TestCase):
         archived = next(item for item in all_results if item.instruction_id == "status-aapl-1")
         self.assertEqual(archived.archived_by, "dashboard")
         self.assertEqual(archived.archive_reason, "Clean dashboard.")
+
+    def test_list_instruction_statuses_can_hide_expired_rows(self) -> None:
+        cutoff = datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc)
+        self._insert_instruction(
+            instruction_id="status-aapl-expired",
+            state="MODEL_ROUTED_PENDING",
+            expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+        )
+        self._insert_instruction(
+            instruction_id="status-aapl-active",
+            state="MODEL_ROUTED_PENDING",
+            expire_at=datetime(2026, 4, 10, 20, 1, tzinfo=timezone.utc),
+        )
+
+        results = list_instruction_statuses(
+            self.session_factory,
+            limit=10,
+            model_routed=True,
+            expire_after=cutoff,
+        )
+
+        self.assertEqual(
+            [item.instruction_id for item in results],
+            ["status-aapl-active"],
+        )
 
     def test_instruction_status_prefers_current_broker_order_rows(self) -> None:
         self._insert_instruction(

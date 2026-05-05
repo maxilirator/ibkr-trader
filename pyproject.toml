@@ -29,6 +29,7 @@ server = [
   "pandas",
   "pyarrow",
   "duckdb",
+  "protobuf>=7.34.1",
 ]
 rl = [
   "numpy",

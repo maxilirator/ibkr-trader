@@ -72,6 +72,11 @@ class AccountRef:
             raise ValueError("account.account_key is required")
         if not self.book_key:
             raise ValueError("account.book_key is required")
+        if (
+            str(self.book_role or "").strip().lower() == "virtual"
+            and not self.account_key.strip().lower().startswith("virtual")
+        ):
+            raise ValueError("account.book_role=virtual requires a virtual account_key")
 
 
 @dataclass(slots=True)

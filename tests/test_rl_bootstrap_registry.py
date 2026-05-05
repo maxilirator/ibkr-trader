@@ -1,72 +1,28 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
-import pandas as pd
-
-from scripts.bootstrap_rl_registry import selected_candidate_symbols
-
-
-def test_selected_candidate_symbols_is_uncapped_by_default() -> None:
-    with TemporaryDirectory() as temp_dir:
-        path = Path(temp_dir) / "candidate_tape.parquet"
-        pd.DataFrame(
-            [
-                {
-                    "instrument": "low",
-                    "datetime": "2026-03-23",
-                    "selected": True,
-                    "meta_score": 0.5,
-                },
-                {
-                    "instrument": "high",
-                    "datetime": "2026-03-23",
-                    "selected": True,
-                    "meta_score": 2.0,
-                },
-                {
-                    "instrument": "skip",
-                    "datetime": "2026-03-23",
-                    "selected": False,
-                    "meta_score": 9.0,
-                },
-            ]
-        ).to_parquet(path, index=False)
-
-        symbols = selected_candidate_symbols(
-            path,
-            candidate_date="latest",
-            limit=None,
-        )
-
-    assert symbols == ("HIGH", "LOW")
+from ibkr_trader.rl.model_artifacts import deployment_registry_payload
+from ibkr_trader.rl.model_artifacts import load_model_bundle_manifest
+from tests.test_rl_model_artifacts import _write_bundle
 
 
-def test_selected_candidate_symbols_can_still_be_capped_explicitly() -> None:
-    with TemporaryDirectory() as temp_dir:
-        path = Path(temp_dir) / "candidate_tape.parquet"
-        pd.DataFrame(
-            [
-                {
-                    "instrument": "low",
-                    "datetime": "2026-03-23",
-                    "selected": True,
-                    "meta_score": 0.5,
-                },
-                {
-                    "instrument": "high",
-                    "datetime": "2026-03-23",
-                    "selected": True,
-                    "meta_score": 2.0,
-                },
-            ]
-        ).to_parquet(path, index=False)
+def test_bootstrap_payload_leaves_daily_universe_to_model_routed_candidates(
+    tmp_path: Path,
+) -> None:
+    artifact = load_model_bundle_manifest(_write_bundle(tmp_path))
 
-        symbols = selected_candidate_symbols(
-            path,
-            candidate_date="latest",
-            limit=1,
-        )
+    payload = deployment_registry_payload(artifact)
 
-    assert symbols == ("HIGH",)
+    assert "allowed_symbols" not in payload
+    assert payload["metadata"]["daily_universe_source"] == "model_routed_candidates"
+
+
+def test_bootstrap_payload_still_accepts_explicit_emergency_allow_list(
+    tmp_path: Path,
+) -> None:
+    artifact = load_model_bundle_manifest(_write_bundle(tmp_path))
+
+    payload = deployment_registry_payload(artifact, allowed_symbols=("axfo", "telia"))
+
+    assert payload["allowed_symbols"] == ["AXFO", "TELIA"]

@@ -10,7 +10,6 @@ import pandas as pd
 from ibkr_trader.ibkr.shortability import (
     OfficialIbkrShortableRow,
     StockholmInstrumentIdentity,
-    ShortabilityEntry,
     ShortabilitySource,
     ShortabilityStatus,
     ShortabilitySnapshotQuery,

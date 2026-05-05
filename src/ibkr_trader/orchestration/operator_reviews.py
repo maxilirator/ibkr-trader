@@ -47,6 +47,15 @@ class OperatorReviewStatus:
     latest_action_note: str | None
 
 
+@dataclass(slots=True)
+class ReconciliationIssueArchiveResult:
+    archived_at: datetime
+    archived_by: str
+    archive_reason: str | None
+    archived_issue_count: int
+    issue_ids: tuple[int, ...]
+
+
 def _serialize_for_json(payload: Any) -> Any:
     if isinstance(payload, Enum):
         return payload.value
@@ -66,6 +75,12 @@ def _serialize_for_json(payload: Any) -> Any:
 
 
 def serialize_operator_review_status(payload: OperatorReviewStatus) -> dict[str, Any]:
+    return _serialize_for_json(asdict(payload))
+
+
+def serialize_reconciliation_issue_archive_result(
+    payload: ReconciliationIssueArchiveResult,
+) -> dict[str, Any]:
     return _serialize_for_json(asdict(payload))
 
 
@@ -319,4 +334,60 @@ def record_reconciliation_issue_review_action(
                 "severity": issue.severity,
                 "message": issue.message,
             },
+        )
+
+
+def archive_open_reconciliation_issues(
+    session_factory: sessionmaker[Session],
+    *,
+    updated_by: str,
+    note: str | None = None,
+    source: str = "api",
+) -> ReconciliationIssueArchiveResult:
+    normalized_updated_by = _normalize_updated_by(updated_by)
+    normalized_note = _normalize_note(note)
+
+    with session_scope(session_factory) as session:
+        issues = list(
+            session.execute(
+                select(ReconciliationIssueRecord)
+                .where(ReconciliationIssueRecord.archived_at.is_(None))
+                .order_by(
+                    ReconciliationIssueRecord.observed_at.desc(),
+                    ReconciliationIssueRecord.id.desc(),
+                )
+            ).scalars()
+        )
+        action_at = utc_now()
+        archived_issue_ids: list[int] = []
+
+        for issue in issues:
+            issue.archived_at = action_at
+            issue.archived_by = normalized_updated_by
+            issue.archive_reason = normalized_note
+            archived_issue_ids.append(issue.id)
+            _record_review_action(
+                session,
+                target_kind=RECONCILIATION_ISSUE_TARGET_KIND,
+                target_id=issue.id,
+                action_type=ARCHIVE_ACTION,
+                updated_by=normalized_updated_by,
+                note=normalized_note,
+                source=source,
+                event_at=action_at,
+                payload={
+                    "instruction_id": issue.instruction_id,
+                    "stage": issue.stage,
+                    "severity": issue.severity,
+                    "message": issue.message,
+                    "bulk_archive": True,
+                },
+            )
+
+        return ReconciliationIssueArchiveResult(
+            archived_at=action_at,
+            archived_by=normalized_updated_by,
+            archive_reason=normalized_note,
+            archived_issue_count=len(archived_issue_ids),
+            issue_ids=tuple(archived_issue_ids),
         )

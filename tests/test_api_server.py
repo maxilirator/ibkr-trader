@@ -13,7 +13,12 @@ from unittest.mock import patch
 from ibkr_trader.api.server import (
     create_app,
     enforce_loopback_binding,
+    enrich_operator_snapshot_with_market_stream,
     is_loopback_host,
+    market_stream_contracts_for_current_holdings,
+    market_stream_contracts_for_open_orders,
+    market_stream_contracts_for_open_virtual_positions,
+    market_stream_contracts_for_runtime_holdings,
     parse_account_summary_payload,
     parse_contract_resolve_payload,
     parse_execution_batch_payload,
@@ -50,6 +55,7 @@ from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import InstructionSetCancellationRecord
+from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
@@ -57,6 +63,7 @@ from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.db.models import VirtualMarketQuoteRecord
 from ibkr_trader.ibkr.shortability import ShortabilityMarketDataType
 from ibkr_trader.ibkr.shortability import ShortabilitySource
+from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
 
@@ -430,7 +437,7 @@ class ApiServerTests(TestCase):
             patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
             patch(
                 "ibkr_trader.ibkr.session_manager.ManagedSyncSession.execute",
-                side_effect=lambda _operation_name, callback: callback(None),
+                side_effect=lambda _operation_name, callback, **_kwargs: callback(None),
             ),
             patch(
                 "ibkr_trader.api.server.collect_stockholm_intraday_backfill",
@@ -806,6 +813,289 @@ class ApiServerTests(TestCase):
         self.assertEqual(payload["market_data_type"], "DELAYED")
         self.assertTrue(payload["replace"])
 
+    def test_market_stream_contracts_for_open_orders_uses_stockholm_stream_defaults(
+        self,
+    ) -> None:
+        contracts = market_stream_contracts_for_open_orders(
+            {
+                18: BrokerOpenOrder(
+                    order_id=18,
+                    perm_id=10018,
+                    client_id=0,
+                    status="PreSubmitted",
+                    order_ref="2026-04-29-U25245596-live_top1_31_seedpicker-HTRO-long-01",
+                    action="SELL",
+                    total_quantity=None,
+                    symbol="htro",
+                    security_type="STK",
+                    exchange="SFB",
+                    primary_exchange=None,
+                    currency="SEK",
+                    local_symbol="HTRO",
+                ),
+                19: BrokerOpenOrder(
+                    order_id=19,
+                    perm_id=10019,
+                    client_id=0,
+                    status="Cancelled",
+                    order_ref=None,
+                    action="SELL",
+                    total_quantity=None,
+                    symbol="OLD",
+                    security_type="STK",
+                    exchange="SMART",
+                    primary_exchange="SFB",
+                    currency="SEK",
+                ),
+            }
+        )
+
+        self.assertEqual(len(contracts), 1)
+        self.assertEqual(contracts[0].symbol, "HTRO")
+        self.assertEqual(contracts[0].security_type, "STK")
+        self.assertEqual(contracts[0].exchange, "SMART")
+        self.assertEqual(contracts[0].primary_exchange, "SFB")
+        self.assertEqual(contracts[0].currency, "SEK")
+        self.assertEqual(contracts[0].local_symbol, "HTRO")
+
+    def test_market_stream_contracts_for_runtime_holdings_subscribes_positions(
+        self,
+    ) -> None:
+        contracts = market_stream_contracts_for_runtime_holdings(
+            SimpleNamespace(
+                portfolio=(),
+                positions=(
+                    SimpleNamespace(
+                        account="U25245596",
+                        symbol="hm b",
+                        security_type="STK",
+                        exchange="SFB",
+                        primary_exchange=None,
+                        currency="SEK",
+                        local_symbol="HM B",
+                        position="2",
+                    ),
+                    SimpleNamespace(
+                        account="U25245596",
+                        symbol="OLD",
+                        security_type="STK",
+                        exchange="SFB",
+                        primary_exchange=None,
+                        currency="SEK",
+                        local_symbol="OLD",
+                        position="0",
+                    ),
+                ),
+            )
+        )
+
+        self.assertEqual([contract.symbol for contract in contracts], ["HM B"])
+        self.assertEqual(contracts[0].exchange, "SMART")
+        self.assertEqual(contracts[0].primary_exchange, "SFB")
+
+    def test_market_stream_contracts_for_open_virtual_positions_subscribes_holdings(
+        self,
+    ) -> None:
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+        session = session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="VIRTUAL",
+                account_key="VIRTUALRL01",
+                account_label="Virtual RL",
+                base_currency="SEK",
+                is_virtual=True,
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add_all(
+                [
+                    PositionSnapshotRecord(
+                        broker_account_id=broker_account.id,
+                        is_virtual=True,
+                        snapshot_at=datetime(2026, 4, 29, 14, 0, tzinfo=timezone.utc),
+                        source="virtual_execution",
+                        symbol="AZN",
+                        exchange="SFB",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange=None,
+                        local_symbol="AZN",
+                        quantity="1",
+                        average_cost="1700",
+                        market_price="1701",
+                        market_value="1701",
+                        unrealized_pnl="1",
+                        realized_pnl="0",
+                    ),
+                    PositionSnapshotRecord(
+                        broker_account_id=broker_account.id,
+                        is_virtual=True,
+                        snapshot_at=datetime(2026, 4, 29, 14, 1, tzinfo=timezone.utc),
+                        source="virtual_execution",
+                        symbol="OLD",
+                        exchange="SFB",
+                        currency="SEK",
+                        security_type="STK",
+                        primary_exchange=None,
+                        local_symbol="OLD",
+                        quantity="0",
+                        average_cost=None,
+                        market_price="10",
+                        market_value="0",
+                        unrealized_pnl="0",
+                        realized_pnl="0",
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        try:
+            contracts = market_stream_contracts_for_current_holdings(
+                session_factory,
+            )
+            self.assertEqual([contract.symbol for contract in contracts], ["AZN"])
+            self.assertEqual(contracts[0].exchange, "SMART")
+            self.assertEqual(contracts[0].primary_exchange, "SFB")
+            self.assertEqual(contracts[0].local_symbol, "AZN")
+
+            virtual_contracts = market_stream_contracts_for_open_virtual_positions(
+                session_factory,
+            )
+            self.assertEqual(
+                [contract.symbol for contract in virtual_contracts],
+                ["AZN"],
+            )
+        finally:
+            engine.dispose()
+
+    def test_operator_snapshot_stream_overlay_marks_positions_orders_and_accounts(
+        self,
+    ) -> None:
+        snapshot = {
+            "accounts": [
+                {
+                    "account_key": "U25245596",
+                    "net_liquidation": "100000",
+                    "day_performance": {
+                        "start_net_liquidation": "100000",
+                        "latest_return_pct": "0.00",
+                        "points": [
+                            {
+                                "snapshot_at": "2026-04-29T07:00:00+00:00",
+                                "net_liquidation": "100000",
+                                "return_pct": "0.00",
+                            }
+                        ],
+                    },
+                }
+            ],
+            "positions": [
+                {
+                    "account_key": "U25245596",
+                    "symbol": "AZN",
+                    "quantity": "2",
+                    "average_cost": "100",
+                    "market_price": "101",
+                    "market_value": "202",
+                    "unrealized_pnl": "2",
+                }
+            ],
+            "open_orders": [
+                {
+                    "account_key": "U25245596",
+                    "symbol": "AZN",
+                    "working_price": "104",
+                    "working_price_reference": "LIMIT",
+                    "limit_price": "104",
+                }
+            ],
+        }
+        stream_snapshot = {
+            "running": True,
+            "desired_subscription_count": 1,
+            "quote_count": 0,
+            "bars_by_symbol": {
+                "AZN": [
+                    {
+                        "timestamp": "2026-04-29T07:01:00+00:00",
+                        "close": "102",
+                    },
+                    {
+                        "timestamp": "2026-04-29T07:02:00+00:00",
+                        "close": "103",
+                    },
+                ]
+            },
+        }
+
+        enriched = enrich_operator_snapshot_with_market_stream(
+            snapshot,
+            stream_snapshot,
+        )
+
+        self.assertEqual(enriched["positions"][0]["market_price"], "103")
+        self.assertEqual(enriched["positions"][0]["market_value"], "206")
+        self.assertEqual(enriched["positions"][0]["unrealized_pnl"], "6")
+        self.assertEqual(enriched["open_orders"][0]["reference_market_price"], "103")
+        self.assertEqual(enriched["open_orders"][0]["last_market_price_direction"], "UP")
+        self.assertEqual(enriched["open_orders"][0]["price_spread"], "+1.00")
+        self.assertEqual(enriched["accounts"][0]["net_liquidation"], "100004")
+        self.assertEqual(
+            enriched["accounts"][0]["day_performance"]["latest_return_pct"],
+            "0.00",
+        )
+        self.assertTrue(enriched["market_stream_overlay"]["applied"])
+
+    def test_operator_snapshot_stream_overlay_does_not_double_count_live_position_value(
+        self,
+    ) -> None:
+        snapshot = {
+            "accounts": [
+                {
+                    "account_key": "U25245596",
+                    "is_virtual": False,
+                    "net_liquidation": "18716.12",
+                    "day_performance": {"points": []},
+                }
+            ],
+            "positions": [
+                {
+                    "account_key": "U25245596",
+                    "symbol": "HTRO",
+                    "quantity": "518",
+                    "average_cost": "34.01559531",
+                    "market_price": None,
+                    "market_value": "0",
+                    "unrealized_pnl": None,
+                }
+            ],
+            "open_orders": [],
+        }
+
+        enriched = enrich_operator_snapshot_with_market_stream(
+            snapshot,
+            {
+                "running": True,
+                "bars_by_symbol": {
+                    "HTRO": [
+                        {
+                            "timestamp": "2026-04-29T14:44:00+00:00",
+                            "close": "32.21",
+                        }
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(enriched["positions"][0]["market_value"], "16684.78")
+        self.assertEqual(enriched["accounts"][0]["net_liquidation"], "18716.12")
+        self.assertEqual(enriched["market_stream_overlay"]["marked_account_count"], 0)
+
     def test_parse_market_stream_subscribe_payload_enriches_stockholm_identity(self) -> None:
         payload = parse_market_stream_subscribe_payload(
             {
@@ -822,6 +1112,27 @@ class ApiServerTests(TestCase):
 
         contract = payload["contracts"][0]
         self.assertEqual(contract.symbol, "ERIC-B")
+        self.assertEqual(contract.local_symbol, "ERIC B")
+        self.assertEqual(contract.isin, "SE0000108656")
+
+    def test_parse_market_stream_subscribe_payload_enriches_share_class_alias(
+        self,
+    ) -> None:
+        payload = parse_market_stream_subscribe_payload(
+            {
+                "symbols": ["eric b"],
+                "market_data_type": "live",
+            },
+            stockholm_identity_map={
+                "ERIC-B": SimpleNamespace(
+                    ticker_alias="ERIC B",
+                    isin="SE0000108656",
+                )
+            },
+        )
+
+        contract = payload["contracts"][0]
+        self.assertEqual(contract.symbol, "ERIC B")
         self.assertEqual(contract.local_symbol, "ERIC B")
         self.assertEqual(contract.isin, "SE0000108656")
 
@@ -1407,8 +1718,8 @@ class ApiServerTests(TestCase):
                         exchange="XSTO",
                         currency="SEK",
                         state="MODEL_ROUTED_PENDING",
-                        submit_at=datetime(2026, 4, 28, 7, 0, tzinfo=timezone.utc),
-                        expire_at=datetime(2026, 4, 28, 15, 30, tzinfo=timezone.utc),
+                        submit_at=datetime(2099, 4, 28, 7, 0, tzinfo=timezone.utc),
+                        expire_at=datetime(2099, 4, 28, 15, 30, tzinfo=timezone.utc),
                         order_type="MODEL_ROUTED",
                         side="BUY",
                         payload={
@@ -1416,7 +1727,7 @@ class ApiServerTests(TestCase):
                             "source": {
                                 "system": "upstream-agent",
                                 "batch_id": "candidate-batch-001",
-                                "generated_at": "2026-04-28T06:30:00Z",
+                                "generated_at": "2099-04-28T06:30:00Z",
                             },
                             "instruction": {
                                 "instruction_id": "candidate-AXFO",
@@ -1445,13 +1756,13 @@ class ApiServerTests(TestCase):
                                         "canonical_long_live_execution_policy"
                                     ),
                                     "window": {
-                                        "start_at": "2026-04-28T09:00:00+02:00",
-                                        "end_at": "2026-04-28T17:30:00+02:00",
+                                        "start_at": "2099-04-28T09:00:00+02:00",
+                                        "end_at": "2099-04-28T17:30:00+02:00",
                                     },
                                 },
                                 "trace": {
                                     "reason_code": "rl_model_routed_candidate",
-                                    "trade_date": "2026-04-28",
+                                    "trade_date": "2099-04-28",
                                 },
                             },
                         },
@@ -1524,11 +1835,157 @@ class ApiServerTests(TestCase):
             self.assertEqual(candidate["state"], "MODEL_ROUTED_PENDING")
             self.assertEqual(candidate["model_id"], "long_trial_106_v1")
             self.assertEqual(candidate["symbol"], "AXFO")
-            self.assertEqual(candidate["execution_window"]["start_at"], "2026-04-28T09:00:00+02:00")
+            self.assertEqual(candidate["execution_window"]["start_at"], "2099-04-28T09:00:00+02:00")
             self.assertEqual(
                 candidate["candidate"]["instruction_id"],
                 "candidate-AXFO",
             )
+
+    def test_rl_dashboard_archives_expired_candidate_sources(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "rl_dashboard_rollover.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                for instruction_id, expire_at in (
+                    (
+                        "expired-candidate",
+                        datetime(2000, 1, 1, 15, 30, tzinfo=timezone.utc),
+                    ),
+                    (
+                        "future-candidate",
+                        datetime(2099, 1, 1, 15, 30, tzinfo=timezone.utc),
+                    ),
+                ):
+                    session.add(
+                        InstructionRecord(
+                            instruction_id=instruction_id,
+                            schema_version="2026-04-25",
+                            source_system="upstream-agent",
+                            batch_id="candidate-batch-001",
+                            account_key="VIRTUALRL01",
+                            book_key="rl_shared_long_trial_106_virtual_01",
+                            is_virtual=True,
+                            symbol="AXFO",
+                            exchange="XSTO",
+                            currency="SEK",
+                            state="MODEL_ROUTED_PENDING",
+                            submit_at=datetime(
+                                2000,
+                                1,
+                                1,
+                                7,
+                                0,
+                                tzinfo=timezone.utc,
+                            ),
+                            expire_at=expire_at,
+                            order_type="MODEL_ROUTED",
+                            side="BUY",
+                            payload={
+                                "instruction": {
+                                    "instruction_id": instruction_id,
+                                    "execution": {
+                                        "mode": "model_routed",
+                                        "model_id": "long_trial_106_v1",
+                                    },
+                                }
+                            },
+                        )
+                    )
+                session.add(
+                    InstructionRecord(
+                        instruction_id="generated-position",
+                        schema_version="2026-04-10",
+                        source_system="rl-runner",
+                        batch_id="generated-batch",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        is_virtual=True,
+                        symbol="AXFO",
+                        exchange="XSTO",
+                        currency="SEK",
+                        state="POSITION_OPEN",
+                        submit_at=datetime(2000, 1, 1, 7, 0, tzinfo=timezone.utc),
+                        expire_at=datetime(2099, 1, 1, 7, 0, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        payload={
+                            "instruction": {
+                                "instruction_id": "generated-position",
+                                "trace": {
+                                    "metadata": {
+                                        "rl_source_instruction_id": (
+                                            "expired-candidate"
+                                        )
+                                    }
+                                },
+                            }
+                        },
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="U25245596",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                response = client.get("/v1/read/rl-dashboard")
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["rl_dashboard"]["summary"]["candidate_count"], 1)
+            self.assertEqual(
+                body["rl_dashboard"]["candidates"][0]["candidate_id"],
+                "future-candidate",
+            )
+
+            session = session_factory()
+            try:
+                rows = {
+                    row.instruction_id: row
+                    for row in session.query(InstructionRecord).all()
+                }
+                self.assertIsNotNone(rows["expired-candidate"].archived_at)
+                self.assertIsNone(rows["future-candidate"].archived_at)
+                self.assertIsNone(rows["generated-position"].archived_at)
+            finally:
+                session.close()
+                engine.dispose()
 
     def test_ledger_snapshot_endpoint_returns_append_only_history(self) -> None:
         try:
@@ -1947,6 +2404,10 @@ class ApiServerTests(TestCase):
                     "/v1/reconciliation-issues/1/review",
                     json={"action": "RESOLVE", "updated_by": "test-suite"},
                 )
+                archive_response = client.post(
+                    "/v1/reconciliation-issues/archive-open",
+                    json={"updated_by": "test-suite"},
+                )
 
             self.assertEqual(attention_response.status_code, 200)
             self.assertEqual(
@@ -1957,6 +2418,13 @@ class ApiServerTests(TestCase):
             self.assertEqual(
                 issue_response.json()["operator_review"]["status"],
                 "RESOLVED",
+            )
+            self.assertEqual(archive_response.status_code, 200)
+            self.assertEqual(
+                archive_response.json()["reconciliation_issue_archive"][
+                    "archived_issue_count"
+                ],
+                1,
             )
 
     def test_submit_endpoint_rejects_when_kill_switch_is_enabled(self) -> None:

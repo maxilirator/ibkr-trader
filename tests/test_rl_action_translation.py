@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from importlib import util as importlib_util
 from datetime import datetime
 from datetime import timezone
 from decimal import Decimal
@@ -18,6 +20,7 @@ from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.domain.execution_payloads import parse_execution_batch_payload
 from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
@@ -32,6 +35,24 @@ from ibkr_trader.rl.action_translation import LONG_OPEN
 from ibkr_trader.rl.action_translation import SHORT_OPEN
 from ibkr_trader.rl.action_translation import translate_rl_action
 from ibkr_trader.virtual.execution import record_virtual_market_quote
+
+
+def _load_q_training_intraday_simulator():
+    for repo_root in (
+        Path("/home/mattias/dev/q-training"),
+        Path("/home/mattias/dev/q-training-bucket-booster"),
+    ):
+        simulator_path = repo_root / "src/q_train/intraday/simulator.py"
+        if simulator_path.exists():
+            module_name = "_q_training_intraday_simulator_for_trader_tests"
+            module_spec = importlib_util.spec_from_file_location(module_name, simulator_path)
+            if module_spec is None or module_spec.loader is None:
+                continue
+            module = importlib_util.module_from_spec(module_spec)
+            sys.modules[module_name] = module
+            module_spec.loader.exec_module(module)
+            return module.IntradayReplaySpec, module.simulate_component_session
+    return None, None
 
 
 def _write_schedule_fixture(schedule_path: Path) -> None:
@@ -225,6 +246,24 @@ class RLActionTranslationTests(TestCase):
             )
             self.assertEqual(result.action_status, ACTION_STATUS_LOGGED)
             self.assertIsNone(result.instruction_payload)
+
+    def test_pending_entry_action_maintains_existing_pending_order(self) -> None:
+        result = _translate(
+            _model_routed_payload(
+                instruction_id="long-pending-entry-1",
+                model_id="long_trial_106_v1",
+                symbol="AXFO",
+                side="LONG",
+            ),
+            deployment_key="long_trial_106_virtual_shared_01",
+            action_name="entry_prevclose_-50bp",
+            state_before="ENTRY_PENDING",
+        )
+
+        self.assertEqual(result.action_status, ACTION_STATUS_LOGGED)
+        self.assertEqual(result.state_after, "ENTRY_PENDING")
+        self.assertIsNone(result.instruction_payload)
+        self.assertIn("already pending", result.note)
 
     def test_long_rejects_short_prevclose_direction(self) -> None:
         result = _translate(
@@ -438,6 +477,199 @@ class RLActionVirtualExecutionTests(TestCase):
                 self.assertEqual(instruction.state, ExecutionState.POSITION_OPEN.value)
             finally:
                 session.close()
+
+    def test_virtual_decision_bar_matches_training_limit_fill_semantics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            _write_schedule_fixture(schedule_path)
+            result = _translate(
+                _model_routed_payload(
+                    instruction_id="long-parity-1",
+                    model_id="long_trial_106_v1",
+                    symbol="AXFO",
+                    side="LONG",
+                    book_key="rl_shared_long_trial_106_virtual_01",
+                ),
+                deployment_key="long_trial_106_virtual_shared_01",
+                action_name="entry_prevclose_-50bp",
+            )
+            self._submit_translated(result.instruction_payload, schedule_path)
+            cycle = self._run_cycle(schedule_path, 5)
+            self.assertEqual(len(cycle.submitted_entries), 1)
+
+            # q-training fills a long prev-close -50bp limit when the same
+            # decision bar's low crosses 99.50; the virtual tape must do the same.
+            record_virtual_market_quote(
+                self.session_factory,
+                account_key="VIRTUALRL01",
+                symbol="AXFO",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                last_price=Decimal("100.20"),
+                bid_price=Decimal("100.20"),
+                ask_price=Decimal("100.20"),
+                observed_at=datetime(2026, 4, 27, 7, 5, tzinfo=timezone.utc),
+                source="rl_decision_bar",
+                raw_payload={
+                    "latest_stream_bar": {
+                        "timestamp": "2026-04-27T07:00:00+00:00",
+                        "open": "100.00",
+                        "high": "100.80",
+                        "low": "99.40",
+                        "close": "100.20",
+                    }
+                },
+                metadata={"fill_price_policy": "training_limit_price"},
+            )
+
+        session = self.session_factory()
+        try:
+            order = session.execute(select(BrokerOrderRecord)).scalar_one()
+            fill = session.execute(select(ExecutionFillRecord)).scalar_one()
+            self.assertEqual(order.status, "FILLED")
+            self.assertEqual(fill.price, "99.5000")
+            self.assertEqual(
+                fill.raw_payload["condition_code"],
+                "BUY_LIMIT_MET:STREAM_BAR_LOW",
+            )
+        finally:
+            session.close()
+
+    def test_virtual_entry_parity_with_q_training_prevclose_limit_replay(self) -> None:
+        IntradayReplaySpec, simulate_component_session = _load_q_training_intraday_simulator()
+        if IntradayReplaySpec is None or simulate_component_session is None:
+            self.skipTest("q-training intraday simulator is not available")
+
+        import pandas as pd
+
+        cases = [
+            {
+                "symbol": "AXFO",
+                "side": "LONG",
+                "model_id": "long_trial_106_v1",
+                "book_key": "rl_shared_long_trial_106_virtual_01",
+                "deployment_key": "long_trial_106_virtual_shared_01",
+                "action_name": "entry_prevclose_-50bp",
+                "entry_prev_close_rel": -0.005,
+                "bar": {
+                    "open": "100.00",
+                    "high": "100.80",
+                    "low": "99.40",
+                    "close": "100.20",
+                },
+                "condition_code": "BUY_LIMIT_MET:STREAM_BAR_LOW",
+            },
+            {
+                "symbol": "AZA",
+                "side": "SHORT",
+                "model_id": "short_trial36_v1",
+                "book_key": "rl_shared_short_trial_36_virtual_01",
+                "deployment_key": "short_trial_36_virtual_shared_01",
+                "action_name": "entry_prevclose_88bp",
+                "entry_prev_close_rel": 0.0088,
+                "bar": {
+                    "open": "100.70",
+                    "high": "101.20",
+                    "low": "100.20",
+                    "close": "100.60",
+                },
+                "condition_code": "SELL_LIMIT_MET:STREAM_BAR_HIGH",
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(side=case["side"]):
+                engine = build_engine("sqlite+pysqlite:///:memory:")
+                create_schema(engine)
+                session_factory = create_session_factory(engine)
+                self.session_factory = session_factory
+                self.engine = engine
+                try:
+                    with TemporaryDirectory() as temp_dir:
+                        schedule_path = Path(temp_dir) / "day_sessions.parquet"
+                        _write_schedule_fixture(schedule_path)
+                        bar = case["bar"]
+                        replay = simulate_component_session(
+                            session_df=pd.DataFrame(
+                                [
+                                    {
+                                        "instrument": case["symbol"].lower(),
+                                        "session_date": pd.Timestamp("2026-04-27"),
+                                        "ts_local": pd.Timestamp(
+                                            "2026-04-27 09:05:00+02:00"
+                                        ),
+                                        "open": float(bar["open"]),
+                                        "high": float(bar["high"]),
+                                        "low": float(bar["low"]),
+                                        "close": float(bar["close"]),
+                                    }
+                                ]
+                            ),
+                            side=str(case["side"]).lower(),
+                            weight=1.0,
+                            spec=IntradayReplaySpec(
+                                entry_mode="prev_close_limit",
+                                entry_bar_offset=0,
+                                entry_prev_close_rel=case["entry_prev_close_rel"],
+                            ),
+                            prev_close_price=100.0,
+                        )
+                        self.assertTrue(replay.entry_filled)
+
+                        result = _translate(
+                            _model_routed_payload(
+                                instruction_id=f"{case['side'].lower()}-parity-1",
+                                model_id=case["model_id"],
+                                symbol=case["symbol"],
+                                side=case["side"],
+                                book_key=case["book_key"],
+                            ),
+                            deployment_key=case["deployment_key"],
+                            action_name=case["action_name"],
+                        )
+                        self._submit_translated(result.instruction_payload, schedule_path)
+                        cycle = self._run_cycle(schedule_path, 5)
+                        self.assertEqual(len(cycle.submitted_entries), 1)
+
+                        record_virtual_market_quote(
+                            session_factory,
+                            account_key="VIRTUALRL01",
+                            symbol=case["symbol"],
+                            exchange="SMART",
+                            currency="SEK",
+                            security_type="STK",
+                            primary_exchange="SFB",
+                            last_price=Decimal(bar["close"]),
+                            bid_price=Decimal(bar["close"]),
+                            ask_price=Decimal(bar["close"]),
+                            observed_at=datetime(2026, 4, 27, 7, 5, tzinfo=timezone.utc),
+                            source="rl_decision_bar",
+                            raw_payload={
+                                "latest_stream_bar": {
+                                    "timestamp": "2026-04-27T07:05:00+00:00",
+                                    **bar,
+                                }
+                            },
+                            metadata={"fill_price_policy": "training_limit_price"},
+                        )
+
+                        session = session_factory()
+                        try:
+                            fill = session.execute(select(ExecutionFillRecord)).scalar_one()
+                            self.assertEqual(
+                                Decimal(fill.price),
+                                Decimal(str(replay.entry_price)).quantize(Decimal("0.0001")),
+                            )
+                            self.assertEqual(
+                                fill.raw_payload["condition_code"],
+                                case["condition_code"],
+                            )
+                        finally:
+                            session.close()
+                finally:
+                    engine.dispose()
 
     def test_cancel_entry_marks_owned_pending_instruction_cancelled(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -774,6 +1006,11 @@ class RLActionTranslationApiTests(TestCase):
                         "decision_id": "2026-04-27T07:05:00Z",
                         "submit": True,
                         "log_action": True,
+                        "model_diagnostics": {
+                            "chosen_action": "entry_prevclose_-50bp",
+                            "action_margin": "0.42",
+                            "q_values": ["0.1", "0.5"],
+                        },
                     },
                 )
 
@@ -790,6 +1027,10 @@ class RLActionTranslationApiTests(TestCase):
         self.assertEqual(instruction["entry"]["limit_price"], "99.5000")
         self.assertEqual(body["submitted_batch"]["instruction_count"], 1)
         self.assertEqual(body["trader_action"]["action_status"], "translated")
+        self.assertEqual(
+            body["trader_action"]["payload"]["model_diagnostics"]["chosen_action"],
+            "entry_prevclose_-50bp",
+        )
 
     def test_translate_endpoint_executes_owned_long_take_profit_exit(self) -> None:
         try:

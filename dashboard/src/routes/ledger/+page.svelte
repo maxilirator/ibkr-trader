@@ -441,8 +441,8 @@
 
 <style>
   .page {
-    max-width: 1380px;
-    margin: 0 auto;
+    width: 100%;
+    box-sizing: border-box;
     padding: 2rem 1.25rem 4rem;
   }
 

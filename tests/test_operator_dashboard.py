@@ -747,6 +747,220 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
 
         self.assertEqual(tuple(snapshot.recent_broker_attention), ())
 
+    def test_build_operator_dashboard_snapshot_hides_expected_oca_exit_sibling_cancel(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="2026-05-04-U25245596-live_top1_31_seedpicker-HACK-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="live_top1_31_seedpicker",
+                symbol="HACK",
+                exchange="SMART",
+                currency="SEK",
+                state="COMPLETED",
+                submit_at=datetime(2026, 5, 4, 7, 25, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 5, 4, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            session.add(instruction)
+            session.flush()
+
+            oca_group = "OCAB5AB0E78DC34DB63"
+            stop_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4840",
+                external_perm_id="1010318184",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:catastrophic_stop",
+                symbol="HACK",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="HACK",
+                side="SELL",
+                order_type="STP",
+                time_in_force="DAY",
+                status="Cancelled",
+                total_quantity="229",
+                stop_price="66.10",
+                submitted_at=datetime(2026, 5, 4, 7, 25, 13, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 5, 4, 12, 22, 50, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={"oca_group": oca_group},
+            )
+            take_profit_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4841",
+                external_perm_id="1010318185",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:take_profit",
+                symbol="HACK",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="HACK",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="FILLED",
+                total_quantity="229",
+                limit_price="79.30",
+                submitted_at=datetime(2026, 5, 4, 7, 25, 14, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 5, 4, 12, 22, 50, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={"oca_group": oca_group},
+            )
+            session.add_all([stop_order, take_profit_order])
+            session.flush()
+
+            session.add(
+                BrokerOrderEventRecord(
+                    broker_order_id=stop_order.id,
+                    event_type="order_error_callback",
+                    event_at=datetime(2026, 5, 4, 12, 22, 50, tzinfo=timezone.utc),
+                    status_before="Cancelled",
+                    status_after="Cancelled",
+                    payload={
+                        "orderId": 4840,
+                        "errorCode": 202,
+                        "errorString": "Order Canceled - reason:",
+                    },
+                    note="Persisted broker order error callback directly from the live session.",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(tuple(snapshot.recent_broker_attention), ())
+
+    def test_build_operator_dashboard_snapshot_keeps_unmatched_exit_cancel_attention(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="2026-05-04-U25245596-live_top1_31_seedpicker-HACK-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="live_top1_31_seedpicker",
+                symbol="HACK",
+                exchange="SMART",
+                currency="SEK",
+                state="POSITION_OPEN",
+                submit_at=datetime(2026, 5, 4, 7, 25, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 5, 4, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            session.add(instruction)
+            session.flush()
+
+            stop_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4840",
+                external_perm_id="1010318184",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:catastrophic_stop",
+                symbol="HACK",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="HACK",
+                side="SELL",
+                order_type="STP",
+                time_in_force="DAY",
+                status="Cancelled",
+                total_quantity="229",
+                stop_price="66.10",
+                submitted_at=datetime(2026, 5, 4, 7, 25, 13, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 5, 4, 12, 22, 50, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={"oca_group": "OCAB5AB0E78DC34DB63"},
+            )
+            session.add(stop_order)
+            session.flush()
+
+            session.add(
+                BrokerOrderEventRecord(
+                    broker_order_id=stop_order.id,
+                    event_type="order_error_callback",
+                    event_at=datetime(2026, 5, 4, 12, 22, 50, tzinfo=timezone.utc),
+                    status_before="Cancelled",
+                    status_after="Cancelled",
+                    payload={
+                        "orderId": 4840,
+                        "errorCode": 202,
+                        "errorString": "Order Canceled - reason:",
+                    },
+                    note="Persisted broker order error callback directly from the live session.",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(len(snapshot.recent_broker_attention), 1)
+        self.assertEqual(
+            snapshot.recent_broker_attention[0].message,
+            "[202] Order Canceled - reason:",
+        )
+
     def test_build_operator_dashboard_snapshot_dedupes_replaced_open_order_lineage(self) -> None:
         session: Session = self.session_factory()
         try:
@@ -1011,6 +1225,165 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
         symbols = {row.symbol for row in snapshot.open_orders}
         self.assertNotIn("VOLCAR.B", symbols)
         self.assertNotIn("SIVE", symbols)
+
+    def test_open_orders_are_not_starved_by_recent_closed_rows(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    order_role="ENTRY",
+                    external_order_id="open-1",
+                    external_perm_id="open-perm-1",
+                    external_client_id="0",
+                    order_ref="old-open-order",
+                    symbol="SAAB",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    side="BUY",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Submitted",
+                    total_quantity="2",
+                    limit_price="100.00",
+                    submitted_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            for index in range(20):
+                session.add(
+                    BrokerOrderRecord(
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        order_role="ENTRY",
+                        external_order_id=f"closed-{index}",
+                        external_perm_id=f"closed-perm-{index}",
+                        external_client_id="0",
+                        order_ref=f"closed-order-{index}",
+                        symbol="ERIC B",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        side="BUY",
+                        order_type="LMT",
+                        time_in_force="DAY",
+                        status="Filled",
+                        total_quantity="1",
+                        limit_price="80.00",
+                        submitted_at=datetime(
+                            2026, 4, 19, 7, index + 1, tzinfo=timezone.utc
+                        ),
+                        last_status_at=datetime(
+                            2026, 4, 19, 7, index + 1, tzinfo=timezone.utc
+                        ),
+                        raw_payload={},
+                        metadata_json={},
+                    )
+                )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=1,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(len(snapshot.open_orders), 1)
+        self.assertEqual(snapshot.open_orders[0].order_ref, "old-open-order")
+
+    def test_partially_filled_exit_order_remains_open(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+            broker_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="exit-1",
+                external_perm_id="exit-perm-1",
+                external_client_id="0",
+                order_ref="position-1:exit:forced",
+                symbol="SAAB",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Submitted",
+                total_quantity="10",
+                limit_price="105.00",
+                submitted_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.flush()
+            session.add(
+                ExecutionFillRecord(
+                    broker_order_id=broker_order.id,
+                    instruction_id=None,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    external_execution_id="partial-exit-fill",
+                    external_order_id="exit-1",
+                    external_perm_id="exit-perm-1",
+                    order_ref="position-1:exit:forced",
+                    symbol="SAAB",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    side="SLD",
+                    quantity="4",
+                    price="105.00",
+                    commission="1.00",
+                    commission_currency="SEK",
+                    executed_at=datetime(2026, 4, 19, 7, 1, tzinfo=timezone.utc),
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(len(snapshot.open_orders), 1)
+        self.assertEqual(snapshot.open_orders[0].external_order_id, "exit-1")
 
 
 if __name__ == "__main__":

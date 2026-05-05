@@ -86,7 +86,10 @@ function parseJsonObject(rawValue, fieldName) {
 }
 
 function rlDashboardUrl(apiBaseUrl) {
-  return `${apiBaseUrl}/v1/read/rl-dashboard?model_limit=50&deployment_limit=50&action_limit=150`;
+  return (
+    `${apiBaseUrl}/v1/read/rl-dashboard` +
+    '?model_limit=50&deployment_limit=50&action_limit=150&candidate_limit=80'
+  );
 }
 
 export async function load({ fetch }) {

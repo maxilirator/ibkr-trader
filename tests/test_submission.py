@@ -74,7 +74,7 @@ def _model_routed_payload() -> dict[str, object]:
     return {
         "schema_version": "2026-04-25",
         "source": {
-            "system": "q-training-bucket",
+            "system": "q-training",
             "batch_id": "long-rl-smoke-2026-04-28",
             "generated_at": "2026-04-27T21:30:00Z",
             "strategy_id": "long_trial_106",
@@ -221,6 +221,20 @@ class SubmissionTests(TestCase):
             record.payload["instruction"]["execution"]["model_id"],
             "long_trial_106_v1",
         )
+
+    def test_parse_rejects_virtual_book_role_on_live_account(self) -> None:
+        payload = _model_routed_payload()
+        instruction_payload = payload["instructions"][0]
+        assert isinstance(instruction_payload, dict)
+        account_payload = instruction_payload["account"]
+        assert isinstance(account_payload, dict)
+        account_payload["account_key"] = "U25245596"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "book_role=virtual requires a virtual account_key",
+        ):
+            parse_execution_batch_payload(payload)
 
     def test_parse_model_routed_batch_accepts_root_model_shortcut(self) -> None:
         payload = _model_routed_payload()

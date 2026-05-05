@@ -74,7 +74,10 @@ account key.
 
 Current virtual fill semantics:
 
-- requested quantity is ignored and every virtual fill uses `quantity="1"`
+- `target_quantity` is used directly and must be a whole-share quantity
+- `target_notional` is converted to whole shares using the entry limit price,
+  or the current virtual market price for market orders, rounded down
+- exit orders use the actual filled entry quantity
 - each fill carries a fixed commission of `49` `SEK`
 - a market order fills when a usable virtual quote exists
 - a buy limit fills when the virtual action price is less than or equal to the

@@ -17,7 +17,6 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
-import pandas as pd
 
 try:
     import torch
@@ -36,10 +35,21 @@ from ibkr_trader.rl.observations import build_history_override_from_source_bars
 
 
 STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
-MODEL_CONFIGS: dict[str, PromotedRLModelArtifact] = {
-    artifact.model_key: artifact for artifact in promoted_rl_models()
+DEFAULT_BENCHMARK_SYMBOLS = ("OMXS30",)
+BENCHMARK_STREAM_CONTRACTS = {
+    "OMXS30": {
+        "symbol": "OMXS30",
+        "security_type": "IND",
+        "exchange": "OMS",
+        "currency": "SEK",
+        "primary_exchange": "",
+    }
 }
-DEFAULT_BENCHMARK_SYMBOLS = ("XACT-OMXS30",)
+DEFAULT_CANDIDATE_REASON_CODES = (
+    "rl_model_routed_selected_candidate",
+    "rl_model_routed_candidate",
+    "rl_model_routed_candidate_tape_selected",
+)
 
 
 @dataclass(slots=True)
@@ -49,7 +59,16 @@ class LoadedModel:
     obs_dim: int
     model: Any
     static_feature_names: list[str]
-    candidate_tape: pd.DataFrame
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedDeployment:
+    deployment_key: str
+    model_key: str
+    account_key: str
+    book_key: str
+    mode: str
+    loaded: LoadedModel
 
 
 class ApiError(RuntimeError):
@@ -68,21 +87,183 @@ def parse_symbol_list(raw_value: str | None) -> list[str]:
     )
 
 
+def parse_reason_code_filter(raw_value: str | None) -> set[str]:
+    if raw_value is None:
+        return set(DEFAULT_CANDIDATE_REASON_CODES)
+    return {
+        item.strip()
+        for item in raw_value.replace("\n", ",").split(",")
+        if item.strip()
+    }
+
+
+def load_running_deployments(
+    api_base: str,
+    loaded_models: Mapping[str, LoadedModel],
+    *,
+    account_mode: str,
+) -> dict[str, LoadedDeployment]:
+    """Bind deployed model artifacts to currently running deployment rows.
+
+    The runner owns deployments, not just model keys. That keeps virtual and
+    future paper/live deployments of the same model from sharing state or
+    accidentally consuming each other's candidates.
+    """
+
+    payload = get_json(f"{api_base}/v1/read/rl-dashboard")
+    dashboard = payload.get("rl_dashboard", {})
+    deployments = dashboard.get("deployments", [])
+    if not isinstance(deployments, list):
+        raise ValueError("rl_dashboard.deployments must be an array")
+
+    active: dict[str, LoadedDeployment] = {}
+    for row in deployments:
+        if not isinstance(row, Mapping):
+            continue
+        model_key = str(row.get("model_key") or "").strip()
+        loaded = loaded_models.get(model_key)
+        if loaded is None:
+            continue
+        mode = str(row.get("mode") or "").strip().lower()
+        if not _mode_selected(mode, account_mode):
+            continue
+        if str(row.get("status") or "").strip().lower() != "running":
+            continue
+        deployment_key = str(row.get("deployment_key") or "").strip()
+        account_key = str(row.get("account_key") or "").strip().upper()
+        book_key = str(row.get("book_key") or "").strip().lower()
+        if not deployment_key or not account_key or not book_key:
+            continue
+        active[deployment_key] = LoadedDeployment(
+            deployment_key=deployment_key,
+            model_key=model_key,
+            account_key=account_key,
+            book_key=book_key,
+            mode=mode,
+            loaded=loaded,
+        )
+    return active
+
+
+def legacy_loaded_deployments(
+    loaded_models: Mapping[str, LoadedModel],
+    *,
+    account_mode: str,
+) -> dict[str, LoadedDeployment]:
+    """Compatibility path for unit tests and older APIs without dashboard rows."""
+
+    deployments: dict[str, LoadedDeployment] = {}
+    for loaded in loaded_models.values():
+        mode = "virtual" if account_mode == "all" else account_mode
+        deployment_key = str(loaded.config.deployment_key)
+        deployments[deployment_key] = LoadedDeployment(
+            deployment_key=deployment_key,
+            model_key=str(loaded.config.model_key),
+            account_key="",
+            book_key="",
+            mode=mode,
+            loaded=loaded,
+        )
+    return deployments
+
+
+def group_candidates_by_deployment(
+    candidates: list[Mapping[str, Any]],
+    deployments: Mapping[str, LoadedDeployment],
+    *,
+    account_mode: str,
+) -> dict[str, list[Mapping[str, Any]]]:
+    grouped = {deployment_key: [] for deployment_key in deployments}
+    for candidate in candidates:
+        for deployment in deployments.values():
+            if candidate_matches_deployment(
+                candidate,
+                deployment,
+                account_mode=account_mode,
+            ):
+                grouped[deployment.deployment_key].append(candidate)
+                break
+    return grouped
+
+
+def candidate_matches_deployment(
+    candidate: Mapping[str, Any],
+    deployment: LoadedDeployment,
+    *,
+    account_mode: str,
+) -> bool:
+    if str(candidate.get("model_id") or "") != deployment.model_key:
+        return False
+    if deployment.account_key and str(candidate.get("account_key") or "").upper() != deployment.account_key:
+        return False
+    if deployment.book_key and str(candidate.get("book_key") or "").lower() != deployment.book_key:
+        return False
+    if deployment.mode == "virtual":
+        return candidate.get("is_virtual") is True
+    if deployment.mode in {"paper", "live"}:
+        return candidate.get("is_virtual") is not True
+    return _candidate_mode_selected(candidate, account_mode)
+
+
+def _mode_selected(mode: str, account_mode: str) -> bool:
+    normalized = account_mode.strip().lower()
+    return normalized == "all" or mode == normalized
+
+
+def _candidate_mode_selected(candidate: Mapping[str, Any], account_mode: str) -> bool:
+    normalized = account_mode.strip().lower()
+    if normalized == "all":
+        return True
+    if normalized == "virtual":
+        return candidate.get("is_virtual") is True
+    if normalized in {"paper", "live"}:
+        return candidate.get("is_virtual") is not True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run promoted virtual RL agents against the trader API.")
     parser.add_argument("--api-base", default="http://quant.geisler.se:8000")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--execute-virtual", action="store_true")
+    parser.add_argument(
+        "--execute-broker",
+        action="store_true",
+        help=(
+            "Allow translated actions to submit for paper/live deployments. "
+            "This is intentionally separate from --execute-virtual."
+        ),
+    )
     parser.add_argument("--include-smoke", action="store_true")
     parser.add_argument("--stop-stream-on-empty", action="store_true")
     parser.add_argument("--market-data-type", default="LIVE")
-    parser.add_argument("--candidate-reason-code", default="rl_model_routed_selected_candidate")
+    parser.add_argument(
+        "--account-mode",
+        choices=("virtual", "paper", "live", "all"),
+        default="virtual",
+        help="Which running RL deployments the runner should own.",
+    )
+    parser.add_argument(
+        "--candidate-reason-code",
+        default=",".join(DEFAULT_CANDIDATE_REASON_CODES),
+        help=(
+            "Comma-separated trace.reason_code allow-list for model-routed candidates. "
+            "Use an empty string to accept every reason code."
+        ),
+    )
     parser.add_argument("--state-file", default=".rl_runner_state.json")
     parser.add_argument("--history-cache-file", default=".rl_runner_history_cache.json")
-    parser.add_argument("--history-duration", default="30 D")
+    parser.add_argument(
+        "--history-duration",
+        default="5 D",
+        help=(
+            "IBKR historical warmup window for live RL observations. Keep this "
+            "small because large 1-minute Stockholm requests are slow and can be rejected."
+        ),
+    )
     parser.add_argument("--history-bar-size", default="1 min")
-    parser.add_argument("--history-timeout", type=int, default=20)
+    parser.add_argument("--history-timeout", type=int, default=45)
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument(
         "--benchmark-symbols",
@@ -104,7 +285,8 @@ def main() -> int:
     if str(history_cache_path.parent) not in {"", "."}:
         history_cache_path.parent.mkdir(parents=True, exist_ok=True)
     history_cache = _load_history_cache(history_cache_path)
-    loaded_models = {key: load_model(config) for key, config in MODEL_CONFIGS.items()}
+    model_configs = {artifact.model_key: artifact for artifact in promoted_rl_models()}
+    loaded_models = {key: load_model(config) for key, config in model_configs.items()}
     print(
         "Loaded models: "
         + ", ".join(
@@ -116,16 +298,24 @@ def main() -> int:
 
     while True:
         try:
+            loaded_deployments = load_running_deployments(
+                args.api_base.rstrip("/"),
+                loaded_models,
+                account_mode=args.account_mode,
+            )
             run_once(
                 api_base=args.api_base.rstrip("/"),
                 limit=args.limit,
                 loaded_models=loaded_models,
+                loaded_deployments=loaded_deployments,
                 processed_decisions=processed_decisions,
                 execute_virtual=args.execute_virtual,
+                execute_broker=args.execute_broker,
                 include_smoke=args.include_smoke,
                 stop_stream_on_empty=args.stop_stream_on_empty,
                 market_data_type=args.market_data_type,
-                candidate_reason_code=args.candidate_reason_code,
+                account_mode=args.account_mode,
+                candidate_reason_codes=parse_reason_code_filter(args.candidate_reason_code),
                 trade_date=args.trade_date or datetime.now(STOCKHOLM_TZ).date().isoformat(),
                 history_cache=history_cache,
                 history_duration=args.history_duration,
@@ -148,12 +338,15 @@ def run_once(
     api_base: str,
     limit: int,
     loaded_models: Mapping[str, LoadedModel],
+    loaded_deployments: Mapping[str, LoadedDeployment] | None = None,
     processed_decisions: set[str],
     execute_virtual: bool,
+    execute_broker: bool = False,
     include_smoke: bool,
     stop_stream_on_empty: bool,
     market_data_type: str,
-    candidate_reason_code: str,
+    account_mode: str = "virtual",
+    candidate_reason_codes: set[str],
     trade_date: str,
     history_cache: dict[str, Any],
     history_duration: str,
@@ -161,18 +354,42 @@ def run_once(
     history_timeout: int,
     benchmark_symbols: list[str],
 ) -> None:
-    candidates = get_json(f"{api_base}/v1/rl/candidates?limit={limit}")["candidates"]
-    candidates = [
+    active_deployments = dict(
+        loaded_deployments
+        if loaded_deployments is not None
+        else legacy_loaded_deployments(
+            loaded_models,
+            account_mode=account_mode,
+        )
+    )
+    if not active_deployments:
+        print(
+            f"No running RL deployments found for account_mode={account_mode}.",
+            flush=True,
+        )
+        return
+
+    raw_candidates = get_json(f"{api_base}/v1/rl/candidates?limit={limit}")["candidates"]
+    candidate_pool = [
         candidate
-        for candidate in candidates
+        for candidate in raw_candidates
         if candidate.get("model_id") in loaded_models
-        and candidate.get("is_virtual") is True
         and candidate.get("trace", {}).get("trade_date") == trade_date
         and (
-            not candidate_reason_code
-            or candidate.get("trace", {}).get("reason_code") == candidate_reason_code
+            not candidate_reason_codes
+            or candidate.get("trace", {}).get("reason_code") in candidate_reason_codes
         )
         and (include_smoke or candidate.get("source", {}).get("system") != "codex-smoke")
+    ]
+    candidates_by_deployment = group_candidates_by_deployment(
+        candidate_pool,
+        active_deployments,
+        account_mode=account_mode,
+    )
+    candidates = [
+        candidate
+        for deployment_candidates in candidates_by_deployment.values()
+        for candidate in deployment_candidates
     ]
     if not candidates:
         if benchmark_symbols:
@@ -184,10 +401,10 @@ def run_once(
                 )
             except ApiError as exc:
                 print(f"Benchmark stream unavailable: {exc}", flush=True)
-        for loaded in loaded_models.values():
+        for deployment in active_deployments.values():
             heartbeat(
                 api_base,
-                loaded.config.deployment_key,
+                deployment.deployment_key,
                 "running",
                 runtime_error=None,
                 metrics={"candidate_count": 0, "runner_mode": "idle"},
@@ -206,8 +423,8 @@ def run_once(
     except ApiError as exc:
         heartbeat_stream_failure(
             api_base=api_base,
-            loaded_models=loaded_models,
-            candidates=candidates,
+            loaded_deployments=active_deployments,
+            candidates_by_deployment=candidates_by_deployment,
             error=str(exc),
             market_data_type=market_data_type,
             stop_stream_on_empty=stop_stream_on_empty,
@@ -220,75 +437,42 @@ def run_once(
         if symbol in symbols
         if isinstance(bars, list) and bars
     }
-    if not symbols_with_bars:
-        if stop_stream_on_empty:
-            post_json(f"{api_base}/v1/market-data/stream/stop", {})
-        candidate_models = {str(candidate.get("model_id")) for candidate in candidates}
-        for loaded in loaded_models.values():
-            if loaded.config.model_key not in candidate_models:
-                heartbeat(
-                    api_base,
-                    loaded.config.deployment_key,
-                    "running",
-                    runtime_error=None,
-                    metrics={"candidate_count": 0, "runner_mode": "idle"},
-                )
-                continue
-            heartbeat(
-                api_base,
-                loaded.config.deployment_key,
-                "degraded",
-                runtime_error="market stream has no 1-minute bars for active RL candidates",
-                metrics={
-                    "candidate_count": sum(
-                        1
-                        for candidate in candidates
-                        if candidate.get("model_id") == loaded.config.model_key
-                    ),
-                    "symbols": sorted(
-                        {
-                            str(candidate["symbol"]).upper()
-                            for candidate in candidates
-                            if candidate.get("model_id") == loaded.config.model_key
-                        }
-                    ),
-                    "stream_running": stream.get("running"),
-                    "stream_connect_attempt_count": stream.get("connect_attempt_count"),
-                    "desired_subscription_count": stream.get("desired_subscription_count"),
-                    "stopped_stream": stop_stream_on_empty,
-                },
-            )
-        print("No stream bars yet; not running model.", flush=True)
-        return
+    if not symbols_with_bars and stop_stream_on_empty:
+        post_json(f"{api_base}/v1/market-data/stream/stop", {})
 
-    for model_key, loaded in loaded_models.items():
-        model_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.get("model_id") == model_key and str(candidate["symbol"]).upper() in symbols_with_bars
-        ]
-        if not model_candidates:
+    for deployment in active_deployments.values():
+        deployment_candidates = candidates_by_deployment.get(deployment.deployment_key, [])
+        if not deployment_candidates:
             heartbeat(
                 api_base,
-                loaded.config.deployment_key,
+                deployment.deployment_key,
                 "running",
                 runtime_error=None,
                 metrics={
-                    "candidate_count": 0,
+                    "candidate_count": len(deployment_candidates),
                     "runner_mode": "no_candidates_with_stream_bars",
                 },
             )
             continue
+        execute_actions = (
+            deployment.mode == "virtual"
+            and execute_virtual
+            or deployment.mode in {"paper", "live"}
+            and execute_broker
+        )
         run_model_candidates(
             api_base=api_base,
-            loaded=loaded,
-            candidates=model_candidates,
+            loaded=deployment.loaded,
+            deployment_key=deployment.deployment_key,
+            deployment_mode=deployment.mode,
+            candidates=deployment_candidates,
             processed_decisions=processed_decisions,
-            execute_virtual=execute_virtual,
+            execute_actions=execute_actions,
             history_cache=history_cache,
             history_duration=history_duration,
             history_bar_size=history_bar_size,
             history_timeout=history_timeout,
+            stream_bar_ready_symbols=symbols_with_bars,
         )
 
 
@@ -296,18 +480,21 @@ def run_model_candidates(
     *,
     api_base: str,
     loaded: LoadedModel,
+    deployment_key: str,
+    deployment_mode: str,
     candidates: list[Mapping[str, Any]],
     processed_decisions: set[str],
-    execute_virtual: bool,
+    execute_actions: bool,
     history_cache: dict[str, Any],
     history_duration: str,
     history_bar_size: str,
     history_timeout: int,
+    stream_bar_ready_symbols: set[str] | None = None,
 ) -> None:
     symbols = sorted({str(candidate["symbol"]).upper() for candidate in candidates})
     runtime_states = load_runtime_states_from_instructions(
         api_base=api_base,
-        deployment_key=loaded.config.deployment_key,
+        deployment_key=deployment_key,
         symbols=symbols,
         side=loaded.config.side,
     )
@@ -369,7 +556,7 @@ def run_model_candidates(
     if not active_candidates:
         heartbeat(
             api_base,
-            loaded.config.deployment_key,
+            deployment_key,
             "degraded",
             runtime_error="no candidates had complete static features and history overrides",
             metrics={
@@ -381,7 +568,7 @@ def run_model_candidates(
         print(
             json.dumps(
                 {
-                    "deployment_key": loaded.config.deployment_key,
+                    "deployment_key": deployment_key,
                     "actions": skipped_candidates,
                 },
                 indent=2,
@@ -393,14 +580,25 @@ def run_model_candidates(
     active_symbols = sorted({str(candidate["symbol"]).upper() for candidate in active_candidates})
 
     observation_response = post_json(
-        f"{api_base}/v1/rl/observations/build",
+        f"{api_base}/v1/rl/observations/build?timeout={history_timeout}",
         {
             "deployment_key": loaded.config.deployment_key,
             "symbols": active_symbols,
             "history_overrides": history_overrides,
             "static_features": static_features,
-            "fetch": {"mode": "market_stream", "bar_limit": 390},
+            "fetch": {
+                "mode": "market_stream",
+                "bar_limit": 390,
+                "backfill_missing": True,
+                "backfill_duration": "1 D",
+                "backfill_bar_size": "1 min",
+                "instruments": {
+                    str(candidate["symbol"]).upper(): dict(candidate_instrument(candidate))
+                    for candidate in active_candidates
+                },
+            },
         },
+        timeout=max(history_timeout + 15, 60),
     )
     rl_observation = observation_response["rl_observation"]
     observations = rl_observation["observations"]
@@ -421,7 +619,7 @@ def run_model_candidates(
             actions.append({"symbol": symbol, "status": "not_ready", "decision": decision})
             continue
         decision_id = str(decision["decision_id"])
-        dedupe_key = f"{loaded.config.deployment_key}:{candidate['instruction_id']}:{decision_id}"
+        dedupe_key = f"{deployment_key}:{candidate['instruction_id']}:{decision_id}"
         if dedupe_key in processed_decisions:
             actions.append({"symbol": symbol, "status": "already_processed", "decision_id": decision_id})
             continue
@@ -439,23 +637,43 @@ def run_model_candidates(
             vector,
             runner_state,
         )
+        diagnostics = action_diagnostics(
+            loaded.action_names,
+            q_values,
+            runner_state,
+            chosen_action=action_name,
+        )
         previous_close = symbol_observation["pricing_context"]["prev_close"]
         state_before = translation_state_before(runner_state, loaded.config.side)
         observed_at = decision_observed_at(symbol_observation)
         translation = post_json(
             f"{api_base}/v1/rl/actions/translate",
             {
-                "deployment_key": loaded.config.deployment_key,
+                "deployment_key": deployment_key,
                 "source_instruction_id": candidate["instruction_id"],
                 "action_name": action_name,
                 "state_before": state_before,
                 "observed_at": observed_at,
                 "previous_close": previous_close,
                 "decision_id": decision_id,
-                "submit": bool(execute_virtual and _is_executable_action(action_name)),
+                "submit": bool(execute_actions and _is_executable_action(action_name)),
                 "log_action": True,
+                "model_diagnostics": diagnostics,
             },
         )
+        virtual_quote_result = None
+        if deployment_mode == "virtual":
+            try:
+                virtual_quote_result = publish_virtual_decision_bar(
+                    api_base,
+                    candidate=candidate,
+                    symbol_observation=symbol_observation,
+                    deployment_key=deployment_key,
+                    action_name=action_name,
+                    decision_id=decision_id,
+                )
+            except ApiError as exc:
+                virtual_quote_result = {"accepted": False, "error": str(exc)}
         processed_decisions.add(dedupe_key)
         last_action_at = datetime.now(timezone.utc).isoformat()
         actions.append(
@@ -466,27 +684,38 @@ def run_model_candidates(
                 "state_before": state_before,
                 "runner_state": asdict(runner_state),
                 "q_values": q_values,
+                "action_margin": diagnostics.get("action_margin"),
                 "submitted": translation.get("submitted"),
                 "action_status": translation.get("translation", {}).get("action_status"),
+                "virtual_decision_bar": virtual_quote_result,
             }
         )
 
     heartbeat(
         api_base,
-        loaded.config.deployment_key,
+        deployment_key,
         "running",
         last_bar_at=last_bar_at,
         last_action_at=last_action_at,
         metrics={
             "candidate_count": len(candidates),
             "active_candidate_count": len(active_candidates),
+            "stream_bar_ready_candidate_count": len(
+                [
+                    candidate
+                    for candidate in active_candidates
+                    if str(candidate["symbol"]).upper() in (stream_bar_ready_symbols or set())
+                ]
+            ),
+            "backfilled_symbol_count": len(observation_response.get("fetched_symbols", [])),
             "symbols": active_symbols,
             "actions": actions,
-            "execute_virtual": execute_virtual,
+            "deployment_mode": deployment_mode,
+            "execute_actions": execute_actions,
             "history_cache_count": len(history_cache),
         },
     )
-    print(json.dumps({"deployment_key": loaded.config.deployment_key, "actions": actions}, indent=2), flush=True)
+    print(json.dumps({"deployment_key": deployment_key, "actions": actions}, indent=2), flush=True)
 
 
 def choose_action(
@@ -503,6 +732,117 @@ def choose_action(
     masked = np.where(mask, q_values, -np.inf)
     action_idx = int(np.argmax(masked))
     return action_names[action_idx], [float(value) for value in q_values]
+
+
+def action_diagnostics(
+    action_names: list[str],
+    q_values: list[float],
+    state: RunnerSymbolState,
+    *,
+    chosen_action: str,
+) -> dict[str, Any]:
+    mask = valid_action_mask(action_names, state)
+    valid_actions = [
+        {
+            "action_name": action_names[idx],
+            "q_value": float(q_values[idx]),
+        }
+        for idx, allowed in enumerate(mask)
+        if bool(allowed)
+    ]
+    ranked = sorted(valid_actions, key=lambda item: item["q_value"], reverse=True)
+    best = ranked[0]["q_value"] if ranked else None
+    second = ranked[1]["q_value"] if len(ranked) > 1 else None
+    return {
+        "action_names": list(action_names),
+        "q_values": [float(value) for value in q_values],
+        "valid_action_mask": [bool(value) for value in mask],
+        "valid_actions_ranked": ranked,
+        "chosen_action": chosen_action,
+        "action_margin": (
+            float(best - second)
+            if best is not None and second is not None
+            else None
+        ),
+    }
+
+
+def publish_virtual_decision_bar(
+    api_base: str,
+    *,
+    candidate: Mapping[str, Any],
+    symbol_observation: Mapping[str, Any],
+    deployment_key: str,
+    action_name: str,
+    decision_id: str,
+) -> dict[str, Any] | None:
+    bar = latest_decision_phase1_bar(symbol_observation)
+    if bar is None:
+        return None
+    instrument = candidate_instrument(candidate)
+    symbol = str(candidate.get("symbol") or instrument.get("symbol") or "").upper()
+    if not symbol:
+        return None
+    observed_at = (
+        str(bar.get("ended_at") or bar.get("timestamp") or bar.get("started_at") or "")
+        or decision_observed_at(symbol_observation)
+    )
+    close_price = bar.get("close")
+    if close_price is None:
+        return None
+    payload = {
+        "account_key": candidate.get("account_key"),
+        "observed_at": observed_at,
+        "symbol": symbol,
+        "security_type": str(instrument.get("security_type") or "STK").upper(),
+        "exchange": str(instrument.get("exchange") or candidate.get("exchange") or "SMART").upper(),
+        "currency": str(instrument.get("currency") or candidate.get("currency") or "SEK").upper(),
+        "primary_exchange": instrument.get("primary_exchange"),
+        "local_symbol": instrument.get("local_symbol"),
+        "bid_price": close_price,
+        "ask_price": close_price,
+        "last_price": close_price,
+        "source": "rl_decision_bar",
+        "latest_stream_bar": {
+            "timestamp": bar.get("started_at") or bar.get("timestamp"),
+            "open": bar.get("open"),
+            "high": bar.get("high"),
+            "low": bar.get("low"),
+            "close": bar.get("close"),
+            "ended_at": bar.get("ended_at"),
+            "complete": bar.get("complete"),
+            "source": "rl_phase1_decision_bar",
+        },
+        "metadata": {
+            "deployment_key": deployment_key,
+            "source_instruction_id": candidate.get("instruction_id"),
+            "decision_id": decision_id,
+            "action_name": action_name,
+            "purpose": "virtual_same_bar_fill_parity",
+        },
+    }
+    return post_json(f"{api_base}/v1/virtual/market-watch", payload)
+
+
+def latest_decision_phase1_bar(symbol_observation: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    phase1_bars = symbol_observation.get("phase1_bars")
+    if not isinstance(phase1_bars, list) or not phase1_bars:
+        return None
+    decision = symbol_observation.get("model_decision")
+    decision_ended_at = (
+        decision.get("latest_usable_bar_ended_at")
+        if isinstance(decision, Mapping)
+        else None
+    )
+    if decision_ended_at:
+        for bar in reversed(phase1_bars):
+            if isinstance(bar, Mapping) and str(bar.get("ended_at")) == str(decision_ended_at):
+                return bar
+    for bar in reversed(phase1_bars):
+        if isinstance(bar, Mapping) and bool(bar.get("complete", True)):
+            return bar
+    last = phase1_bars[-1]
+    return last if isinstance(last, Mapping) else None
 
 
 def decision_observed_at(symbol_observation: Mapping[str, Any]) -> str:
@@ -621,8 +961,7 @@ def _require_torch() -> tuple[Any, Any]:
     if torch is None or nn is None:
         raise RuntimeError(
             "The promoted RL runner needs PyTorch. Install the trader RL extras "
-            "for pandas/pyarrow plus a CPU or GPU PyTorch wheel appropriate for "
-            "this host, or run the script from the q-training environment."
+            "plus a CPU or GPU PyTorch wheel appropriate for this host."
         )
     return torch, nn
 
@@ -651,7 +990,7 @@ def load_model(config: PromotedRLModelArtifact) -> LoadedModel:
     action_names = [str(item) for item in summary["action_names"]]
     if action_names != list(config.action_space):
         raise ValueError(
-            f"{config.model_key} action space mismatch between q-training summary and trader registry"
+            f"{config.model_key} action space mismatch between deployed bundle summary and trader registry"
         )
     state_dict = torch_module.load(config.promoted_checkpoint_path, map_location="cpu")
     if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
@@ -682,19 +1021,12 @@ def load_model(config: PromotedRLModelArtifact) -> LoadedModel:
             f"{config.model_key} observation width {obs_dim} is not large enough "
             f"for {len(static_feature_names)} static features"
         )
-    candidate_tape = pd.read_parquet(config.candidate_tape_path)
-    candidate_tape = candidate_tape.copy()
-    candidate_tape["instrument_norm"] = (
-        candidate_tape["instrument"].astype(str).str.upper().str.replace("-", " ", regex=False)
-    )
-    candidate_tape["date_norm"] = pd.to_datetime(candidate_tape["datetime"]).dt.strftime("%Y-%m-%d")
     return LoadedModel(
         config=config,
         action_names=action_names,
         obs_dim=obs_dim,
         model=model,
         static_feature_names=static_feature_names,
-        candidate_tape=candidate_tape,
     )
 
 
@@ -713,23 +1045,11 @@ def static_feature_payload(
     if candidate_payload is not None:
         return candidate_payload
 
-    normalized_symbol = symbol.upper().replace("-", " ")
-    rows = loaded.candidate_tape[
-        (loaded.candidate_tape["instrument_norm"] == normalized_symbol)
-        & (loaded.candidate_tape["date_norm"] == trade_date)
-    ]
-    if rows.empty:
-        raise ValueError(f"no static feature row for {loaded.config.model_key} {symbol} {trade_date}")
-    row = rows.iloc[0]
-    values = [float(row[name]) for name in loaded.static_feature_names]
-    if any(np.isnan(values)):
-        raise ValueError(f"static features contain NaN for {loaded.config.model_key} {symbol} {trade_date}")
-    return {
-        "feature_names": loaded.static_feature_names,
-        "values": values,
-        "normalized": True,
-        "source": str(loaded.config.candidate_tape_path),
-    }
+    raise ValueError(
+        f"missing required instruction static_features for {loaded.config.model_key} "
+        f"{symbol} {trade_date}; production RL candidates must carry "
+        "trace.metadata.static_features"
+    )
 
 
 def candidate_static_feature_payload(
@@ -900,6 +1220,10 @@ def build_historical_bars_payload(
     symbol = str(candidate.get("symbol") or instrument.get("symbol") or "").upper()
     if not symbol:
         raise ValueError("candidate symbol is required for historical backfill")
+    exchange, primary_exchange = ibkr_historical_exchange(
+        exchange=instrument.get("exchange") or candidate.get("exchange"),
+        primary_exchange=instrument.get("primary_exchange"),
+    )
     target_date = date.fromisoformat(trade_date)
     end_at = datetime.combine(
         target_date,
@@ -909,8 +1233,8 @@ def build_historical_bars_payload(
     return {
         "symbol": symbol,
         "security_type": str(instrument.get("security_type") or "STK").upper(),
-        "exchange": str(instrument.get("exchange") or candidate.get("exchange") or "SMART").upper(),
-        "primary_exchange": str(instrument.get("primary_exchange") or "SFB").upper(),
+        "exchange": exchange,
+        "primary_exchange": primary_exchange,
         "currency": str(instrument.get("currency") or candidate.get("currency") or "SEK").upper(),
         "isin": instrument.get("isin"),
         "duration": duration,
@@ -924,10 +1248,36 @@ def build_historical_bars_payload(
 def candidate_instrument(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
     nested = candidate.get("candidate")
     if isinstance(nested, Mapping):
+        payload = nested.get("payload")
+        if isinstance(payload, Mapping):
+            instruction = payload.get("instruction")
+            if isinstance(instruction, Mapping):
+                instrument = instruction.get("instrument")
+                if isinstance(instrument, Mapping):
+                    return instrument
         instrument = nested.get("instrument")
         if isinstance(instrument, Mapping):
             return instrument
+    payload = candidate.get("payload")
+    if isinstance(payload, Mapping):
+        instruction = payload.get("instruction")
+        if isinstance(instruction, Mapping):
+            instrument = instruction.get("instrument")
+            if isinstance(instrument, Mapping):
+                return instrument
     return {}
+
+
+def ibkr_historical_exchange(
+    *,
+    exchange: Any,
+    primary_exchange: Any,
+) -> tuple[str, str | None]:
+    raw_exchange = str(exchange or "").strip().upper()
+    raw_primary = str(primary_exchange or "").strip().upper()
+    if raw_exchange in {"", "XSTO", "STO", "STOCKHOLM"}:
+        return "SMART", raw_primary or "SFB"
+    return raw_exchange, raw_primary or None
 
 
 def _history_cache_key(
@@ -968,15 +1318,28 @@ def _is_recent_failure(payload: Mapping[str, Any], *, cooldown_seconds: int = 60
 
 
 def subscribe_symbols(api_base: str, symbols: list[str], *, market_data_type: str) -> None:
+    contracts: list[dict[str, Any]] = []
+    for symbol in symbols:
+        normalized_symbol = str(symbol).strip().upper()
+        benchmark_contract = BENCHMARK_STREAM_CONTRACTS.get(normalized_symbol)
+        if benchmark_contract is not None:
+            contracts.append(dict(benchmark_contract))
+            continue
+        contracts.append(
+            {
+                "symbol": normalized_symbol,
+                "security_type": "STK",
+                "exchange": "SMART",
+                "primary_exchange": "SFB",
+                "currency": "SEK",
+            }
+        )
     post_json(
         f"{api_base}/v1/market-data/stream/subscribe",
         {
-            "symbols": symbols,
-            "exchange": "SMART",
-            "primary_exchange": "SFB",
-            "currency": "SEK",
+            "contracts": contracts,
             "market_data_type": market_data_type,
-            "replace": True,
+            "replace": False,
         },
     )
 
@@ -984,8 +1347,8 @@ def subscribe_symbols(api_base: str, symbols: list[str], *, market_data_type: st
 def heartbeat_stream_failure(
     *,
     api_base: str,
-    loaded_models: Mapping[str, LoadedModel],
-    candidates: list[Mapping[str, Any]],
+    loaded_deployments: Mapping[str, LoadedDeployment],
+    candidates_by_deployment: Mapping[str, list[Mapping[str, Any]]],
     error: str,
     market_data_type: str,
     stop_stream_on_empty: bool,
@@ -997,30 +1360,30 @@ def heartbeat_stream_failure(
             post_json(f"{api_base}/v1/market-data/stream/stop", {})
         except ApiError:
             pass
-    candidate_models = {str(candidate.get("model_id")) for candidate in candidates}
-    for loaded in loaded_models.values():
-        if loaded.config.model_key not in candidate_models:
+    for deployment in loaded_deployments.values():
+        deployment_candidates = candidates_by_deployment.get(deployment.deployment_key, [])
+        if not deployment_candidates:
             heartbeat(
                 api_base,
-                loaded.config.deployment_key,
+                deployment.deployment_key,
                 "running",
                 runtime_error=None,
                 metrics={"candidate_count": 0, "runner_mode": "idle"},
             )
             continue
-        model_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.get("model_id") == loaded.config.model_key
-        ]
         heartbeat(
             api_base,
-            loaded.config.deployment_key,
+            deployment.deployment_key,
             "degraded",
             runtime_error="market stream unavailable for active RL candidates",
             metrics={
-                "candidate_count": len(model_candidates),
-                "symbols": sorted({str(candidate["symbol"]).upper() for candidate in model_candidates}),
+                "candidate_count": len(deployment_candidates),
+                "symbols": sorted(
+                    {
+                        str(candidate["symbol"]).upper()
+                        for candidate in deployment_candidates
+                    }
+                ),
                 "market_data_type": market_data_type,
                 "stream_error": error,
                 "stopped_stream": stop_stream_on_empty,

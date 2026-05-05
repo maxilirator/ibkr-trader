@@ -4,18 +4,28 @@ This file is the active implementation tracker for the production-grade trader p
 
 ## Next
 
-- [ ] RL trader registry and deployment layer:
-  add durable `trader_model`, `trader_deployment`, `trader_action`, and
-  `trader_heartbeat` objects so promoted RL policies can run through the same
-  instruction and broker-order path as every other strategy
-- [ ] Short RL action translation:
-  map the promoted short action set (`skip`, `wait`, `market_entry`,
-  `cancel_entry`, `exit_market`, `clear_exit`, `entry_prevclose_88bp`,
-  `exit_tp_180bp`) into the existing execution contract with explicit
-  deployment-symbol state validation
-- [ ] RL dashboard and execution pane:
-  add a dedicated operator page for RL deployments, action stream, deployment
-  health, and account-bound risk state
+- [ ] Production readiness command should be part of the server runbook:
+  `scripts/check_operational_readiness.py` now identifies blockers across
+  IBKR dependencies, API health, broker monitor freshness, runtime state,
+  RL registry/deployment count, side-aware action maps, candidate static
+  features, capital plans, and stale active instructions. Wire this into the
+  morning/overnight operational checklist and make it visible in the dashboard.
+- [ ] Official IBKR API packaging needs a durable source:
+  PyPI `ibapi` is incomplete for this project because it lacks modules such
+  as `ibapi.order_cancel` and `ibapi.sync_wrapper`. The trading host currently
+  has the full TWS API package installed. Preserve that as an internal wheel or
+  documented install artifact so a fresh environment cannot silently install
+  the wrong package.
+- [ ] RL live-switch deployment flow:
+  the runner now binds candidates to running deployments by
+  `model_key + account_key + book_key + mode`, and paper/live submissions
+  require an explicit `--execute-broker` flag. The remaining operator task is
+  to create separate live/paper deployment rows with live account/book keys
+  when moving beyond `VIRTUALRL01`.
+- [ ] Candidate lifecycle after session close:
+  `MODEL_ROUTED_PENDING` rows are the daily RL universe while the window is
+  open. After the strategy window closes, archive candidates that have no open
+  generated instruction or position so the dashboard starts the next day clean.
 - [x] Operator controls for reconciliation warnings and broker attention:
   the dashboard can now trigger a durable startup reconciliation run and
   shows operator review state on broker-attention and reconciliation items

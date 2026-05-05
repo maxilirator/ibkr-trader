@@ -20,6 +20,7 @@ from ibkr_trader.orchestration.operator_reviews import (
     OPEN_REVIEW_STATUS,
     RESOLVED_REVIEW_STATUS,
     OperatorReviewTargetNotFoundError,
+    archive_open_reconciliation_issues,
     extract_broker_attention_message,
     record_broker_attention_review_action,
     record_reconciliation_issue_review_action,
@@ -220,6 +221,27 @@ class OperatorReviewTests(TestCase):
             assert issue is not None
             self.assertIsNotNone(issue.archived_at)
             self.assertEqual(issue.archived_by, "dashboard")
+        finally:
+            session.close()
+
+    def test_archive_open_reconciliation_issues_marks_all_unarchived_issues(self) -> None:
+        _, issue_id = self._seed_attention_and_issue()
+
+        result = archive_open_reconciliation_issues(
+            self.session_factory,
+            updated_by="dashboard",
+            note="Clear dashboard noise.",
+        )
+
+        self.assertEqual(result.archived_issue_count, 1)
+        self.assertEqual(result.issue_ids, (issue_id,))
+        session: Session = self.session_factory()
+        try:
+            issue = session.get(ReconciliationIssueRecord, issue_id)
+            assert issue is not None
+            self.assertIsNotNone(issue.archived_at)
+            self.assertEqual(issue.archived_by, "dashboard")
+            self.assertEqual(issue.archive_reason, "Clear dashboard noise.")
         finally:
             session.close()
 
