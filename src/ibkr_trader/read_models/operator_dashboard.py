@@ -4,6 +4,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import time
 from datetime import timezone
 from decimal import Decimal
@@ -61,6 +62,8 @@ _RECOVERED_RETRY_STATUSES = {
 }
 
 _STOCKHOLM_TZ = ZoneInfo("Europe/Stockholm")
+_ACCOUNT_PERFORMANCE_SESSION_OPEN = time(9, 0)
+_ACCOUNT_PERFORMANCE_SESSION_CLOSE = time(17, 30)
 _MAX_ACCOUNT_DAY_PERFORMANCE_POINTS = 96
 
 
@@ -478,14 +481,22 @@ def _aware_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _account_day_start(reference_at: datetime) -> datetime:
+def _account_day_window(reference_at: datetime) -> tuple[datetime, datetime]:
     local_reference = _aware_utc(reference_at).astimezone(_STOCKHOLM_TZ)
+    session_date = local_reference.date()
+    if local_reference.time() < _ACCOUNT_PERFORMANCE_SESSION_OPEN:
+        session_date -= timedelta(days=1)
     local_start = datetime.combine(
-        local_reference.date(),
-        time.min,
+        session_date,
+        _ACCOUNT_PERFORMANCE_SESSION_OPEN,
         tzinfo=_STOCKHOLM_TZ,
     )
-    return local_start.astimezone(timezone.utc)
+    local_close = datetime.combine(
+        session_date,
+        _ACCOUNT_PERFORMANCE_SESSION_CLOSE,
+        tzinfo=_STOCKHOLM_TZ,
+    )
+    return local_start.astimezone(timezone.utc), local_close.astimezone(timezone.utc)
 
 
 def _downsample_account_performance_points(
@@ -526,12 +537,13 @@ def _build_account_day_performance_by_account_id(
     if not account_ids:
         return {}
 
-    day_start_at = _account_day_start(reference_at)
+    day_start_at, day_end_at = _account_day_window(reference_at)
     rows = session.execute(
         select(AccountSnapshotRecord)
         .where(
             AccountSnapshotRecord.broker_account_id.in_(account_ids),
             AccountSnapshotRecord.snapshot_at >= day_start_at,
+            AccountSnapshotRecord.snapshot_at <= day_end_at,
         )
         .order_by(
             AccountSnapshotRecord.broker_account_id.asc(),

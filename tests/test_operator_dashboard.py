@@ -380,6 +380,58 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
         self.assertEqual(performance.points[0].return_pct, "0.00")
         self.assertEqual(performance.points[1].return_pct, "+1.50")
 
+    def test_account_day_performance_uses_trading_session_window(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+            for snapshot_at, net_liquidation in [
+                (datetime(2026, 5, 6, 6, 45, tzinfo=timezone.utc), "99000.00"),
+                (datetime(2026, 5, 6, 7, 0, tzinfo=timezone.utc), "100000.00"),
+                (datetime(2026, 5, 6, 14, 55, tzinfo=timezone.utc), "101000.00"),
+                (datetime(2026, 5, 6, 15, 20, tzinfo=timezone.utc), "102000.00"),
+                (datetime(2026, 5, 6, 16, 5, tzinfo=timezone.utc), "103000.00"),
+            ]:
+                session.add(
+                    AccountSnapshotRecord(
+                        broker_account_id=broker_account.id,
+                        snapshot_at=snapshot_at,
+                        source="runtime_snapshot",
+                        net_liquidation=net_liquidation,
+                        currency="SEK",
+                    )
+                )
+            session.commit()
+        finally:
+            session.close()
+
+        with patch(
+            "ibkr_trader.read_models.operator_dashboard.utc_now",
+            return_value=datetime(2026, 5, 6, 20, 0, tzinfo=timezone.utc),
+        ):
+            snapshot = build_operator_dashboard_snapshot(self.session_factory)
+
+        performance = snapshot.accounts[0].day_performance
+        self.assertEqual(performance.start_net_liquidation, "100000")
+        self.assertEqual(performance.latest_net_liquidation, "102000")
+        self.assertEqual(performance.latest_return_pct, "+2.00")
+        self.assertEqual(
+            [
+                point.snapshot_at.replace(tzinfo=timezone.utc)
+                for point in performance.points
+            ],
+            [
+                datetime(2026, 5, 6, 7, 0, tzinfo=timezone.utc),
+                datetime(2026, 5, 6, 14, 55, tzinfo=timezone.utc),
+                datetime(2026, 5, 6, 15, 20, tzinfo=timezone.utc),
+            ],
+        )
+
     def test_build_operator_dashboard_snapshot_hides_archived_attention_and_warnings(self) -> None:
         self._seed_operator_data()
         record_broker_attention_review_action(

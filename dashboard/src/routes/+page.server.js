@@ -10,6 +10,8 @@ import {
 } from '$lib/server/trader-api';
 
 const RECONCILIATION_RUN_READ_LIMIT = 120;
+const OPERATOR_INSTRUCTION_READ_LIMIT = 500;
+const OPERATOR_ORDER_READ_LIMIT = 500;
 
 function readOptionalField(formData, fieldName) {
   const value = formData.get(fieldName);
@@ -40,8 +42,8 @@ function parsePositiveIntegerIdsFromForm(formData, fieldName) {
 function operatorSnapshotUrl(apiBaseUrl) {
   return (
     `${apiBaseUrl}/v1/read/operator-snapshot` +
-    '?instruction_limit=50&candidate_limit=40' +
-    `&order_limit=50&fill_limit=50&attention_limit=20&reconciliation_run_limit=${RECONCILIATION_RUN_READ_LIMIT}`
+    `?instruction_limit=${OPERATOR_INSTRUCTION_READ_LIMIT}&candidate_limit=40` +
+    `&order_limit=${OPERATOR_ORDER_READ_LIMIT}&fill_limit=50&attention_limit=20&reconciliation_run_limit=${RECONCILIATION_RUN_READ_LIMIT}`
   );
 }
 

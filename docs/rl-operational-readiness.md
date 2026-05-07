@@ -9,6 +9,7 @@ This is the morning checklist for making the long and short RL agents real.
 - model-routed candidate intake as `MODEL_ROUTED_PENDING`
 - persistent IBKR market-data stream subscribe/snapshot endpoints
 - market-stream desired watchlist and automatic reconnect backoff
+- explicit market-stream subscription cap and overflow reporting
 - 1-minute source bars aggregated into model-facing 5-minute OHLC
 - completed-5-minute-bar decision gating
 - history and trailing-volatility feature payloads
@@ -43,9 +44,18 @@ The promoted runner is `scripts/run_rl_agents.py`. It is designed to:
 - subscribe active names with `POST /v1/market-data/stream/subscribe`
 - call `POST /v1/rl/observations/build` every minute from the stream buffer
 - infer only when `model_decision.ready=true` and the `decision_id` is new
+- infer only when the symbol has the current completed 5-minute decision bar;
+  stale bars are reported as `stale_bar` instead of being traded late
 - load the exact trader-local bundle checkpoint and action space
 - call `POST /v1/rl/actions/translate` for entries, owned cancels, and owned exits
 - write heartbeat with `last_bar_at` and `last_action_at`
+- write decision coverage in heartbeat metrics:
+  - `fresh_decision_bar_candidate_count`
+  - `stale_decision_bar_candidate_count`
+  - `not_ready_candidate_count`
+  - `already_processed_candidate_count`
+  - `evaluated_candidate_count`
+  - `target_decision_bar_ended_at`
 - recover per-deployment symbol state after restart
 - bind candidates to deployment rows by `model_key`, `account_key`, `book_key`,
   and `mode`, so virtual, paper, and live deployments of the same model do not
@@ -151,3 +161,27 @@ The trader should not spam IB Gateway during an outage:
 - background execution runtime retries after broker exceptions with restart backoff
 
 The API and dashboard should remain available while broker access is degraded.
+
+## Stream Capacity Policy
+
+The runner and API now use an explicit stream cap. The default is:
+
+```dotenv
+MARKET_STREAM_MAX_SUBSCRIPTIONS=120
+```
+
+The runner prioritizes active candidate symbols over dashboard benchmark
+symbols. If the desired set is larger than the cap, overflow symbols are
+reported in the runner heartbeat under `stream_plan`. The operational target is
+to keep normal long plus short RL universes comfortably below the cap; if the
+upstream payload starts producing larger daily universes, raise the cap only
+after checking IBKR market-data line limits and host resource usage.
+
+Dashboard truth rule:
+
+- `Queued` means the candidate exists for the day.
+- `Any Bars` means at least one local stream bar exists.
+- `Bar-Ready` means the current completed 5-minute model bar exists.
+- `Evaluated` means the runner actually made a model decision for that bar.
+- `Stale Bars` means the runner intentionally did not trade because the symbol
+  had only an older decision bar.

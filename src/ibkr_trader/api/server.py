@@ -1276,6 +1276,7 @@ def parse_market_stream_subscribe_payload(
     payload: Mapping[str, Any],
     *,
     stockholm_identity_map: Mapping[str, Any] | None = None,
+    max_contracts: int = 120,
 ) -> dict[str, Any]:
     raw_contracts = payload.get("contracts") or payload.get("instruments")
     raw_symbols = payload.get("symbols")
@@ -1339,8 +1340,10 @@ def parse_market_stream_subscribe_payload(
             for symbol in symbols
         ]
 
-    if len(contracts) > 100:
-        raise ValueError("market stream subscriptions are limited to 100 symbols")
+    if len(contracts) > max_contracts:
+        raise ValueError(
+            f"market stream subscriptions are limited to {max_contracts} symbols"
+        )
 
     market_data_type = (
         str(payload["market_data_type"]).strip().upper()
@@ -2425,6 +2428,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             broker_kind="IBKR",
             captured_at=captured_at,
             default_account_key=app_config.ibkr.account_id or None,
+            close_missing_open_orders=True,
         )
         try:
             subscribe_open_order_market_streams(
@@ -2449,6 +2453,9 @@ def create_app(config: AppConfig | None = None) -> Any:
         app_config.ibkr.streaming_session(),
         initial_connect_backoff_seconds=app_config.broker_connect_backoff_initial_seconds,
         max_connect_backoff_seconds=app_config.broker_connect_backoff_max_seconds,
+        stale_data_after_seconds=app_config.market_stream_stale_after_seconds,
+        stale_reconnect_enabled=app_config.market_stream_stale_reconnect_enabled,
+        stale_reconnect_timezone=app_config.timezone,
     )
 
     def sync_virtual_market_watch_from_stream(cycle_at: datetime) -> dict[str, Any]:
@@ -2764,6 +2771,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             parsed = parse_market_stream_subscribe_payload(
                 payload,
                 stockholm_identity_map=request.app.state.market_stream_identity_map,
+                max_contracts=app_config.market_stream_max_subscriptions,
             )
             snapshot = request.app.state.market_stream_service.subscribe_many(
                 parsed["contracts"],
@@ -3902,6 +3910,12 @@ def create_app(config: AppConfig | None = None) -> Any:
             "queued_candidate_count": len(rl_candidates),
             "active_candidate_count": 0,
             "bar_ready_candidate_count": 0,
+            "stream_any_bar_candidate_count": 0,
+            "fresh_decision_bar_candidate_count": 0,
+            "stale_decision_bar_candidate_count": 0,
+            "not_ready_candidate_count": 0,
+            "already_processed_candidate_count": 0,
+            "evaluated_candidate_count": 0,
             "backfilled_symbol_count": 0,
         }
         for deployment in dashboard_payload.get("deployments", []):
@@ -3914,6 +3928,24 @@ def create_app(config: AppConfig | None = None) -> Any:
             )
             candidate_runtime["bar_ready_candidate_count"] += int(
                 metrics.get("stream_bar_ready_candidate_count") or 0
+            )
+            candidate_runtime["stream_any_bar_candidate_count"] += int(
+                metrics.get("stream_any_bar_candidate_count") or 0
+            )
+            candidate_runtime["fresh_decision_bar_candidate_count"] += int(
+                metrics.get("fresh_decision_bar_candidate_count") or 0
+            )
+            candidate_runtime["stale_decision_bar_candidate_count"] += int(
+                metrics.get("stale_decision_bar_candidate_count") or 0
+            )
+            candidate_runtime["not_ready_candidate_count"] += int(
+                metrics.get("not_ready_candidate_count") or 0
+            )
+            candidate_runtime["already_processed_candidate_count"] += int(
+                metrics.get("already_processed_candidate_count") or 0
+            )
+            candidate_runtime["evaluated_candidate_count"] += int(
+                metrics.get("evaluated_candidate_count") or 0
             )
             candidate_runtime["backfilled_symbol_count"] += int(
                 metrics.get("backfilled_symbol_count") or 0
@@ -3928,7 +3960,7 @@ def create_app(config: AppConfig | None = None) -> Any:
     @app.get("/v1/read/operator-snapshot")
     def get_operator_snapshot(
         request: FastAPIRequest,
-        instruction_limit: int = 50,
+        instruction_limit: int = 500,
         candidate_limit: int = 20,
         candidate_reason_code: str | None = None,
         order_limit: int = 50,

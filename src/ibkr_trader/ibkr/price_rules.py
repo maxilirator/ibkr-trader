@@ -44,6 +44,64 @@ def _parse_market_rule_ids(raw_detail: Any) -> tuple[int, ...]:
     return tuple(market_rule_ids)
 
 
+def _contract_text_values(raw_detail: Any) -> tuple[str, ...]:
+    contract = getattr(raw_detail, "contract", None)
+    values = (
+        getattr(raw_detail, "validExchanges", None),
+        getattr(raw_detail, "marketName", None),
+        getattr(raw_detail, "stockType", None),
+        getattr(contract, "exchange", None),
+        getattr(contract, "primaryExchange", None),
+        getattr(contract, "currency", None),
+        getattr(contract, "secType", None),
+        getattr(contract, "symbol", None),
+        getattr(contract, "localSymbol", None),
+        getattr(contract, "tradingClass", None),
+    )
+    return tuple(str(value).strip().upper() for value in values if str(value or "").strip())
+
+
+def _is_stockholm_equity_contract(raw_detail: Any, *, exchange: str) -> bool:
+    contract = getattr(raw_detail, "contract", None)
+    sec_type = str(getattr(contract, "secType", "") or "").strip().upper()
+    currency = str(getattr(contract, "currency", "") or "").strip().upper()
+    if sec_type != "STK" or currency != "SEK":
+        return False
+
+    values = set(_contract_text_values(raw_detail))
+    values.add(exchange.strip().upper())
+    stockholm_markers = {"SFB", "XSTO", "STO", "NASDAQ OMX", "EUIBSI"}
+    return any(marker in value for marker in stockholm_markers for value in values)
+
+
+def _stockholm_equity_fallback_increment(price: Decimal) -> Decimal:
+    """Fallback only used when IBKR market-rule lookup is unavailable.
+
+    IBKR contract `minTick` can be a display precision that is finer than the
+    orderable increment for Stockholm equities. Sending that finer price causes
+    error 110 at order placement time, so use a conservative venue fallback.
+    """
+
+    if price < Decimal("0.1"):
+        return Decimal("0.0001")
+    if price < Decimal("1"):
+        return Decimal("0.001")
+    if price < Decimal("10"):
+        return Decimal("0.005")
+    return Decimal("0.01")
+
+
+def _fallback_increment(
+    raw_detail: Any,
+    *,
+    exchange: str,
+    price: Decimal,
+) -> Decimal | None:
+    if _is_stockholm_equity_contract(raw_detail, exchange=exchange):
+        return _stockholm_equity_fallback_increment(price)
+    return None
+
+
 def _select_market_rule_id(raw_detail: Any, *, exchange: str) -> int | None:
     valid_exchanges = _parse_csv(getattr(raw_detail, "validExchanges", ""))
     market_rule_ids = _parse_market_rule_ids(raw_detail)
@@ -103,6 +161,14 @@ def resolve_price_increment(
             )
             if resolved_increment is not None:
                 return resolved_increment
+
+    fallback_increment = _fallback_increment(
+        raw_detail,
+        exchange=exchange,
+        price=price,
+    )
+    if fallback_increment is not None:
+        return fallback_increment
 
     min_tick = _to_decimal(getattr(raw_detail, "minTick", None))
     if min_tick is not None and min_tick > 0:

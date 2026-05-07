@@ -599,7 +599,7 @@ def static_feature_metadata(
         "model_key": config.model_key,
         "feature_names": feature_names,
         "values": values,
-        "normalized": True,
+        "normalized": False,
         "source": "lockbox_candidate_row",
     }
 

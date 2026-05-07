@@ -63,6 +63,7 @@ BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60
 BROKER_STATUS_REFRESH_MIN_INTERVAL_SECONDS=30
 MARKET_STREAM_AUTO_RECONNECT_ENABLED=true
 MARKET_STREAM_RECONNECT_INTERVAL_SECONDS=15
+MARKET_STREAM_MAX_SUBSCRIPTIONS=120
 EXECUTION_RUNTIME_ENABLED=true
 EXECUTION_RUNTIME_INTERVAL_SECONDS=5
 EXECUTION_RUNTIME_SUBMISSION_LEAD_SECONDS=60
@@ -79,6 +80,8 @@ Recommended repo usage:
 - do not work around ownership problems by generating fresh client IDs during normal operation
 - keep broker backoff enabled so failed Gateway connects cool down instead of looping
 - keep market-stream auto reconnect enabled so existing subscribed symbols are restored after a Gateway recovery
+- keep the market-stream subscription cap explicit; the current default is 120
+  symbols, with the runner reporting overflow instead of silently dropping names
 - keep dashboard-triggered broker status refresh throttled so operator pages can notice stale state without creating extra Gateway pressure
 
 When the API host is running with `EXECUTION_RUNTIME_ENABLED=true`, that same colocated process now hosts the long-lived execution loop. The runtime takes a durable Postgres lease before it starts cycling, and the dashboard can show whether the execution loop is running, degraded, stale, blocked on startup reconciliation, or stopped.
@@ -204,7 +207,7 @@ The failure mode to recover is:
 - port `4002` accepts TCP connections
 - the trader API is alive
 - `POST /v1/ibkr/probe` fails repeatedly because Gateway does not return
-  `nextValidId`
+  `currentTime` or `nextValidId`
 
 That means the Gateway API server is wedged even though systemd still sees the
 Java process as running. Install the root-owned watchdog timer:
@@ -212,6 +215,10 @@ Java process as running. Install the root-owned watchdog timer:
 ```bash
 install -m 0755 /home/mattias/ibkr-trader/ops/scripts/ibgateway_api_watchdog.sh \
   /usr/local/sbin/ibgateway_api_watchdog.sh
+install -m 0755 /home/mattias/ibkr-trader/ops/scripts/ibgateway_relogin_restart.sh \
+  /usr/local/sbin/ibgateway_relogin_restart.sh
+install -m 0644 /home/mattias/ibkr-trader/ops/needrestart/99-ibgateway.conf \
+  /etc/needrestart/conf.d/99-ibgateway.conf
 cp /home/mattias/ibkr-trader/ops/systemd/ibgateway-api-watchdog.service \
   /etc/systemd/system/
 cp /home/mattias/ibkr-trader/ops/systemd/ibgateway-api-watchdog.timer \
@@ -224,8 +231,34 @@ The watchdog is intentionally conservative:
 
 - it first verifies the trader API health endpoint is reachable
 - it uses the same official probe endpoint the dashboard trusts
-- it restarts `ibgateway-ibc.service` only after three consecutive probe
+- it restarts `ibgateway-ibc.service` only after twelve consecutive probe
   failures
+- it allows a startup grace period after a Gateway restart before counting
+  more failures
+- it uses `/usr/local/sbin/ibgateway_relogin_restart.sh`, which first tries
+  the IBC CommandServer `RESTART` command. IBC documents this as the auto
+  restart path that reuses the current session credentials, so it normally
+  avoids fresh two-factor authentication during the trading week.
+- it does not fall back to `systemctl restart` by default. A hard service
+  restart starts a fresh login and may require operator 2FA; if the command
+  server path is unavailable, the watchdog alerts instead of cycling Gateway
+  repeatedly.
+- it only performs automatic restarts Monday through Friday by default. Sunday
+  restarts usually require a fresh weekly authentication and should be handled
+  while the operator is available.
+- it will not restart again immediately if the probe is still failing after a
+  recent restart; that condition usually means Gateway is waiting for manual
+  login or second-factor confirmation
+- unattended package upgrades must not restart `ibgateway-ibc.service`
+  directly; the `needrestart` override keeps those hard restarts out of the
+  automatic maintenance path
+
+IBC's own user guide documents the CommandServer `RESTART` behavior: for
+Gateway, IBC sets the next auto-restart time and reuses the current session
+credentials. That command cannot bypass IBKR's full Sunday authentication
+requirement, so the weekly restart should be planned for a time when the
+operator can approve it.
+
 - it writes recent Gateway log context to
   `/run/ibgateway-api-watchdog.last-journal`
 - it resets its failure counter after a successful probe or restart
@@ -236,8 +269,29 @@ Tune the timer or threshold by editing
 ```ini
 Environment=TRADER_API_BASE_URL=http://127.0.0.1:8000
 Environment=GATEWAY_SERVICE=ibgateway-ibc.service
-Environment=FAILURE_THRESHOLD=3
+Environment=GATEWAY_RESTART_COMMAND=/usr/local/sbin/ibgateway_relogin_restart.sh
+Environment=FAILURE_THRESHOLD=12
 Environment=CURL_TIMEOUT_SECONDS=20
+Environment=RESTART_ALLOWED_WINDOWS=06:00-23:00
+Environment=RESTART_WINDOW_TZ=Europe/Stockholm
+Environment=RESTART_ALLOWED_DAYS=Mon,Tue,Wed,Thu,Fri
+Environment=STARTUP_GRACE_SECONDS=900
+Environment=RESTART_COOLDOWN_SECONDS=3600
+# Optional generic JSON webhook: {"text": "..."}
+# Environment=OPERATOR_ALERT_WEBHOOK_URL=https://example.invalid/webhook
+# Optional mobile push through ntfy.
+# Environment=OPERATOR_ALERT_NTFY_TOPIC=your-secret-topic
+# Optional mobile push through Pushover.
+# Environment=OPERATOR_ALERT_PUSHOVER_APP_TOKEN=...
+# Environment=OPERATOR_ALERT_PUSHOVER_USER_KEY=...
+# Environment=OPERATOR_ALERT_COOLDOWN_SECONDS=1800
+```
+
+Install the restart wrapper alongside the watchdog:
+
+```bash
+install -m 0755 /home/mattias/ibkr-trader/ops/scripts/ibgateway_relogin_restart.sh \
+  /usr/local/sbin/ibgateway_relogin_restart.sh
 ```
 
 Useful checks:
@@ -249,14 +303,31 @@ journalctl -u ibgateway-api-watchdog.service -n 100 --no-pager
 cat /run/ibgateway-api-watchdog.last-journal
 ```
 
+The restart window is intentional. A Gateway restart can still require manual
+second-factor confirmation, so the watchdog should restart Gateway only during
+hours when an operator can answer the IBKR prompt. Outside the configured window
+it records the failure and leaves the trader API degraded instead of creating a
+hidden 2FA problem.
+
+If one of the operator alert settings is set, the watchdog sends one
+cooldown-protected human-action alert when a restart is outside the allowed
+window, when the probe is still failing shortly after a restart, or when the
+restart command fails. For mobile push, the simplest path is `ntfy`: install the
+mobile app, choose a private topic, then set `OPERATOR_ALERT_NTFY_TOPIC`.
+
 ### Operational notes
 
 - If the XRDP display number changes later, rerun
   `write_ibgateway_session_env.sh` and restart the service.
 - This service will fail closed if `DISPLAY`, `XAUTHORITY`, IBC, or the Gateway
   config path are missing.
-- This service does not solve second-factor authentication by itself. It only
-  makes the launch path durable and explicit.
+- IBC 3.14+ uses `ReloginAfterSecondFactorAuthenticationTimeout=yes` for
+  modern IBKR Mobile 2FA handling. The repo start script and restart wrapper
+  enforce that row, and the launch argument now defaults to
+  `--on2fatimeout=restart`.
+- This service cannot bypass IBKR's mandatory weekly or risk-triggered
+  authentication. It can keep unattended restarts on the relogin path; if IBKR
+  requires a fresh approval, the watchdog should notify the operator.
 - For XRDP reconnect behavior, the server should use `KillDisconnected=false`
   and a reconnect policy such as `Policy=UBI` in `/etc/xrdp/sesman.ini`.
 

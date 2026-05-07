@@ -16,6 +16,7 @@ from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.models import AccountSnapshotRecord
 from ibkr_trader.db.models import BrokerAccountRecord
+from ibkr_trader.db.models import BrokerOrderEventRecord
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionRecord
@@ -218,13 +219,94 @@ class VirtualTradingTests(TestCase):
             self.assertEqual(len(fills), 2)
             self.assertTrue(all(fill.is_virtual for fill in fills))
             self.assertEqual([fill.quantity for fill in fills], ["100", "100"])
-            self.assertEqual([fill.commission for fill in fills], ["49", "49"])
+            self.assertEqual([fill.commission for fill in fills], ["15", "15"])
             self.assertEqual([fill.commission_currency for fill in fills], ["SEK", "SEK"])
             self.assertEqual(positions[-1].quantity, "0")
             self.assertTrue(positions[-1].is_virtual)
             self.assertTrue(account_snapshots[-1].is_virtual)
-            self.assertEqual(account_snapshots[-1].total_cash_value, "52.00")
-            self.assertEqual(account_snapshots[-1].net_liquidation, "52.00")
+            self.assertEqual(account_snapshots[-1].total_cash_value, "120.00")
+            self.assertEqual(account_snapshots[-1].net_liquidation, "120.00")
+        finally:
+            session.close()
+
+    def test_virtual_exit_fill_cancels_open_exit_sibling(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            _write_schedule_fixture(schedule_path)
+            payload = deepcopy(_virtual_payload())
+            payload["instructions"][0]["exit"]["catastrophic_stop_loss_pct"] = "0.15"
+            batch = parse_execution_batch_payload(payload)
+
+            record_virtual_market_quote(
+                self.session_factory,
+                account_key="virtual0001",
+                symbol="SIVE",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                last_price=Decimal("10.00"),
+                ask_price=Decimal("10.00"),
+                bid_price=Decimal("9.95"),
+                observed_at=datetime(2026, 4, 27, 7, 0, tzinfo=timezone.utc),
+                source="test",
+            )
+            submit_execution_batch(
+                self.session_factory,
+                batch,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+            )
+            run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 27, 7, 1, tzinfo=timezone.utc),
+            )
+            second_cycle = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 27, 7, 2, tzinfo=timezone.utc),
+            )
+            self.assertEqual(len(second_cycle.submitted_exits), 2)
+
+            quote_result = record_virtual_market_quote(
+                self.session_factory,
+                account_key="VIRTUAL0001",
+                symbol="SIVE",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                last_price=Decimal("11.50"),
+                bid_price=Decimal("11.50"),
+                ask_price=Decimal("11.55"),
+                observed_at=datetime(2026, 4, 27, 7, 3, tzinfo=timezone.utc),
+                source="test",
+            )
+            self.assertEqual(quote_result["filled_order_count"], 1)
+
+        session = self.session_factory()
+        try:
+            exit_orders = session.execute(
+                select(BrokerOrderRecord)
+                .where(BrokerOrderRecord.order_role == "EXIT")
+                .order_by(BrokerOrderRecord.order_ref)
+            ).scalars().all()
+            events = session.execute(
+                select(BrokerOrderEventRecord)
+                .where(BrokerOrderEventRecord.event_type == "virtual_exit_sibling_cancelled")
+            ).scalars().all()
+
+            self.assertEqual(len(exit_orders), 2)
+            self.assertEqual(
+                sorted(order.status for order in exit_orders),
+                ["Cancelled", "FILLED"],
+            )
+            self.assertEqual(len(events), 1)
         finally:
             session.close()
 
@@ -361,8 +443,8 @@ class VirtualTradingTests(TestCase):
                 select(AccountSnapshotRecord).order_by(AccountSnapshotRecord.id)
             ).scalars().all()
             self.assertEqual(fill.quantity, "95")
-            self.assertEqual(snapshots[-1].total_cash_value, "199951")
-            self.assertEqual(snapshots[-1].buying_power, "199951.00")
+            self.assertEqual(snapshots[-1].total_cash_value, "199985")
+            self.assertEqual(snapshots[-1].buying_power, "199985.00")
         finally:
             session.close()
 
@@ -443,8 +525,8 @@ class VirtualTradingTests(TestCase):
             self.assertEqual(position.source, "virtual_market_mark")
             self.assertEqual(position.market_price, "10.50")
             self.assertEqual(position.unrealized_pnl, "50.00")
-            self.assertEqual(account_snapshot.total_cash_value, "199951")
-            self.assertEqual(account_snapshot.net_liquidation, "200001.00")
+            self.assertEqual(account_snapshot.total_cash_value, "199985")
+            self.assertEqual(account_snapshot.net_liquidation, "200035.00")
         finally:
             session.close()
 

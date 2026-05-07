@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -109,6 +111,87 @@ def test_runner_action_diagnostics_include_margin_and_mask() -> None:
     }
 
 
+def test_runner_action_distribution_warns_when_short_flat_names_all_skip() -> None:
+    metrics = runner.action_distribution_metrics(
+        [
+            {
+                "symbol": f"SHORT{i}",
+                "action_name": "skip",
+                "state_before": "FLAT",
+            }
+            for i in range(6)
+        ],
+        model_side="SHORT",
+    )
+
+    assert metrics["evaluated_action_count"] == 6
+    assert metrics["flat_entry_action_count"] == 0
+    assert metrics["flat_idle_action_rate"] == 1.0
+    assert metrics["warning"] == "short_flat_candidates_all_skip"
+
+
+def test_runner_action_distribution_does_not_warn_on_pending_waits() -> None:
+    metrics = runner.action_distribution_metrics(
+        [
+            {
+                "symbol": f"LONG{i}",
+                "action_name": "wait",
+                "state_before": "ENTRY_PENDING",
+            }
+            for i in range(6)
+        ],
+        model_side="LONG",
+    )
+
+    assert metrics["evaluated_action_count"] == 6
+    assert metrics["flat_evaluated_action_count"] == 0
+    assert metrics["warning"] is None
+
+
+def test_runner_expected_decision_bar_uses_completed_five_minute_boundary() -> None:
+    stockholm = ZoneInfo("Europe/Stockholm")
+
+    assert (
+        runner.expected_decision_bar_ended_at(
+            trade_date="2026-05-05",
+            now=datetime(2026, 5, 5, 9, 4, 59, tzinfo=stockholm),
+        )
+        is None
+    )
+    assert runner.expected_decision_bar_ended_at(
+        trade_date="2026-05-05",
+        now=datetime(2026, 5, 5, 9, 31, 2, tzinfo=stockholm),
+    ) == "2026-05-05T09:30:00+02:00"
+    assert runner.expected_decision_bar_ended_at(
+        trade_date="2026-05-05",
+        now=datetime(2026, 5, 5, 18, 0, 0, tzinfo=stockholm),
+    ) == "2026-05-05T17:30:00+02:00"
+
+
+def test_runner_classifies_stale_decision_bar() -> None:
+    assert runner.classify_decision_bar_freshness(
+        {
+            "ready": True,
+            "latest_usable_bar_ended_at": "2026-05-05T09:25:00+02:00",
+        },
+        target_decision_bar_ended_at="2026-05-05T09:30:00+02:00",
+    )["status"] == "stale_bar"
+
+
+def test_runner_stream_plan_prioritizes_candidates_over_benchmarks() -> None:
+    plan = runner.build_stream_symbol_plan(
+        candidate_symbols=["BBB", "AAA"],
+        benchmark_symbols=["OMXS30", "AAA"],
+        max_stream_symbols=2,
+        warning_symbols=2,
+    )
+
+    assert plan["stream_symbols"] == ["AAA", "BBB"]
+    assert plan["overflow_symbols"] == ["OMXS30"]
+    assert plan["overflow_candidate_symbol_count"] == 0
+    assert plan["over_warning_threshold"] is True
+
+
 def test_runner_publish_virtual_decision_bar_posts_phase1_bar(monkeypatch) -> None:
     posted: list[tuple[str, dict[str, object]]] = []
 
@@ -204,6 +287,72 @@ def test_runner_prefers_static_features_from_candidate_payload() -> None:
         "normalized": True,
         "source": "upstream_candidate_payload",
     }
+
+
+def test_runner_normalizes_raw_static_features_when_bundle_stats_exist() -> None:
+    loaded = SimpleNamespace(
+        config=SimpleNamespace(model_key="long_trial_106_v1"),
+        static_feature_names=["rank_score", "turnover"],
+        static_feature_mean=runner.np.asarray([10.0, 100.0], dtype=runner.np.float32),
+        static_feature_std=runner.np.asarray([2.0, 10.0], dtype=runner.np.float32),
+        static_feature_normalization_id="trial_106_seed240",
+    )
+
+    payload = static_feature_payload(
+        loaded,
+        candidate={
+            "trace": {
+                "metadata": {
+                    "static_features": {
+                        "schema_version": "rl_static_features_v1",
+                        "model_key": "long_trial_106_v1",
+                        "feature_names": ["rank_score", "turnover"],
+                        "values": [12.0, 80.0],
+                        "normalized": False,
+                        "source": "upstream_candidate_payload",
+                    }
+                }
+            }
+        },
+        symbol="AXFO",
+        trade_date="2026-03-23",
+    )
+
+    assert payload["values"] == [1.0, -2.0]
+    assert payload["normalized"] is True
+    assert payload["source"] == "upstream_candidate_payload+trader_static_zscore"
+
+
+def test_runner_normalizes_candidate_values_even_when_legacy_payload_claims_normalized() -> None:
+    loaded = SimpleNamespace(
+        config=SimpleNamespace(model_key="short_trial36_v1"),
+        static_feature_names=["vote_sum"],
+        static_feature_mean=runner.np.asarray([250.0], dtype=runner.np.float32),
+        static_feature_std=runner.np.asarray([25.0], dtype=runner.np.float32),
+        static_feature_normalization_id="trial_36_seed140",
+    )
+
+    payload = static_feature_payload(
+        loaded,
+        candidate={
+            "trace": {
+                "metadata": {
+                    "static_features": {
+                        "schema_version": "rl_static_features_v1",
+                        "model_key": "short_trial36_v1",
+                        "feature_names": ["vote_sum"],
+                        "values": [300.0],
+                        "normalized": True,
+                        "source": "upstream_candidate_payload",
+                    }
+                }
+            }
+        },
+        symbol="SCA B",
+        trade_date="2026-05-06",
+    )
+
+    assert payload["values"] == [2.0]
 
 
 def test_runner_requires_static_features_on_candidate_payload() -> None:
@@ -438,3 +587,113 @@ def test_runner_degrades_heartbeat_when_stream_subscribe_fails(monkeypatch) -> N
     ]
     assert short_heartbeat["status"] == "running"
     assert short_heartbeat["metrics"] == {"candidate_count": 0, "runner_mode": "idle"}
+
+
+def test_runner_reports_stale_bar_without_calling_model_or_translator(monkeypatch) -> None:
+    heartbeats: list[dict[str, object]] = []
+    translated: list[dict[str, object]] = []
+
+    monkeypatch.setattr(runner, "load_runtime_states_from_instructions", lambda **_: {})
+    monkeypatch.setattr(
+        runner,
+        "static_feature_payload",
+        lambda *_, **__: {"feature_names": ["x"], "values": [0.0], "normalized": True},
+    )
+    monkeypatch.setattr(
+        runner,
+        "history_override_payload",
+        lambda **_: {"previous_session": {"prev_close": 100}, "history_features": {}},
+    )
+    monkeypatch.setattr(
+        runner,
+        "expected_decision_bar_ended_at",
+        lambda **_: "2026-05-05T09:10:00+02:00",
+    )
+    monkeypatch.setattr(
+        runner,
+        "choose_action",
+        lambda *_, **__: pytest.fail("stale bars must not reach the model"),
+    )
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        if "/v1/rl/observations/build" in url:
+            return {
+                "rl_observation": {
+                    "feature_schema": {"path_pad_length": 102},
+                    "observations": {
+                        "AXFO": {
+                            "latest_bar_ended_at": "2026-05-05T09:05:00+02:00",
+                            "model_decision": {
+                                "ready": True,
+                                "decision_id": "long:AXFO:2026-05-05T09:05:00+02:00",
+                                "latest_usable_bar_ended_at": "2026-05-05T09:05:00+02:00",
+                            },
+                        }
+                    },
+                },
+                "fetched_symbols": [],
+            }
+        if "/v1/rl/actions/translate" in url:
+            translated.append(payload)
+            return {"accepted": True}
+        assert "/heartbeat" in url
+        heartbeats.append(payload)
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+
+    runner.run_model_candidates(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(
+            config=SimpleNamespace(
+                model_key="long_trial_106_v1",
+                deployment_key="long_trial_106_virtual_shared_01",
+                side="LONG",
+            ),
+            action_names=["skip", "wait", "entry_prevclose_-50bp"],
+            obs_dim=10,
+        ),
+        deployment_key="long_trial_106_virtual_shared_01",
+        deployment_mode="virtual",
+        candidates=[
+            {
+                "instruction_id": "long-axfo",
+                "symbol": "AXFO",
+                "account_key": "VIRTUALRL01",
+                "trace": {
+                    "trade_date": "2026-05-05",
+                    "data_cutoff_date": "2026-05-04",
+                },
+            }
+        ],
+        processed_decisions=set(),
+        execute_actions=True,
+        history_cache={},
+        history_duration="5 D",
+        history_bar_size="1 min",
+        history_timeout=20,
+        stream_bar_ready_symbols={"AXFO"},
+        stream_plan={"stream_symbol_count": 1},
+        trade_date="2026-05-05",
+    )
+
+    assert translated == []
+    assert heartbeats[-1]["status"] == "degraded"
+    assert (
+        heartbeats[-1]["runtime_error"]
+        == "market stream bars are stale for all active RL candidates"
+    )
+    metrics = heartbeats[-1]["metrics"]
+    assert metrics["stale_decision_bar_candidate_count"] == 1
+    assert metrics["fresh_decision_bar_candidate_count"] == 0
+    assert metrics["evaluated_candidate_count"] == 0
+    assert metrics["actions"][0]["status"] == "stale_bar"
+    assert metrics["timing"]["cadence_budget_seconds"] == 300.0
+    assert metrics["timing"]["cadence_over_budget"] is False
+    assert metrics["timing"]["total_seconds"] >= 0.0

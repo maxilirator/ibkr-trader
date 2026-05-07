@@ -594,7 +594,7 @@ def _static_features_valid(
     names = static_features.get("feature_names")
     values = static_features.get("values")
     return (
-        static_features.get("normalized") is True
+        isinstance(static_features.get("normalized"), bool)
         and str(static_features.get("model_key") or "") == str(candidate.get("model_id") or "")
         and isinstance(names, list)
         and isinstance(values, list)

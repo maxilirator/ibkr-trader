@@ -1278,6 +1278,72 @@ def _persist_virtual_position_mark_snapshot(
     return snapshot
 
 
+def _cancel_open_virtual_exit_siblings_after_fill(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+    observed_at: datetime,
+) -> None:
+    if broker_order.order_role != "EXIT" or broker_order.instruction_id is None:
+        return
+
+    filled_oca_group = _normalize_text(
+        (broker_order.metadata_json or {}).get("oca_group")
+    )
+    rows = session.execute(
+        select(BrokerOrderRecord)
+        .where(
+            BrokerOrderRecord.broker_kind == BROKER_KIND_VIRTUAL,
+            BrokerOrderRecord.is_virtual.is_(True),
+            BrokerOrderRecord.account_key == broker_order.account_key,
+            BrokerOrderRecord.instruction_id == broker_order.instruction_id,
+            BrokerOrderRecord.order_role == "EXIT",
+            BrokerOrderRecord.id != broker_order.id,
+            _open_virtual_order_status_clause(),
+        )
+        .order_by(BrokerOrderRecord.id.asc())
+    ).scalars()
+
+    for sibling_order in rows:
+        sibling_oca_group = _normalize_text(
+            (sibling_order.metadata_json or {}).get("oca_group")
+        )
+        if filled_oca_group is not None and sibling_oca_group != filled_oca_group:
+            continue
+        status_before = sibling_order.status
+        sibling_order.status = "Cancelled"
+        sibling_order.last_status_at = observed_at
+        metadata = dict(sibling_order.metadata_json or {})
+        metadata["cancelled_by_virtual_exit_fill"] = {
+            "filled_broker_order_id": broker_order.id,
+            "filled_external_order_id": broker_order.external_order_id,
+            "filled_order_ref": broker_order.order_ref,
+            "oca_group": filled_oca_group,
+        }
+        sibling_order.metadata_json = _serialize_for_json(metadata)
+        session.add(
+            BrokerOrderEventRecord(
+                broker_order_id=sibling_order.id,
+                event_type="virtual_exit_sibling_cancelled",
+                event_at=observed_at,
+                status_before=status_before,
+                status_after=sibling_order.status,
+                payload=_serialize_for_json(
+                    {
+                        "filled_broker_order_id": broker_order.id,
+                        "filled_external_order_id": broker_order.external_order_id,
+                        "filled_order_ref": broker_order.order_ref,
+                        "oca_group": filled_oca_group,
+                    }
+                ),
+                note=(
+                    "Virtual exit fill cancelled the sibling exit order so the "
+                    "simulated OCA state matches broker behaviour."
+                ),
+            )
+        )
+
+
 def persist_virtual_execution_fill(
     session: Session,
     *,
@@ -1361,6 +1427,11 @@ def persist_virtual_execution_fill(
         broker_account=broker_account,
         broker_order=broker_order,
         fill_payload=normalized_fill_payload,
+    )
+    _cancel_open_virtual_exit_siblings_after_fill(
+        session,
+        broker_order=broker_order,
+        observed_at=observed_at,
     )
     _persist_virtual_account_snapshot(
         session,

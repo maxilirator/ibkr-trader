@@ -52,7 +52,7 @@
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
   const positionOwningInstructionStates = new Set(['POSITION_OPEN', 'EXIT_PENDING']);
   const AUTO_REFRESH_INTERVAL_MS = 30000;
-  const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v2';
+  const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v3';
   const BUTTON_CLICK_TO_WORK_MS = 140;
   const BUTTON_SUCCESS_RESET_MS = 1600;
   const BUTTON_ERROR_RESET_MS = 2200;
@@ -570,14 +570,133 @@
       .filter(Boolean);
   }
 
+  function stockholmDstStartUtc(year) {
+    const lastDay = new Date(Date.UTC(year, 2, 31));
+    const lastSunday = 31 - lastDay.getUTCDay();
+    return Date.UTC(year, 2, lastSunday, 1, 0, 0);
+  }
+
+  function stockholmDstEndUtc(year) {
+    const lastDay = new Date(Date.UTC(year, 9, 31));
+    const lastSunday = 31 - lastDay.getUTCDay();
+    return Date.UTC(year, 9, lastSunday, 1, 0, 0);
+  }
+
+  function stockholmOffsetHours(year, month, day, hour, minute, second = 0) {
+    const standardUtc = Date.UTC(year, month - 1, day, hour - 1, minute, second);
+    return standardUtc >= stockholmDstStartUtc(year) && standardUtc < stockholmDstEndUtc(year)
+      ? 2
+      : 1;
+  }
+
+  function stockholmDateKey(date) {
+    const parts = new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'Europe/Stockholm',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(date);
+    const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${byType.year}-${byType.month}-${byType.day}`;
+  }
+
+  function stockholmLocalDate(dateKey, hour, minute) {
+    const [year, month, day] = dateKey.split('-').map((part) => Number.parseInt(part, 10));
+    const offsetHours = stockholmOffsetHours(year, month, day, hour, minute);
+    return new Date(Date.UTC(year, month - 1, day, hour - offsetHours, minute, 0));
+  }
+
+  function sessionWindowForPoints(points) {
+    const latestPoint = points
+      .map((point) => point.timestamp)
+      .filter((timestamp) => timestamp instanceof Date && !Number.isNaN(timestamp.getTime()))
+      .sort((left, right) => left.getTime() - right.getTime())
+      .at(-1);
+    const dateKey = stockholmDateKey(latestPoint ?? referenceNow);
+    return {
+      dateKey,
+      open: stockholmLocalDate(dateKey, 9, 0),
+      close: stockholmLocalDate(dateKey, 17, 30)
+    };
+  }
+
+  function tradingSessionPoints(points, session) {
+    const openTime = session.open.getTime();
+    const closeTime = session.close.getTime();
+    return points
+      .filter((point) => {
+        const timestamp = point.timestamp.getTime();
+        return timestamp >= openTime && timestamp <= closeTime;
+      })
+      .sort((left, right) => left.timestamp.getTime() - right.timestamp.getTime());
+  }
+
+  function anchorSessionSeries(points, session, { extendToClose = false } = {}) {
+    const sessionPoints = tradingSessionPoints(points, session);
+    if (sessionPoints.length === 0) {
+      return [];
+    }
+    const anchorValue = sessionPoints[0].value;
+    const anchored = sessionPoints.map((point) => ({
+      timestamp: point.timestamp,
+      value: point.value - anchorValue
+    }));
+    if (anchored[0].timestamp.getTime() !== session.open.getTime()) {
+      anchored.unshift({
+        timestamp: session.open,
+        value: 0
+      });
+    } else {
+      anchored[0] = {
+        timestamp: session.open,
+        value: 0
+      };
+    }
+    const latest = anchored.at(-1);
+    if (extendToClose && latest && latest.timestamp.getTime() < session.close.getTime()) {
+      anchored.push({
+        timestamp: session.close,
+        value: latest.value
+      });
+    }
+    return anchored;
+  }
+
+  function interpolateSeriesValue(points, timestamp) {
+    if (points.length === 0) {
+      return null;
+    }
+    const time = timestamp.getTime();
+    if (time <= points[0].timestamp.getTime()) {
+      return points[0].value;
+    }
+    for (let index = 1; index < points.length; index += 1) {
+      const previous = points[index - 1];
+      const next = points[index];
+      const previousTime = previous.timestamp.getTime();
+      const nextTime = next.timestamp.getTime();
+      if (time <= nextTime) {
+        if (nextTime === previousTime) {
+          return next.value;
+        }
+        const fraction = (time - previousTime) / (nextTime - previousTime);
+        return previous.value + (next.value - previous.value) * fraction;
+      }
+    }
+    return points.at(-1).value;
+  }
+
   function accountDayChart(account) {
-    const accountPoints = normalizePerformancePoints(account.day_performance?.points);
-    const benchmarkPoints = normalizePerformancePoints(omxBenchmark?.points);
-    const chartPoints = [...accountPoints, ...benchmarkPoints];
-    if (accountPoints.length < 2 || chartPoints.length < 2) {
+    const rawAccountPoints = normalizePerformancePoints(account.day_performance?.points);
+    const rawBenchmarkPoints = normalizePerformancePoints(omxBenchmark?.points);
+    const session = sessionWindowForPoints([...rawAccountPoints, ...rawBenchmarkPoints]);
+    const extendToClose = referenceNow.getTime() >= session.close.getTime();
+    const accountPoints = anchorSessionSeries(rawAccountPoints, session, { extendToClose });
+    const benchmarkPoints = anchorSessionSeries(rawBenchmarkPoints, session, { extendToClose });
+    if (accountPoints.length < 2) {
       return {
         ready: false,
-        message: 'Waiting for at least two account snapshots from this trading day.'
+        message: 'Waiting for at least two account snapshots from this trading session.'
       };
     }
 
@@ -587,43 +706,57 @@
     const right = 308;
     const top = 12;
     const bottom = 98;
-    const times = chartPoints.map((point) => point.timestamp.getTime());
-    const minTime = Math.min(...times);
-    const maxTime = Math.max(...times);
-    const yValues = chartPoints.map((point) => point.value).concat(0);
-    let minValue = Math.min(...yValues);
-    let maxValue = Math.max(...yValues);
-    if (minValue === maxValue) {
-      minValue -= 0.05;
-      maxValue += 0.05;
-    }
-    const padding = Math.max((maxValue - minValue) * 0.15, 0.05);
-    minValue -= padding;
-    maxValue += padding;
+    const openTime = session.open.getTime();
+    const closeTime = session.close.getTime();
+    const benchmarkAvailable = benchmarkPoints.length >= 2 && omxBenchmark?.status === 'ok';
+    const relativePoints = accountPoints.map((point) => {
+      const benchmarkValue = benchmarkAvailable
+        ? interpolateSeriesValue(benchmarkPoints, point.timestamp)
+        : 0;
+      return {
+        timestamp: point.timestamp,
+        value: point.value - (benchmarkValue ?? 0)
+      };
+    });
+    const yValues = accountPoints
+      .map((point) => point.value)
+      .concat(benchmarkAvailable ? benchmarkPoints.map((point) => point.value) : [])
+      .concat(0);
+    const maxAbsValue = Math.max(...yValues.map((value) => Math.abs(value)), 0.05) * 1.18;
+    const minValue = -maxAbsValue;
+    const maxValue = maxAbsValue;
 
     const xFor = (date) => {
-      if (maxTime === minTime) return left;
-      return left + ((date.getTime() - minTime) / (maxTime - minTime)) * (right - left);
+      if (closeTime === openTime) return left;
+      const clampedTime = Math.min(Math.max(date.getTime(), openTime), closeTime);
+      return left + ((clampedTime - openTime) / (closeTime - openTime)) * (right - left);
     };
     const yFor = (value) => bottom - ((value - minValue) / (maxValue - minValue)) * (bottom - top);
     const pathFor = (points) =>
       points
         .map((point, index) => `${index === 0 ? 'M' : 'L'} ${xFor(point.timestamp).toFixed(2)} ${yFor(point.value).toFixed(2)}`)
         .join(' ');
-    const latestAccount = accountPoints.at(-1)?.value ?? null;
-    const latestBenchmark = benchmarkPoints.at(-1)?.value ?? null;
+    const latestAccountRaw = accountPoints.at(-1)?.value ?? null;
+    const latestBenchmarkRaw = benchmarkAvailable
+      ? interpolateSeriesValue(benchmarkPoints, accountPoints.at(-1).timestamp)
+      : null;
+    const latestRelative = relativePoints.at(-1)?.value ?? null;
+    const zeroPath = `M ${left} ${yFor(0).toFixed(2)} L ${right} ${yFor(0).toFixed(2)}`;
 
     return {
       ready: true,
       accountPath: pathFor(accountPoints),
-      benchmarkPath: benchmarkPoints.length >= 2 ? pathFor(benchmarkPoints) : '',
-      zeroPath: `M ${left} ${yFor(0).toFixed(2)} L ${right} ${yFor(0).toFixed(2)}`,
+      benchmarkPath: benchmarkAvailable ? pathFor(benchmarkPoints) : null,
+      zeroPath,
       yMin: minValue,
       yMax: maxValue,
-      latestAccount,
-      latestBenchmark,
-      benchmarkAvailable: benchmarkPoints.length >= 2 && omxBenchmark?.status === 'ok',
-      benchmarkLabel: omxBenchmark?.symbol ?? 'OMX'
+      latestAccount: latestAccountRaw,
+      latestBenchmark: latestBenchmarkRaw,
+      latestRelative,
+      benchmarkAvailable,
+      benchmarkLabel: omxBenchmark?.symbol ?? 'OMX',
+      openLabel: '09:00',
+      closeLabel: '17:30'
     };
   }
 
@@ -1113,17 +1246,25 @@
           runIds: [],
           runStatuses: [],
           runCompletedAts: [],
+          suppressedCount: 0,
           count: 0
         };
 
+        const suppressedRepeats = Number(run.metadata_json?.suppressed_reconciliation_repeats ?? 0);
         currentGroup.count += 1;
+        if (Number.isFinite(suppressedRepeats) && suppressedRepeats > currentGroup.suppressedCount) {
+          currentGroup.suppressedCount = suppressedRepeats;
+        }
         currentGroup.issueIds.push(Number(issue.issue_id));
         currentGroup.runIds.push(Number(run.run_id));
         currentGroup.runStatuses.push(run.status);
         currentGroup.runCompletedAts.push(run.completed_at);
 
-        if (parseTimestamp(issue.observed_at)?.getTime() >= (parseTimestamp(currentGroup.latestAt)?.getTime() ?? 0)) {
-          currentGroup.latestAt = issue.observed_at;
+        const latestObservedAt = parseTimestamp(issue.observed_at)?.getTime() ?? 0;
+        const latestRunAt = parseTimestamp(run.completed_at)?.getTime() ?? 0;
+        const effectiveLatestAt = Math.max(latestObservedAt, latestRunAt);
+        if (effectiveLatestAt >= (parseTimestamp(currentGroup.latestAt)?.getTime() ?? 0)) {
+          currentGroup.latestAt = new Date(effectiveLatestAt).toISOString();
         }
 
         groupedRows.set(groupKey, currentGroup);
@@ -1680,27 +1821,22 @@
                 <div class="account-chart-head">
                   <div>
                     <span>Today vs OMX</span>
-                    <strong>{formatReturnPct(account.day_performance?.latest_return_pct)}</strong>
+                    <strong>{formatReturnPct(chart.latestRelative)}</strong>
                   </div>
-                  <small>
-                    {#if chart.ready && chart.benchmarkAvailable}
-                      OMX {formatReturnPct(chart.latestBenchmark)}
-                    {:else if chart.ready}
-                      OMX benchmark unavailable
-                    {:else}
-                      {chart.message}
-                    {/if}
-                  </small>
                 </div>
 
                 {#if chart.ready}
                   <svg class="performance-chart" viewBox="0 0 320 120" role="img" aria-label={`Trading day performance for ${account.account_key} versus OMX`}>
                     <path class="chart-zero" d={chart.zeroPath}></path>
-                    <path class="chart-line account-line" d={chart.accountPath}></path>
                     {#if chart.benchmarkPath}
                       <path class="chart-line benchmark-line" d={chart.benchmarkPath}></path>
                     {/if}
+                    <path class="chart-line account-line" d={chart.accountPath}></path>
                   </svg>
+                  <div class="chart-axis-labels">
+                    <span>{chart.openLabel}</span>
+                    <span>{chart.closeLabel}</span>
+                  </div>
                   <div class="chart-legend">
                     <span><i class="account-dot"></i>Account {formatReturnPct(chart.latestAccount)}</span>
                     <span class:subtle={!chart.benchmarkAvailable}>
@@ -1856,7 +1992,7 @@
                 </div>
                 <div class="run-pills">
                   <span class={`pill ${run.severity === 'ERROR' ? 'bad' : 'warn'}`}>{run.severity}</span>
-                  <span class="pill neutral">{run.count}x</span>
+                  <span class="pill neutral">{run.count + run.suppressedCount}x</span>
                   <span class="pill neutral">{run.runCount} runs</span>
                 </div>
               </div>
@@ -1864,9 +2000,15 @@
                 <li>
                   <div class="issue-main">
                     <strong>{run.stage}</strong>
-                    <span class="pill neutral">{run.count}x</span>
+                    <span class="pill neutral">{run.count + run.suppressedCount}x</span>
                   </div>
                   <span>{run.message}</span>
+                  {#if run.suppressedCount > 0}
+                    <small>
+                      Suppressed {run.suppressedCount} repeated broker-down audit
+                      {run.suppressedCount === 1 ? '' : 's'} in the current cooldown window.
+                    </small>
+                  {/if}
                   {#if run.instructionId}
                     <small class="mono">{run.instructionId}</small>
                   {/if}
@@ -1921,6 +2063,11 @@
     </div>
     {#if positions.length === 0}
       <p class="empty">No durable open positions are available yet.</p>
+    {:else if filteredPositions.length === 0}
+      <p class="empty">
+        No holdings match the active filters. Clear filters to show all {positions.length}
+        holdings.
+      </p>
     {:else}
       <div class="table-wrap">
         <table>
@@ -2751,7 +2898,16 @@
 
   .benchmark-line {
     stroke: var(--benchmark-line);
-    stroke-dasharray: 5 4;
+    stroke-dasharray: 6 5;
+  }
+
+  .chart-axis-labels {
+    display: flex;
+    justify-content: space-between;
+    margin-top: -0.25rem;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    line-height: 1;
   }
 
   .chart-legend {

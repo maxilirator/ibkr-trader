@@ -16,7 +16,8 @@ IBG_IBC_PATH="${IBG_IBC_PATH:-${HOME}/IBC}"
 IBG_TWS_PATH="${IBG_TWS_PATH:-${HOME}/Jts}"
 IBG_IBC_INI="${IBG_IBC_INI:-${IBG_IBC_PATH}/config.ini}"
 IBG_TRADING_MODE="${IBG_TRADING_MODE:-live}"
-IBG_TWOFA_TIMEOUT_ACTION="${IBG_TWOFA_TIMEOUT_ACTION:-exit}"
+IBG_TWOFA_TIMEOUT_ACTION="${IBG_TWOFA_TIMEOUT_ACTION:-restart}"
+IBG_ENSURE_RELOGIN_AFTER_TWOFA_TIMEOUT="${IBG_ENSURE_RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}"
 IBG_TWS_SETTINGS_PATH="${IBG_TWS_SETTINGS_PATH:-}"
 IBG_JAVA_PATH="${IBG_JAVA_PATH:-}"
 
@@ -24,6 +25,21 @@ IBG_JAVA_PATH="${IBG_JAVA_PATH:-}"
 [[ -d "${IBG_TWS_PATH}" ]] || fail "TWS/Gateway path not found: ${IBG_TWS_PATH}"
 [[ -x "${IBG_IBC_PATH}/scripts/ibcstart.sh" ]] || fail "IBC launcher missing or not executable: ${IBG_IBC_PATH}/scripts/ibcstart.sh"
 [[ -f "${IBG_IBC_INI}" ]] || fail "IBC config file not found: ${IBG_IBC_INI}"
+
+ensure_ini_setting() {
+    local key="$1"
+    local value="$2"
+    if grep -qE "^${key}=" "${IBG_IBC_INI}"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "${IBG_IBC_INI}"
+    else
+        printf '\n%s=%s\n' "${key}" "${value}" >> "${IBG_IBC_INI}"
+    fi
+}
+
+if [[ "${IBG_ENSURE_RELOGIN_AFTER_TWOFA_TIMEOUT,,}" != "no" ]]; then
+    ensure_ini_setting "ReloginAfterSecondFactorAuthenticationTimeout" "yes"
+    ensure_ini_setting "ExitAfterSecondFactorAuthenticationTimeout" "no"
+fi
 
 if pgrep -f "ibcalpha\\.ibc\\.IbcGateway.*${IBG_IBC_INI}" >/dev/null 2>&1; then
     fail "IB Gateway already appears to be running for ${IBG_IBC_INI}"

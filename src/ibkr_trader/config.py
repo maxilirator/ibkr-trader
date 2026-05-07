@@ -147,6 +147,9 @@ class AppConfig:
     broker_status_refresh_min_interval_seconds: float = 30.0
     market_stream_auto_reconnect_enabled: bool = True
     market_stream_reconnect_interval_seconds: float = 15.0
+    market_stream_max_subscriptions: int = 120
+    market_stream_stale_after_seconds: float = 180.0
+    market_stream_stale_reconnect_enabled: bool = True
     execution_runtime_enabled: bool = False
     execution_runtime_interval_seconds: float = 5.0
     execution_runtime_timeout_seconds: int = 10
@@ -225,6 +228,17 @@ class AppConfig:
             market_stream_reconnect_interval_seconds=float(
                 getenv("MARKET_STREAM_RECONNECT_INTERVAL_SECONDS", "15")
             ),
+            market_stream_max_subscriptions=int(
+                getenv("MARKET_STREAM_MAX_SUBSCRIPTIONS", "120")
+            ),
+            market_stream_stale_after_seconds=float(
+                getenv("MARKET_STREAM_STALE_AFTER_SECONDS", "180")
+            ),
+            market_stream_stale_reconnect_enabled=getenv(
+                "MARKET_STREAM_STALE_RECONNECT_ENABLED",
+                "true",
+            ).lower()
+            not in {"0", "false", "no"},
             execution_runtime_enabled=getenv(
                 "EXECUTION_RUNTIME_ENABLED",
                 "false",

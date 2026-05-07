@@ -125,6 +125,47 @@ class BrokerLedgerPersistenceTests(TestCase):
         finally:
             session.close()
 
+    def test_runtime_snapshot_marks_missing_open_orders_not_found_when_authoritative(
+        self,
+    ) -> None:
+        self._insert_broker_order()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=datetime(2026, 4, 19, 8, 32, tzinfo=timezone.utc),
+            default_account_key="DU1234567",
+            close_missing_open_orders=True,
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(select(BrokerOrderRecord)).scalar_one()
+            events = session.execute(
+                select(BrokerOrderEventRecord).order_by(BrokerOrderEventRecord.id)
+            ).scalars().all()
+
+            self.assertEqual(broker_order.status, "NOT_FOUND_AT_BROKER")
+            self.assertTrue(
+                broker_order.metadata_json["missing_from_runtime_snapshot"]
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(
+                events[0].event_type,
+                "open_order_missing_from_runtime_snapshot",
+            )
+            self.assertEqual(events[0].status_before, "PreSubmitted")
+            self.assertEqual(events[0].status_after, "NOT_FOUND_AT_BROKER")
+        finally:
+            session.close()
+
     def test_persist_broker_runtime_snapshot_writes_real_ledger_rows(self) -> None:
         self._insert_instruction()
 
@@ -306,6 +347,225 @@ class BrokerLedgerPersistenceTests(TestCase):
             self.assertEqual(execution_fills[0].instruction_id, 1)
             self.assertEqual(execution_fills[0].commission, "1.25")
             self.assertEqual(execution_fills[0].commission_currency, "USD")
+        finally:
+            session.close()
+
+    def test_persist_broker_runtime_snapshot_tolerates_ambiguous_reused_order_id(
+        self,
+    ) -> None:
+        self._insert_instruction()
+        session = self.session_factory()
+        try:
+            old_instruction = InstructionRecord(
+                instruction_id="old-aapl-1",
+                schema_version="2026-04-10",
+                source_system="q-training",
+                batch_id="old-batch",
+                account_key="DU1234567",
+                book_key="long_risk_book",
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                state=ExecutionState.COMPLETED.value,
+                submit_at=datetime(2026, 4, 18, 19, 55, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 18, 19, 59, tzinfo=timezone.utc),
+                order_type="LIMIT",
+                side="BUY",
+                payload={"instruction": {"instruction_id": "old-aapl-1"}},
+            )
+            session.add(old_instruction)
+            current_instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "persisted-aapl-1"
+                )
+            ).scalar_one()
+            old_instruction.broker_order_id = 17
+            current_instruction.broker_order_id = 17
+            broker_account = BrokerAccountRecord(
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=old_instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind=BROKER_KIND_IBKR,
+                    account_key="DU1234567",
+                    order_role="ENTRY",
+                    external_order_id="17",
+                    external_perm_id="8001",
+                    external_client_id="0",
+                    order_ref=None,
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    side="BUY",
+                    order_type="LMT",
+                    status="PreSubmitted",
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={
+                    17: BrokerOpenOrder(
+                        order_id=17,
+                        perm_id=9001,
+                        client_id=0,
+                        status="Submitted",
+                        order_ref=None,
+                        action="BUY",
+                        total_quantity=Decimal("1"),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        order_type="LMT",
+                        limit_price=Decimal("200.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc),
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            row = session.execute(
+                select(BrokerOrderRecord).where(
+                    BrokerOrderRecord.external_order_id == "17"
+                )
+            ).scalar_one()
+
+            self.assertEqual(row.status, "Submitted")
+            self.assertIsNone(row.order_ref)
+            self.assertNotEqual(row.instruction_id, 1)
+        finally:
+            session.close()
+
+    def test_persist_broker_runtime_snapshot_relinks_order_ref_to_current_instruction(
+        self,
+    ) -> None:
+        self._insert_instruction()
+        session = self.session_factory()
+        try:
+            old_instruction = InstructionRecord(
+                instruction_id="old-aapl-1",
+                schema_version="2026-04-10",
+                source_system="q-training",
+                batch_id="old-batch",
+                account_key="DU1234567",
+                book_key="long_risk_book",
+                symbol="AAPL",
+                exchange="SMART",
+                currency="USD",
+                state=ExecutionState.COMPLETED.value,
+                submit_at=datetime(2026, 4, 18, 19, 55, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 18, 19, 59, tzinfo=timezone.utc),
+                order_type="LIMIT",
+                side="BUY",
+                payload={"instruction": {"instruction_id": "old-aapl-1"}},
+            )
+            session.add(old_instruction)
+            broker_account = BrokerAccountRecord(
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=old_instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind=BROKER_KIND_IBKR,
+                    account_key="DU1234567",
+                    order_role="ENTRY",
+                    external_order_id="18",
+                    external_perm_id="9002",
+                    external_client_id="0",
+                    order_ref="persisted-aapl-1",
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    side="BUY",
+                    order_type="LMT",
+                    status="PreSubmitted",
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={
+                    18: BrokerOpenOrder(
+                        order_id=18,
+                        perm_id=9002,
+                        client_id=0,
+                        status="Submitted",
+                        order_ref="persisted-aapl-1",
+                        action="BUY",
+                        total_quantity=Decimal("1"),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        order_type="LMT",
+                        limit_price=Decimal("200.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc),
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(
+                select(BrokerOrderRecord).where(
+                    BrokerOrderRecord.external_order_id == "18"
+                )
+            ).scalar_one()
+            current_instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "persisted-aapl-1"
+                )
+            ).scalar_one()
+
+            self.assertEqual(broker_order.status, "Submitted")
+            self.assertEqual(broker_order.instruction_id, current_instruction.id)
         finally:
             session.close()
 
@@ -652,6 +912,206 @@ class BrokerLedgerPersistenceTests(TestCase):
                 ["order_error_callback"],
             )
             self.assertEqual(broker_order_events[0].payload["errorCode"], 401)
+        finally:
+            session.close()
+
+    def test_open_order_snapshot_upgrades_unmatched_exit_order_role(self) -> None:
+        self._insert_instruction()
+        session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=None,
+                    broker_account_id=broker_account.id,
+                    broker_kind=BROKER_KIND_IBKR,
+                    account_key="DU1234567",
+                    order_role="BROKER_NATIVE",
+                    external_order_id="4845",
+                    external_perm_id=None,
+                    external_client_id=None,
+                    order_ref=None,
+                    symbol="UNKNOWN",
+                    exchange="UNKNOWN",
+                    currency="UNKNOWN",
+                    security_type="UNKNOWN",
+                    side="UNKNOWN",
+                    order_type="UNKNOWN",
+                    status="ERROR",
+                    submitted_at=None,
+                    last_status_at=datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={
+                        "unmatched_callback": True,
+                        "reconstructed_from_broker_error": True,
+                    },
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={
+                    4845: BrokerOpenOrder(
+                        order_id=4845,
+                        perm_id=9045,
+                        client_id=0,
+                        status="PreSubmitted",
+                        order_ref="persisted-aapl-1:exit:catastrophic_stop",
+                        action="SELL",
+                        total_quantity=Decimal("1"),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        order_type="STP",
+                        aux_price=Decimal("170.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=datetime(2026, 4, 19, 8, 32, tzinfo=timezone.utc),
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(
+                select(BrokerOrderRecord).where(
+                    BrokerOrderRecord.external_order_id == "4845"
+                )
+            ).scalar_one()
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "persisted-aapl-1"
+                )
+            ).scalar_one()
+
+            self.assertEqual(broker_order.order_role, "EXIT")
+            self.assertEqual(broker_order.instruction_id, instruction.id)
+            self.assertEqual(
+                broker_order.order_ref,
+                "persisted-aapl-1:exit:catastrophic_stop",
+            )
+            self.assertEqual(broker_order.side, "SELL")
+            self.assertEqual(broker_order.order_type, "STP")
+        finally:
+            session.close()
+
+    def test_open_order_snapshot_does_not_merge_replacement_order_by_ref(self) -> None:
+        self._insert_instruction()
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "persisted-aapl-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind=BROKER_KIND_IBKR,
+                    account_key="DU1234567",
+                    order_role="EXIT",
+                    external_order_id="4845",
+                    external_perm_id="9045",
+                    external_client_id="0",
+                    order_ref="persisted-aapl-1:exit:catastrophic_stop",
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    local_symbol="AAPL",
+                    side="SELL",
+                    order_type="STP",
+                    status="Inactive",
+                    total_quantity="1",
+                    stop_price="170.00",
+                    submitted_at=datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={
+                    4864: BrokerOpenOrder(
+                        order_id=4864,
+                        perm_id=9064,
+                        client_id=0,
+                        status="PreSubmitted",
+                        order_ref="persisted-aapl-1:exit:catastrophic_stop",
+                        action="SELL",
+                        total_quantity=Decimal("1"),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        order_type="STP",
+                        aux_price=Decimal("170.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=datetime(2026, 4, 19, 8, 32, tzinfo=timezone.utc),
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_orders = list(
+                session.execute(
+                    select(BrokerOrderRecord).order_by(BrokerOrderRecord.external_order_id)
+                ).scalars()
+            )
+
+            self.assertEqual([row.external_order_id for row in broker_orders], ["4845", "4864"])
+            self.assertEqual([row.status for row in broker_orders], ["Inactive", "PreSubmitted"])
+            self.assertEqual(
+                [row.order_ref for row in broker_orders],
+                [
+                    "persisted-aapl-1:exit:catastrophic_stop",
+                    "persisted-aapl-1:exit:catastrophic_stop",
+                ],
+            )
         finally:
             session.close()
 

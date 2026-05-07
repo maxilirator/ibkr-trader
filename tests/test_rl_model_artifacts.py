@@ -129,3 +129,34 @@ def test_bundle_runtime_file_paths_must_be_relative(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must be relative"):
         load_model_bundle_manifest(manifest_path)
+
+
+def test_bundle_can_carry_static_feature_normalization_file(tmp_path: Path) -> None:
+    manifest_path = _write_bundle(tmp_path)
+    bundle_dir = manifest_path.parent
+    (bundle_dir / "static_feature_normalization.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "rl_static_feature_normalization_v1",
+                "feature_names": ["rank_score_z", "turnover_z"],
+                "mean": [10.0, 100.0],
+                "std": [2.0, 10.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"]["static_feature_normalization"] = (
+        "static_feature_normalization.json"
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    artifact = load_model_bundle_manifest(manifest_path)
+    payload = model_registry_payload(artifact)
+
+    assert artifact.static_feature_normalization_path == (
+        bundle_dir / "static_feature_normalization.json"
+    )
+    assert payload["metadata"]["static_feature_runtime_policy"] == (
+        "normalize_candidate_values_in_trader"
+    )

@@ -154,7 +154,7 @@ before `POST /v1/instructions/submit` when checking candidate orders.
 
 Quote submission also evaluates open virtual orders for the same account and
 instrument. Matching orders fill locally, use `quantity="1"`, record a fixed
-`49 SEK` commission, and update virtual account and position snapshots.
+`15 SEK` commission, and update virtual account and position snapshots.
 
 Use the normal instruction endpoints with `account.account_key="virtual0001"` to
 schedule and run virtual trades:

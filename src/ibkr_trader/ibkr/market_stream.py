@@ -4,6 +4,7 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
+from datetime import time
 from datetime import timedelta
 from decimal import Decimal
 from decimal import InvalidOperation
@@ -13,6 +14,7 @@ from threading import RLock
 from threading import Thread
 from threading import current_thread
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
@@ -168,6 +170,11 @@ class LiveMarketDataStreamService:
         max_bars_per_symbol: int = 780,
         initial_connect_backoff_seconds: float = 5.0,
         max_connect_backoff_seconds: float = 300.0,
+        stale_data_after_seconds: float = 180.0,
+        stale_reconnect_enabled: bool = True,
+        stale_reconnect_timezone: str | None = None,
+        stale_reconnect_start_local: time = time(8, 45),
+        stale_reconnect_end_local: time = time(17, 35),
     ) -> None:
         self._config = config
         self._timeout = timeout
@@ -177,6 +184,15 @@ class LiveMarketDataStreamService:
             self._initial_connect_backoff_seconds,
             max_connect_backoff_seconds,
         )
+        self._stale_data_after_seconds = max(0.0, stale_data_after_seconds)
+        self._stale_reconnect_enabled = stale_reconnect_enabled
+        self._stale_reconnect_zone = (
+            ZoneInfo(stale_reconnect_timezone)
+            if stale_reconnect_timezone is not None
+            else None
+        )
+        self._stale_reconnect_start_local = stale_reconnect_start_local
+        self._stale_reconnect_end_local = stale_reconnect_end_local
         self._lock = RLock()
         self._request_id_lock = Lock()
         self._connected_event = Event()
@@ -201,6 +217,8 @@ class LiveMarketDataStreamService:
         self._disconnect_failure_recorded_for_success_at: datetime | None = None
         self._last_error: str | None = None
         self._cooldown_until: datetime | None = None
+        self._last_stale_detected_at: datetime | None = None
+        self._stale_reconnect_count = 0
         self._supervisor_stop_event = Event()
         self._supervisor_thread: Thread | None = None
 
@@ -419,7 +437,26 @@ class LiveMarketDataStreamService:
                 connected = self._client is not None and self._client.isConnected()
                 if has_desired_contracts and not connected:
                     self._record_unexpected_disconnect_locked()
+                reconnect_stale = (
+                    has_desired_contracts
+                    and connected
+                    and self._stale_reconnect_enabled
+                    and self._is_stream_stale_locked(_utc_now())
+                    and self._stale_reconnect_allowed_locked(_utc_now())
+                )
+                if reconnect_stale:
+                    self._last_stale_detected_at = _utc_now()
+                    self._stale_reconnect_count += 1
+                    self._last_error = (
+                        "market stream connected but stale; reconnecting stream client"
+                    )
             if has_desired_contracts and not connected:
+                try:
+                    self._restore_desired_subscriptions()
+                except Exception:
+                    pass
+            elif reconnect_stale:
+                self._disconnect_client()
                 try:
                     self._restore_desired_subscriptions()
                 except Exception:
@@ -529,6 +566,24 @@ class LiveMarketDataStreamService:
                     ]
                 ]
             connected = self._client is not None and self._client.isConnected()
+            now = _utc_now()
+            latest_quote_at = self._latest_quote_update_locked()
+            latest_trade_at = self._latest_trade_update_locked()
+            latest_market_data_at = max(
+                [item for item in (latest_quote_at, latest_trade_at) if item is not None],
+                default=None,
+            )
+            latest_market_data_age_seconds = (
+                int((now - latest_market_data_at).total_seconds())
+                if latest_market_data_at is not None
+                else None
+            )
+            stale_after_seconds = (
+                int(self._stale_data_after_seconds)
+                if self._stale_data_after_seconds > 0
+                else None
+            )
+            is_stale = self._is_stream_stale_locked(now)
             return {
                 "running": connected,
                 "started_at": (
@@ -559,6 +614,28 @@ class LiveMarketDataStreamService:
                     if self._last_disconnect_observed_at is not None
                     else None
                 ),
+                "latest_market_data_at": (
+                    latest_market_data_at.isoformat()
+                    if latest_market_data_at is not None
+                    else None
+                ),
+                "latest_market_data_age_seconds": latest_market_data_age_seconds,
+                "latest_quote_at": (
+                    latest_quote_at.isoformat() if latest_quote_at is not None else None
+                ),
+                "latest_trade_at": (
+                    latest_trade_at.isoformat() if latest_trade_at is not None else None
+                ),
+                "stale_after_seconds": stale_after_seconds,
+                "is_stale": is_stale,
+                "stale_reconnect_enabled": self._stale_reconnect_enabled,
+                "stale_reconnect_allowed": self._stale_reconnect_allowed_locked(now),
+                "stale_reconnect_count": self._stale_reconnect_count,
+                "last_stale_detected_at": (
+                    self._last_stale_detected_at.isoformat()
+                    if self._last_stale_detected_at is not None
+                    else None
+                ),
                 "desired_subscription_count": len(self._desired_contracts_by_key),
                 "desired_symbols": sorted(self._desired_contracts_by_key),
                 "subscribed_count": len(self._subscriptions_by_key),
@@ -568,6 +645,61 @@ class LiveMarketDataStreamService:
                 "bars_by_symbol": bars_by_symbol,
                 "errors": list(self._errors[-50:]),
             }
+
+    def _latest_quote_update_locked(self) -> datetime | None:
+        return max(
+            (quote.updated_at for quote in self._quotes_by_key.values() if quote.updated_at),
+            default=None,
+        )
+
+    def _latest_trade_update_locked(self) -> datetime | None:
+        return max(
+            (
+                quote.last_trade_at
+                for quote in self._quotes_by_key.values()
+                if quote.last_trade_at
+            ),
+            default=None,
+        )
+
+    def _is_stream_stale_locked(self, now: datetime) -> bool:
+        if self._stale_data_after_seconds <= 0:
+            return False
+        if not self._subscriptions_by_key:
+            return False
+        if self._client is None or not self._client.isConnected():
+            return False
+        latest_market_data_at = max(
+            [
+                item
+                for item in (
+                    self._latest_quote_update_locked(),
+                    self._latest_trade_update_locked(),
+                )
+                if item is not None
+            ],
+            default=None,
+        )
+        if latest_market_data_at is None:
+            if self._started_at is None:
+                return False
+            age_seconds = (now - self._started_at).total_seconds()
+        else:
+            age_seconds = (now - latest_market_data_at).total_seconds()
+        return age_seconds > self._stale_data_after_seconds
+
+    def _stale_reconnect_allowed_locked(self, now: datetime) -> bool:
+        if self._stale_reconnect_zone is None:
+            return True
+        local_now = now.astimezone(self._stale_reconnect_zone)
+        if local_now.weekday() >= 5:
+            return False
+        local_time = local_now.time()
+        return (
+            self._stale_reconnect_start_local
+            <= local_time
+            <= self._stale_reconnect_end_local
+        )
 
     def _allocate_request_id(self) -> int:
         with self._request_id_lock:

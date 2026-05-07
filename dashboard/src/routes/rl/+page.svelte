@@ -110,6 +110,26 @@
     return (symbols ?? []).join('\n');
   }
 
+  function heartbeatMetric(deployment, key, fallback = 0) {
+    return deployment?.heartbeat?.metrics?.[key] ?? fallback;
+  }
+
+  function heartbeatTiming(deployment) {
+    return deployment?.heartbeat?.metrics?.timing ?? {};
+  }
+
+  function formatSeconds(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
+    const seconds = Number(value);
+    if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
+    return `${seconds.toFixed(2)} s`;
+  }
+
+  function formatPercent(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
+    return `${Number(value).toFixed(2)}%`;
+  }
+
   function candidateModelId(candidate) {
     return candidate.model_id ?? candidate.trace?.model_id ?? 'n/a';
   }
@@ -204,6 +224,22 @@
       <strong>{summary.bar_ready_candidate_count ?? 0}</strong>
     </article>
     <article class="summary-card">
+      <span>Any Bars</span>
+      <strong>{summary.stream_any_bar_candidate_count ?? 0}</strong>
+    </article>
+    <article class="summary-card">
+      <span>Evaluated</span>
+      <strong>{summary.evaluated_candidate_count ?? 0}</strong>
+    </article>
+    <article class="summary-card">
+      <span>Stale Bars</span>
+      <strong>{summary.stale_decision_bar_candidate_count ?? 0}</strong>
+    </article>
+    <article class="summary-card">
+      <span>No Current Bar</span>
+      <strong>{summary.not_ready_candidate_count ?? 0}</strong>
+    </article>
+    <article class="summary-card">
       <span>Backfilled</span>
       <strong>{summary.backfilled_symbol_count ?? 0}</strong>
     </article>
@@ -262,6 +298,25 @@
                 <span>Seen {formatTimestamp(deployment.heartbeat.last_seen_at)}</span>
                 <span>Last bar {formatTimestamp(deployment.heartbeat.last_bar_at)}</span>
                 <span>Last action {formatTimestamp(deployment.heartbeat.last_action_at)}</span>
+                <span>
+                  Fresh {heartbeatMetric(deployment, 'fresh_decision_bar_candidate_count')}
+                  / Active {heartbeatMetric(deployment, 'active_candidate_count')}
+                </span>
+                <span>
+                  Stale {heartbeatMetric(deployment, 'stale_decision_bar_candidate_count')}
+                  · No bar {heartbeatMetric(deployment, 'not_ready_candidate_count')}
+                  · Done {heartbeatMetric(deployment, 'already_processed_candidate_count')}
+                </span>
+                {#if deployment.heartbeat.metrics?.target_decision_bar_ended_at}
+                  <span>Target bar {formatTimestamp(deployment.heartbeat.metrics.target_decision_bar_ended_at)}</span>
+                {/if}
+                {#if deployment.heartbeat.metrics?.timing}
+                  <span class:warning-text={heartbeatTiming(deployment).cadence_over_budget}>
+                    Loop {formatSeconds(heartbeatTiming(deployment).total_seconds)}
+                    · Budget {formatPercent(heartbeatTiming(deployment).cadence_budget_used_pct)}
+                    · Per name {formatSeconds(heartbeatTiming(deployment).seconds_per_active_candidate)}
+                  </span>
+                {/if}
                 {#if deployment.heartbeat.runtime_error}
                   <span class="error-text">{deployment.heartbeat.runtime_error}</span>
                 {/if}
@@ -333,7 +388,8 @@
         <h2>Candidate Feed</h2>
         <p>
           Model-routed names waiting for the runner to process bar by bar.
-          {summary.bar_ready_candidate_count ?? 0} have live or rebuilt bars in the latest heartbeat.
+          {summary.bar_ready_candidate_count ?? 0} have the current completed decision bar;
+          {summary.stream_any_bar_candidate_count ?? 0} have any stream bars.
         </p>
       </div>
     </div>
@@ -675,6 +731,11 @@
   .error-panel,
   .error-text {
     color: var(--bad);
+  }
+
+  .warning-text {
+    color: var(--warn);
+    font-weight: 700;
   }
 
   .error-panel {

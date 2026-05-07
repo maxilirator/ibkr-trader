@@ -8,10 +8,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime, timezone
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -50,6 +52,8 @@ DEFAULT_CANDIDATE_REASON_CODES = (
     "rl_model_routed_candidate",
     "rl_model_routed_candidate_tape_selected",
 )
+DEFAULT_MAX_STREAM_SYMBOLS = 120
+DEFAULT_STREAM_WARNING_SYMBOLS = 100
 
 
 @dataclass(slots=True)
@@ -59,6 +63,9 @@ class LoadedModel:
     obs_dim: int
     model: Any
     static_feature_names: list[str]
+    static_feature_mean: np.ndarray | None = None
+    static_feature_std: np.ndarray | None = None
+    static_feature_normalization_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +278,21 @@ def main() -> int:
         help="Comma-separated symbols to keep in the market stream for dashboard benchmarking.",
     )
     parser.add_argument(
+        "--max-stream-symbols",
+        type=int,
+        default=DEFAULT_MAX_STREAM_SYMBOLS,
+        help=(
+            "Maximum symbols the runner will ask the API stream to maintain. "
+            "Candidates are prioritized over benchmark symbols."
+        ),
+    )
+    parser.add_argument(
+        "--stream-warning-symbols",
+        type=int,
+        default=DEFAULT_STREAM_WARNING_SYMBOLS,
+        help="Heartbeat warning threshold for active stream symbols.",
+    )
+    parser.add_argument(
         "--trade-date",
         default=None,
         help="Only process candidates whose trace.trade_date matches YYYY-MM-DD. Defaults to today's Stockholm date.",
@@ -322,6 +344,8 @@ def main() -> int:
                 history_bar_size=args.history_bar_size,
                 history_timeout=args.history_timeout,
                 benchmark_symbols=parse_symbol_list(args.benchmark_symbols),
+                max_stream_symbols=args.max_stream_symbols,
+                stream_warning_symbols=args.stream_warning_symbols,
             )
             _save_processed_decisions(state_path, processed_decisions)
             _save_history_cache(history_cache_path, history_cache)
@@ -353,6 +377,8 @@ def run_once(
     history_bar_size: str,
     history_timeout: int,
     benchmark_symbols: list[str],
+    max_stream_symbols: int = DEFAULT_MAX_STREAM_SYMBOLS,
+    stream_warning_symbols: int = DEFAULT_STREAM_WARNING_SYMBOLS,
 ) -> None:
     active_deployments = dict(
         loaded_deployments
@@ -413,7 +439,13 @@ def run_once(
         return
 
     symbols = sorted({str(candidate["symbol"]).upper() for candidate in candidates})
-    stream_symbols = sorted(set(symbols) | set(benchmark_symbols))
+    stream_plan = build_stream_symbol_plan(
+        candidate_symbols=symbols,
+        benchmark_symbols=benchmark_symbols,
+        max_stream_symbols=max_stream_symbols,
+        warning_symbols=stream_warning_symbols,
+    )
+    stream_symbols = stream_plan["stream_symbols"]
     try:
         subscribe_symbols(api_base, stream_symbols, market_data_type=market_data_type)
         stream = get_json(
@@ -473,6 +505,8 @@ def run_once(
             history_bar_size=history_bar_size,
             history_timeout=history_timeout,
             stream_bar_ready_symbols=symbols_with_bars,
+            stream_plan=stream_plan,
+            trade_date=trade_date,
         )
 
 
@@ -490,18 +524,25 @@ def run_model_candidates(
     history_bar_size: str,
     history_timeout: int,
     stream_bar_ready_symbols: set[str] | None = None,
+    stream_plan: Mapping[str, Any] | None = None,
+    trade_date: str | None = None,
 ) -> None:
+    run_started = time.perf_counter()
+    timing_metrics: dict[str, Any] = {}
     symbols = sorted({str(candidate["symbol"]).upper() for candidate in candidates})
+    stage_started = time.perf_counter()
     runtime_states = load_runtime_states_from_instructions(
         api_base=api_base,
         deployment_key=deployment_key,
         symbols=symbols,
         side=loaded.config.side,
     )
+    timing_metrics["load_runtime_states_seconds"] = _elapsed_seconds(stage_started)
     active_candidates: list[Mapping[str, Any]] = []
     static_features: dict[str, Any] = {}
     history_overrides: dict[str, Any] = {}
     skipped_candidates: list[dict[str, Any]] = []
+    stage_started = time.perf_counter()
     for candidate in candidates:
         symbol = str(candidate["symbol"]).upper()
         trace = candidate.get("trace", {})
@@ -552,8 +593,14 @@ def run_model_candidates(
             )
             continue
         active_candidates.append(candidate)
+    timing_metrics["prepare_features_history_seconds"] = _elapsed_seconds(stage_started)
 
     if not active_candidates:
+        _finalize_timing_metrics(
+            timing_metrics,
+            started_at=run_started,
+            active_candidate_count=0,
+        )
         heartbeat(
             api_base,
             deployment_key,
@@ -563,6 +610,7 @@ def run_model_candidates(
                 "candidate_count": len(candidates),
                 "symbols": symbols,
                 "skipped_candidates": skipped_candidates,
+                "timing": timing_metrics,
             },
         )
         print(
@@ -579,51 +627,132 @@ def run_model_candidates(
 
     active_symbols = sorted({str(candidate["symbol"]).upper() for candidate in active_candidates})
 
-    observation_response = post_json(
-        f"{api_base}/v1/rl/observations/build?timeout={history_timeout}",
-        {
-            "deployment_key": loaded.config.deployment_key,
-            "symbols": active_symbols,
-            "history_overrides": history_overrides,
-            "static_features": static_features,
-            "fetch": {
-                "mode": "market_stream",
-                "bar_limit": 390,
-                "backfill_missing": True,
-                "backfill_duration": "1 D",
-                "backfill_bar_size": "1 min",
-                "instruments": {
-                    str(candidate["symbol"]).upper(): dict(candidate_instrument(candidate))
-                    for candidate in active_candidates
+    target_decision_bar_ended_at = expected_decision_bar_ended_at(
+        trade_date=trade_date_from_candidates(active_candidates, fallback=trade_date)
+    )
+    stage_started = time.perf_counter()
+    try:
+        observation_response = post_json(
+            f"{api_base}/v1/rl/observations/build?timeout={history_timeout}",
+            {
+                "deployment_key": loaded.config.deployment_key,
+                "symbols": active_symbols,
+                "history_overrides": history_overrides,
+                "static_features": static_features,
+                "fetch": {
+                    "mode": "market_stream",
+                    "bar_limit": 390,
+                    "backfill_missing": True,
+                    "backfill_duration": "1 D",
+                    "backfill_bar_size": "1 min",
+                    "instruments": {
+                        str(candidate["symbol"]).upper(): dict(candidate_instrument(candidate))
+                        for candidate in active_candidates
+                    },
                 },
             },
-        },
-        timeout=max(history_timeout + 15, 60),
-    )
+            timeout=max(history_timeout + 15, 60),
+        )
+        timing_metrics["build_observations_seconds"] = _elapsed_seconds(stage_started)
+    except ApiError as exc:
+        timing_metrics["build_observations_seconds"] = _elapsed_seconds(stage_started)
+        _finalize_timing_metrics(
+            timing_metrics,
+            started_at=run_started,
+            active_candidate_count=len(active_candidates),
+        )
+        heartbeat(
+            api_base,
+            deployment_key,
+            "degraded",
+            runtime_error="failed to build RL observations from market stream",
+            metrics={
+                "candidate_count": len(candidates),
+                "active_candidate_count": len(active_candidates),
+                "symbols": active_symbols,
+                "target_decision_bar_ended_at": target_decision_bar_ended_at,
+                "observation_error": str(exc),
+                "stream_plan": dict(stream_plan or {}),
+                "timing": timing_metrics,
+            },
+        )
+        print(
+            json.dumps(
+                {
+                    "deployment_key": deployment_key,
+                    "error": "failed to build RL observations from market stream",
+                    "detail": str(exc),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        return
     rl_observation = observation_response["rl_observation"]
     observations = rl_observation["observations"]
     last_bar_at = None
     last_action_at = None
     actions = list(skipped_candidates)
+    decision_coverage: dict[str, dict[str, Any]] = {}
+    action_loop_started = time.perf_counter()
+    model_inference_seconds = 0.0
+    translate_seconds = 0.0
+    virtual_publish_seconds = 0.0
 
     for candidate in active_candidates:
         symbol = str(candidate["symbol"]).upper()
         symbol_observation = observations[symbol]
         decision = symbol_observation["model_decision"]
+        freshness = classify_decision_bar_freshness(
+            decision,
+            target_decision_bar_ended_at=target_decision_bar_ended_at,
+        )
+        decision_coverage[symbol] = freshness
         last_bar_at = (
             decision.get("latest_usable_bar_ended_at")
             or symbol_observation.get("latest_bar_ended_at")
             or last_bar_at
         )
         if not decision.get("ready"):
-            actions.append({"symbol": symbol, "status": "not_ready", "decision": decision})
+            actions.append(
+                {
+                    "symbol": symbol,
+                    "status": freshness["status"],
+                    "decision": decision,
+                    "target_decision_bar_ended_at": target_decision_bar_ended_at,
+                }
+            )
+            continue
+        if freshness["status"] not in {"fresh_bar", "no_target_bar"}:
+            actions.append(
+                {
+                    "symbol": symbol,
+                    "status": freshness["status"],
+                    "decision_id": decision.get("decision_id"),
+                    "latest_usable_bar_ended_at": freshness.get(
+                        "latest_usable_bar_ended_at"
+                    ),
+                    "target_decision_bar_ended_at": target_decision_bar_ended_at,
+                }
+            )
             continue
         decision_id = str(decision["decision_id"])
         dedupe_key = f"{deployment_key}:{candidate['instruction_id']}:{decision_id}"
         if dedupe_key in processed_decisions:
-            actions.append({"symbol": symbol, "status": "already_processed", "decision_id": decision_id})
+            actions.append(
+                {
+                    "symbol": symbol,
+                    "status": "already_processed",
+                    "decision_id": decision_id,
+                    "latest_usable_bar_ended_at": freshness.get(
+                        "latest_usable_bar_ended_at"
+                    ),
+                    "target_decision_bar_ended_at": target_decision_bar_ended_at,
+                }
+            )
             continue
         runner_state = runtime_states.get(symbol, RunnerSymbolState())
+        inference_started = time.perf_counter()
         vector = assemble_dqn_observation_vector(
             symbol_observation,
             state=runner_state,
@@ -643,9 +772,11 @@ def run_model_candidates(
             runner_state,
             chosen_action=action_name,
         )
+        model_inference_seconds += time.perf_counter() - inference_started
         previous_close = symbol_observation["pricing_context"]["prev_close"]
         state_before = translation_state_before(runner_state, loaded.config.side)
         observed_at = decision_observed_at(symbol_observation)
+        translate_started = time.perf_counter()
         translation = post_json(
             f"{api_base}/v1/rl/actions/translate",
             {
@@ -661,9 +792,11 @@ def run_model_candidates(
                 "model_diagnostics": diagnostics,
             },
         )
+        translate_seconds += time.perf_counter() - translate_started
         virtual_quote_result = None
         if deployment_mode == "virtual":
             try:
+                virtual_publish_started = time.perf_counter()
                 virtual_quote_result = publish_virtual_decision_bar(
                     api_base,
                     candidate=candidate,
@@ -672,7 +805,9 @@ def run_model_candidates(
                     action_name=action_name,
                     decision_id=decision_id,
                 )
+                virtual_publish_seconds += time.perf_counter() - virtual_publish_started
             except ApiError as exc:
+                virtual_publish_seconds += time.perf_counter() - virtual_publish_started
                 virtual_quote_result = {"accepted": False, "error": str(exc)}
         processed_decisions.add(dedupe_key)
         last_action_at = datetime.now(timezone.utc).isoformat()
@@ -690,32 +825,328 @@ def run_model_candidates(
                 "virtual_decision_bar": virtual_quote_result,
             }
         )
+    timing_metrics["action_loop_seconds"] = _elapsed_seconds(action_loop_started)
+    timing_metrics["model_inference_seconds"] = round(model_inference_seconds, 6)
+    timing_metrics["translate_actions_seconds"] = round(translate_seconds, 6)
+    timing_metrics["publish_virtual_bars_seconds"] = round(virtual_publish_seconds, 6)
+    _finalize_timing_metrics(
+        timing_metrics,
+        started_at=run_started,
+        active_candidate_count=len(active_candidates),
+    )
 
+    status_counts = dict(Counter(str(action.get("status") or "unknown") for action in actions))
+    coverage_counts = dict(
+        Counter(item["status"] for item in decision_coverage.values())
+    )
+    action_distribution = action_distribution_metrics(
+        actions,
+        model_side=loaded.config.side,
+    )
+    heartbeat_status = "running"
+    runtime_error = None
+    if active_candidates and coverage_counts.get("fresh_bar", 0) == 0 and coverage_counts.get("stale_bar", 0):
+        heartbeat_status = "degraded"
+        runtime_error = "market stream bars are stale for all active RL candidates"
+    elif action_distribution.get("warning"):
+        heartbeat_status = "degraded"
+        runtime_error = str(action_distribution.get("warning_detail") or action_distribution["warning"])
+    elif timing_metrics.get("cadence_over_budget"):
+        heartbeat_status = "degraded"
+        runtime_error = "RL runner processing exceeded the 5-minute decision cadence"
     heartbeat(
         api_base,
         deployment_key,
-        "running",
+        heartbeat_status,
+        runtime_error=runtime_error,
         last_bar_at=last_bar_at,
         last_action_at=last_action_at,
         metrics={
             "candidate_count": len(candidates),
             "active_candidate_count": len(active_candidates),
-            "stream_bar_ready_candidate_count": len(
-                [
-                    candidate
+            "stream_any_bar_candidate_count": len(
+                {
+                    str(candidate["symbol"]).upper()
                     for candidate in active_candidates
                     if str(candidate["symbol"]).upper() in (stream_bar_ready_symbols or set())
+                }
+            ),
+            "stream_bar_ready_candidate_count": coverage_counts.get("fresh_bar", 0),
+            "fresh_decision_bar_candidate_count": coverage_counts.get("fresh_bar", 0),
+            "stale_decision_bar_candidate_count": coverage_counts.get("stale_bar", 0),
+            "not_ready_candidate_count": coverage_counts.get("not_ready", 0)
+            + coverage_counts.get("waiting_for_target_bar", 0),
+            "already_processed_candidate_count": status_counts.get("already_processed", 0),
+            "evaluated_candidate_count": len(
+                [
+                    action
+                    for action in actions
+                    if action.get("action_name") is not None
                 ]
             ),
             "backfilled_symbol_count": len(observation_response.get("fetched_symbols", [])),
             "symbols": active_symbols,
             "actions": actions,
+            "action_status_counts": status_counts,
+            "action_distribution": action_distribution,
+            "decision_bar_status_counts": coverage_counts,
+            "target_decision_bar_ended_at": target_decision_bar_ended_at,
+            "stream_plan": dict(stream_plan or {}),
             "deployment_mode": deployment_mode,
             "execute_actions": execute_actions,
             "history_cache_count": len(history_cache),
+            "timing": timing_metrics,
         },
     )
     print(json.dumps({"deployment_key": deployment_key, "actions": actions}, indent=2), flush=True)
+
+
+def _elapsed_seconds(started_at: float) -> float:
+    return round(time.perf_counter() - started_at, 6)
+
+
+def _finalize_timing_metrics(
+    timing_metrics: dict[str, Any],
+    *,
+    started_at: float,
+    active_candidate_count: int,
+) -> None:
+    total_seconds = _elapsed_seconds(started_at)
+    cadence_budget_seconds = 300.0
+    timing_metrics["total_seconds"] = total_seconds
+    timing_metrics["cadence_budget_seconds"] = cadence_budget_seconds
+    timing_metrics["cadence_budget_used_pct"] = round(
+        total_seconds / cadence_budget_seconds * 100.0,
+        3,
+    )
+    timing_metrics["cadence_over_budget"] = total_seconds > cadence_budget_seconds
+    if active_candidate_count > 0:
+        timing_metrics["seconds_per_active_candidate"] = round(
+            total_seconds / active_candidate_count,
+            6,
+        )
+
+
+def action_distribution_metrics(
+    actions: list[Mapping[str, Any]],
+    *,
+    model_side: str,
+) -> dict[str, Any]:
+    """Summarize model choices so input/model drift is visible in heartbeat.
+
+    The bucket booster policies should usually enter most flat names early in
+    the session. If a runner evaluates many flat candidates and emits only
+    skip/wait, that is important operator evidence even when every API call is
+    technically succeeding.
+    """
+
+    evaluated_actions = [
+        action for action in actions if action.get("action_name") is not None
+    ]
+    action_name_counts = Counter(
+        str(action.get("action_name")) for action in evaluated_actions
+    )
+    entry_count = sum(
+        count
+        for action_name, count in action_name_counts.items()
+        if action_name == "market_entry" or action_name.startswith("entry_prevclose_")
+    )
+    exit_count = sum(
+        count
+        for action_name, count in action_name_counts.items()
+        if action_name == "exit_market" or action_name.startswith("exit_tp_")
+    )
+    cancel_count = sum(
+        count
+        for action_name, count in action_name_counts.items()
+        if action_name in {"cancel_entry", "clear_exit"}
+    )
+    idle_count = action_name_counts.get("skip", 0) + action_name_counts.get("wait", 0)
+    flat_actions = [
+        action
+        for action in evaluated_actions
+        if str(action.get("state_before") or "").upper() == "FLAT"
+    ]
+    flat_action_counts = Counter(str(action.get("action_name")) for action in flat_actions)
+    flat_entry_count = sum(
+        count
+        for action_name, count in flat_action_counts.items()
+        if action_name == "market_entry" or action_name.startswith("entry_prevclose_")
+    )
+    flat_idle_count = flat_action_counts.get("skip", 0) + flat_action_counts.get("wait", 0)
+    evaluated_count = len(evaluated_actions)
+    flat_evaluated_count = len(flat_actions)
+    warning = None
+    warning_detail = None
+    if flat_evaluated_count >= 5 and flat_entry_count == 0 and flat_idle_count == flat_evaluated_count:
+        side = str(model_side).upper()
+        if side == "SHORT" and flat_action_counts.get("skip", 0) == flat_evaluated_count:
+            warning = "short_flat_candidates_all_skip"
+        elif side == "LONG" and flat_action_counts.get("wait", 0) == flat_evaluated_count:
+            warning = "long_flat_candidates_all_wait"
+        else:
+            warning = "flat_candidates_all_idle"
+        warning_detail = (
+            "The runner evaluated flat candidates but produced no entry actions. "
+            "For bucket booster policies this is a strong signal of feature, "
+            "bar, state, or model-bundle drift."
+        )
+
+    metrics: dict[str, Any] = {
+        "model_side": str(model_side).upper(),
+        "evaluated_action_count": evaluated_count,
+        "entry_action_count": entry_count,
+        "exit_action_count": exit_count,
+        "cancel_action_count": cancel_count,
+        "idle_action_count": idle_count,
+        "flat_evaluated_action_count": flat_evaluated_count,
+        "flat_entry_action_count": flat_entry_count,
+        "flat_idle_action_count": flat_idle_count,
+        "action_name_counts": dict(action_name_counts),
+        "flat_action_name_counts": dict(flat_action_counts),
+        "warning": warning,
+    }
+    if evaluated_count:
+        metrics["entry_action_rate"] = entry_count / evaluated_count
+        metrics["idle_action_rate"] = idle_count / evaluated_count
+    if flat_evaluated_count:
+        metrics["flat_entry_action_rate"] = flat_entry_count / flat_evaluated_count
+        metrics["flat_idle_action_rate"] = flat_idle_count / flat_evaluated_count
+    if warning_detail:
+        metrics["warning_detail"] = warning_detail
+    return metrics
+
+
+def build_stream_symbol_plan(
+    *,
+    candidate_symbols: list[str],
+    benchmark_symbols: list[str],
+    max_stream_symbols: int,
+    warning_symbols: int,
+) -> dict[str, Any]:
+    if max_stream_symbols <= 0:
+        raise ValueError("max_stream_symbols must be positive")
+    normalized_candidates = sorted({str(symbol).strip().upper() for symbol in candidate_symbols if str(symbol).strip()})
+    normalized_benchmarks = sorted({str(symbol).strip().upper() for symbol in benchmark_symbols if str(symbol).strip()})
+    desired_symbols = list(dict.fromkeys(normalized_candidates + normalized_benchmarks))
+    stream_symbols = desired_symbols[:max_stream_symbols]
+    dropped_symbols = desired_symbols[max_stream_symbols:]
+    dropped_candidate_symbols = [
+        symbol for symbol in dropped_symbols if symbol in normalized_candidates
+    ]
+    return {
+        "candidate_symbol_count": len(normalized_candidates),
+        "benchmark_symbol_count": len(normalized_benchmarks),
+        "desired_symbol_count": len(desired_symbols),
+        "stream_symbol_count": len(stream_symbols),
+        "max_stream_symbols": max_stream_symbols,
+        "warning_symbols": warning_symbols,
+        "over_warning_threshold": len(stream_symbols) >= warning_symbols,
+        "overflow_symbol_count": len(dropped_symbols),
+        "overflow_symbols": dropped_symbols,
+        "overflow_candidate_symbol_count": len(dropped_candidate_symbols),
+        "stream_symbols": stream_symbols,
+    }
+
+
+def trade_date_from_candidates(
+    candidates: list[Mapping[str, Any]],
+    *,
+    fallback: str | None = None,
+) -> str | None:
+    for candidate in candidates:
+        trace = candidate.get("trace")
+        if isinstance(trace, Mapping) and trace.get("trade_date"):
+            return str(trace["trade_date"])
+    return fallback
+
+
+def expected_decision_bar_ended_at(
+    *,
+    trade_date: str | None,
+    now: datetime | None = None,
+) -> str | None:
+    if not trade_date:
+        return None
+    try:
+        session_date = date.fromisoformat(str(trade_date))
+    except ValueError:
+        return None
+    local_now = (now or datetime.now(STOCKHOLM_TZ)).astimezone(STOCKHOLM_TZ)
+    session_open = datetime.combine(
+        session_date,
+        datetime.strptime("09:00", "%H:%M").time(),
+        tzinfo=STOCKHOLM_TZ,
+    )
+    session_close = datetime.combine(
+        session_date,
+        datetime.strptime("17:30", "%H:%M").time(),
+        tzinfo=STOCKHOLM_TZ,
+    )
+    first_decision = session_open + timedelta(minutes=5)
+    if local_now.date() < session_date:
+        return None
+    if local_now.date() > session_date:
+        return session_close.isoformat()
+    if local_now < first_decision:
+        return None
+    capped = min(local_now, session_close)
+    floored_minute = (capped.minute // 5) * 5
+    ended_at = capped.replace(minute=floored_minute, second=0, microsecond=0)
+    if ended_at < first_decision:
+        return None
+    return ended_at.isoformat()
+
+
+def classify_decision_bar_freshness(
+    decision: Mapping[str, Any],
+    *,
+    target_decision_bar_ended_at: str | None,
+) -> dict[str, Any]:
+    latest_raw = decision.get("latest_usable_bar_ended_at")
+    if not decision.get("ready"):
+        return {
+            "status": "not_ready",
+            "latest_usable_bar_ended_at": latest_raw,
+            "target_decision_bar_ended_at": target_decision_bar_ended_at,
+        }
+    if target_decision_bar_ended_at is None:
+        return {
+            "status": "no_target_bar",
+            "latest_usable_bar_ended_at": latest_raw,
+            "target_decision_bar_ended_at": target_decision_bar_ended_at,
+        }
+    latest = _parse_iso_datetime(latest_raw)
+    target = _parse_iso_datetime(target_decision_bar_ended_at)
+    if latest is None or target is None:
+        return {
+            "status": "unknown_bar_freshness",
+            "latest_usable_bar_ended_at": latest_raw,
+            "target_decision_bar_ended_at": target_decision_bar_ended_at,
+        }
+    if latest == target:
+        status = "fresh_bar"
+    elif latest < target:
+        status = "stale_bar"
+    else:
+        status = "future_bar"
+    return {
+        "status": status,
+        "latest_usable_bar_ended_at": latest_raw,
+        "target_decision_bar_ended_at": target_decision_bar_ended_at,
+    }
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def choose_action(
@@ -1010,6 +1441,18 @@ def load_model(config: PromotedRLModelArtifact) -> LoadedModel:
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     static_feature_names = list(read_static_feature_names(config.static_feature_cols_path))
+    static_feature_mean: np.ndarray | None = None
+    static_feature_std: np.ndarray | None = None
+    static_feature_normalization_id: str | None = None
+    if config.static_feature_normalization_path is not None:
+        (
+            static_feature_mean,
+            static_feature_std,
+            static_feature_normalization_id,
+        ) = load_static_feature_normalization(
+            config.static_feature_normalization_path,
+            expected_feature_names=static_feature_names,
+        )
     expected_static_count = summary.get("static_feature_count")
     if expected_static_count is not None and int(expected_static_count) != len(static_feature_names):
         raise ValueError(
@@ -1027,7 +1470,53 @@ def load_model(config: PromotedRLModelArtifact) -> LoadedModel:
         obs_dim=obs_dim,
         model=model,
         static_feature_names=static_feature_names,
+        static_feature_mean=static_feature_mean,
+        static_feature_std=static_feature_std,
+        static_feature_normalization_id=static_feature_normalization_id,
     )
+
+
+def load_static_feature_normalization(
+    path: Path,
+    *,
+    expected_feature_names: list[str],
+) -> tuple[np.ndarray, np.ndarray, str]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path} must contain a JSON object")
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version != "rl_static_feature_normalization_v1":
+        raise ValueError(
+            f"{path} schema_version must be rl_static_feature_normalization_v1"
+        )
+    feature_names = payload.get("feature_names")
+    if feature_names != expected_feature_names:
+        raise ValueError(
+            f"{path} feature_names do not match static_feature_cols.csv"
+        )
+    mean = _float_array(payload.get("mean"), field_name=f"{path}.mean")
+    std = _float_array(payload.get("std"), field_name=f"{path}.std")
+    if mean.shape != std.shape or mean.shape[0] != len(expected_feature_names):
+        raise ValueError(
+            f"{path} mean/std length must match {len(expected_feature_names)} features"
+        )
+    if not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise ValueError(f"{path} mean/std contain non-finite values")
+    if np.any(std <= 0.0):
+        raise ValueError(f"{path} std must be positive")
+    normalization_id = str(
+        payload.get("normalization_id")
+        or payload.get("model_artifact_id")
+        or path.name
+    )
+    return mean.astype(np.float32), std.astype(np.float32), normalization_id
+
+
+def _float_array(raw_value: Any, *, field_name: str) -> np.ndarray:
+    if not isinstance(raw_value, list) or not raw_value:
+        raise ValueError(f"{field_name} must be a non-empty array")
+    values = np.asarray([float(value) for value in raw_value], dtype=np.float32)
+    return values
 
 
 def static_feature_payload(
@@ -1102,11 +1591,24 @@ def candidate_static_feature_payload(
             f"candidate static feature value count mismatch for {loaded.config.model_key} {symbol}: "
             f"got {len(raw_values)}, expected {len(names)}"
         )
-    values = [float(value) for value in raw_values]
-    if any(np.isnan(values)) or not all(np.isfinite(values)):
+    values = np.asarray([float(value) for value in raw_values], dtype=np.float32)
+    if not np.isfinite(values).all():
         raise ValueError(f"candidate static features contain non-finite values for {symbol}")
 
-    normalized = bool(raw_payload.get("normalized", True))
+    normalization = raw_payload.get("normalization")
+    already_model_normalized = _payload_declares_model_bundle_normalization(
+        normalization,
+        normalization_id=getattr(loaded, "static_feature_normalization_id", None),
+    )
+    mean = getattr(loaded, "static_feature_mean", None)
+    std = getattr(loaded, "static_feature_std", None)
+    source = str(raw_payload.get("source") or "upstream_candidate_payload")
+    if mean is not None and std is not None and not already_model_normalized:
+        values = (values - mean) / std
+        normalized = True
+        source = f"{source}+trader_static_zscore"
+    else:
+        normalized = bool(raw_payload.get("normalized", True))
     if not normalized:
         raise ValueError(
             f"candidate static features must already be normalized for {loaded.config.model_key} {symbol}"
@@ -1114,10 +1616,26 @@ def candidate_static_feature_payload(
 
     return {
         "feature_names": names,
-        "values": values,
+        "values": [float(value) for value in values.tolist()],
         "normalized": True,
-        "source": str(raw_payload.get("source") or "upstream_candidate_payload"),
+        "source": source,
     }
+
+
+def _payload_declares_model_bundle_normalization(
+    raw_value: Any,
+    *,
+    normalization_id: str | None,
+) -> bool:
+    if not isinstance(raw_value, Mapping) or not normalization_id:
+        return False
+    method = str(raw_value.get("method") or "").strip()
+    payload_id = str(
+        raw_value.get("normalization_id")
+        or raw_value.get("model_artifact_id")
+        or ""
+    ).strip()
+    return method == "training_static_zscore" and payload_id == normalization_id
 
 
 def extract_candidate_static_features(

@@ -34,6 +34,7 @@ class PromotedRLModelArtifact:
     promoted_checkpoint_path: Path
     summary_path: Path
     static_feature_cols_path: Path
+    static_feature_normalization_path: Path | None
     deployment_key: str
     book_key: str
     action_space: tuple[str, ...]
@@ -134,6 +135,15 @@ def load_model_bundle_manifest(path: Path) -> PromotedRLModelArtifact:
             _required_str(files, "static_feature_cols"),
             field_name="files.static_feature_cols",
         ),
+        static_feature_normalization_path=(
+            _resolve_bundle_file(
+                bundle_dir,
+                str(files["static_feature_normalization"]),
+                field_name="files.static_feature_normalization",
+            )
+            if files.get("static_feature_normalization") is not None
+            else None
+        ),
         deployment_key=str(
             deployment.get("deployment_key")
             or f"{_required_str(payload, 'model_key')}_virtual_shared_01"
@@ -181,6 +191,10 @@ def validate_promoted_artifact(
         "summary_path": artifact.summary_path,
         "static_feature_cols_path": artifact.static_feature_cols_path,
     }
+    if artifact.static_feature_normalization_path is not None:
+        required_paths["static_feature_normalization_path"] = (
+            artifact.static_feature_normalization_path
+        )
     missing = {
         name: str(path)
         for name, path in required_paths.items()
@@ -245,6 +259,11 @@ def model_registry_payload(artifact: PromotedRLModelArtifact) -> dict[str, Any]:
         "static_feature_source": "instruction.trace.metadata.static_features",
         "runner": "scripts/run_rl_agents.py",
     }
+    if artifact.static_feature_normalization_path is not None:
+        metadata["static_feature_normalization_path"] = str(
+            artifact.static_feature_normalization_path
+        )
+        metadata["static_feature_runtime_policy"] = "normalize_candidate_values_in_trader"
     if artifact.lineage:
         metadata["lineage"] = artifact.lineage
     return {

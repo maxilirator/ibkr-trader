@@ -78,7 +78,7 @@ Current virtual fill semantics:
 - `target_notional` is converted to whole shares using the entry limit price,
   or the current virtual market price for market orders, rounded down
 - exit orders use the actual filled entry quantity
-- each fill carries a fixed commission of `49` `SEK`
+- each fill carries a fixed commission of `15` `SEK`
 - a market order fills when a usable virtual quote exists
 - a buy limit fills when the virtual action price is less than or equal to the
   limit price
@@ -286,4 +286,4 @@ those rows appear.
 
 The regression test `tests/test_virtual_trading.py` follows that sequence with
 `SIVE`, buys virtually at `10.00`, sells virtually at `11.50`, records two
-`49 SEK` commissions, and ends with virtual position quantity `0`.
+`15 SEK` commissions, and ends with virtual position quantity `0`.

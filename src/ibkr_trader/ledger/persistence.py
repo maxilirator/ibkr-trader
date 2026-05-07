@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy import or_
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -27,6 +28,16 @@ from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
 from ibkr_trader.virtual.accounts import is_virtual_account_key
 
 BROKER_KIND_IBKR = "IBKR"
+
+_OPEN_ORDER_CLOSED_STATUSES = {
+    "API_CANCELLED",
+    "CANCELLED",
+    "ERROR",
+    "FILLED",
+    "INACTIVE",
+    "NOT_FOUND_AT_BROKER",
+    "REJECTED",
+}
 
 
 def _serialize_for_json(payload: Any) -> Any:
@@ -215,29 +226,47 @@ def _find_instruction_record_for_order(
             )
         ).scalar_one_or_none()
 
-    predicates = []
-    if external_order_id is not None:
-        try:
-            order_id = int(external_order_id)
-        except ValueError:
-            order_id = None
-        if order_id is not None:
-            predicates.append(InstructionRecord.broker_order_id == order_id)
-            predicates.append(InstructionRecord.exit_order_id == order_id)
     if external_perm_id is not None:
         try:
             perm_id = int(external_perm_id)
         except ValueError:
             perm_id = None
         if perm_id is not None:
-            predicates.append(InstructionRecord.broker_perm_id == perm_id)
-            predicates.append(InstructionRecord.exit_perm_id == perm_id)
+            matches = session.execute(
+                select(InstructionRecord)
+                .where(
+                    or_(
+                        InstructionRecord.broker_perm_id == perm_id,
+                        InstructionRecord.exit_perm_id == perm_id,
+                    )
+                )
+                .order_by(InstructionRecord.id.desc())
+            ).scalars().all()
+            if len(matches) == 1:
+                return matches[0]
+            if matches:
+                return None
 
-    if not predicates:
-        return None
-    return session.execute(
-        select(InstructionRecord).where(or_(*predicates))
-    ).scalar_one_or_none()
+    if external_order_id is not None:
+        try:
+            order_id = int(external_order_id)
+        except ValueError:
+            order_id = None
+        if order_id is not None:
+            matches = session.execute(
+                select(InstructionRecord)
+                .where(
+                    or_(
+                        InstructionRecord.broker_order_id == order_id,
+                        InstructionRecord.exit_order_id == order_id,
+                    )
+                )
+                .order_by(InstructionRecord.id.desc())
+            ).scalars().all()
+            if len(matches) == 1:
+                return matches[0]
+
+    return None
 
 
 def _find_broker_order(
@@ -255,8 +284,8 @@ def _find_broker_order(
                 BrokerOrderRecord.broker_kind == broker_kind,
                 BrokerOrderRecord.account_key == account_key,
                 BrokerOrderRecord.external_order_id == external_order_id,
-            )
-        ).scalar_one_or_none()
+            ).order_by(BrokerOrderRecord.id.desc())
+        ).scalars().first()
         if broker_order is not None:
             return broker_order
 
@@ -266,20 +295,27 @@ def _find_broker_order(
                 BrokerOrderRecord.broker_kind == broker_kind,
                 BrokerOrderRecord.account_key == account_key,
                 BrokerOrderRecord.external_perm_id == external_perm_id,
-            )
-        ).scalar_one_or_none()
+            ).order_by(BrokerOrderRecord.id.desc())
+        ).scalars().first()
         if broker_order is not None:
             return broker_order
 
     normalized_ref = _normalize_text(order_ref)
-    if normalized_ref is not None:
-        return session.execute(
+    if (
+        normalized_ref is not None
+        and external_order_id is None
+        and external_perm_id is None
+    ):
+        broker_order = session.execute(
             select(BrokerOrderRecord).where(
                 BrokerOrderRecord.broker_kind == broker_kind,
                 BrokerOrderRecord.account_key == account_key,
                 BrokerOrderRecord.order_ref == normalized_ref,
-            )
-        ).scalar_one_or_none()
+            ).order_by(BrokerOrderRecord.id.desc())
+        ).scalars().first()
+        if broker_order is not None:
+            return broker_order
+
     return None
 
 
@@ -343,6 +379,142 @@ def _record_broker_order_event(
             note=note,
         )
     )
+
+
+def _open_order_status_clause():
+    return or_(
+        BrokerOrderRecord.status.is_(None),
+        func.upper(BrokerOrderRecord.status).not_in(_OPEN_ORDER_CLOSED_STATUSES),
+    )
+
+
+def _snapshot_account_scope(
+    snapshot: BrokerRuntimeSnapshot,
+    *,
+    default_account_key: str | None,
+) -> set[str]:
+    account_keys: set[str] = set()
+    for raw_account_key in snapshot.account_values:
+        normalized = _normalize_text(raw_account_key)
+        if normalized is not None:
+            account_keys.add(normalized)
+    for open_order in snapshot.open_orders.values():
+        account_keys.add(
+            _resolve_account_key(
+                open_order.account,
+                default_account_key=default_account_key,
+                context=f"Open order {open_order.order_id}",
+            )
+        )
+    for execution in snapshot.executions:
+        normalized = _normalize_text(execution.account)
+        if normalized is not None:
+            account_keys.add(normalized)
+    for portfolio_item in snapshot.portfolio:
+        normalized = _normalize_text(portfolio_item.account)
+        if normalized is not None:
+            account_keys.add(normalized)
+    for position in snapshot.positions:
+        normalized = _normalize_text(position.account)
+        if normalized is not None:
+            account_keys.add(normalized)
+    default_account = _normalize_text(default_account_key)
+    if default_account is not None:
+        account_keys.add(default_account)
+    return account_keys
+
+
+def _mark_missing_open_orders_closed(
+    session: Session,
+    *,
+    broker_kind: str,
+    snapshot: BrokerRuntimeSnapshot,
+    observed_at: datetime,
+    default_account_key: str | None,
+) -> None:
+    account_scope = _snapshot_account_scope(
+        snapshot,
+        default_account_key=default_account_key,
+    )
+    if not account_scope:
+        return
+
+    observed_external_order_ids = {
+        str(open_order.order_id)
+        for open_order in snapshot.open_orders.values()
+        if open_order.order_id not in (None, "")
+    }
+    observed_external_perm_ids = {
+        str(open_order.perm_id)
+        for open_order in snapshot.open_orders.values()
+        if open_order.perm_id not in (None, "")
+    }
+    observed_order_refs = {
+        str(open_order.order_ref).strip()
+        for open_order in snapshot.open_orders.values()
+        if str(open_order.order_ref or "").strip()
+    }
+
+    rows = session.execute(
+        select(BrokerOrderRecord)
+        .where(
+            BrokerOrderRecord.broker_kind == broker_kind,
+            BrokerOrderRecord.account_key.in_(account_scope),
+            _open_order_status_clause(),
+        )
+        .order_by(BrokerOrderRecord.id.asc())
+    ).scalars()
+
+    for broker_order in rows:
+        if (
+            broker_order.external_order_id
+            and broker_order.external_order_id in observed_external_order_ids
+        ):
+            continue
+        if (
+            broker_order.external_perm_id
+            and broker_order.external_perm_id in observed_external_perm_ids
+        ):
+            continue
+        if (
+            not broker_order.external_order_id
+            and not broker_order.external_perm_id
+            and broker_order.order_ref
+            and broker_order.order_ref in observed_order_refs
+        ):
+            continue
+
+        status_before = broker_order.status
+        if status_before == "NOT_FOUND_AT_BROKER":
+            continue
+        broker_order.status = "NOT_FOUND_AT_BROKER"
+        broker_order.last_status_at = observed_at
+        metadata = dict(broker_order.metadata_json or {})
+        metadata["missing_from_runtime_snapshot"] = True
+        metadata["missing_from_runtime_snapshot_at"] = observed_at.isoformat()
+        metadata["missing_from_runtime_snapshot_account_scope"] = sorted(account_scope)
+        metadata["missing_from_runtime_snapshot_open_order_count"] = len(
+            snapshot.open_orders
+        )
+        broker_order.metadata_json = _serialize_for_json(metadata)
+        _record_broker_order_event(
+            session,
+            broker_order=broker_order,
+            event_type="open_order_missing_from_runtime_snapshot",
+            event_at=observed_at,
+            status_before=status_before,
+            status_after=broker_order.status,
+            payload={
+                "account_scope": sorted(account_scope),
+                "observed_external_order_ids": sorted(observed_external_order_ids),
+                "observed_external_perm_ids": sorted(observed_external_perm_ids),
+                "observed_order_refs": sorted(observed_order_refs),
+            },
+            note=(
+                "A fresh runtime snapshot did not contain this locally-open "
+                "broker order, so it was marked terminal in the local ledger."
+            ),
+        )
 
 
 def _entry_payload(instruction_record: InstructionRecord) -> dict[str, Any]:
@@ -1386,10 +1558,16 @@ def _upsert_open_order(
         session.add(broker_order)
         session.flush()
     else:
-        if broker_order.instruction_id is None and instruction_record is not None:
+        inferred_order_role = _infer_order_role(open_order.order_ref)
+        if instruction_record is not None:
             broker_order.instruction_id = instruction_record.id
+        if inferred_order_role != "BROKER_NATIVE":
+            broker_order.order_role = inferred_order_role
+        elif broker_order.order_role in (None, ""):
+            broker_order.order_role = inferred_order_role
         broker_order.broker_account_id = broker_account.id
         broker_order.is_virtual = broker_order.is_virtual or is_virtual
+        broker_order.external_order_id = external_order_id or broker_order.external_order_id
         broker_order.external_perm_id = external_perm_id
         broker_order.external_client_id = (
             str(open_order.client_id) if open_order.client_id is not None else None
@@ -1893,7 +2071,7 @@ def _persist_executions(
                 note="Created broker order record from execution because no open-order ledger row existed.",
             )
         else:
-            if broker_order.instruction_id is None and instruction_record is not None:
+            if instruction_record is not None:
                 broker_order.instruction_id = instruction_record.id
             previous_status = broker_order.status
             broker_order.status = "FILLED"
@@ -2456,6 +2634,7 @@ def persist_broker_runtime_snapshot(
     broker_kind: str,
     captured_at: datetime,
     default_account_key: str | None = None,
+    close_missing_open_orders: bool = False,
 ) -> None:
     """Persist a real broker runtime snapshot into durable ledger tables."""
 
@@ -2497,6 +2676,15 @@ def persist_broker_runtime_snapshot(
                 broker_kind=broker_kind,
                 broker_account=broker_account,
                 open_order=open_order,
+                observed_at=captured_at,
+                default_account_key=default_account_key,
+            )
+
+        if close_missing_open_orders:
+            _mark_missing_open_orders_closed(
+                session,
+                broker_kind=broker_kind,
+                snapshot=snapshot,
                 observed_at=captured_at,
                 default_account_key=default_account_key,
             )

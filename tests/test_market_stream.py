@@ -226,3 +226,90 @@ class MarketStreamTests(TestCase):
             snapshot["last_disconnect_observed_at"],
             "2026-04-28T07:01:00+00:00",
         )
+
+    def test_snapshot_marks_connected_stream_stale_when_ticks_stop(self) -> None:
+        class FakeClient:
+            def isConnected(self) -> bool:  # noqa: N802
+                return True
+
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            stale_data_after_seconds=120,
+            stale_reconnect_timezone="Europe/Stockholm",
+        )
+        service._client = FakeClient()
+        contract = MarketStreamContract(symbol="AXFO")
+        service._desired_contracts_by_key["AXFO"] = contract
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=contract,
+            subscribed_at=datetime(2026, 5, 6, 7, 0, tzinfo=UTC),
+        )
+        service._quotes_by_key["AXFO"] = MarketStreamQuote(
+            symbol="AXFO",
+            exchange="SMART",
+            currency="SEK",
+            security_type="STK",
+            primary_exchange="SFB",
+            updated_at=datetime(2026, 5, 6, 7, 0, tzinfo=UTC),
+            last_trade_at=datetime(2026, 5, 6, 7, 0, tzinfo=UTC),
+        )
+
+        with patch(
+            "ibkr_trader.ibkr.market_stream._utc_now",
+            return_value=datetime(2026, 5, 6, 7, 3, 1, tzinfo=UTC),
+        ):
+            snapshot = service.snapshot()
+
+        self.assertTrue(snapshot["running"])
+        self.assertTrue(snapshot["is_stale"])
+        self.assertEqual(snapshot["latest_market_data_age_seconds"], 181)
+        self.assertEqual(snapshot["stale_after_seconds"], 120)
+        self.assertTrue(snapshot["stale_reconnect_allowed"])
+
+    def test_snapshot_disallows_stale_reconnect_outside_trading_window(self) -> None:
+        class FakeClient:
+            def isConnected(self) -> bool:  # noqa: N802
+                return True
+
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            stale_data_after_seconds=120,
+            stale_reconnect_timezone="Europe/Stockholm",
+        )
+        service._client = FakeClient()
+        contract = MarketStreamContract(symbol="AXFO")
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=contract,
+            subscribed_at=datetime(2026, 5, 6, 7, 0, tzinfo=UTC),
+        )
+        service._quotes_by_key["AXFO"] = MarketStreamQuote(
+            symbol="AXFO",
+            exchange="SMART",
+            currency="SEK",
+            security_type="STK",
+            primary_exchange="SFB",
+            updated_at=datetime(2026, 5, 6, 7, 0, tzinfo=UTC),
+        )
+
+        with patch(
+            "ibkr_trader.ibkr.market_stream._utc_now",
+            return_value=datetime(2026, 5, 6, 18, 0, tzinfo=UTC),
+        ):
+            snapshot = service.snapshot()
+
+        self.assertTrue(snapshot["is_stale"])
+        self.assertFalse(snapshot["stale_reconnect_allowed"])

@@ -213,7 +213,7 @@ Virtual execution uses the same sizing fields as normal execution. A
 `target_quantity` must be whole shares. A `target_notional` is converted into a
 whole-share quantity by dividing by the entry limit price, or by the current
 virtual market price for market orders, and rounding down. Each virtual fill
-uses a fixed commission of `49 SEK`.
+uses a fixed commission of `15 SEK`.
 
 See [Virtual Trading](virtual-trading.md) for the full API contract and smoke
 test sequence.

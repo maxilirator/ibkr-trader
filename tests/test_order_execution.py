@@ -6,7 +6,9 @@ from unittest import TestCase
 
 from ibkr_trader.api.server import parse_execution_batch_payload
 from ibkr_trader.config import IbkrConnectionConfig
+from ibkr_trader.domain.execution_contract import OrderType
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
+from ibkr_trader.ibkr.order_execution import submit_exit_order_from_instruction
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
 
 
@@ -301,6 +303,80 @@ class OrderExecutionTests(TestCase):
         self.assertEqual(result["order"]["price_increment"], "0.01")
         self.assertIn(
             "Entry limit price was normalized to the nearest valid IBKR tick increment.",
+            result["warnings"],
+        )
+
+    def test_submit_exit_order_uses_stockholm_tick_fallback_when_market_rule_times_out(self) -> None:
+        class _StockholmMarketRuleTimeoutWrapper(_FakeOrderExecutionSyncWrapper):
+            def get_contract_details(
+                self,
+                contract: _FakeContract,
+                timeout: int | None = None,
+            ) -> list[object]:
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(
+                            conId=492734118,
+                            symbol="NIBE.B",
+                            localSymbol="NIBE B",
+                            secType="STK",
+                            exchange="SMART",
+                            primaryExchange="SFB",
+                            currency="SEK",
+                            tradingClass="NIBE.B",
+                        ),
+                        marketName="NIBE.B",
+                        minTick=0.0001,
+                        validExchanges="SMART,SFB,EUIBSI",
+                        marketRuleIds="26,1875,1876",
+                        orderTypes="LMT,MKT,STP",
+                        timeZoneId="MET",
+                        tradingHours="20260506:0900-20260506:1730",
+                        liquidHours="20260506:0900-20260506:1730",
+                        stockType="COMMON",
+                        industry="Industrial",
+                        category="Building Materials",
+                        subcategory="Bldg Prod-Air&Heating",
+                        longName="NIBE INDUSTRIER AB-B SHS",
+                        secIdList=[SimpleNamespace(tag="ISIN", value="SE0015988019")],
+                    )
+                ]
+
+            def get_market_rule(self, market_rule_id: int, timeout: int = 5) -> list[object]:
+                raise TimeoutError("market rule lookup timed out")
+
+        payload = _base_payload()
+        instruction_payload = payload["instructions"][0]
+        instruction_payload["instruction_id"] = "nibe-live-1"
+        instruction_payload["instrument"] = {
+            "symbol": "NIBE B",
+            "security_type": "STK",
+            "exchange": "SMART",
+            "currency": "SEK",
+            "primary_exchange": "SFB",
+        }
+        instruction_payload["entry"]["limit_price"] = "45.5113"
+        batch = parse_execution_batch_payload(payload)
+
+        result = submit_exit_order_from_instruction(
+            self.config,
+            batch.instructions[0],
+            quantity=Decimal("430"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("46.4202"),
+            order_ref="nibe-live-1:exit:take_profit",
+            sync_wrapper_cls=_StockholmMarketRuleTimeoutWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["order"]["action"], "SELL")
+        self.assertEqual(result["order"]["order_type"], "LMT")
+        self.assertEqual(result["order"]["limit_price"], "46.43")
+        self.assertEqual(result["order"]["limit_price_increment"], "0.01")
+        self.assertIn(
+            "Exit limit price was normalized to the nearest valid IBKR tick increment.",
             result["warnings"],
         )
 

@@ -34,6 +34,11 @@ class _TimeoutingSyncWrapper(_FakeSyncWrapper):
         raise TimeoutError("library timeout")
 
 
+class _NextValidIdTimeoutingSyncWrapper(_FakeSyncWrapper):
+    def get_next_valid_id(self, *, timeout: int | None = None) -> int:
+        raise TimeoutError("library timeout")
+
+
 class _ExistingConnectedApp:
     def __init__(self) -> None:
         self.disconnect_calls = 0
@@ -46,6 +51,15 @@ class _ExistingConnectedApp:
 
     def disconnect_and_stop(self) -> None:
         self.disconnect_calls += 1
+
+
+class _LibraryTimeout(Exception):
+    pass
+
+
+class _ExistingTimeoutingApp(_ExistingConnectedApp):
+    def get_current_time(self, *, timeout: int | None = None) -> int:
+        raise _LibraryTimeout("library timeout")
 
 
 class ProbeTests(TestCase):
@@ -108,6 +122,26 @@ class ProbeTests(TestCase):
                 response_timeout_cls=TimeoutError,
             )
 
+    def test_probe_gateway_reports_timed_out_probe_step(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+            diagnostic_client_id=7,
+            account_id="DU1234567",
+        )
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "during next_valid_id",
+        ):
+            probe_gateway(
+                config,
+                timeout=7,
+                sync_wrapper_cls=_NextValidIdTimeoutingSyncWrapper,
+                response_timeout_cls=TimeoutError,
+            )
+
     def test_probe_gateway_can_reuse_existing_connected_app(self) -> None:
         config = IbkrConnectionConfig(
             host="127.0.0.1",
@@ -126,3 +160,23 @@ class ProbeTests(TestCase):
 
         self.assertEqual(result.next_valid_order_id, 42)
         self.assertEqual(existing_app.disconnect_calls, 0)
+
+    def test_probe_gateway_maps_existing_app_library_timeout_to_timeout_error(self) -> None:
+        config = IbkrConnectionConfig(
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+            diagnostic_client_id=7,
+            account_id="DU1234567",
+        )
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "Gateway did not answer the probe requests",
+        ):
+            probe_gateway(
+                config,
+                timeout=7,
+                app=_ExistingTimeoutingApp(),
+                response_timeout_cls=_LibraryTimeout,
+            )

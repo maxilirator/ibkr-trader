@@ -158,7 +158,7 @@ def test_build_candidate_payload_creates_per_symbol_model_routed_instructions() 
         "model_key": "short_trial36_v1",
         "feature_names": ["meta_score"],
         "values": [1.0],
-        "normalized": True,
+        "normalized": False,
         "source": "lockbox_candidate_row",
     }
 

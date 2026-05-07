@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, TypeVar, runtime_checkable
 
 from ibkr_trader.config import AppConfig, IbkrConnectionConfig
 from ibkr_trader.ibkr.sync_wrapper import (
     load_response_timeout_class as _load_response_timeout_class,
 )
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
+
+LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 @runtime_checkable
@@ -38,6 +43,40 @@ class GatewayProbeResult:
         return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int((time.monotonic() - started_at) * 1000))
+
+
+def _run_probe_step(
+    step_name: str,
+    call: Callable[[], _T],
+    *,
+    config: IbkrConnectionConfig,
+    timeout: int,
+    timeout_cls: type[Exception],
+) -> _T:
+    started_at = time.monotonic()
+    try:
+        return call()
+    except timeout_cls as exc:
+        elapsed_ms = _elapsed_ms(started_at)
+        LOGGER.warning(
+            "IBKR Gateway probe timed out during %s: host=%s port=%s "
+            "client_id=%s timeout_seconds=%s elapsed_ms=%s error=%s",
+            step_name,
+            config.host,
+            config.port,
+            config.client_id,
+            timeout,
+            elapsed_ms,
+            exc,
+        )
+        raise TimeoutError(
+            "Connected to IBKR, but the Gateway did not answer the probe requests "
+            f"during {step_name} within {timeout}s."
+        ) from exc
+
+
 def probe_gateway(
     config: IbkrConnectionConfig,
     *,
@@ -48,11 +87,7 @@ def probe_gateway(
 ) -> GatewayProbeResult:
     timeout_cls = response_timeout_cls
     if timeout_cls is None:
-        timeout_cls = (
-            TimeoutError
-            if sync_wrapper_cls is not None or app is not None
-            else _load_response_timeout_class()
-        )
+        timeout_cls = TimeoutError if sync_wrapper_cls is not None else _load_response_timeout_class()
     runtime_app = app
     owns_connection = runtime_app is None
     if runtime_app is None:
@@ -63,22 +98,36 @@ def probe_gateway(
             port=config.port,
             client_id=config.client_id,
         ):
+            LOGGER.warning(
+                "IBKR Gateway probe connection failed: host=%s port=%s client_id=%s",
+                config.host,
+                config.port,
+                config.client_id,
+            )
             raise ConnectionError(
                 f"Failed to connect to IBKR at {config.host}:{config.port} "
                 f"with client_id={config.client_id}."
             )
 
     try:
-        try:
-            broker_current_time = datetime.fromtimestamp(
-                runtime_app.get_current_time(timeout=timeout),
-                tz=UTC,
-            )
-            next_valid_order_id = runtime_app.get_next_valid_id(timeout=timeout)
-        except timeout_cls as exc:
-            raise TimeoutError(
-                "Connected to IBKR, but the Gateway did not answer the probe requests."
-            ) from exc
+        raw_broker_current_time = _run_probe_step(
+            "current_time",
+            lambda: runtime_app.get_current_time(timeout=timeout),
+            config=config,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+        )
+        broker_current_time = datetime.fromtimestamp(
+            raw_broker_current_time,
+            tz=UTC,
+        )
+        next_valid_order_id = _run_probe_step(
+            "next_valid_id",
+            lambda: runtime_app.get_next_valid_id(timeout=timeout),
+            config=config,
+            timeout=timeout,
+            timeout_cls=timeout_cls,
+        )
     finally:
         if owns_connection:
             runtime_app.disconnect_and_stop()

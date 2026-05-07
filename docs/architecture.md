@@ -94,7 +94,7 @@ Current simulation rules:
 
 - requested quantity is intentionally ignored for now and every fill uses
   `quantity="1"`
-- every fill records a fixed `49 SEK` commission
+- every fill records a fixed `15 SEK` commission
 - virtual-only runtime cycles do not fetch a broker runtime snapshot from IBKR
 - the operator, ledger, and RL dashboards display virtual accounts and rows with
   a `Virtual` badge

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import logging
+import time
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -10,6 +12,8 @@ from typing import Any, Callable, Iterator
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -67,6 +71,7 @@ class BrokerOperationRecord:
     started_at: datetime
     completed_at: datetime
     duration_ms: int
+    lock_wait_ms: int
     success: bool
     error: str | None
 
@@ -85,6 +90,7 @@ class BrokerActivityTracker:
         completed_at: datetime,
         success: bool,
         error: str | None,
+        lock_wait_ms: int = 0,
     ) -> None:
         duration_ms = max(
             0,
@@ -98,6 +104,7 @@ class BrokerActivityTracker:
                     started_at=started_at,
                     completed_at=completed_at,
                     duration_ms=duration_ms,
+                    lock_wait_ms=max(0, lock_wait_ms),
                     success=success,
                     error=error,
                 )
@@ -135,6 +142,7 @@ class BrokerActivityTracker:
                 "started_at": _serialize_datetime(item.started_at),
                 "completed_at": _serialize_datetime(item.completed_at),
                 "duration_ms": item.duration_ms,
+                "lock_wait_ms": item.lock_wait_ms,
                 "success": item.success,
                 "error": item.error,
             }
@@ -401,7 +409,20 @@ class ManagedSyncSession:
         ignore_cooldown: bool = False,
     ) -> Iterator[Any]:
         started_at = _utc_now()
-        with self._lock:
+        lock_wait_started_at = time.monotonic()
+        self._lock.acquire()
+        lock_wait_ms = max(0, int((time.monotonic() - lock_wait_started_at) * 1000))
+        if lock_wait_ms >= 1000:
+            LOGGER.warning(
+                "IBKR broker operation waited for session lock: role=%s "
+                "operation=%s client_id=%s lock_wait_ms=%s",
+                self.role,
+                operation_name,
+                self.config.client_id,
+                lock_wait_ms,
+            )
+
+        try:
             try:
                 self._ensure_connected_locked(ignore_cooldown=ignore_cooldown)
                 self._record_checkout_locked()
@@ -429,15 +450,32 @@ class ManagedSyncSession:
                 if should_open_cooldown:
                     self._record_gateway_failure_locked(str(exc))
                     self._disconnect_locked()
+                completed_at = _utc_now()
                 if self._activity_tracker is not None:
                     self._activity_tracker.record(
                         role=self.role,
                         operation_name=operation_name,
                         started_at=started_at,
-                        completed_at=_utc_now(),
+                        completed_at=completed_at,
                         success=False,
                         error=str(exc),
+                        lock_wait_ms=lock_wait_ms,
                     )
+                duration_ms = max(
+                    0,
+                    int((completed_at - started_at).total_seconds() * 1000),
+                )
+                LOGGER.warning(
+                    "IBKR broker operation failed before checkout: role=%s "
+                    "operation=%s client_id=%s duration_ms=%s lock_wait_ms=%s "
+                    "error=%s",
+                    self.role,
+                    operation_name,
+                    self.config.client_id,
+                    duration_ms,
+                    lock_wait_ms,
+                    exc,
+                )
                 raise
 
             try:
@@ -445,29 +483,49 @@ class ManagedSyncSession:
             except Exception as exc:
                 self._failed_checkout_count += 1
                 self._last_error = str(exc)
+                completed_at = _utc_now()
                 if self._activity_tracker is not None:
                     self._activity_tracker.record(
                         role=self.role,
                         operation_name=operation_name,
                         started_at=started_at,
-                        completed_at=_utc_now(),
+                        completed_at=completed_at,
                         success=False,
                         error=str(exc),
+                        lock_wait_ms=lock_wait_ms,
                     )
+                duration_ms = max(
+                    0,
+                    int((completed_at - started_at).total_seconds() * 1000),
+                )
+                LOGGER.warning(
+                    "IBKR broker operation failed: role=%s operation=%s "
+                    "client_id=%s duration_ms=%s lock_wait_ms=%s error=%s",
+                    self.role,
+                    operation_name,
+                    self.config.client_id,
+                    duration_ms,
+                    lock_wait_ms,
+                    exc,
+                )
                 raise
             else:
+                completed_at = _utc_now()
                 if self._activity_tracker is not None:
                     self._activity_tracker.record(
                         role=self.role,
                         operation_name=operation_name,
                         started_at=started_at,
-                        completed_at=_utc_now(),
+                        completed_at=completed_at,
                         success=True,
                         error=None,
+                        lock_wait_ms=lock_wait_ms,
                     )
             finally:
                 if not _is_connected(app):
                     self._disconnect_locked()
+        finally:
+            self._lock.release()
 
     def execute(
         self,

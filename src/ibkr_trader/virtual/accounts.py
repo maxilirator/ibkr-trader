@@ -5,7 +5,7 @@ from decimal import Decimal
 
 BROKER_KIND_VIRTUAL = "VIRTUAL"
 VIRTUAL_ACCOUNT_PREFIX = "VIRTUAL"
-VIRTUAL_FIXED_COMMISSION_SEK = Decimal("49")
+VIRTUAL_FIXED_COMMISSION_SEK = Decimal("15")
 
 
 def normalize_virtual_account_key(account_key: str) -> str:

@@ -813,6 +813,16 @@ class ApiServerTests(TestCase):
         self.assertEqual(payload["market_data_type"], "DELAYED")
         self.assertTrue(payload["replace"])
 
+    def test_parse_market_stream_subscribe_payload_uses_configurable_cap(self) -> None:
+        with self.assertRaisesRegex(ValueError, "limited to 2 symbols"):
+            parse_market_stream_subscribe_payload(
+                {
+                    "symbols": ["aaa", "bbb", "ccc"],
+                    "market_data_type": "live",
+                },
+                max_contracts=2,
+            )
+
     def test_market_stream_contracts_for_open_orders_uses_stockholm_stream_defaults(
         self,
     ) -> None:
@@ -1664,6 +1674,97 @@ class ApiServerTests(TestCase):
                 body["operator_snapshot"]["instructions"][0]["instruction_id"],
                 "instr-001",
             )
+
+    def test_operator_snapshot_default_keeps_more_than_fifty_instruction_owners(
+        self,
+    ) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "operator_snapshot_many.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                for index in range(60):
+                    session.add(
+                        InstructionRecord(
+                            instruction_id=f"virtual-owner-{index:03d}",
+                            schema_version="2026-04-10",
+                            source_system="q-training",
+                            batch_id="batch-001",
+                            account_key="VIRTUALRL01",
+                            book_key="rl_virtual",
+                            is_virtual=True,
+                            symbol=f"SYM{index:03d}",
+                            exchange="XSTO",
+                            currency="SEK",
+                            state="POSITION_OPEN",
+                            submit_at=datetime(
+                                2026, 4, 19, 8, 20, tzinfo=timezone.utc
+                            ),
+                            expire_at=datetime(
+                                2026, 4, 19, 15, 30, tzinfo=timezone.utc
+                            ),
+                            order_type="MARKET",
+                            side="BUY",
+                            payload={
+                                "instruction": {
+                                    "instruction_id": f"virtual-owner-{index:03d}"
+                                }
+                            },
+                        )
+                    )
+                session.commit()
+            finally:
+                session.close()
+                engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="U25245596",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                response = client.get("/v1/read/operator-snapshot")
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            instruction_ids = {
+                instruction["instruction_id"]
+                for instruction in body["operator_snapshot"]["instructions"]
+            }
+            self.assertEqual(len(instruction_ids), 60)
+            self.assertIn("virtual-owner-000", instruction_ids)
+            self.assertIn("virtual-owner-059", instruction_ids)
 
     def test_rl_candidates_endpoint_returns_model_routed_names(self) -> None:
         try:
