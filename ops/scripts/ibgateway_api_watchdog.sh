@@ -10,9 +10,17 @@ STATE_FILE="${STATE_FILE:-/run/ibgateway-api-watchdog.failures}"
 LAST_ERROR_FILE="${LAST_ERROR_FILE:-/run/ibgateway-api-watchdog.last-error}"
 LAST_JOURNAL_FILE="${LAST_JOURNAL_FILE:-/run/ibgateway-api-watchdog.last-journal}"
 LAST_RESTART_FILE="${LAST_RESTART_FILE:-/run/ibgateway-api-watchdog.last-restart}"
+LAST_RESTART_FAILURE_FILE="${LAST_RESTART_FAILURE_FILE:-/run/ibgateway-api-watchdog.last-restart-failure}"
 LAST_ALERT_FILE="${LAST_ALERT_FILE:-/run/ibgateway-api-watchdog.last-alert}"
 JOURNAL_SINCE="${JOURNAL_SINCE:-20 minutes ago}"
+GATEWAY_JOURNAL_PATTERN="${GATEWAY_JOURNAL_PATTERN:-JTS-DeadlockMonitor|Deadlock|EServerSocket|nextValidId|API|socket|Login has completed|addLogConsole|ERROR|WARN|eufarm|farm|Shutdown progress|Connecting to server|Existing session detected|Second Factor|CommandServer|autorestart}"
 RESTART_COOLDOWN_SECONDS="${RESTART_COOLDOWN_SECONDS:-900}"
+RESTART_FAILURE_COOLDOWN_SECONDS="${RESTART_FAILURE_COOLDOWN_SECONDS:-900}"
+RESTART_OBSERVE_SECONDS="${RESTART_OBSERVE_SECONDS:-120}"
+RESTART_OBSERVE_INTERVAL_SECONDS="${RESTART_OBSERVE_INTERVAL_SECONDS:-5}"
+RESTART_OBSERVE_PROBE_TIMEOUT_SECONDS="${RESTART_OBSERVE_PROBE_TIMEOUT_SECONDS:-5}"
+GATEWAY_PROCESS_PATTERN="${GATEWAY_PROCESS_PATTERN:-ibcalpha[.]ibc[.]IbcGateway}"
+WATCHDOG_RESTART_ENABLED="${WATCHDOG_RESTART_ENABLED:-no}"
 RESTART_ALLOWED_WINDOWS="${RESTART_ALLOWED_WINDOWS:-}"
 RESTART_WINDOW_TZ="${RESTART_WINDOW_TZ:-Europe/Stockholm}"
 RESTART_ALLOWED_DAYS="${RESTART_ALLOWED_DAYS:-Mon,Tue,Wed,Thu,Fri,Sat,Sun}"
@@ -46,7 +54,7 @@ write_failures() {
 }
 
 reset_failures() {
-  rm -f "$STATE_FILE" "$LAST_ERROR_FILE"
+  rm -f "$STATE_FILE" "$LAST_ERROR_FILE" "$LAST_RESTART_FAILURE_FILE"
 }
 
 read_epoch_file() {
@@ -171,6 +179,49 @@ restart_gateway() {
   systemctl restart "$GATEWAY_SERVICE"
 }
 
+capture_gateway_journal() {
+  journalctl -u "$GATEWAY_SERVICE" --since "$JOURNAL_SINCE" --no-pager 2>/dev/null \
+    | grep -Ei "$GATEWAY_JOURNAL_PATTERN" \
+    | tail -300 > "$LAST_JOURNAL_FILE" || true
+}
+
+gateway_process_pids() {
+  pgrep -f "$GATEWAY_PROCESS_PATTERN" 2>/dev/null | sort | paste -sd, - || true
+}
+
+probe_ibkr_api_quiet() {
+  curl -fsS --max-time "$RESTART_OBSERVE_PROBE_TIMEOUT_SECONDS" -X POST "$probe_url" >/dev/null 2>/dev/null
+}
+
+restart_completion_observed() {
+  local before_pids="$1"
+  local deadline
+  deadline="$(( $(date +%s) + RESTART_OBSERVE_SECONDS ))"
+
+  if (( RESTART_OBSERVE_SECONDS <= 0 )); then
+    log "Restart observation is disabled; treating accepted restart command as completed."
+    return 0
+  fi
+
+  log "Observing ${GATEWAY_SERVICE} for up to ${RESTART_OBSERVE_SECONDS}s after restart request (gateway_pids=${before_pids:-none})."
+  while (( $(date +%s) < deadline )); do
+    sleep "$RESTART_OBSERVE_INTERVAL_SECONDS"
+    local after_pids
+    after_pids="$(gateway_process_pids)"
+    if [[ -n "$after_pids" && "$after_pids" != "$before_pids" ]]; then
+      log "Gateway process changed after restart request: ${before_pids:-none} -> ${after_pids}."
+      return 0
+    fi
+    if probe_ibkr_api_quiet; then
+      log "IBKR API probe recovered while observing restart request."
+      return 0
+    fi
+  done
+
+  log "Gateway process did not change within ${RESTART_OBSERVE_SECONDS}s after restart request (gateway_pids=${before_pids:-none})."
+  return 1
+}
+
 restart_window_allows_now() {
   if [[ -z "$RESTART_ALLOWED_WINDOWS" ]]; then
     return 0
@@ -226,6 +277,8 @@ if curl -fsS --max-time "$CURL_TIMEOUT_SECONDS" -X POST "$probe_url" >/dev/null 
   exit 0
 fi
 
+capture_gateway_journal
+
 if (( $(seconds_since_epoch_file "$LAST_RESTART_FILE") < STARTUP_GRACE_SECONDS )); then
   last_error="$(tr '\n' ' ' < "$LAST_ERROR_FILE" 2>/dev/null | cut -c1-500)"
   log "IBKR API probe is still failing during Gateway startup grace (${STARTUP_GRACE_SECONDS}s): ${last_error}"
@@ -241,9 +294,12 @@ if (( failures < FAILURE_THRESHOLD )); then
   exit 0
 fi
 
-journalctl -u "$GATEWAY_SERVICE" --since "$JOURNAL_SINCE" --no-pager 2>/dev/null \
-  | grep -Ei 'JTS-DeadlockMonitor|Deadlock|EServerSocket|nextValidId|API|socket|Login has completed|addLogConsole|ERROR' \
-  | tail -300 > "$LAST_JOURNAL_FILE" || true
+if [[ "${WATCHDOG_RESTART_ENABLED,,}" != "yes" ]]; then
+  log "Restart due but disabled; WATCHDOG_RESTART_ENABLED=${WATCHDOG_RESTART_ENABLED}. Alerting only."
+  write_failures "$FAILURE_THRESHOLD"
+  send_operator_alert "IB Gateway API probe is failing on $(hostname). Automatic Gateway restart is disabled; manual intervention is required."
+  exit 0
+fi
 
 if ! restart_window_allows_now; then
   log "Restart deferred; now is outside RESTART_ALLOWED_WINDOWS=${RESTART_ALLOWED_WINDOWS} ${RESTART_WINDOW_TZ} (${RESTART_ALLOWED_DAYS})."
@@ -259,15 +315,28 @@ if (( $(seconds_since_epoch_file "$LAST_RESTART_FILE") < RESTART_COOLDOWN_SECOND
   exit 0
 fi
 
-log "Restarting ${GATEWAY_SERVICE} after ${failures} consecutive failed IBKR API probes."
-if restart_gateway; then
-  date +%s > "$LAST_RESTART_FILE"
-  reset_failures
-  log "Restart command completed for ${GATEWAY_SERVICE}."
-  send_operator_alert "IB Gateway was restarted on $(hostname) after ${failures} failed API probes. If IBKR prompts for 2FA, approve it on the mobile app."
+if (( $(seconds_since_epoch_file "$LAST_RESTART_FAILURE_FILE") < RESTART_FAILURE_COOLDOWN_SECONDS )); then
+  log "Restart due but deferred; the previous ${GATEWAY_SERVICE} restart command failed less than ${RESTART_FAILURE_COOLDOWN_SECONDS}s ago."
+  write_failures "$FAILURE_THRESHOLD"
+  send_operator_alert "IB Gateway API probe is failing on $(hostname), and the previous restart command failed. Manual intervention is required."
   exit 0
 fi
 
+log "Restarting ${GATEWAY_SERVICE} after ${failures} consecutive failed IBKR API probes."
+gateway_pids_before_restart="$(gateway_process_pids)"
+if restart_gateway; then
+  if restart_completion_observed "$gateway_pids_before_restart"; then
+    date +%s > "$LAST_RESTART_FILE"
+    reset_failures
+    log "Restart command completed for ${GATEWAY_SERVICE}."
+    send_operator_alert "IB Gateway was restarted on $(hostname) after ${failures} failed API probes. If IBKR prompts for 2FA, approve it on the mobile app."
+    exit 0
+  fi
+  log "Restart command was accepted, but no Gateway restart completion was observed."
+fi
+
 log "Restart command failed for ${GATEWAY_SERVICE}; keeping failure counter at ${failures}."
+date +%s > "$LAST_RESTART_FAILURE_FILE"
+write_failures "$FAILURE_THRESHOLD"
 send_operator_alert "IB Gateway API probe is failing on $(hostname), and restarting ${GATEWAY_SERVICE} failed. Manual intervention is required."
 exit 1

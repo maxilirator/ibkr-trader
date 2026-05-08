@@ -651,6 +651,12 @@ returns a normal deterministic entry payload or executes an owned cancel/exit
 mutation. With `"submit": true`, it persists or executes the action. With
 `"log_action": true`, it logs the RL action.
 
+Submitted entry translations first run the same intent replacement cleanup as
+`POST /v1/instructions/submit`: older active entries in the same
+account/book/side/symbol group are cancelled before the new entry is persisted.
+If an open position already owns the group, the API returns a conflict instead
+of submitting another entry.
+
 ```bash
 curl -sS -X POST "$API/v1/rl/actions/translate" \
   -H "Content-Type: application/json" \

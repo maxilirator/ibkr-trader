@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 
 DEFAULT_RL_MODEL_BUNDLE_ROOT = Path("/home/mattias/ibkr-trader/var/rl-models")
-DEFAULT_SHARED_VIRTUAL_ACCOUNT = "VIRTUALRL01"
+DEFAULT_SHARED_VIRTUAL_ACCOUNT = "VIRTUALRL02"
 MODEL_BUNDLE_SCHEMA_VERSION = "rl_model_bundle_v1"
 
 

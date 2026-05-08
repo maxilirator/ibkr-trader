@@ -46,6 +46,10 @@ class DelayedExitReference(StrEnum):
     MARKET_AT_TRIGGER = "MARKET_AT_TRIGGER"
 
 
+class LifecycleScope(StrEnum):
+    ACCOUNT_BOOK_SIDE_SYMBOL_TRADE_DATE = "account_book_side_symbol_trade_date"
+
+
 @dataclass(slots=True)
 class SourceContext:
     system: str
@@ -220,6 +224,27 @@ class DelayedLimitExitSpec:
 
 
 @dataclass(slots=True)
+class LifecyclePolicy:
+    trade_date: date | None = None
+    scope: LifecycleScope = LifecycleScope.ACCOUNT_BOOK_SIDE_SYMBOL_TRADE_DATE
+    max_entry_orders: int | None = None
+    max_exit_orders: int | None = None
+    allow_reentry_after_exit: bool = False
+    allow_reentry_after_cancel: bool = False
+    retire_from_active_universe_when_flat: bool = False
+
+    def validate(self) -> None:
+        if self.scope is not LifecycleScope.ACCOUNT_BOOK_SIDE_SYMBOL_TRADE_DATE:
+            raise ValueError("lifecycle.scope is not supported")
+        for field_name, value in (
+            ("max_entry_orders", self.max_entry_orders),
+            ("max_exit_orders", self.max_exit_orders),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"lifecycle.{field_name} must be positive")
+
+
+@dataclass(slots=True)
 class ExecutionWindow:
     start_at: datetime
     end_at: datetime
@@ -271,6 +296,7 @@ class ExecutionInstruction:
     exit: ExitSpec | None
     trace: TraceSpec
     execution: ModelRoutedExecutionSpec | None = None
+    lifecycle: LifecyclePolicy | None = None
 
     @property
     def is_model_routed(self) -> bool:
@@ -283,6 +309,8 @@ class ExecutionInstruction:
         self.instrument.validate()
         self.intent.validate()
         self.sizing.validate()
+        if self.lifecycle is not None:
+            self.lifecycle.validate()
         if self.execution is not None:
             self.execution.validate()
             if self.entry is not None:

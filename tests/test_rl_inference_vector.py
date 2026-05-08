@@ -73,6 +73,29 @@ class RLInferenceVectorTests(unittest.TestCase):
             [True, True, True, False, False, False, True, False],
         )
 
+    def test_market_entry_pending_state_is_not_flat(self) -> None:
+        action_names = [
+            "skip",
+            "wait",
+            "market_entry",
+            "cancel_entry",
+            "exit_market",
+            "clear_exit",
+            "entry_prevclose_-50bp",
+            "exit_tp_200bp",
+        ]
+        state = RunnerSymbolState(
+            pending_entry_anchor="market",
+            bars_since_entry_order=1,
+        )
+
+        mask = valid_action_mask(action_names, state)
+
+        self.assertEqual(
+            mask.tolist(),
+            [True, True, True, True, False, False, True, False],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,6 +81,183 @@ def test_runner_historical_backfill_payload_maps_payload_xsto_to_ibkr_smart_sfb(
     assert payload["isin"] == "SE0000108656"
 
 
+def test_runner_history_override_can_fall_back_to_candidate_yesterday_close(
+    monkeypatch,
+) -> None:
+    def fail_post_json(*_: object, **__: object) -> dict[str, object]:
+        raise runner.ApiError("historical bars unavailable")
+
+    monkeypatch.setattr(runner, "post_json", fail_post_json)
+
+    override = runner.history_override_payload(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(config=SimpleNamespace(model_key="long_trial_106_v1")),
+        candidate={
+            "symbol": "SAGA B",
+            "trace": {"metadata": {"yesterday_close": "187.9"}},
+        },
+        trade_date="2026-05-08",
+        history_cache={},
+        duration="5 D",
+        bar_size="1 min",
+        timeout=1,
+        allow_metadata_fallback=True,
+    )
+
+    assert override["prev_close"] == "187.9"
+    assert override["source"] == "candidate_metadata_yesterday_close_fallback"
+    assert sorted(override["history_features"]) == sorted(runner.HISTORY_FEATURE_NAMES)
+
+
+def test_runner_metadata_history_only_uses_candidate_history_without_ibkr(
+    monkeypatch,
+) -> None:
+    def fail_post_json(*_: object, **__: object) -> dict[str, object]:
+        pytest.fail("metadata_history_only must not call IBKR historical bars")
+
+    monkeypatch.setattr(runner, "post_json", fail_post_json)
+    history_features = {
+        name: float(index) / 10.0
+        for index, name in enumerate(runner.HISTORY_FEATURE_NAMES)
+    }
+
+    override = runner.history_override_payload(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(config=SimpleNamespace(model_key="long_trial_106_v1")),
+        candidate={
+            "symbol": "SAGA B",
+            "trace": {
+                "metadata": {
+                    "yesterday_close": "187.9",
+                    "history_features": history_features,
+                }
+            },
+        },
+        trade_date="2026-05-08",
+        history_cache={},
+        duration="5 D",
+        bar_size="1 min",
+        timeout=1,
+        metadata_history_only=True,
+    )
+
+    assert override["prev_close"] == "187.9"
+    assert override["history_features"] == history_features
+    assert override["source"] == "candidate_metadata.history_features"
+
+
+def test_runner_metadata_history_only_can_use_yesterday_close_fallback(
+    monkeypatch,
+) -> None:
+    def fail_post_json(*_: object, **__: object) -> dict[str, object]:
+        pytest.fail("metadata_history_only must not call IBKR historical bars")
+
+    monkeypatch.setattr(runner, "post_json", fail_post_json)
+
+    override = runner.history_override_payload(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(config=SimpleNamespace(model_key="long_trial_106_v1")),
+        candidate={
+            "symbol": "SAGA B",
+            "trace": {"metadata": {"yesterday_close": "187.9"}},
+        },
+        trade_date="2026-05-08",
+        history_cache={},
+        duration="5 D",
+        bar_size="1 min",
+        timeout=1,
+        allow_metadata_fallback=True,
+        metadata_history_only=True,
+    )
+
+    assert override["prev_close"] == "187.9"
+    assert override["source"] == "candidate_metadata_yesterday_close_fallback"
+    assert sorted(override["history_features"]) == sorted(runner.HISTORY_FEATURE_NAMES)
+
+
+def test_runner_waits_for_stream_bars_before_feature_or_history_preparation(
+    monkeypatch,
+) -> None:
+    heartbeats: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runner,
+        "load_runtime_state_context",
+        lambda **_: runner.RuntimeStateContext(
+            states={},
+            blocked_symbols={},
+            source="runtime-state",
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "static_feature_payload",
+        lambda *_, **__: pytest.fail("feature prep must wait for stream bars"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "history_override_payload",
+        lambda **_: pytest.fail("history prep must wait for stream bars"),
+    )
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        assert "/heartbeat" in url
+        heartbeats.append(payload)
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+
+    runner.run_model_candidates(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(
+            config=SimpleNamespace(
+                model_key="long_trial_106_v1",
+                deployment_key="long_trial_106_virtual_shared_01",
+                side="LONG",
+            )
+        ),
+        deployment_key="long_trial_106_virtual_shared_01",
+        deployment_mode="virtual",
+        candidates=[
+            {
+                "instruction_id": "long-saga",
+                "symbol": "SAGA B",
+                "account_key": "VIRTUALRL02",
+                "trace": {
+                    "trade_date": "2026-05-08",
+                    "data_cutoff_date": "2026-05-07",
+                },
+            }
+        ],
+        processed_decisions=set(),
+        execute_actions=True,
+        history_cache={},
+        history_duration="5 D",
+        history_bar_size="1 min",
+        history_timeout=20,
+        stream_bar_ready_symbols=set(),
+        stream_plan={"stream_symbol_count": 1},
+        trade_date="2026-05-08",
+    )
+
+    assert heartbeats[-1]["status"] == "degraded"
+    assert (
+        heartbeats[-1]["runtime_error"]
+        == "market stream has no bars for active RL candidates"
+    )
+    assert heartbeats[-1]["metrics"]["waiting_for_stream_bar_candidate_count"] == 1
+    assert (
+        heartbeats[-1]["metrics"]["skipped_candidates"][0]["status"]
+        == "waiting_for_stream_bars"
+    )
+
+
 def test_runner_observed_at_uses_latest_completed_model_bar() -> None:
     observed_at = decision_observed_at(
         {
@@ -146,6 +323,179 @@ def test_runner_action_distribution_does_not_warn_on_pending_waits() -> None:
     assert metrics["evaluated_action_count"] == 6
     assert metrics["flat_evaluated_action_count"] == 0
     assert metrics["warning"] is None
+
+
+def test_runner_loads_market_entry_pending_as_entry_pending(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runner,
+        "get_json",
+        lambda *_args, **_kwargs: {
+            "instructions": [
+                {
+                    "source_system": "rl-runner",
+                    "symbol": "SHB A",
+                    "state": "ENTRY_PENDING",
+                    "activity_at": "2026-05-07T13:38:20Z",
+                    "payload": {
+                        "instruction": {
+                            "trace": {
+                                "metadata": {
+                                    "rl_deployment_key": "long_trial_106_virtual_shared_01",
+                                    "rl_action_name": "market_entry",
+                                }
+                            }
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    states = runner.load_runtime_states_from_instructions(
+        api_base="http://127.0.0.1:8000",
+        deployment_key="long_trial_106_virtual_shared_01",
+        symbols=["SHB A"],
+        side="LONG",
+    )
+
+    assert states["SHB A"].pending_entry_anchor == "market"
+    assert states["SHB A"].bars_since_entry_order == 1
+    assert runner.translation_state_before(states["SHB A"], "LONG") == "ENTRY_PENDING"
+
+
+def test_runner_prefers_runtime_state_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runner,
+        "get_json",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "runtime_state": {
+                "deployment_key": "long_trial_106_virtual_shared_01",
+                "symbols": [
+                    {
+                        "symbol": "SHB A",
+                        "status": "ready",
+                        "state_before": "LONG_OPEN",
+                        "runner_state": {
+                            "in_position": True,
+                            "pending_entry_anchor": None,
+                            "pending_entry_rel_bp": None,
+                            "pending_exit_tp_bp": None,
+                            "entry_price": "130.50",
+                            "entry_bar_idx": None,
+                            "bars_since_entry_order": 0,
+                            "bars_since_exit_order": 0,
+                        },
+                    },
+                    {
+                        "symbol": "BALD B",
+                        "status": "blocked",
+                        "state_before": "INCONSISTENT",
+                        "blockers": [{"reason": "duplicate_active_positions"}],
+                    },
+                ],
+            },
+        },
+    )
+
+    context = runner.load_runtime_state_context(
+        api_base="http://127.0.0.1:8000",
+        deployment_key="long_trial_106_virtual_shared_01",
+        symbols=["SHB A", "BALD B"],
+        side="LONG",
+    )
+
+    assert context.source == "runtime-state"
+    assert context.states["SHB A"].in_position is True
+    assert context.states["SHB A"].entry_price == pytest.approx(130.5)
+    assert "BALD B" in context.blocked_symbols
+
+
+def test_runner_blocks_ambiguous_runtime_state_before_features(monkeypatch) -> None:
+    heartbeats: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runner,
+        "load_runtime_state_context",
+        lambda **_: runner.RuntimeStateContext(
+            states={},
+            blocked_symbols={
+                "BALD B": {
+                    "symbol": "BALD B",
+                    "status": "blocked",
+                    "blockers": [{"reason": "duplicate_active_positions"}],
+                }
+            },
+            source="runtime-state",
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "static_feature_payload",
+        lambda *_, **__: pytest.fail("blocked symbols must not build features"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "history_override_payload",
+        lambda **_: pytest.fail("blocked symbols must not build history"),
+    )
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        assert "/heartbeat" in url
+        heartbeats.append(payload)
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+
+    runner.run_model_candidates(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(
+            config=SimpleNamespace(
+                model_key="long_trial_106_v1",
+                deployment_key="long_trial_106_virtual_shared_01",
+                side="LONG",
+            )
+        ),
+        deployment_key="long_trial_106_virtual_shared_01",
+        deployment_mode="virtual",
+        candidates=[
+            {
+                "instruction_id": "long-bald",
+                "symbol": "BALD B",
+                "account_key": "VIRTUALRL01",
+                "trace": {
+                    "trade_date": "2026-05-07",
+                    "data_cutoff_date": "2026-05-06",
+                },
+            }
+        ],
+        processed_decisions=set(),
+        execute_actions=True,
+        history_cache={},
+        history_duration="5 D",
+        history_bar_size="1 min",
+        history_timeout=20,
+        stream_bar_ready_symbols={"BALD B"},
+        stream_plan={"stream_symbol_count": 1},
+        trade_date="2026-05-07",
+    )
+
+    assert heartbeats[-1]["status"] == "degraded"
+    assert (
+        heartbeats[-1]["runtime_error"]
+        == "authoritative runtime state blocked all RL candidates"
+    )
+    metrics = heartbeats[-1]["metrics"]
+    assert metrics["runtime_state_source"] == "runtime-state"
+    assert metrics["runtime_state_blocked_symbol_count"] == 1
+    assert metrics["runtime_state_blocked_candidate_count"] == 1
+    assert metrics["skipped_candidates"][0]["status"] == "runtime_state_blocked"
 
 
 def test_runner_expected_decision_bar_uses_completed_five_minute_boundary() -> None:
@@ -482,7 +832,7 @@ def test_runner_subscribes_omxs30_as_index_contract(monkeypatch) -> None:
     )
 
     assert posted[0][0] == "http://127.0.0.1:8000/v1/market-data/stream/subscribe"
-    assert posted[0][1]["replace"] is False
+    assert posted[0][1]["replace"] is True
     assert posted[0][1]["market_data_type"] == "LIVE"
     assert posted[0][1]["contracts"] == [
         {
@@ -500,6 +850,62 @@ def test_runner_subscribes_omxs30_as_index_contract(monkeypatch) -> None:
             "primary_exchange": "",
         },
     ]
+
+
+def test_runner_skips_duplicate_stream_subscription_posts(monkeypatch) -> None:
+    posted: list[tuple[str, dict[str, object]]] = []
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        posted.append((url, payload))
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+    subscription_state: dict[str, object] = {}
+
+    first = runner.subscribe_symbols(
+        "http://127.0.0.1:8000",
+        ["AXFO", "OMXS30"],
+        market_data_type="LIVE",
+        subscription_state=subscription_state,
+    )
+    second = runner.subscribe_symbols(
+        "http://127.0.0.1:8000",
+        ["OMXS30", "AXFO"],
+        market_data_type="LIVE",
+        subscription_state=subscription_state,
+    )
+
+    assert first is True
+    assert second is False
+    assert len(posted) == 1
+
+
+def test_runner_repairs_subscription_when_api_stream_lost_state() -> None:
+    assert runner.stream_subscription_needs_repair(
+        {
+            "desired_symbols": ["OMXS30"],
+            "subscriptions": [
+                {"contract": {"symbol": "OMXS30"}},
+            ],
+        },
+        ["OMXS30", "AXFO"],
+    )
+    assert not runner.stream_subscription_needs_repair(
+        {
+            "desired_symbols": ["OMXS30", "AXFO"],
+            "subscriptions": [
+                {"contract": {"symbol": "OMXS30"}},
+                {"contract": {"symbol": "AXFO"}},
+            ],
+        },
+        ["AXFO", "OMXS30"],
+    )
 
 
 def test_runner_degrades_heartbeat_when_stream_subscribe_fails(monkeypatch) -> None:
@@ -697,3 +1103,112 @@ def test_runner_reports_stale_bar_without_calling_model_or_translator(monkeypatc
     assert metrics["timing"]["cadence_budget_seconds"] == 300.0
     assert metrics["timing"]["cadence_over_budget"] is False
     assert metrics["timing"]["total_seconds"] >= 0.0
+
+
+def test_runner_records_translate_conflict_without_aborting(monkeypatch) -> None:
+    heartbeats: list[dict[str, object]] = []
+    processed_decisions: set[str] = set()
+
+    monkeypatch.setattr(
+        runner,
+        "load_runtime_states_from_instructions",
+        lambda **_: {"AXFO": RunnerSymbolState(in_position=True, entry_price=100.0)},
+    )
+    monkeypatch.setattr(
+        runner,
+        "static_feature_payload",
+        lambda *_, **__: {"feature_names": ["x"], "values": [0.0], "normalized": True},
+    )
+    monkeypatch.setattr(
+        runner,
+        "history_override_payload",
+        lambda **_: {"previous_session": {"prev_close": 100}, "history_features": {}},
+    )
+    monkeypatch.setattr(
+        runner,
+        "expected_decision_bar_ended_at",
+        lambda **_: "2026-05-05T09:05:00+02:00",
+    )
+    monkeypatch.setattr(runner, "assemble_dqn_observation_vector", lambda *_, **__: object())
+    monkeypatch.setattr(runner, "choose_action", lambda *_, **__: ("exit_market", [0.0, 1.0]))
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        if "/v1/rl/observations/build" in url:
+            return {
+                "rl_observation": {
+                    "feature_schema": {"path_pad_length": 102},
+                    "observations": {
+                        "AXFO": {
+                            "latest_bar_ended_at": "2026-05-05T09:05:00+02:00",
+                            "pricing_context": {"prev_close": "100"},
+                            "model_decision": {
+                                "ready": True,
+                                "decision_id": "long:AXFO:2026-05-05T09:05:00+02:00",
+                                "latest_usable_bar_ended_at": "2026-05-05T09:05:00+02:00",
+                            },
+                        }
+                    },
+                },
+                "fetched_symbols": [],
+            }
+        if "/v1/rl/actions/translate" in url:
+            raise runner.ApiError("translate -> HTTP 409: duplicate active instructions")
+        assert "/heartbeat" in url
+        heartbeats.append(payload)
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+
+    runner.run_model_candidates(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(
+            config=SimpleNamespace(
+                model_key="long_trial_106_v1",
+                deployment_key="long_trial_106_virtual_shared_01",
+                side="LONG",
+            ),
+            action_names=["wait", "exit_market"],
+            obs_dim=10,
+            model=object(),
+        ),
+        deployment_key="long_trial_106_virtual_shared_01",
+        deployment_mode="virtual",
+        candidates=[
+            {
+                "instruction_id": "long-axfo",
+                "symbol": "AXFO",
+                "account_key": "VIRTUALRL01",
+                "trace": {
+                    "trade_date": "2026-05-05",
+                    "data_cutoff_date": "2026-05-04",
+                },
+            }
+        ],
+        processed_decisions=processed_decisions,
+        execute_actions=True,
+        history_cache={},
+        history_duration="5 D",
+        history_bar_size="1 min",
+        history_timeout=20,
+        stream_bar_ready_symbols={"AXFO"},
+        stream_plan={"stream_symbol_count": 1},
+        trade_date="2026-05-05",
+    )
+
+    assert heartbeats[-1]["status"] == "degraded"
+    assert (
+        heartbeats[-1]["runtime_error"]
+        == "1 RL action translation request(s) failed"
+    )
+    action = heartbeats[-1]["metrics"]["actions"][0]
+    assert action["status"] == "translate_error"
+    assert action["retryable"] is False
+    assert processed_decisions == {
+        "long_trial_106_virtual_shared_01:long-axfo:long:AXFO:2026-05-05T09:05:00+02:00"
+    }

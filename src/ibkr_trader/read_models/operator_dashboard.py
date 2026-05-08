@@ -28,6 +28,7 @@ from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderEventRecord
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import ExecutionFillRecord
+from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import OperatorControlEventRecord
 from ibkr_trader.db.models import OperatorControlRecord
 from ibkr_trader.db.models import OperatorReviewActionRecord
@@ -176,6 +177,7 @@ class OperatorExecutionFill:
     fill_id: int
     broker_order_id: int | None
     instruction_record_id: int | None
+    order_role: str | None
     broker_kind: str
     account_key: str
     account_label: str | None
@@ -186,10 +188,15 @@ class OperatorExecutionFill:
     currency: str
     security_type: str
     side: str | None
+    position_side: str | None
     quantity: str
     price: str
     commission: str | None
     commission_currency: str | None
+    realized_pnl: str | None
+    realized_pnl_gross: str | None
+    realized_pnl_currency: str | None
+    realized_pnl_basis_price: str | None
     order_ref: str | None
     external_execution_id: str
     external_order_id: str | None
@@ -715,6 +722,201 @@ def _exit_fill_basis(
     )
 
 
+def _fill_order_role(
+    fill: ExecutionFillRecord,
+    broker_order: BrokerOrderRecord | None,
+) -> str | None:
+    broker_order_role = (broker_order.order_role or "").strip().upper() if broker_order else ""
+    if broker_order_role:
+        return broker_order_role
+    order_ref = (fill.order_ref or "").strip().lower()
+    if ":exit:" in order_ref:
+        return "EXIT"
+    if order_ref:
+        return "ENTRY"
+    return None
+
+
+def _instruction_position_side(instruction: InstructionRecord | None) -> str | None:
+    if instruction is None:
+        return None
+    payload = instruction.payload if isinstance(instruction.payload, dict) else {}
+    instruction_payload = payload.get("instruction", {})
+    if isinstance(instruction_payload, dict):
+        intent_payload = instruction_payload.get("intent", {})
+        if isinstance(intent_payload, dict):
+            position_side = str(intent_payload.get("position_side") or "").strip().upper()
+            if position_side in {"LONG", "SHORT"}:
+                return position_side
+
+    normalized_side = (instruction.side or "").strip().upper()
+    if normalized_side == "BUY":
+        return "LONG"
+    if normalized_side == "SELL":
+        return "SHORT"
+    return None
+
+
+def _fill_position_side(
+    fill: ExecutionFillRecord,
+    broker_order: BrokerOrderRecord | None,
+    instruction: InstructionRecord | None,
+) -> str | None:
+    instruction_side = _instruction_position_side(instruction)
+    if instruction_side is not None:
+        return instruction_side
+
+    order_role = _fill_order_role(fill, broker_order)
+    normalized_side = (fill.side or (broker_order.side if broker_order else "") or "").strip().upper()
+    if order_role == "EXIT":
+        if normalized_side in {"SLD", "SELL"}:
+            return "LONG"
+        if normalized_side in {"BOT", "BUY"}:
+            return "SHORT"
+    else:
+        if normalized_side in {"BOT", "BUY"}:
+            return "LONG"
+        if normalized_side in {"SLD", "SELL"}:
+            return "SHORT"
+    return None
+
+
+def _commission_cost(
+    value: str | None,
+    *,
+    commission_currency: str | None,
+    pnl_currency: str,
+) -> Decimal:
+    if (commission_currency or "").strip().upper() != pnl_currency.upper():
+        return Decimal("0")
+    parsed = _to_decimal(value)
+    return abs(parsed) if parsed is not None else Decimal("0")
+
+
+def _entry_fill_basis_for_instruction(
+    session: Session,
+    *,
+    instruction_id: int,
+    pnl_currency: str,
+) -> tuple[Decimal | None, Decimal, Decimal, str | None]:
+    instruction = session.get(InstructionRecord, instruction_id)
+    entry_action = (instruction.side or "").strip().upper() if instruction else ""
+    expected_entry_sides: set[str] | None = None
+    inferred_entry_side: str | None = None
+    if entry_action == "BUY":
+        expected_entry_sides = {"BOT", "BUY"}
+        inferred_entry_side = "LONG"
+    elif entry_action == "SELL":
+        expected_entry_sides = {"SLD", "SELL"}
+        inferred_entry_side = "SHORT"
+
+    rows = session.execute(
+        select(ExecutionFillRecord, BrokerOrderRecord)
+        .outerjoin(
+            BrokerOrderRecord,
+            BrokerOrderRecord.id == ExecutionFillRecord.broker_order_id,
+        )
+        .where(ExecutionFillRecord.instruction_id == instruction_id)
+        .order_by(
+            ExecutionFillRecord.executed_at.asc(),
+            ExecutionFillRecord.id.asc(),
+        )
+    ).all()
+
+    total_quantity = Decimal("0")
+    weighted_notional = Decimal("0")
+    commission_total = Decimal("0")
+    entry_side: str | None = inferred_entry_side
+    for entry_fill, broker_order in rows:
+        normalized_side = (entry_fill.side or "").strip().upper()
+        if expected_entry_sides is not None:
+            if normalized_side not in expected_entry_sides:
+                continue
+        elif _fill_order_role(entry_fill, broker_order) == "EXIT":
+            continue
+        quantity = _meaningful_decimal(entry_fill.quantity)
+        price = _meaningful_decimal(entry_fill.price)
+        if quantity is None or price is None:
+            continue
+
+        abs_quantity = abs(quantity)
+        total_quantity += abs_quantity
+        weighted_notional += abs_quantity * price
+        commission_total += _commission_cost(
+            entry_fill.commission,
+            commission_currency=entry_fill.commission_currency,
+            pnl_currency=pnl_currency,
+        )
+        if normalized_side in {"BOT", "BUY"}:
+            entry_side = entry_side or "LONG"
+        elif normalized_side in {"SLD", "SELL"}:
+            entry_side = entry_side or "SHORT"
+
+    if total_quantity <= 0:
+        return None, Decimal("0"), Decimal("0"), entry_side
+    return weighted_notional / total_quantity, total_quantity, commission_total, entry_side
+
+
+def _fill_realized_pnl(
+    session: Session,
+    *,
+    fill: ExecutionFillRecord,
+    broker_order: BrokerOrderRecord | None,
+    instruction: InstructionRecord | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if _fill_order_role(fill, broker_order) != "EXIT":
+        return None, None, None, None
+
+    instruction_id = (
+        fill.instruction_id
+        or (broker_order.instruction_id if broker_order is not None else None)
+    )
+    if instruction_id is None:
+        return None, None, fill.currency, None
+
+    pnl_currency = fill.currency
+    basis_price, entry_quantity, entry_commission, entry_side = (
+        _entry_fill_basis_for_instruction(
+            session,
+            instruction_id=instruction_id,
+            pnl_currency=pnl_currency,
+        )
+    )
+    exit_quantity = _meaningful_decimal(fill.quantity)
+    exit_price = _meaningful_decimal(fill.price)
+    if basis_price is None or exit_quantity is None or exit_price is None:
+        return None, None, pnl_currency, None
+
+    position_side = _instruction_position_side(instruction) or entry_side
+    if position_side == "LONG":
+        gross_pnl = (exit_price - basis_price) * abs(exit_quantity)
+    elif position_side == "SHORT":
+        gross_pnl = (basis_price - exit_price) * abs(exit_quantity)
+    else:
+        return None, None, pnl_currency, _format_decimal(
+            basis_price,
+            places="0.00000001",
+        )
+
+    prorated_entry_commission = (
+        entry_commission * (abs(exit_quantity) / entry_quantity)
+        if entry_quantity > 0
+        else Decimal("0")
+    )
+    exit_commission = _commission_cost(
+        fill.commission,
+        commission_currency=fill.commission_currency,
+        pnl_currency=pnl_currency,
+    )
+    net_pnl = gross_pnl - prorated_entry_commission - exit_commission
+    return (
+        _format_signed_decimal(net_pnl, places="0.01"),
+        _format_signed_decimal(gross_pnl, places="0.01"),
+        pnl_currency,
+        _format_decimal(basis_price, places="0.00000001"),
+    )
+
+
 def _position_snapshot_matches_order(
     position_snapshot: PositionSnapshotRecord,
     *,
@@ -1222,10 +1424,19 @@ def _build_recent_fills(
     limit: int,
 ) -> tuple[OperatorExecutionFill, ...]:
     rows = session.execute(
-        select(ExecutionFillRecord, BrokerAccountRecord)
+        select(ExecutionFillRecord, BrokerAccountRecord, BrokerOrderRecord, InstructionRecord)
         .join(
             BrokerAccountRecord,
             BrokerAccountRecord.id == ExecutionFillRecord.broker_account_id,
+        )
+        .outerjoin(BrokerOrderRecord, BrokerOrderRecord.id == ExecutionFillRecord.broker_order_id)
+        .outerjoin(
+            InstructionRecord,
+            InstructionRecord.id
+            == func.coalesce(
+                ExecutionFillRecord.instruction_id,
+                BrokerOrderRecord.instruction_id,
+            ),
         )
         .order_by(
             ExecutionFillRecord.executed_at.desc(),
@@ -1233,32 +1444,49 @@ def _build_recent_fills(
         )
         .limit(limit)
     ).all()
-    return tuple(
-        OperatorExecutionFill(
-            fill_id=fill.id,
-            broker_order_id=fill.broker_order_id,
-            instruction_record_id=fill.instruction_id,
-            broker_kind=fill.broker_kind,
-            account_key=fill.account_key,
-            account_label=broker_account.account_label,
-            is_virtual=fill.is_virtual or broker_account.is_virtual,
-            executed_at=fill.executed_at,
-            symbol=fill.symbol,
-            exchange=fill.exchange,
-            currency=fill.currency,
-            security_type=fill.security_type,
-            side=fill.side,
-            quantity=fill.quantity,
-            price=fill.price,
-            commission=fill.commission,
-            commission_currency=fill.commission_currency,
-            order_ref=fill.order_ref,
-            external_execution_id=fill.external_execution_id,
-            external_order_id=fill.external_order_id,
-            external_perm_id=fill.external_perm_id,
+    recent_fills: list[OperatorExecutionFill] = []
+    for fill, broker_account, broker_order, instruction in rows:
+        order_role = _fill_order_role(fill, broker_order)
+        realized_pnl, realized_pnl_gross, realized_pnl_currency, realized_pnl_basis_price = (
+            _fill_realized_pnl(
+                session,
+                fill=fill,
+                broker_order=broker_order,
+                instruction=instruction,
+            )
         )
-        for fill, broker_account in rows
-    )
+        recent_fills.append(
+            OperatorExecutionFill(
+                fill_id=fill.id,
+                broker_order_id=fill.broker_order_id,
+                instruction_record_id=fill.instruction_id,
+                order_role=order_role,
+                broker_kind=fill.broker_kind,
+                account_key=fill.account_key,
+                account_label=broker_account.account_label,
+                is_virtual=fill.is_virtual or broker_account.is_virtual,
+                executed_at=fill.executed_at,
+                symbol=fill.symbol,
+                exchange=fill.exchange,
+                currency=fill.currency,
+                security_type=fill.security_type,
+                side=fill.side,
+                position_side=_fill_position_side(fill, broker_order, instruction),
+                quantity=fill.quantity,
+                price=fill.price,
+                commission=fill.commission,
+                commission_currency=fill.commission_currency,
+                realized_pnl=realized_pnl,
+                realized_pnl_gross=realized_pnl_gross,
+                realized_pnl_currency=realized_pnl_currency,
+                realized_pnl_basis_price=realized_pnl_basis_price,
+                order_ref=fill.order_ref,
+                external_execution_id=fill.external_execution_id,
+                external_order_id=fill.external_order_id,
+                external_perm_id=fill.external_perm_id,
+            )
+        )
+    return tuple(recent_fills)
 
 
 def _build_review_status_map(

@@ -18,14 +18,25 @@
   let instructions = operatorSnapshot.instructions;
   let marketTimeZone = data.health.runtime_timezone;
   let brokerMonitor = data.health.broker_monitor;
+  let ibGateway = data.health.ibgateway ?? null;
   let executionRuntime = data.health.execution_runtime;
   let omxBenchmark = data.omxBenchmark;
+  let marketStreamSnapshot = null;
+  let marketStreamMarks = new Map();
+  let marketStreamStatus = {
+    connected: false,
+    received_at: null,
+    latest_market_data_at: null,
+    running: null,
+    last_error: null
+  };
   let endpointErrors = [];
   let warningRuns = [];
   let killSwitchResult = null;
   let startupReconcileResult = null;
   let archiveResult = null;
   let instructionRowActionResult = null;
+  let intentCleanupResult = null;
   let orderRowActionResult = null;
   let brokerAttentionActionResult = null;
   let reconciliationIssueActionResult = null;
@@ -42,6 +53,10 @@
   let rlCandidateInstructions = [];
   let executionInstructions = [];
   let filteredInstructions = [];
+  let sourceIntentGroups = [];
+  let intentCleanupGroups = [];
+  let actionableIntentCleanupGroups = [];
+  let virtualIntentCleanupGroupCount = 0;
   let aggregatedBrokerAttention = [];
   let filteredBrokerAttention = [];
   let aggregatedReconciliation = [];
@@ -50,9 +65,18 @@
   let visibleReconciliationIssueIds = [];
   let stateSync = null;
   const terminalInstructionStates = new Set(['ENTRY_CANCELLED', 'COMPLETED', 'FAILED']);
+  const entryOwningInstructionStates = new Set(['ENTRY_PENDING', 'ENTRY_SUBMITTED']);
   const positionOwningInstructionStates = new Set(['POSITION_OPEN', 'EXIT_PENDING']);
-  const AUTO_REFRESH_INTERVAL_MS = 30000;
-  const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v3';
+  const closedOrderStatuses = new Set([
+    'API_CANCELLED',
+    'CANCELLED',
+    'ERROR',
+    'FILLED',
+    'INACTIVE',
+    'NOT_FOUND_AT_BROKER',
+    'REJECTED'
+  ]);
+  const FILTER_STORAGE_KEY = 'ibkr-trader-operator-filters/v4';
   const BUTTON_CLICK_TO_WORK_MS = 140;
   const BUTTON_SUCCESS_RESET_MS = 1600;
   const BUTTON_ERROR_RESET_MS = 2200;
@@ -66,6 +90,18 @@
     minute: '2-digit',
     second: '2-digit',
     timeZoneName: 'short'
+  });
+  const quantityFormatter = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 4
+  });
+  const priceFormatter = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+  const moneyFormatter = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
   });
 
   function defaultDashboardFilters() {
@@ -103,9 +139,11 @@
         account: '',
         symbol: '',
         side: '',
+        strat: '',
         quantity: '',
         price: '',
-        fee: ''
+        fee: '',
+        pnl: ''
       },
       instructions: {
         instruction: '',
@@ -189,30 +227,36 @@
   }
 
   $: operatorSnapshot = data.operatorSnapshot;
+  $: marketStreamMarks = buildMarketStreamMarks(marketStreamSnapshot);
   $: killSwitch = operatorSnapshot.kill_switch;
-  $: accounts = operatorSnapshot.accounts;
-  $: positions = operatorSnapshot.positions;
-  $: openOrders = operatorSnapshot.open_orders;
+  $: accounts = applyMarketStreamToAccounts(
+    operatorSnapshot.accounts,
+    operatorSnapshot.positions,
+    marketStreamMarks
+  );
+  $: positions = applyMarketStreamToPositions(operatorSnapshot.positions, marketStreamMarks);
+  $: openOrders = applyMarketStreamToOpenOrders(operatorSnapshot.open_orders, marketStreamMarks);
   $: recentFills = operatorSnapshot.recent_fills;
   $: brokerAttention = operatorSnapshot.recent_broker_attention;
   $: reconciliationRuns = operatorSnapshot.recent_reconciliation_runs;
   $: instructions = operatorSnapshot.instructions;
   $: marketTimeZone = data.health.runtime_timezone;
   $: brokerMonitor = data.health.broker_monitor;
+  $: ibGateway = data.health.ibgateway ?? null;
   $: executionRuntime = data.health.execution_runtime;
-  $: omxBenchmark = data.omxBenchmark;
+  $: omxBenchmark = buildLiveOmxBenchmark(data.omxBenchmark, marketStreamSnapshot);
   $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
   $: warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count) > 0);
   $: killSwitchResult = form?.killSwitchResult ?? null;
   $: startupReconcileResult = form?.startupReconcileResult ?? null;
   $: archiveResult = form?.archiveResult ?? null;
   $: instructionRowActionResult = form?.instructionRowActionResult ?? null;
+  $: intentCleanupResult = form?.intentCleanupResult ?? null;
   $: orderRowActionResult = form?.orderRowActionResult ?? null;
   $: brokerAttentionActionResult = form?.brokerAttentionActionResult ?? null;
   $: reconciliationIssueActionResult = form?.reconciliationIssueActionResult ?? null;
   $: acknowledgeAllLogsResult = form?.acknowledgeAllLogsResult ?? null;
   $: reconciliationClearResult = form?.reconciliationClearResult ?? null;
-  $: referenceNow = new Date(operatorSnapshot.generated_at);
   $: timestampFormatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: marketTimeZone,
     year: 'numeric',
@@ -283,6 +327,46 @@
     if (status?.ok === true) return 'ok';
     if (status?.ok === false) return 'bad';
     return 'warn';
+  }
+
+  function ibGatewayLabel() {
+    if (!ibGateway) return 'Unknown';
+    const status = ibGateway.status;
+    if (status === 'stuck_shutdown_after_existing_session') return 'Session Conflict';
+    if (status === 'shutdown_in_progress') return 'Shutting Down';
+    if (status === 'stuck_shutdown') return 'Stuck Shutdown';
+    if (status === 'existing_session_detected') return 'Existing Session';
+    if (status === 'restart_in_progress') return 'Restarting';
+    if (status === 'second_factor') return '2FA Pending';
+    if (status === 'deadlock_reported') return 'Deadlock';
+    if (status === 'login_completed_after_restart_2fa') return 'Restart / 2FA OK';
+    if (status === 'login_completed_with_config_warning') return 'Config Review';
+    if (status === 'login_completed') return 'Login Complete';
+    if (status === 'disabled') return 'Disabled';
+    return status ?? 'Unknown';
+  }
+
+  function ibGatewayClass() {
+    if (ibGateway?.severity === 'bad') return 'bad';
+    if (ibGateway?.severity === 'ok') return 'ok';
+    return 'warn';
+  }
+
+  function ibGatewayDetail() {
+    if (!ibGateway) return 'No Gateway diagnostics have been collected.';
+    const details = [ibGateway.summary].filter(Boolean);
+    if (ibGateway.latest_dialog) details.push(`Dialog: ${ibGateway.latest_dialog}`);
+    if (ibGateway.existing_session_detected_at) {
+      details.push(`Existing session ${formatTimestamp(ibGateway.existing_session_detected_at)}`);
+    }
+    for (const warning of ibGateway.configuration_warnings ?? []) {
+      details.push(warning);
+    }
+    if (ibGateway.latest_event_at) {
+      details.push(`Latest ${formatTimestamp(ibGateway.latest_event_at)}`);
+    }
+    if (ibGateway.error) details.push(ibGateway.error);
+    return details.join(' · ') || ibGateway.status || 'No recent Gateway UI state.';
   }
 
   function executionRuntimeLabel() {
@@ -534,6 +618,46 @@
     return Math.abs(parsed) < 1e12 ? parsed : null;
   }
 
+  function formatNumericValue(value, formatter, { zeroAsUnavailable = false } = {}) {
+    if (value === null || value === undefined || value === '') {
+      return 'n/a';
+    }
+
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) {
+      return String(value);
+    }
+    if (zeroAsUnavailable && parsed === 0) {
+      return 'n/a';
+    }
+    return formatter.format(parsed);
+  }
+
+  function formatQuantity(value) {
+    return formatNumericValue(value, quantityFormatter);
+  }
+
+  function formatPrice(value, options = {}) {
+    return formatNumericValue(value, priceFormatter, options);
+  }
+
+  function formatMoney(value) {
+    return formatNumericValue(value, moneyFormatter);
+  }
+
+  function formatSignedMoney(value) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) return 'n/a';
+    const prefix = parsed > 0 ? '+' : '';
+    return `${prefix}${moneyFormatter.format(parsed)}`;
+  }
+
+  function moneyTone(value) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null || parsed === 0) return 'subtle';
+    return parsed > 0 ? 'ok' : 'bad';
+  }
+
   function formatReturnPct(value) {
     const parsed = parseFiniteNumber(value);
     if (parsed === null) return 'n/a';
@@ -552,6 +676,473 @@
     const parsed = parseFiniteNumber(value);
     if (parsed === null) return 'n/a';
     return Math.abs(parsed).toFixed(digits);
+  }
+
+  function formatPlainNumber(value, digits = 8) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) {
+      return null;
+    }
+    const rounded = Number.parseFloat(parsed.toFixed(digits));
+    return String(rounded);
+  }
+
+  function formatSignedDecimal(value, digits = 2) {
+    const parsed = parseFiniteNumber(value);
+    if (parsed === null) {
+      return null;
+    }
+    const text = parsed.toFixed(digits);
+    return parsed > 0 ? `+${text}` : text;
+  }
+
+  function firstFinite(values) {
+    for (const value of values) {
+      const parsed = parseFiniteNumber(value);
+      if (parsed !== null) {
+        return parsed;
+      }
+    }
+    return null;
+  }
+
+  function streamPayload(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      return {};
+    }
+    return snapshot.stream && typeof snapshot.stream === 'object' ? snapshot.stream : snapshot;
+  }
+
+  function streamSymbolKeys(symbol) {
+    const normalized = String(symbol ?? '').trim().toUpperCase();
+    if (!normalized) {
+      return [];
+    }
+    const keys = new Set([normalized]);
+    if (normalized.includes('-')) {
+      keys.add(normalized.replaceAll('-', ' '));
+    }
+    if (normalized.includes(' ')) {
+      keys.add(normalized.replaceAll(' ', '-'));
+    }
+    return [...keys];
+  }
+
+  function streamRowSymbol(row) {
+    return row?.symbol ?? row?.local_symbol ?? '';
+  }
+
+  function streamQuotePrice(quote) {
+    const bid = parseFiniteNumber(quote?.bid_price);
+    const ask = parseFiniteNumber(quote?.ask_price);
+    const bidAskMidpoint = bid !== null && ask !== null ? (bid + ask) / 2 : null;
+    return firstFinite([
+      quote?.last_price,
+      bidAskMidpoint,
+      quote?.midpoint_price,
+      quote?.close_price,
+      bid,
+      ask
+    ]);
+  }
+
+  function latestStreamBar(bars) {
+    if (!Array.isArray(bars)) {
+      return null;
+    }
+    for (let index = bars.length - 1; index >= 0; index -= 1) {
+      if (bars[index] && typeof bars[index] === 'object') {
+        return bars[index];
+      }
+    }
+    return null;
+  }
+
+  function previousStreamBar(bars) {
+    if (!Array.isArray(bars)) {
+      return null;
+    }
+    let seenLatest = false;
+    for (let index = bars.length - 1; index >= 0; index -= 1) {
+      if (!bars[index] || typeof bars[index] !== 'object') {
+        continue;
+      }
+      if (!seenLatest) {
+        seenLatest = true;
+        continue;
+      }
+      return bars[index];
+    }
+    return null;
+  }
+
+  function streamTimestamp(value) {
+    const parsed = parseTimestamp(value);
+    return parsed ? parsed.toISOString() : null;
+  }
+
+  function buildMarketStreamMarks(snapshot) {
+    const stream = streamPayload(snapshot);
+    const quoteBySymbol = new Map();
+    const barsBySymbol = new Map();
+    const quotes = Array.isArray(stream.quotes) ? stream.quotes : [];
+    const rawBarsBySymbol =
+      stream.bars_by_symbol && typeof stream.bars_by_symbol === 'object'
+        ? stream.bars_by_symbol
+        : {};
+
+    for (const quote of quotes) {
+      if (!quote || typeof quote !== 'object') {
+        continue;
+      }
+      for (const key of streamSymbolKeys(quote.symbol)) {
+        quoteBySymbol.set(key, quote);
+      }
+    }
+
+    for (const [symbol, bars] of Object.entries(rawBarsBySymbol)) {
+      for (const key of streamSymbolKeys(symbol)) {
+        barsBySymbol.set(key, Array.isArray(bars) ? bars : []);
+      }
+    }
+
+    const marks = new Map();
+    const keys = new Set([...quoteBySymbol.keys(), ...barsBySymbol.keys()]);
+    for (const key of keys) {
+      const quote = quoteBySymbol.get(key);
+      const bars = barsBySymbol.get(key) ?? [];
+      const latestBar = latestStreamBar(bars);
+      const previousBar = previousStreamBar(bars);
+      let price = quote ? streamQuotePrice(quote) : null;
+      let source = 'quote';
+      let observedAt = quote
+        ? streamTimestamp(quote.last_trade_at ?? quote.updated_at)
+        : null;
+
+      if (price === null && latestBar) {
+        price = parseFiniteNumber(latestBar.close);
+        observedAt = streamTimestamp(latestBar.timestamp);
+        source = 'bar';
+      } else if (!observedAt && latestBar) {
+        observedAt = streamTimestamp(latestBar.timestamp);
+      }
+      if (price === null) {
+        continue;
+      }
+
+      let previousPrice = previousBar ? parseFiniteNumber(previousBar.close) : null;
+      if (previousPrice === null && quote) {
+        previousPrice = parseFiniteNumber(quote.close_price);
+      }
+      let direction = null;
+      if (previousPrice !== null) {
+        direction = price > previousPrice ? 'UP' : price < previousPrice ? 'DOWN' : 'UNCHANGED';
+      }
+      const canonicalSymbol = String(quote?.symbol ?? key).trim().toUpperCase();
+      const mark = {
+        symbol: canonicalSymbol,
+        price,
+        previous_price: previousPrice,
+        observed_at: observedAt,
+        source,
+        direction
+      };
+      for (const candidate of [...streamSymbolKeys(key), ...streamSymbolKeys(canonicalSymbol)]) {
+        marks.set(candidate, mark);
+      }
+    }
+    return marks;
+  }
+
+  function marketMarkForRow(row, marks = marketStreamMarks) {
+    for (const key of streamSymbolKeys(streamRowSymbol(row))) {
+      const mark = marks.get(key);
+      if (mark) {
+        return mark;
+      }
+    }
+    return null;
+  }
+
+  function applyMarketStreamToPositions(basePositions, marks) {
+    if (!marks || marks.size === 0) {
+      return basePositions ?? [];
+    }
+    let changed = false;
+    const rows = (basePositions ?? []).map((position) => {
+      const quantity = parseFiniteNumber(position.quantity);
+      const mark = marketMarkForRow(position, marks);
+      if (quantity === null || mark === null) {
+        return position;
+      }
+      const averageCost = parseFiniteNumber(position.average_cost);
+      const marketValue = quantity * mark.price;
+      const unrealizedPnl =
+        averageCost !== null ? quantity * (mark.price - averageCost) : null;
+      changed = true;
+      return {
+        ...position,
+        market_price: formatPlainNumber(mark.price),
+        market_value: formatPlainNumber(marketValue),
+        unrealized_pnl: formatPlainNumber(unrealizedPnl),
+        market_price_at: mark.observed_at,
+        market_data_source: 'market_stream'
+      };
+    });
+    return changed ? rows : (basePositions ?? []);
+  }
+
+  function latestIsoTimestamp(left, right) {
+    const leftDate = parseTimestamp(left);
+    const rightDate = parseTimestamp(right);
+    if (!leftDate) {
+      return rightDate ? rightDate.toISOString() : null;
+    }
+    if (!rightDate) {
+      return leftDate.toISOString();
+    }
+    return leftDate.getTime() >= rightDate.getTime()
+      ? leftDate.toISOString()
+      : rightDate.toISOString();
+  }
+
+  function enrichAccountDayPerformance(account, netLiquidation, markedAt) {
+    const markedDate = parseTimestamp(markedAt);
+    const dayPerformance = account.day_performance;
+    if (!markedDate || !dayPerformance || typeof dayPerformance !== 'object') {
+      return account;
+    }
+    const points = Array.isArray(dayPerformance.points) ? [...dayPerformance.points] : [];
+    let startValue = parseFiniteNumber(dayPerformance.start_net_liquidation);
+    if (startValue === null && points.length > 0) {
+      startValue = parseFiniteNumber(points[0]?.net_liquidation);
+    }
+    if (startValue === null || startValue === 0) {
+      return account;
+    }
+
+    const latestReturn = ((netLiquidation - startValue) / startValue) * 100;
+    const point = {
+      snapshot_at: markedDate.toISOString(),
+      net_liquidation: formatPlainNumber(netLiquidation),
+      return_pct: formatSignedDecimal(latestReturn) ?? '0.00'
+    };
+    const latestPointAt = parseTimestamp(points.at(-1)?.snapshot_at ?? points.at(-1)?.timestamp);
+    if (!latestPointAt || markedDate.getTime() > latestPointAt.getTime()) {
+      points.push(point);
+    } else if (markedDate.getTime() === latestPointAt.getTime()) {
+      points[points.length - 1] = point;
+    }
+
+    return {
+      ...account,
+      day_performance: {
+        ...dayPerformance,
+        latest_at: markedDate.toISOString(),
+        latest_net_liquidation: formatPlainNumber(netLiquidation),
+        latest_return_pct: formatSignedDecimal(latestReturn),
+        points
+      }
+    };
+  }
+
+  function incrementMap(map, key, amount = 1) {
+    map.set(key, (map.get(key) ?? 0) + amount);
+  }
+
+  function applyMarketStreamToAccounts(baseAccounts, basePositions, marks) {
+    const accountsToMark = baseAccounts ?? [];
+    if (!marks || marks.size === 0) {
+      return accountsToMark;
+    }
+
+    const virtualAccounts = new Set(
+      accountsToMark
+        .filter((account) => account?.is_virtual)
+        .map((account) => String(account.account_key ?? ''))
+    );
+    const accountPositionCounts = new Map();
+    const accountMarkedPositionCounts = new Map();
+    const accountStreamMarketValues = new Map();
+    const accountDeltas = new Map();
+    const accountLatestAt = new Map();
+
+    for (const position of basePositions ?? []) {
+      const accountKey = String(position?.account_key ?? '');
+      const quantity = parseFiniteNumber(position?.quantity);
+      if (!accountKey || quantity === null || quantity === 0) {
+        continue;
+      }
+      incrementMap(accountPositionCounts, accountKey);
+      const mark = marketMarkForRow(position, marks);
+      if (!mark) {
+        continue;
+      }
+
+      const marketValue = quantity * mark.price;
+      let oldMarketValue = parseFiniteNumber(position.market_value);
+      const oldMarketValueWasAvailable = oldMarketValue !== null;
+      if (oldMarketValue === null) {
+        const oldMarketPrice = parseFiniteNumber(position.market_price);
+        oldMarketValue = oldMarketPrice !== null ? quantity * oldMarketPrice : 0;
+      }
+      incrementMap(accountMarkedPositionCounts, accountKey);
+      incrementMap(accountStreamMarketValues, accountKey, marketValue);
+      if (mark.observed_at) {
+        accountLatestAt.set(
+          accountKey,
+          latestIsoTimestamp(accountLatestAt.get(accountKey), mark.observed_at)
+        );
+      }
+      if (virtualAccounts.has(accountKey) || (oldMarketValueWasAvailable && oldMarketValue !== 0)) {
+        incrementMap(accountDeltas, accountKey, marketValue - oldMarketValue);
+      }
+    }
+
+    let changed = false;
+    const rows = accountsToMark.map((account) => {
+      const accountKey = String(account?.account_key ?? '');
+      const currentNet = parseFiniteNumber(account?.net_liquidation);
+      if (!accountKey || currentNet === null) {
+        return account;
+      }
+
+      let valuationMethod = 'mark_delta';
+      let delta = accountDeltas.get(accountKey);
+      let streamNet = null;
+      if (
+        !virtualAccounts.has(accountKey) &&
+        (accountPositionCounts.get(accountKey) ?? 0) > 0 &&
+        accountMarkedPositionCounts.get(accountKey) === accountPositionCounts.get(accountKey)
+      ) {
+        const cashValue = parseFiniteNumber(account.total_cash_value);
+        if (cashValue !== null) {
+          streamNet = cashValue + (accountStreamMarketValues.get(accountKey) ?? 0);
+          delta = streamNet - currentNet;
+          valuationMethod = 'cash_plus_stream_positions';
+        }
+      }
+      if (streamNet === null && delta !== undefined) {
+        streamNet = currentNet + delta;
+      }
+      if (streamNet === null) {
+        return account;
+      }
+
+      changed = true;
+      const markedAt = accountLatestAt.get(accountKey) ?? null;
+      const nextAccount = {
+        ...account,
+        net_liquidation: formatPlainNumber(streamNet),
+        stream_valuation: {
+          source: 'market_stream',
+          method: valuationMethod,
+          base_net_liquidation: formatPlainNumber(currentNet),
+          mark_delta: formatPlainNumber(delta),
+          stream_position_market_value: formatPlainNumber(accountStreamMarketValues.get(accountKey)),
+          marked_at: markedAt
+        }
+      };
+      return enrichAccountDayPerformance(nextAccount, streamNet, markedAt);
+    });
+    return changed ? rows : accountsToMark;
+  }
+
+  function workingOrderPrice(order) {
+    return firstFinite([order?.working_price, order?.limit_price, order?.stop_price]);
+  }
+
+  function applyMarketStreamToOpenOrders(baseOpenOrders, marks) {
+    if (!marks || marks.size === 0) {
+      return baseOpenOrders ?? [];
+    }
+    let changed = false;
+    const rows = (baseOpenOrders ?? []).map((order) => {
+      const mark = marketMarkForRow(order, marks);
+      if (!mark) {
+        return order;
+      }
+      const workingPrice = workingOrderPrice(order);
+      const nextOrder = {
+        ...order,
+        reference_market_price: formatPlainNumber(mark.price),
+        reference_market_price_at: mark.observed_at,
+        last_market_price_direction: mark.direction,
+        market_data_source: 'market_stream'
+      };
+      if (workingPrice !== null) {
+        const spread = workingPrice - mark.price;
+        nextOrder.price_spread = formatSignedDecimal(spread);
+        nextOrder.price_spread_pct =
+          mark.price !== 0 ? formatSignedDecimal((spread / mark.price) * 100) : null;
+        nextOrder.spread_reference =
+          order.working_price_reference ?? (order.limit_price ? 'LIMIT' : 'STOP');
+      }
+      changed = true;
+      return nextOrder;
+    });
+    return changed ? rows : (baseOpenOrders ?? []);
+  }
+
+  function streamBarsForSymbol(snapshot, symbol) {
+    const stream = streamPayload(snapshot);
+    const barsBySymbol =
+      stream.bars_by_symbol && typeof stream.bars_by_symbol === 'object'
+        ? stream.bars_by_symbol
+        : {};
+    for (const key of streamSymbolKeys(symbol)) {
+      const bars = barsBySymbol[key];
+      if (Array.isArray(bars)) {
+        return bars;
+      }
+    }
+    return [];
+  }
+
+  function buildLiveOmxBenchmark(fallbackBenchmark, snapshot) {
+    const bars = streamBarsForSymbol(snapshot, 'OMXS30');
+    const validBars = bars
+      .map((bar) => ({
+        timestamp: streamTimestamp(bar?.timestamp),
+        value: parseFiniteNumber(bar?.close)
+      }))
+      .filter((bar) => bar.timestamp && bar.value !== null);
+    const fallbackPoints = Array.isArray(fallbackBenchmark?.points)
+      ? fallbackBenchmark.points
+          .map((point) => ({
+            timestamp: streamTimestamp(point?.timestamp),
+            value: parseFiniteNumber(point?.value)
+          }))
+          .filter((point) => point.timestamp && point.value !== null)
+      : [];
+    const mergedByTimestamp = new Map();
+    for (const point of [...fallbackPoints, ...validBars]) {
+      mergedByTimestamp.set(point.timestamp, point);
+    }
+    const mergedPoints = [...mergedByTimestamp.values()].sort(
+      (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()
+    );
+    const first = mergedPoints.find((bar) => bar.value !== 0);
+    if (!first) {
+      return fallbackBenchmark;
+    }
+
+    const points = mergedPoints.map((bar) => ({
+      timestamp: bar.timestamp,
+      value: bar.value,
+      return_pct: ((bar.value - first.value) / first.value) * 100
+    }));
+    const latest = points.at(-1);
+    return {
+      ...(fallbackBenchmark ?? {}),
+      label: 'OMX',
+      symbol: 'OMXS30',
+      status: points.length > 1 ? 'ok' : 'insufficient_data',
+      error: null,
+      latest_return_pct: latest?.return_pct ?? null,
+      points,
+      source: 'market_stream'
+    };
   }
 
   function normalizePerformancePoints(points, valueField = 'return_pct') {
@@ -831,17 +1422,35 @@
     return `${order.fill_price_spread}${pctSuffix}`;
   }
 
+  function fillExitPnlLabel(fill) {
+    if (!fill.realized_pnl) {
+      return fill.order_role === 'EXIT' ? 'pending' : 'n/a';
+    }
+    return `${formatSignedMoney(fill.realized_pnl)} ${fill.realized_pnl_currency ?? fill.currency}`;
+  }
+
+  function fillStrategyLabel(fill) {
+    const side = String(fill.position_side ?? '').trim().toUpperCase();
+    if (side === 'LONG') {
+      return 'Long';
+    }
+    if (side === 'SHORT') {
+      return 'Short';
+    }
+    return 'n/a';
+  }
+
+  function fillExitPnlSearchText(fill) {
+    return [
+      fill.order_role,
+      fillExitPnlLabel(fill),
+      fill.realized_pnl_gross ? `gross ${fill.realized_pnl_gross}` : null,
+      fill.realized_pnl_basis_price ? `basis ${fill.realized_pnl_basis_price}` : null
+    ].filter(Boolean).join(' ');
+  }
+
   function displayOrderPrice(value) {
-    if (value === null || value === undefined || value === '') {
-      return 'n/a';
-    }
-
-    const normalized = String(value).trim();
-    if (normalized === '0' || normalized === '0.0' || normalized === '0.00') {
-      return 'n/a';
-    }
-
-    return normalized;
+    return formatPrice(value, { zeroAsUnavailable: true });
   }
 
   async function refreshDashboard() {
@@ -859,18 +1468,123 @@
     }
   }
 
+  function marketStreamStatusClass() {
+    if (marketStreamStatus.last_error) {
+      return marketStreamStatus.connected ? 'warn' : 'bad';
+    }
+    if (marketStreamStatus.running === false) {
+      return 'bad';
+    }
+    const age = ageSeconds(marketStreamStatus.latest_market_data_at);
+    if (age === null) {
+      return marketStreamStatus.connected ? 'warn' : 'bad';
+    }
+    if (age <= 15) {
+      return 'ok';
+    }
+    if (age <= 180) {
+      return 'warn';
+    }
+    return 'bad';
+  }
+
+  function marketStreamStatusLabel() {
+    if (marketStreamStatus.last_error && !marketStreamStatus.connected) {
+      return 'Disconnected';
+    }
+    if (marketStreamStatus.running === false) {
+      return 'Stopped';
+    }
+    if (marketStreamStatus.latest_market_data_at) {
+      return 'Live';
+    }
+    return marketStreamStatus.connected ? 'Listening' : 'Connecting';
+  }
+
+  function marketStreamStatusDetail() {
+    if (marketStreamStatus.last_error) {
+      return marketStreamStatus.last_error;
+    }
+    if (marketStreamStatus.latest_market_data_at) {
+      return `Latest tick ${formatTimestamp(marketStreamStatus.latest_market_data_at)}`;
+    }
+    if (marketStreamStatus.received_at) {
+      return `Snapshot received ${formatTimestamp(marketStreamStatus.received_at)}`;
+    }
+    return 'Waiting for stream snapshot';
+  }
+
+  function openMarketStreamEvents() {
+    if (!browser || !window.EventSource) {
+      return null;
+    }
+    const source = new EventSource('/api/market-stream/events?bar_limit=1');
+    source.onopen = () => {
+      marketStreamStatus = {
+        ...marketStreamStatus,
+        connected: true,
+        last_error: null
+      };
+    };
+    source.addEventListener('stream', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        const stream = payload?.stream ?? {};
+        marketStreamSnapshot = stream;
+        marketStreamStatus = {
+          connected: true,
+          received_at: payload?.received_at ?? new Date().toISOString(),
+          latest_market_data_at:
+            stream.latest_market_data_at ?? stream.latest_quote_at ?? stream.latest_trade_at ?? null,
+          running: stream.running ?? null,
+          last_error: stream.last_error ?? null
+        };
+      } catch (error) {
+        marketStreamStatus = {
+          ...marketStreamStatus,
+          connected: true,
+          last_error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    });
+    source.addEventListener('stream-error', (event) => {
+      let message = 'Live market stream unavailable';
+      try {
+        message = JSON.parse(event.data)?.message ?? message;
+      } catch {
+        // Keep the generic message.
+      }
+      marketStreamStatus = {
+        ...marketStreamStatus,
+        connected: false,
+        received_at: new Date().toISOString(),
+        last_error: message
+      };
+    });
+    source.onerror = () => {
+      marketStreamStatus = {
+        ...marketStreamStatus,
+        connected: false,
+        last_error: 'Live market event stream disconnected.'
+      };
+    };
+    return source;
+  }
+
   onMount(() => {
     if (browser) {
       dashboardFilters = parseStoredFilters(window.localStorage.getItem(FILTER_STORAGE_KEY));
       filtersLoaded = true;
     }
 
-    const intervalId = window.setInterval(() => {
-      void refreshDashboard();
-    }, AUTO_REFRESH_INTERVAL_MS);
+    const marketStreamEvents = openMarketStreamEvents();
+    const clockIntervalId = window.setInterval(() => {
+      referenceNow = new Date();
+    }, 5000);
 
     return () => {
-      window.clearInterval(intervalId);
+      marketStreamEvents?.close();
+      window.clearInterval(clockIntervalId);
     };
   });
 
@@ -884,6 +1598,10 @@
     const state = instruction.state ?? 'UNKNOWN';
 
     if (state === 'EXIT_PENDING') {
+      const exitPlanState = instructionExitPlanState(instruction);
+      if (exitPlanState) {
+        return exitPlanState;
+      }
       return {
         label: 'Exit Active',
         className: 'ok',
@@ -897,6 +1615,10 @@
     }
 
     if (state === 'POSITION_OPEN') {
+      const exitPlanState = instructionExitPlanState(instruction);
+      if (exitPlanState) {
+        return exitPlanState;
+      }
       return {
         label: 'Position Open',
         className: 'ok',
@@ -1008,6 +1730,10 @@
   function instructionGuidance(instruction) {
     const windowState = instructionWindowState(instruction);
     const forceNextOpen = instructionForcesNextOpenExit(instruction);
+    const nextOpenAt = instructionNextSessionOpenAt(instruction);
+    const nextOpenPassed = forceNextOpen && nextOpenAt && referenceNow > nextOpenAt;
+    const liveEntryOrder = liveEntryOrderForInstruction(instruction, openOrders);
+    const liveExitOrder = liveMarketExitOrderForInstruction(instruction, openOrders);
 
     if (instruction.state === 'ENTRY_PENDING') {
       if (windowState.isScheduled) {
@@ -1020,6 +1746,9 @@
     }
 
     if (instruction.state === 'ENTRY_SUBMITTED') {
+      if (liveEntryOrder) {
+        return workingEntryGuidance(liveEntryOrder);
+      }
       if (windowState.isExpired) {
         return 'The broker entry is past expiry. Runtime should cancel or reconcile it.';
       }
@@ -1028,6 +1757,12 @@
 
     if (instruction.state === 'POSITION_OPEN') {
       if (forceNextOpen) {
+        if (liveExitOrder) {
+          return 'Entry filled. A matching live market exit order is working at broker; runtime should not duplicate it.';
+        }
+        if (nextOpenPassed) {
+          return 'Entry filled. The forced next-open timestamp has passed; verify that a live market exit order covers the position.';
+        }
         return 'Entry filled. Next-session-open forced market exit is armed; runtime owns the close.';
       }
       return 'Entry filled. Runtime is now responsible for exit management.';
@@ -1035,6 +1770,12 @@
 
     if (instruction.state === 'EXIT_PENDING') {
       if (forceNextOpen) {
+        if (liveExitOrder) {
+          return 'Exit workflow is active. A matching live market exit order is working at broker; runtime should not duplicate it.';
+        }
+        if (nextOpenPassed) {
+          return 'Exit workflow is active. The forced next-open timestamp has passed; runtime treats it as due until a live market exit or completion is reconciled.';
+        }
         return 'Exit workflow is active. Next-session-open forced market exit is armed even if an older protective exit row was cancelled.';
       }
       return 'Exit workflow is active and still awaiting completion.';
@@ -1095,8 +1836,413 @@
     );
   }
 
+  function normalizedStatus(value) {
+    const normalized = String(value ?? '').trim().toUpperCase();
+    return normalized || null;
+  }
+
+  function isOpenBrokerOrder(order) {
+    const status = normalizedStatus(order?.status);
+    return !closedOrderStatuses.has(status);
+  }
+
+  function isMarketOrder(order) {
+    const orderType = normalizedStatus(order?.order_type);
+    return orderType === 'MKT' || orderType === 'MARKET';
+  }
+
+  function exitSideForInstruction(instruction) {
+    return normalizedStatus(instruction?.side) === 'SELL' ? 'BUY' : 'SELL';
+  }
+
+  function exitSideForPosition(position, instruction) {
+    const quantity = parseFiniteNumber(position?.quantity);
+    if (quantity !== null && quantity < 0) return 'BUY';
+    if (quantity !== null && quantity > 0) return 'SELL';
+    return exitSideForInstruction(instruction);
+  }
+
+  function orderMatchesPositionAccount(order, position) {
+    const orderAccount = normalizedStatus(order?.account_key);
+    const positionAccount = normalizedStatus(position?.account_key);
+    return !orderAccount || !positionAccount || orderAccount === positionAccount;
+  }
+
+  function orderMatchesPositionInstrument(order, position) {
+    const orderSymbols = [order?.local_symbol, order?.symbol].map(normalizedSymbol).filter(Boolean);
+    const positionSymbols = [position?.local_symbol, position?.symbol].map(normalizedSymbol).filter(Boolean);
+    return orderSymbols.some((symbol) => positionSymbols.includes(symbol));
+  }
+
+  function orderQuantityCoversPosition(order, position) {
+    const orderQuantity = parseFiniteNumber(order?.total_quantity);
+    const positionQuantity = parseFiniteNumber(position?.quantity);
+    if (orderQuantity === null || positionQuantity === null) {
+      return true;
+    }
+    return Math.abs(orderQuantity) >= Math.abs(positionQuantity);
+  }
+
+  function orderMatchesInstructionAccount(order, instruction) {
+    const orderAccount = normalizedStatus(order?.account_key);
+    const instructionAccount = normalizedStatus(instruction?.account_key);
+    return !orderAccount || !instructionAccount || orderAccount === instructionAccount;
+  }
+
+  function orderMatchesInstructionInstrument(order, instruction) {
+    const payloadInstrument = instruction?.payload?.instruction?.instrument ?? {};
+    const orderSymbols = [order?.local_symbol, order?.symbol].map(normalizedSymbol).filter(Boolean);
+    const instructionSymbols = [
+      instruction?.symbol,
+      payloadInstrument?.local_symbol,
+      payloadInstrument?.symbol
+    ].map(normalizedSymbol).filter(Boolean);
+    return orderSymbols.some((symbol) => instructionSymbols.includes(symbol));
+  }
+
+  function remainingExitQuantityForInstruction(instruction) {
+    const entryQuantity = parseFiniteNumber(
+      instruction?.entry_filled_quantity ?? instruction?.entry_submitted_quantity
+    );
+    if (entryQuantity === null) {
+      return null;
+    }
+    const exitQuantity = parseFiniteNumber(instruction?.exit_filled_quantity) ?? 0;
+    return Math.max(0, Math.abs(entryQuantity) - Math.abs(exitQuantity));
+  }
+
+  function orderQuantityCoversInstruction(order, instruction) {
+    const orderQuantity = parseFiniteNumber(order?.total_quantity);
+    const remainingQuantity = remainingExitQuantityForInstruction(instruction);
+    if (orderQuantity === null || remainingQuantity === null) {
+      return true;
+    }
+    return Math.abs(orderQuantity) >= remainingQuantity;
+  }
+
+  function liveMarketExitOrderForPosition(position, instruction, orderRows = openOrders) {
+    const expectedSide = exitSideForPosition(position, instruction);
+    return (orderRows ?? []).find(
+      (order) =>
+        isOpenBrokerOrder(order) &&
+        isMarketOrder(order) &&
+        normalizedStatus(order?.side) === expectedSide &&
+        orderMatchesPositionAccount(order, position) &&
+        orderMatchesPositionInstrument(order, position) &&
+        orderQuantityCoversPosition(order, position)
+    );
+  }
+
+  function liveMarketExitOrderForInstruction(instruction, orderRows = openOrders) {
+    const expectedSide = exitSideForInstruction(instruction);
+    return (orderRows ?? []).find(
+      (order) =>
+        isOpenBrokerOrder(order) &&
+        isMarketOrder(order) &&
+        normalizedStatus(order?.side) === expectedSide &&
+        orderMatchesInstructionAccount(order, instruction) &&
+        orderMatchesInstructionInstrument(order, instruction) &&
+        orderQuantityCoversInstruction(order, instruction)
+    );
+  }
+
+  function liveEntryOrderForInstruction(instruction, orderRows = openOrders) {
+    const expectedSide = normalizedStatus(instruction?.side);
+    return (orderRows ?? []).find(
+      (order) =>
+        isOpenBrokerOrder(order) &&
+        normalizedStatus(order?.order_role) === 'ENTRY' &&
+        normalizedStatus(order?.side) === expectedSide &&
+        (
+          String(order?.instruction_record_id ?? '') === String(instruction?.record_id ?? '') ||
+          String(order?.order_ref ?? '') === String(instruction?.instruction_id ?? '') ||
+          String(order?.external_order_id ?? '') === String(instruction?.broker_order_id ?? '')
+        ) &&
+        orderMatchesInstructionAccount(order, instruction) &&
+        orderMatchesInstructionInstrument(order, instruction)
+    );
+  }
+
+  function workingEntryGuidance(order) {
+    const orderId = order?.external_order_id ? `order ${order.external_order_id}` : openOrderReference(order);
+    const symbol = order?.local_symbol ?? order?.symbol ?? 'symbol';
+    const limitPrice = displayOrderPrice(order?.limit_price);
+    const stopPrice = displayOrderPrice(order?.stop_price);
+    const priceParts = [];
+    if (limitPrice !== 'n/a') priceParts.push(`limit ${limitPrice}`);
+    if (stopPrice !== 'n/a') priceParts.push(`stop ${stopPrice}`);
+    const priceText = priceParts.length > 0 ? ` at ${priceParts.join(', ')}` : '';
+    const marketText = order?.reference_market_price
+      ? ` Market ${formatPrice(order.reference_market_price)}, ${orderSpreadLabel(order)}.`
+      : '';
+    return (
+      `Working broker entry ${orderId}: ${order?.side ?? 'n/a'} ` +
+      `${formatQuantity(order?.total_quantity)} ${symbol} ${order?.order_type ?? 'order'}${priceText}.` +
+      marketText
+    );
+  }
+
+  function openOrderReference(order) {
+    return (
+      order?.order_ref ??
+      (order?.external_perm_id ? `perm ${order.external_perm_id}` : null) ??
+      (order?.external_order_id ? `order ${order.external_order_id}` : null) ??
+      'broker order'
+    );
+  }
+
   function instructionForcesNextOpenExit(instruction) {
     return instruction?.payload?.instruction?.exit?.force_exit_next_session_open === true;
+  }
+
+  function instructionNextSessionExit(instruction) {
+    return instruction?.runtime_schedule?.next_session_exit ?? null;
+  }
+
+  function instructionNextSessionOpenAt(instruction) {
+    const nextSessionExit = instructionNextSessionExit(instruction);
+    return parseTimestamp(
+      nextSessionExit?.next_session_open_utc ?? nextSessionExit?.next_session_open_local
+    );
+  }
+
+  function instructionExitPlanState(instruction) {
+    const liveExitOrder = liveMarketExitOrderForInstruction(instruction, openOrders);
+    if (liveExitOrder) {
+      return {
+        label: 'Exit order live',
+        className: 'ok',
+        detail:
+          `${instruction.state}; ${liveExitOrder.side} ` +
+          `${formatQuantity(liveExitOrder.total_quantity)} ${liveExitOrder.order_type} ` +
+          `${openOrderReference(liveExitOrder)} is working at broker.`,
+        isScheduled: false,
+        isOpen: true,
+        isExpired: false
+      };
+    }
+
+    if (!instructionForcesNextOpenExit(instruction)) {
+      return null;
+    }
+
+    const nextOpenAt = instructionNextSessionOpenAt(instruction);
+    if (nextOpenAt && referenceNow > nextOpenAt) {
+      return {
+        label: 'Next open passed',
+        className: 'bad',
+        detail:
+          `${instruction.state}; forced next-open time passed ` +
+          `${formatTimestamp(nextOpenAt.toISOString())}, and no matching live market exit order is visible.`,
+        isScheduled: false,
+        isOpen: true,
+        isExpired: true
+      };
+    }
+    if (nextOpenAt) {
+      return {
+        label: 'Next open armed',
+        className: 'ok',
+        detail:
+          `${instruction.state}; runtime will submit the forced market exit near ` +
+          `${formatTimestamp(nextOpenAt.toISOString())}.`,
+        isScheduled: true,
+        isOpen: true,
+        isExpired: false
+      };
+    }
+    return {
+      label: 'Next open unresolved',
+      className: 'warn',
+      detail:
+        `${instruction.state}; force_exit_next_session_open is set, ` +
+        'but the runtime schedule is unavailable in the dashboard snapshot.',
+      isScheduled: false,
+      isOpen: true,
+      isExpired: false
+    };
+  }
+
+  function normalizeIntentText(value, { upper = true } = {}) {
+    const normalized = String(value ?? '').trim();
+    return upper ? normalized.toUpperCase() : normalized.toLowerCase();
+  }
+
+  function instructionBookSide(instruction) {
+    const payloadInstruction = instruction?.payload?.instruction ?? {};
+    const bookSide =
+      payloadInstruction?.account?.book_side ??
+      payloadInstruction?.intent?.position_side;
+    if (bookSide) {
+      return normalizeIntentText(bookSide);
+    }
+    return normalizeIntentText(instruction?.side) === 'SELL' ? 'SHORT' : 'LONG';
+  }
+
+  function accountLabelLookup(accountRows) {
+    return new Map(
+      (accountRows ?? [])
+        .map((account) => [
+          normalizeIntentText(account.account_key),
+          account.account_label ?? account.account_key
+        ])
+        .filter(([accountKey]) => accountKey)
+    );
+  }
+
+  function instructionCleanupSelector(instruction) {
+    return {
+      account_key: normalizeIntentText(instruction.account_key),
+      book_key: normalizeIntentText(instruction.book_key, { upper: false }),
+      book_side: instructionBookSide(instruction),
+      symbol: normalizeIntentText(instruction.symbol),
+      exchange: normalizeIntentText(instruction.exchange),
+      currency: normalizeIntentText(instruction.currency)
+    };
+  }
+
+  function instructionCleanupGroupKey(instruction) {
+    const selector = instructionCleanupSelector(instruction);
+    return [
+      selector.account_key,
+      selector.book_key,
+      selector.book_side,
+      selector.symbol,
+      selector.exchange,
+      selector.currency
+    ].join('|');
+  }
+
+  function cleanupGroupLatestTimestamp(group) {
+    return latestTimestamp(group.instructions, ['activity_at', 'updated_at', 'created_at', 'submit_at']);
+  }
+
+  function cleanupGroupClassName(group) {
+    if (group.entryCount > 0 && group.positionOwnerCount > 0) return 'warn';
+    if (group.entryCount > 1) return 'warn';
+    if (group.entryCount > 0) return 'neutral';
+    return 'ok';
+  }
+
+  function groupIntentCleanupRows(instructionRows, accountRows) {
+    const labels = accountLabelLookup(accountRows);
+    const groups = new Map();
+
+    for (const instruction of instructionRows ?? []) {
+      if (!entryOwningInstructionStates.has(instruction.state) && !positionOwningInstructionStates.has(instruction.state)) {
+        continue;
+      }
+      const selector = instructionCleanupSelector(instruction);
+      if (!selector.account_key || !selector.symbol) {
+        continue;
+      }
+      const key = instructionCleanupGroupKey(instruction);
+      const group = groups.get(key) ?? {
+        key,
+        selector,
+        accountLabel: labels.get(selector.account_key) ?? selector.account_key,
+        isVirtual: false,
+        instructions: [],
+        entries: [],
+        positionOwners: [],
+        forceNextOpen: false
+      };
+
+      group.instructions.push(instruction);
+      group.isVirtual = group.isVirtual || instruction.is_virtual === true;
+      group.forceNextOpen = group.forceNextOpen || instructionForcesNextOpenExit(instruction);
+      if (entryOwningInstructionStates.has(instruction.state)) {
+        group.entries.push(instruction);
+      }
+      if (positionOwningInstructionStates.has(instruction.state)) {
+        group.positionOwners.push(instruction);
+      }
+      groups.set(key, group);
+    }
+
+    return [...groups.values()]
+      .map((group) => ({
+        ...group,
+        entryCount: group.entries.length,
+        submittedEntryCount: group.entries.filter((instruction) => instruction.state === 'ENTRY_SUBMITTED').length,
+        pendingEntryCount: group.entries.filter((instruction) => instruction.state === 'ENTRY_PENDING').length,
+        positionOwnerCount: group.positionOwners.length,
+        latestAt: cleanupGroupLatestTimestamp(group),
+        entryRefs: summarizeRefs(group.entries.map((instruction) => instruction.instruction_id)),
+        ownerRefs: summarizeRefs(group.positionOwners.map((instruction) => instruction.instruction_id)),
+        className: cleanupGroupClassName({
+          entryCount: group.entries.length,
+          positionOwnerCount: group.positionOwners.length
+        })
+      }))
+      .sort((left, right) => {
+        if (left.entryCount !== right.entryCount) return right.entryCount - left.entryCount;
+        if (left.positionOwnerCount !== right.positionOwnerCount) return right.positionOwnerCount - left.positionOwnerCount;
+        const leftAt = parseTimestamp(left.latestAt)?.getTime() ?? 0;
+        const rightAt = parseTimestamp(right.latestAt)?.getTime() ?? 0;
+        return rightAt - leftAt;
+      });
+  }
+
+  function candidateLifecyclePolicy(instruction) {
+    return instruction?.payload?.instruction?.lifecycle ?? null;
+  }
+
+  function candidateLifecycleLabel(instruction) {
+    const lifecycle = candidateLifecyclePolicy(instruction);
+    if (!lifecycle) {
+      return 'Policy missing';
+    }
+    const entryLimit = lifecycle.max_entry_orders ?? 'n/a';
+    const exitLimit = lifecycle.max_exit_orders ?? 'n/a';
+    return `${entryLimit} entry / ${exitLimit} exit`;
+  }
+
+  function groupSourceIntentRows(candidateRows, accountRows) {
+    const labels = accountLabelLookup(accountRows);
+    const groups = new Map();
+
+    for (const instruction of candidateRows ?? []) {
+      const selector = instructionCleanupSelector(instruction);
+      if (!selector.account_key || !selector.symbol) {
+        continue;
+      }
+      const key = instructionCleanupGroupKey(instruction);
+      const group = groups.get(key) ?? {
+        key,
+        selector,
+        accountLabel: labels.get(selector.account_key) ?? selector.account_key,
+        isVirtual: false,
+        candidates: [],
+        modelIds: new Set(),
+        states: new Set(),
+        policyLabels: new Set()
+      };
+
+      group.candidates.push(instruction);
+      group.isVirtual = group.isVirtual || instruction.is_virtual === true;
+      group.modelIds.add(rlCandidateModelId(instruction));
+      group.states.add(instruction.state ?? 'UNKNOWN');
+      group.policyLabels.add(candidateLifecycleLabel(instruction));
+      groups.set(key, group);
+    }
+
+    return [...groups.values()]
+      .map((group) => ({
+        ...group,
+        candidateCount: group.candidates.length,
+        modelLabel: summarizeRefs([...group.modelIds]),
+        stateLabel: summarizeRefs([...group.states]),
+        policyLabel: summarizeRefs([...group.policyLabels]),
+        latestAt: latestTimestamp(group.candidates, ['activity_at', 'updated_at', 'created_at', 'submit_at']),
+        candidateRefs: summarizeRefs(group.candidates.map((instruction) => instruction.instruction_id))
+      }))
+      .sort((left, right) => {
+        const leftAt = parseTimestamp(left.latestAt)?.getTime() ?? 0;
+        const rightAt = parseTimestamp(right.latestAt)?.getTime() ?? 0;
+        if (rightAt !== leftAt) return rightAt - leftAt;
+        return left.selector.symbol.localeCompare(right.selector.symbol);
+      });
   }
 
   function positionInstructionMatches(position, instruction) {
@@ -1129,11 +2275,46 @@
         instructionId: null
       };
     }
-    if (instructionForcesNextOpenExit(primaryInstruction)) {
+    const liveExitOrder = liveMarketExitOrderForPosition(position, primaryInstruction, openOrders);
+    if (liveExitOrder) {
       return {
-        label: 'Next open armed',
+        label: 'Exit order live',
         className: 'ok',
-        detail: `${primaryInstruction.state}; runtime will submit the forced market exit when due.`,
+        detail:
+          `${primaryInstruction.state}; ${liveExitOrder.side} ` +
+          `${formatQuantity(liveExitOrder.total_quantity)} ${liveExitOrder.order_type} ` +
+          `${openOrderReference(liveExitOrder)} is working at broker.`,
+        instructionId: primaryInstruction.instruction_id
+      };
+    }
+    if (instructionForcesNextOpenExit(primaryInstruction)) {
+      const nextOpenAt = instructionNextSessionOpenAt(primaryInstruction);
+      if (nextOpenAt && referenceNow > nextOpenAt) {
+        return {
+          label: 'Next open passed',
+          className: 'bad',
+          detail:
+            `${primaryInstruction.state}; forced next-open time passed ` +
+            `${formatTimestamp(nextOpenAt.toISOString())}, and no matching live market exit order is visible.`,
+          instructionId: primaryInstruction.instruction_id
+        };
+      }
+      if (nextOpenAt) {
+        return {
+          label: 'Next open armed',
+          className: 'ok',
+          detail:
+            `${primaryInstruction.state}; runtime will submit the forced market exit near ` +
+            `${formatTimestamp(nextOpenAt.toISOString())}.`,
+          instructionId: primaryInstruction.instruction_id
+        };
+      }
+      return {
+        label: 'Next open unresolved',
+        className: 'warn',
+        detail:
+          `${primaryInstruction.state}; force_exit_next_session_open is set, ` +
+          'but the runtime schedule is unavailable in the dashboard snapshot.',
         instructionId: primaryInstruction.instruction_id
       };
     }
@@ -1217,6 +2398,25 @@
       });
   }
 
+  function reconciliationGroupMessageKey(stage, message) {
+    const normalized = String(message ?? '').toLowerCase();
+    if (stage === 'broker_snapshot') {
+      if (normalized.includes('nextvalidid') || normalized.includes('api startup')) {
+        return 'broker api startup did not complete';
+      }
+      if (normalized.includes('cooling down')) {
+        return 'broker api connection cooling down';
+      }
+      if (normalized.includes('timed out') || normalized.includes('timeout')) {
+        return 'broker api snapshot timed out';
+      }
+      if (normalized.includes('connection refused') || normalized.includes('socket')) {
+        return 'broker api socket unavailable';
+      }
+    }
+    return String(message ?? '');
+  }
+
   function groupReconciliationRuns(runs) {
     const groupedRows = new Map();
 
@@ -1226,12 +2426,13 @@
           continue;
         }
 
+        const messageKey = reconciliationGroupMessageKey(issue.stage, issue.message);
         const groupKey = [
           run.run_kind,
           issue.stage,
           issue.severity,
           issue.instruction_id ?? '',
-          issue.message
+          messageKey
         ].join('|');
 
         const currentGroup = groupedRows.get(groupKey) ?? {
@@ -1265,6 +2466,7 @@
         const effectiveLatestAt = Math.max(latestObservedAt, latestRunAt);
         if (effectiveLatestAt >= (parseTimestamp(currentGroup.latestAt)?.getTime() ?? 0)) {
           currentGroup.latestAt = new Date(effectiveLatestAt).toISOString();
+          currentGroup.message = issue.message;
         }
 
         groupedRows.set(groupKey, currentGroup);
@@ -1393,9 +2595,11 @@
     matchesFilterValue(fill.account_label ?? fill.account_key, dashboardFilters.recentFills.account) &&
     matchesFilterValue(fill.symbol, dashboardFilters.recentFills.symbol) &&
     matchesFilterValue(fill.side ?? 'n/a', dashboardFilters.recentFills.side) &&
+    matchesFilterValue(fillStrategyLabel(fill), dashboardFilters.recentFills.strat) &&
     matchesFilterValue(fill.quantity, dashboardFilters.recentFills.quantity) &&
     matchesFilterValue(fill.price, dashboardFilters.recentFills.price) &&
-    matchesFilterValue(`${fill.commission ?? 'n/a'} ${fill.commission_currency ?? ''}`, dashboardFilters.recentFills.fee)
+    matchesFilterValue(`${fill.commission ?? 'n/a'} ${fill.commission_currency ?? ''}`, dashboardFilters.recentFills.fee) &&
+    matchesFilterValue(fillExitPnlSearchText(fill), dashboardFilters.recentFills.pnl)
   );
 
   $: rlCandidateInstructions = instructions.filter((instruction) =>
@@ -1404,6 +2608,10 @@
   $: executionInstructions = instructions.filter(
     (instruction) => !isRlCandidateInstruction(instruction)
   );
+  $: sourceIntentGroups = groupSourceIntentRows(rlCandidateInstructions, accounts);
+  $: intentCleanupGroups = groupIntentCleanupRows(executionInstructions, accounts);
+  $: actionableIntentCleanupGroups = intentCleanupGroups.filter((group) => group.entryCount > 0);
+  $: virtualIntentCleanupGroupCount = actionableIntentCleanupGroups.filter((group) => group.isVirtual).length;
   $: filteredInstructions = executionInstructions.filter((instruction) => {
     const lifecycle = instructionWindowState(instruction);
     return (
@@ -1454,10 +2662,18 @@
       <div>
         <span>Page updated</span>
         <strong>{formatTimestamp(data.generatedAt)}</strong>
+        <button class="inline-button neutral hero-refresh" type="button" on:click={refreshDashboard} disabled={refreshInFlight}>
+          {refreshInFlight ? 'Refreshing...' : 'Refresh Snapshot'}
+        </button>
       </div>
       <div>
         <span>Snapshot generated</span>
         <strong>{formatTimestamp(operatorSnapshot.generated_at)}</strong>
+      </div>
+      <div>
+        <span>Live market data</span>
+        <strong class={marketStreamStatusClass()}>{marketStreamStatusLabel()}</strong>
+        <small>{marketStreamStatusDetail()}</small>
       </div>
       <div>
         <span>Market timezone</span>
@@ -1493,6 +2709,12 @@
             'No heartbeat has completed yet.'}
         {/if}
       </small>
+    </article>
+
+    <article class="stat-card">
+      <span>Gateway UI State</span>
+      <strong class={ibGatewayClass()}>{ibGatewayLabel()}</strong>
+      <small>{ibGatewayDetail()}</small>
     </article>
 
     <article class="stat-card">
@@ -1785,6 +3007,189 @@
     </form>
   </section>
 
+  <section class="panel control-panel" id="intent-cleanup">
+    <div class="panel-head">
+      <div>
+        <h2>Intent Cleanup</h2>
+        <p>Entry rows only; position owners and next-open close flags stay in the ledger.</p>
+      </div>
+      <div class="panel-tools">
+        <span class="subtle">
+          {sourceIntentGroups.length} source intent(s) · {actionableIntentCleanupGroups.length} cleanable group(s)
+        </span>
+        <form
+          method="POST"
+          action="?/intentCleanup"
+          class="inline-action-form"
+          use:enhance={enhanceDashboardAction('intent-cleanup-virtual-total')}
+        >
+          <input type="hidden" name="scope" value="virtual_total" />
+          <input type="hidden" name="apply" value="true" />
+          <input type="hidden" name="cancel_all_entries" value="true" />
+          <button
+            class={`inline-button danger ${buttonStateClass('intent-cleanup-virtual-total')}`}
+            type="submit"
+            data-action-key="intent-cleanup-virtual-total"
+            disabled={buttonIsBusy('intent-cleanup-virtual-total') || virtualIntentCleanupGroupCount === 0}
+          >
+            {buttonLabel('intent-cleanup-virtual-total', 'Clean Virtual Entries')}
+          </button>
+        </form>
+      </div>
+    </div>
+
+    {#if intentCleanupResult}
+      <p class={`action-feedback ${intentCleanupResult.ok ? 'ok' : 'bad'}`}>
+        {intentCleanupResult.message}
+      </p>
+    {/if}
+
+    {#if sourceIntentGroups.length === 0 && intentCleanupGroups.length === 0}
+      <p class="empty">No active intent groups are visible.</p>
+    {:else}
+      {#if sourceIntentGroups.length > 0}
+        <h3 class="section-subhead">Model-Routed Source Intents</h3>
+        <div class="table-wrap intent-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Intent</th>
+                <th>Account</th>
+                <th>Model</th>
+                <th>State</th>
+                <th>Policy</th>
+                <th>Latest</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each sourceIntentGroups as group}
+                <tr>
+                  <td>
+                    <strong>{group.selector.symbol}</strong>
+                    <small class="row-detail">
+                      {group.selector.exchange} · {group.selector.currency} · {group.selector.book_key}/{group.selector.book_side}
+                    </small>
+                    {#if group.candidateRefs}
+                      <small class="row-detail mono">{group.candidateRefs}</small>
+                    {/if}
+                  </td>
+                  <td>
+                    {group.accountLabel}
+                    {#if group.isVirtual}<span class="mini-badge">Virtual</span>{/if}
+                    <small class="row-detail mono">{group.selector.account_key}</small>
+                  </td>
+                  <td>{group.modelLabel ?? 'n/a'}</td>
+                  <td>
+                    <span class="pill neutral">{group.stateLabel ?? 'UNKNOWN'}</span>
+                    <small class="row-detail">{group.candidateCount} source row(s)</small>
+                  </td>
+                  <td>{group.policyLabel ?? 'n/a'}</td>
+                  <td>{formatTimestamp(group.latestAt)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+
+      {#if intentCleanupGroups.length > 0}
+        <h3 class="section-subhead">Broker Execution Intents</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Intent</th>
+                <th>Account</th>
+                <th>Entries</th>
+                <th>Position Owner</th>
+                <th>Latest</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each intentCleanupGroups as group}
+                <tr>
+                  <td>
+                    <strong>{group.selector.symbol}</strong>
+                    <small class="row-detail">
+                      {group.selector.exchange} · {group.selector.currency} · {group.selector.book_key}/{group.selector.book_side}
+                    </small>
+                  </td>
+                  <td>
+                    {group.accountLabel}
+                    {#if group.isVirtual}<span class="mini-badge">Virtual</span>{/if}
+                    <small class="row-detail mono">{group.selector.account_key}</small>
+                  </td>
+                  <td>
+                    <span class={`pill ${group.className}`}>
+                      {group.entryCount} active
+                    </span>
+                    <small class="row-detail">
+                      {group.pendingEntryCount} pending · {group.submittedEntryCount} submitted
+                    </small>
+                    {#if group.entryRefs}
+                      <small class="row-detail mono">{group.entryRefs}</small>
+                    {/if}
+                  </td>
+                  <td>
+                    {#if group.positionOwnerCount > 0}
+                      <span class="pill ok">
+                        {group.forceNextOpen ? 'Next Open' : 'Owned'}
+                      </span>
+                      <small class="row-detail">{group.positionOwnerCount} owner row(s)</small>
+                      {#if group.ownerRefs}
+                        <small class="row-detail mono">{group.ownerRefs}</small>
+                      {/if}
+                    {:else}
+                      <span class="pill neutral">None</span>
+                    {/if}
+                  </td>
+                  <td>{formatTimestamp(group.latestAt)}</td>
+                  <td class="actions-cell">
+                    {#if group.entryCount > 0}
+                      {@const cleanupKey = `intent-cleanup-${group.key}`}
+                      <form
+                        method="POST"
+                        action="?/intentCleanup"
+                        class="inline-action-form"
+                        use:enhance={enhanceDashboardAction(cleanupKey)}
+                      >
+                        <input type="hidden" name="scope" value="group" />
+                        <input type="hidden" name="apply" value="true" />
+                        <input type="hidden" name="cancel_all_entries" value="true" />
+                        <input type="hidden" name="account_key" value={group.selector.account_key} />
+                        <input type="hidden" name="book_key" value={group.selector.book_key} />
+                        <input type="hidden" name="book_side" value={group.selector.book_side} />
+                        <input type="hidden" name="symbol" value={group.selector.symbol} />
+                        <input type="hidden" name="exchange" value={group.selector.exchange} />
+                        <input type="hidden" name="currency" value={group.selector.currency} />
+                        <input
+                          type="hidden"
+                          name="reason"
+                          value={`Dashboard intent cleanup for ${group.selector.account_key} ${group.selector.book_side} ${group.selector.symbol}.`}
+                        />
+                        <button
+                          class={`inline-button danger ${buttonStateClass(cleanupKey)}`}
+                          type="submit"
+                          data-action-key={cleanupKey}
+                          disabled={buttonIsBusy(cleanupKey)}
+                        >
+                          {buttonLabel(cleanupKey, 'Clean Entries')}
+                        </button>
+                      </form>
+                    {:else}
+                      <span class="subtle">No entry rows</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    {/if}
+  </section>
+
   <section class="panel" id="accounts">
     <div class="panel-head">
       <h2>Accounts</h2>
@@ -1807,11 +3212,11 @@
             </div>
             <dl>
               <div><dt>Snapshot</dt><dd>{formatTimestamp(account.snapshot_at)}</dd></div>
-              <div><dt>Net liquidation</dt><dd>{account.net_liquidation ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
-              <div><dt>Total cash</dt><dd>{account.total_cash_value ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
-              <div><dt>Buying power</dt><dd>{account.buying_power ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
-              <div><dt>Available funds</dt><dd>{account.available_funds ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
-              <div><dt>Excess liquidity</dt><dd>{account.excess_liquidity ?? 'n/a'} {account.currency ?? account.base_currency ?? ''}</dd></div>
+              <div><dt>Net liquidation</dt><dd>{formatMoney(account.net_liquidation)} {account.currency ?? account.base_currency ?? ''}</dd></div>
+              <div><dt>Total cash</dt><dd>{formatMoney(account.total_cash_value)} {account.currency ?? account.base_currency ?? ''}</dd></div>
+              <div><dt>Buying power</dt><dd>{formatMoney(account.buying_power)} {account.currency ?? account.base_currency ?? ''}</dd></div>
+              <div><dt>Available funds</dt><dd>{formatMoney(account.available_funds)} {account.currency ?? account.base_currency ?? ''}</dd></div>
+              <div><dt>Excess liquidity</dt><dd>{formatMoney(account.excess_liquidity)} {account.currency ?? account.base_currency ?? ''}</dd></div>
               <div><dt>Cushion</dt><dd>{account.cushion ?? 'n/a'}</dd></div>
             </dl>
 
@@ -2108,11 +3513,11 @@
                 <td>{position.local_symbol ?? position.symbol}</td>
                 <td>{position.primary_exchange ?? position.exchange}</td>
                 <td>{position.currency}</td>
-                <td>{position.quantity}</td>
-                <td>{position.average_cost ?? 'n/a'}</td>
-                <td>{position.market_price ?? 'n/a'}</td>
-                <td>{position.market_value ?? 'n/a'}</td>
-                <td>{position.unrealized_pnl ?? 'n/a'}</td>
+                <td>{formatQuantity(position.quantity)}</td>
+                <td>{formatPrice(position.average_cost)}</td>
+                <td>{formatPrice(position.market_price)}</td>
+                <td>{formatMoney(position.market_value)}</td>
+                <td>{formatMoney(position.unrealized_pnl)}</td>
                 <td>
                   <span class={`pill ${exitPlan.className}`}>{exitPlan.label}</span>
                   <small class="row-detail">{exitPlan.detail}</small>
@@ -2153,6 +3558,11 @@
     {/if}
     {#if openOrders.length === 0}
       <p class="empty">No open broker orders are persisted right now.</p>
+    {:else if filteredOpenOrders.length === 0}
+      <p class="empty">
+        No open orders match the active filters. Clear filters to show all {openOrders.length}
+        open orders.
+      </p>
     {:else}
       <div class="table-wrap">
         <table>
@@ -2203,7 +3613,7 @@
                 <td>{order.order_role}</td>
                 <td>{order.order_purpose ?? 'n/a'}</td>
                 <td>{order.side}</td>
-                <td>{order.total_quantity ?? 'n/a'}</td>
+                <td>{formatQuantity(order.total_quantity)}</td>
                 <td>{order.order_type}</td>
                 <td>{displayOrderPrice(order.limit_price)}</td>
                 <td>{displayOrderPrice(order.stop_price)}</td>
@@ -2211,7 +3621,7 @@
                   {#if order.fill_basis_price}
                     <div>{orderFillSpreadLabel(order)}</div>
                     <small class="row-detail">
-                      from {order.fill_basis_price}
+                      from {formatPrice(order.fill_basis_price)}
                       {#if order.fill_basis_at}
                         at {formatTimestamp(order.fill_basis_at)}
                       {/if}
@@ -2223,7 +3633,7 @@
                 <td>
                   {#if order.reference_market_price}
                     <div class="market-cell">
-                      <span>{order.reference_market_price}</span>
+                      <span>{formatPrice(order.reference_market_price)}</span>
                       {#if marketDirectionArrow(order.last_market_price_direction)}
                         <span class={`market-arrow ${marketDirectionClass(order.last_market_price_direction)}`}>
                           {marketDirectionArrow(order.last_market_price_direction)}
@@ -2295,6 +3705,11 @@
     </div>
     {#if recentFills.length === 0}
       <p class="empty">No execution fills have been recorded yet.</p>
+    {:else if filteredRecentFills.length === 0}
+      <p class="empty">
+        No fills match the active filters. Clear filters to show all {recentFills.length}
+        fills.
+      </p>
     {:else}
       <div class="table-wrap">
         <table>
@@ -2304,18 +3719,22 @@
               <th>Account</th>
               <th>Symbol</th>
               <th>Side</th>
+              <th>Strat</th>
               <th>Quantity</th>
               <th>Price</th>
               <th>Fee</th>
+              <th>PnL</th>
             </tr>
             <tr class="filter-row">
               <th><input bind:value={dashboardFilters.recentFills.time} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.recentFills.account} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.recentFills.symbol} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.recentFills.side} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.strat} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.recentFills.quantity} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.recentFills.price} placeholder="Filter" /></th>
               <th><input bind:value={dashboardFilters.recentFills.fee} placeholder="Filter" /></th>
+              <th><input bind:value={dashboardFilters.recentFills.pnl} placeholder="Filter" /></th>
             </tr>
           </thead>
           <tbody>
@@ -2328,9 +3747,23 @@
                 </td>
                 <td>{fill.symbol}</td>
                 <td>{fill.side ?? 'n/a'}</td>
-                <td>{fill.quantity}</td>
-                <td>{fill.price}</td>
-                <td>{fill.commission ?? 'n/a'} {fill.commission_currency ?? ''}</td>
+                <td>{fillStrategyLabel(fill)}</td>
+                <td>{formatQuantity(fill.quantity)}</td>
+                <td>{formatPrice(fill.price)}</td>
+                <td>{formatMoney(fill.commission)} {fill.commission_currency ?? ''}</td>
+                <td>
+                  <span class={moneyTone(fill.realized_pnl)}>
+                    {fillExitPnlLabel(fill)}
+                  </span>
+                  {#if fill.realized_pnl_basis_price}
+                    <small class="row-detail">
+                      Basis {formatPrice(fill.realized_pnl_basis_price)}
+                      {#if fill.realized_pnl_gross && fill.realized_pnl_gross !== fill.realized_pnl}
+                        · Gross {formatSignedMoney(fill.realized_pnl_gross)}
+                      {/if}
+                    </small>
+                  {/if}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -2412,6 +3845,11 @@
     {/if}
     {#if executionInstructions.length === 0}
       <p class="empty">No translated execution instructions were found.</p>
+    {:else if filteredInstructions.length === 0}
+      <p class="empty">
+        No execution instructions match the active filters. Clear filters to show all
+        {executionInstructions.length} instructions.
+      </p>
     {:else}
       <div class="table-wrap">
         <table>
@@ -2646,6 +4084,17 @@
     word-break: break-word;
   }
 
+  .hero-meta small {
+    display: block;
+    margin-top: 0.25rem;
+    color: var(--text-muted);
+    line-height: 1.35;
+  }
+
+  .hero-refresh {
+    margin-top: 0.45rem;
+  }
+
   .stat-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
@@ -2817,6 +4266,12 @@
     color: var(--text-secondary);
   }
 
+  .section-subhead {
+    margin: 0.85rem 0 0.45rem;
+    font-size: 0.9rem;
+    font-weight: 700;
+  }
+
   .account-grid,
   .two-up {
     display: grid;
@@ -2983,6 +4438,10 @@
 
   .table-wrap {
     overflow-x: auto;
+  }
+
+  .intent-table-wrap {
+    margin-bottom: 0.85rem;
   }
 
   .filter-row th {

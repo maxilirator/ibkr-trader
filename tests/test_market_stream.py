@@ -227,6 +227,67 @@ class MarketStreamTests(TestCase):
             "2026-04-28T07:01:00+00:00",
         )
 
+    def test_identical_subscribe_request_is_noop_when_stream_is_active(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.market_data_type_requests = 0
+                self.market_data_requests = 0
+                self.cancel_requests = 0
+
+            def isConnected(self) -> bool:  # noqa: N802
+                return True
+
+            def reqMarketDataType(self, market_data_type: int) -> None:  # noqa: N802
+                _ = market_data_type
+                self.market_data_type_requests += 1
+
+            def reqMktData(self, *args: object) -> None:  # noqa: N802
+                _ = args
+                self.market_data_requests += 1
+
+            def cancelMktData(self, request_id: int) -> None:  # noqa: N802
+                _ = request_id
+                self.cancel_requests += 1
+
+        class FakeContract:
+            pass
+
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        client = FakeClient()
+        contract = MarketStreamContract(symbol="AXFO")
+        service._client = client
+        service._contract_cls = FakeContract
+        service._desired_contracts_by_key["AXFO"] = contract
+        service._desired_market_data_type = "LIVE"
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=contract,
+            subscribed_at=datetime(2026, 5, 8, 7, 0, tzinfo=UTC),
+            status="subscribed",
+        )
+
+        snapshot = service.subscribe_many(
+            [contract],
+            replace=True,
+            market_data_type="LIVE",
+        )
+
+        self.assertEqual(snapshot["subscribe_request_count"], 1)
+        self.assertEqual(snapshot["subscribe_noop_count"], 1)
+        self.assertEqual(snapshot["actual_subscription_count"], 0)
+        self.assertEqual(snapshot["market_data_type_request_count"], 0)
+        self.assertEqual(client.market_data_type_requests, 0)
+        self.assertEqual(client.market_data_requests, 0)
+        self.assertEqual(client.cancel_requests, 0)
+
     def test_snapshot_marks_connected_stream_stale_when_ticks_stop(self) -> None:
         class FakeClient:
             def isConnected(self) -> bool:  # noqa: N802

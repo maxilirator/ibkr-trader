@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from ibkr_trader.rl.model_artifacts import DEFAULT_SHARED_VIRTUAL_ACCOUNT
 from ibkr_trader.rl.model_artifacts import read_static_feature_names
 
 
@@ -51,7 +52,7 @@ CONFIGS: tuple[CandidateBatchConfig, ...] = (
         model_family="canonical_long_live_execution_policy",
         model_artifact_id="trial_106_seed240",
         deployment_key="long_trial_106_virtual_shared_01",
-        book_key="rl_shared_long_trial_106_virtual_01",
+        book_key="bb_long_02",
         candidate_tape_path=CANDIDATE_SOURCE_ROOT
         / "artifacts/analysis/long_trial_104_ex_long_true_rl_input_materialize_ranker_v1/lockbox_candidate_tape.parquet",
         static_feature_cols_path=CANDIDATE_SOURCE_ROOT
@@ -65,7 +66,7 @@ CONFIGS: tuple[CandidateBatchConfig, ...] = (
         model_family="canonical_short_live_execution_policy",
         model_artifact_id="trial_36_seed140",
         deployment_key="short_trial_36_virtual_shared_01",
-        book_key="rl_shared_short_trial_36_virtual_01",
+        book_key="bb_short_02",
         candidate_tape_path=CANDIDATE_SOURCE_ROOT
         / "artifacts/analysis/short_trial_14_replay_tape_ibkr_shortable_v1/lockbox_candidate_tape.parquet",
         static_feature_cols_path=CANDIDATE_SOURCE_ROOT
@@ -80,7 +81,7 @@ def main() -> int:
         description="Submit selected RL names as model-routed trader candidates."
     )
     parser.add_argument("--api-base", default="http://quant.geisler.se:8000")
-    parser.add_argument("--account-key", default="VIRTUALRL01")
+    parser.add_argument("--account-key", default=DEFAULT_SHARED_VIRTUAL_ACCOUNT)
     parser.add_argument("--trade-date", default=_today_stockholm().isoformat())
     parser.add_argument("--candidate-date", default="latest")
     parser.add_argument("--target-notional", default="1000")
@@ -440,6 +441,15 @@ def build_candidate_instruction(
                 "start_at": start_at.isoformat(),
                 "end_at": end_at.isoformat(),
             },
+        },
+        "lifecycle": {
+            "trade_date": trade_date.isoformat(),
+            "scope": "account_book_side_symbol_trade_date",
+            "max_entry_orders": 1,
+            "max_exit_orders": 1,
+            "allow_reentry_after_exit": False,
+            "allow_reentry_after_cancel": False,
+            "retire_from_active_universe_when_flat": True,
         },
         "trace": {
             "reason_code": "rl_model_routed_selected_candidate",

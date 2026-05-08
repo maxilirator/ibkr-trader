@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=%h/ibkr-trader
 Environment=PYTHONPATH=%h/ibkr-trader/src
 ExecStartPre=/usr/bin/mkdir -p %h/ibkr-trader/var/rl-runner
-ExecStart=%h/ibkr-trader/.venv/bin/python %h/ibkr-trader/scripts/run_rl_agents.py --api-base http://127.0.0.1:8000 --execute-virtual --state-file %h/ibkr-trader/var/rl-runner/state.json --history-cache-file %h/ibkr-trader/var/rl-runner/history-cache.json
+ExecStart=%h/ibkr-trader/.venv/bin/python %h/ibkr-trader/scripts/run_rl_agents.py --api-base http://127.0.0.1:8000 --execute-virtual --state-file %h/ibkr-trader/var/rl-runner/state.json --history-cache-file %h/ibkr-trader/var/rl-runner/history-cache.json --allow-metadata-history-fallback --metadata-history-only
 Restart=always
 RestartSec=15
 TimeoutStopSec=20

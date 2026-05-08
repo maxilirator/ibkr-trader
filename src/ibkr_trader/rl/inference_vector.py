@@ -21,6 +21,18 @@ class RunnerSymbolState:
     bars_since_exit_order: int = 0
 
 
+def has_pending_entry(state: RunnerSymbolState) -> bool:
+    """Return whether the runner has a live entry order, including market entries."""
+
+    return (
+        not state.in_position
+        and (
+            state.pending_entry_anchor is not None
+            or state.bars_since_entry_order > 0
+        )
+    )
+
+
 def flat_runner_state() -> RunnerSymbolState:
     return RunnerSymbolState()
 
@@ -53,8 +65,8 @@ def build_runtime_dynamic_features(
         unrealized_at_open = float(trade_sign * ((open_now / float(state.entry_price)) - 1.0))
 
     return [
-        1.0 if not state.in_position and state.pending_entry_anchor is None else 0.0,
-        1.0 if not state.in_position and state.pending_entry_anchor is not None else 0.0,
+        1.0 if not state.in_position and not has_pending_entry(state) else 0.0,
+        1.0 if has_pending_entry(state) else 0.0,
         1.0 if state.in_position else 0.0,
         1.0 if state.pending_entry_anchor == "prev_close" else 0.0,
         1.0 if state.pending_entry_anchor == "session_open" else 0.0,
@@ -169,10 +181,11 @@ def assemble_dqn_observation_vector(
 
 def valid_action_mask(action_names: Sequence[str], state: RunnerSymbolState | None = None) -> np.ndarray:
     symbol_state = state or flat_runner_state()
+    pending_entry = has_pending_entry(symbol_state)
     mask = np.zeros(len(action_names), dtype=bool)
     for idx, raw_name in enumerate(action_names):
         name = str(raw_name)
-        if not symbol_state.in_position and symbol_state.pending_entry_anchor is None:
+        if not symbol_state.in_position and not pending_entry:
             mask[idx] = (
                 name in {"skip", "wait", "market_entry"}
                 or name.startswith("entry_prevclose_")

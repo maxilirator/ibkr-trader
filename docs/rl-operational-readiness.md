@@ -29,6 +29,10 @@ This is the morning checklist for making the long and short RL agents real.
   - short `exit_tp_180bp` -> `BUY` take-profit limit below entry fill
   - `exit_market` submits an opposite-side market exit
   - `clear_exit` cancels the owned pending exit and keeps the position open
+- intent replacement cleanup:
+  - new submitted entries cancel older active entries in the same intent group
+  - open positions block fresh entries for that group instead of being mutated
+  - `POST /v1/instructions/intent-cleanup` provides dry-run/apply cleanup
 - virtual stream-crossing tests for long and short entries, exits, and cancel/clear actions
 
 ## Runner Contract

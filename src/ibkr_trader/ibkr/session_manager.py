@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import logging
+import os
 import time
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -11,9 +12,23 @@ from threading import RLock
 from typing import Any, Callable, Iterator
 
 from ibkr_trader.config import IbkrConnectionConfig
+from ibkr_trader.ibkr.gateway_diagnostics import format_gateway_diagnostic_hint
+from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class
 
 LOGGER = logging.getLogger(__name__)
+API_STARTUP_FAILURE_MARKERS = (
+    "api startup",
+    "gateway did not complete",
+    "nextvalidid",
+    "socket connected but api startup",
+)
+STUCK_GATEWAY_CIRCUIT_STATUSES = {
+    "deadlock_reported",
+    "existing_session_detected",
+    "stuck_shutdown",
+    "stuck_shutdown_after_existing_session",
+}
 
 
 def _utc_now() -> datetime:
@@ -61,6 +76,8 @@ class ManagedSessionStatus:
     consecutive_failures: int
     cooldown_until: datetime | None
     cooldown_seconds_remaining: int | None
+    circuit_breaker_reason: str | None
+    circuit_breaker_until: datetime | None
     metrics: ManagedSessionMetrics
 
 
@@ -162,6 +179,7 @@ class BrokerActivityTracker:
 def serialize_managed_session_status(status: ManagedSessionStatus) -> dict[str, Any]:
     payload = asdict(status)
     payload["cooldown_until"] = _serialize_datetime(status.cooldown_until)
+    payload["circuit_breaker_until"] = _serialize_datetime(status.circuit_breaker_until)
     payload["metrics"]["last_connect_attempt_at"] = _serialize_datetime(
         status.metrics.last_connect_attempt_at
     )
@@ -188,6 +206,8 @@ class ManagedSyncSession:
         activity_tracker: BrokerActivityTracker | None = None,
         initial_connect_backoff_seconds: float = 5.0,
         max_connect_backoff_seconds: float = 300.0,
+        api_startup_failure_slow_probe_seconds: float | None = None,
+        gateway_diagnostics_reader: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.role = role
         self.config = config
@@ -199,11 +219,29 @@ class ManagedSyncSession:
             self._initial_connect_backoff_seconds,
             max_connect_backoff_seconds,
         )
+        if api_startup_failure_slow_probe_seconds is None:
+            raw_slow_probe = os.getenv(
+                "IBKR_API_STARTUP_FAILURE_SLOW_PROBE_SECONDS",
+                "900",
+            )
+            try:
+                api_startup_failure_slow_probe_seconds = float(raw_slow_probe)
+            except ValueError:
+                api_startup_failure_slow_probe_seconds = 900.0
+        self._api_startup_failure_slow_probe_seconds = max(
+            0.0,
+            api_startup_failure_slow_probe_seconds,
+        )
+        self._gateway_diagnostics_reader = gateway_diagnostics_reader or (
+            lambda: read_ibgateway_diagnostics()
+        )
         self._lock = RLock()
         self._app: Any | None = None
         self._last_error: str | None = None
         self._consecutive_failures = 0
         self._cooldown_until: datetime | None = None
+        self._circuit_breaker_reason: str | None = None
+        self._circuit_breaker_until: datetime | None = None
         self._connect_attempt_count = 0
         self._connect_success_count = 0
         self._disconnect_count = 0
@@ -233,19 +271,54 @@ class ManagedSyncSession:
         self._last_connect_success_at = _utc_now()
         self._consecutive_failures = 0
         self._cooldown_until = None
+        self._circuit_breaker_reason = None
+        self._circuit_breaker_until = None
 
-    def _record_gateway_failure_locked(self, error: str) -> None:
-        self._last_error = error
+    def _is_api_startup_failure(self, error: str) -> bool:
+        lowered = error.lower()
+        return any(marker in lowered for marker in API_STARTUP_FAILURE_MARKERS)
+
+    def _gateway_failure_diagnostics(self, error: str) -> tuple[str, str | None]:
+        if not self._is_api_startup_failure(error):
+            return error, None
+        try:
+            diagnostics = self._gateway_diagnostics_reader()
+        except Exception as exc:  # pragma: no cover - defensive diagnostics path.
+            LOGGER.debug("Gateway diagnostics failed during circuit classification: %s", exc)
+            return error, None
+
+        hint = format_gateway_diagnostic_hint(diagnostics)
+        enhanced_error = error
+        if hint is not None and hint not in enhanced_error:
+            enhanced_error = f"{enhanced_error} {hint}"
+        status = str(diagnostics.get("status") or "")
+        if status in STUCK_GATEWAY_CIRCUIT_STATUSES:
+            summary = diagnostics.get("summary") or status
+            return enhanced_error, f"{status}: {summary}"
+        return enhanced_error, None
+
+    def _record_gateway_failure_locked(self, error: str) -> str:
+        recorded_error, circuit_reason = self._gateway_failure_diagnostics(error)
+        self._last_error = recorded_error
         self._consecutive_failures += 1
+        self._circuit_breaker_reason = circuit_reason
         if self._initial_connect_backoff_seconds <= 0:
+            delay = 0.0
+        else:
+            delay = min(
+                self._max_connect_backoff_seconds,
+                self._initial_connect_backoff_seconds
+                * (2 ** max(0, self._consecutive_failures - 1)),
+            )
+        if circuit_reason is not None:
+            delay = max(delay, self._api_startup_failure_slow_probe_seconds)
+        if delay <= 0:
             self._cooldown_until = None
-            return
-        delay = min(
-            self._max_connect_backoff_seconds,
-            self._initial_connect_backoff_seconds
-            * (2 ** max(0, self._consecutive_failures - 1)),
-        )
+            self._circuit_breaker_until = None
+            return recorded_error
         self._cooldown_until = _utc_now() + timedelta(seconds=delay)
+        self._circuit_breaker_until = self._cooldown_until if circuit_reason else None
+        return recorded_error
 
     def _cooldown_seconds_remaining_locked(self, *, now: datetime) -> int | None:
         if self._cooldown_until is None:
@@ -262,10 +335,15 @@ class ManagedSyncSession:
         if self._cooldown_until <= now:
             return
         retry_at = self._cooldown_until.isoformat()
+        circuit = (
+            f" Circuit breaker: {self._circuit_breaker_reason}."
+            if self._circuit_breaker_reason
+            else ""
+        )
         raise ConnectionError(
             f"Managed IBKR session '{self.role}' is cooling down after "
             f"{self._consecutive_failures} failed broker attempt(s); next retry at "
-            f"{retry_at}. Last error: {self._last_error}"
+            f"{retry_at}. Last error: {self._last_error}.{circuit}"
         )
 
     def _record_disconnect_locked(self) -> None:
@@ -298,6 +376,8 @@ class ManagedSyncSession:
     def _ensure_connected_locked(self, *, ignore_cooldown: bool = False) -> None:
         if self._app is not None and _is_connected(self._app):
             self._last_error = None
+            self._circuit_breaker_reason = None
+            self._circuit_breaker_until = None
             return
 
         self._raise_if_cooling_down_locked(ignore_cooldown=ignore_cooldown)
@@ -318,8 +398,8 @@ class ManagedSyncSession:
                 app.disconnect_and_stop()
             except Exception:
                 pass
-            self._record_gateway_failure_locked(error)
-            raise ConnectionError(error)
+            recorded_error = self._record_gateway_failure_locked(error)
+            raise ConnectionError(recorded_error)
 
         self._app = app
         self._record_connect_success_locked()
@@ -353,6 +433,8 @@ class ManagedSyncSession:
                 cooldown_seconds_remaining=self._cooldown_seconds_remaining_locked(
                     now=_utc_now()
                 ),
+                circuit_breaker_reason=self._circuit_breaker_reason,
+                circuit_breaker_until=self._circuit_breaker_until,
                 metrics=ManagedSessionMetrics(
                     connect_attempt_count=self._connect_attempt_count,
                     connect_success_count=self._connect_success_count,
@@ -384,6 +466,8 @@ class ManagedSyncSession:
                 cooldown_seconds_remaining=self._cooldown_seconds_remaining_locked(
                     now=now
                 ),
+                circuit_breaker_reason=self._circuit_breaker_reason,
+                circuit_breaker_until=self._circuit_breaker_until,
                 metrics=ManagedSessionMetrics(
                     connect_attempt_count=self._connect_attempt_count,
                     connect_success_count=self._connect_success_count,
@@ -465,10 +549,19 @@ class ManagedSyncSession:
                     0,
                     int((completed_at - started_at).total_seconds() * 1000),
                 )
-                LOGGER.warning(
-                    "IBKR broker operation failed before checkout: role=%s "
-                    "operation=%s client_id=%s duration_ms=%s lock_wait_ms=%s "
-                    "error=%s",
+                log_method = LOGGER.info if is_cooldown_error else LOGGER.warning
+                log_method(
+                    (
+                        "IBKR broker operation skipped during cooldown: role=%s "
+                        "operation=%s client_id=%s duration_ms=%s lock_wait_ms=%s "
+                        "error=%s"
+                    )
+                    if is_cooldown_error
+                    else (
+                        "IBKR broker operation failed before checkout: role=%s "
+                        "operation=%s client_id=%s duration_ms=%s lock_wait_ms=%s "
+                        "error=%s"
+                    ),
                     self.role,
                     operation_name,
                     self.config.client_id,
@@ -483,6 +576,9 @@ class ManagedSyncSession:
             except Exception as exc:
                 self._failed_checkout_count += 1
                 self._last_error = str(exc)
+                if isinstance(exc, (ConnectionError, TimeoutError)):
+                    self._record_gateway_failure_locked(str(exc))
+                    self._disconnect_locked()
                 completed_at = _utc_now()
                 if self._activity_tracker is not None:
                     self._activity_tracker.record(
@@ -540,7 +636,11 @@ class ManagedSyncSession:
         ) as app:
             return operation(app)
 
-    def drain_broker_callback_events(self) -> list[dict[str, Any]]:
+    def drain_broker_callback_events(
+        self,
+        *,
+        connect_if_needed: bool = True,
+    ) -> list[dict[str, Any]]:
         def _drain(app: Any) -> list[dict[str, Any]]:
             drainer = getattr(app, "drain_broker_callback_events", None)
             if drainer is None:
@@ -557,7 +657,24 @@ class ManagedSyncSession:
                 )
             return events
 
-        return self.execute("drain_broker_callbacks", _drain)
+        if connect_if_needed:
+            return self.execute("drain_broker_callbacks", _drain)
+
+        with self._lock:
+            app = self._app
+            if app is None or not _is_connected(app):
+                return []
+            try:
+                return _drain(app)
+            except Exception as exc:
+                self._last_error = str(exc)
+                if isinstance(exc, (ConnectionError, TimeoutError)):
+                    self._record_gateway_failure_locked(str(exc))
+                    self._disconnect_locked()
+                raise
+            finally:
+                if app is self._app and not _is_connected(app):
+                    self._disconnect_locked()
 
 
 class CanonicalSyncSessions:
@@ -569,6 +686,7 @@ class CanonicalSyncSessions:
         default_timeout: int = 30,
         initial_connect_backoff_seconds: float = 5.0,
         max_connect_backoff_seconds: float = 300.0,
+        api_startup_failure_slow_probe_seconds: float | None = None,
     ) -> None:
         self.activity_tracker = BrokerActivityTracker()
         self.primary = ManagedSyncSession(
@@ -579,6 +697,7 @@ class CanonicalSyncSessions:
             activity_tracker=self.activity_tracker,
             initial_connect_backoff_seconds=initial_connect_backoff_seconds,
             max_connect_backoff_seconds=max_connect_backoff_seconds,
+            api_startup_failure_slow_probe_seconds=api_startup_failure_slow_probe_seconds,
         )
         self.diagnostic = ManagedSyncSession(
             "diagnostic",
@@ -588,6 +707,7 @@ class CanonicalSyncSessions:
             activity_tracker=self.activity_tracker,
             initial_connect_backoff_seconds=initial_connect_backoff_seconds,
             max_connect_backoff_seconds=max_connect_backoff_seconds,
+            api_startup_failure_slow_probe_seconds=api_startup_failure_slow_probe_seconds,
         )
 
     def warmup(self) -> dict[str, dict[str, Any]]:

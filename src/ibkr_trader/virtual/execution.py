@@ -251,9 +251,10 @@ def _latest_virtual_quote(
     symbol: str,
     currency: str,
     security_type: str,
+    instruction: ExecutionInstruction | None = None,
 ) -> VirtualMarketQuoteRecord | None:
     normalized_account_key = normalize_virtual_account_key(account_key)
-    return session.execute(
+    quotes = session.execute(
         select(VirtualMarketQuoteRecord)
         .where(
             VirtualMarketQuoteRecord.account_key == normalized_account_key,
@@ -265,8 +266,72 @@ def _latest_virtual_quote(
             VirtualMarketQuoteRecord.observed_at.desc(),
             VirtualMarketQuoteRecord.id.desc(),
         )
-        .limit(1)
-    ).scalar_one_or_none()
+        .limit(50)
+    ).scalars()
+    for quote in quotes:
+        if _quote_matches_instruction_owner(quote, instruction):
+            return quote
+    return None
+
+
+def _quote_owner_scope(
+    quote: VirtualMarketQuoteRecord,
+) -> dict[str, str | None] | None:
+    metadata = quote.metadata_json if isinstance(quote.metadata_json, dict) else {}
+    source = str(quote.source or "").strip().lower()
+    purpose = str(metadata.get("purpose") or "").strip().lower()
+    deployment_key = _normalize_text(metadata.get("deployment_key"))
+    source_instruction_id = _normalize_text(metadata.get("source_instruction_id"))
+    if deployment_key is None and source_instruction_id is None:
+        return None
+    if source != "rl_decision_bar" and purpose != "virtual_same_bar_fill_parity":
+        return None
+    return {
+        "deployment_key": deployment_key,
+        "source_instruction_id": source_instruction_id,
+    }
+
+
+def _execution_instruction_owner_scope(
+    instruction: ExecutionInstruction | None,
+) -> dict[str, str | None]:
+    metadata = (
+        instruction.trace.metadata
+        if instruction is not None and instruction.trace is not None
+        else {}
+    )
+    return {
+        "deployment_key": _normalize_text(metadata.get("rl_deployment_key")),
+        "source_instruction_id": _normalize_text(
+            metadata.get("rl_source_instruction_id")
+        ),
+    }
+
+
+def _owner_scope_matches_quote_scope(
+    owner: dict[str, str | None],
+    quote_scope: dict[str, str | None],
+) -> bool:
+    quote_deployment = quote_scope.get("deployment_key")
+    quote_source = quote_scope.get("source_instruction_id")
+    if quote_deployment is not None and owner.get("deployment_key") != quote_deployment:
+        return False
+    if quote_source is not None and owner.get("source_instruction_id") != quote_source:
+        return False
+    return True
+
+
+def _quote_matches_instruction_owner(
+    quote: VirtualMarketQuoteRecord,
+    instruction: ExecutionInstruction | None,
+) -> bool:
+    quote_scope = _quote_owner_scope(quote)
+    if quote_scope is None:
+        return True
+    return _owner_scope_matches_quote_scope(
+        _execution_instruction_owner_scope(instruction),
+        quote_scope,
+    )
 
 
 def serialize_virtual_quote(quote: VirtualMarketQuoteRecord) -> dict[str, Any]:
@@ -785,6 +850,7 @@ def submit_virtual_entry_order(
             symbol=instruction.instrument.symbol,
             currency=instruction.instrument.currency,
             security_type=instruction.instrument.security_type.value,
+            instruction=instruction,
         )
         return _build_virtual_order_submission(
             instruction=instruction,
@@ -829,6 +895,7 @@ def submit_virtual_exit_order(
             symbol=instruction.instrument.symbol,
             currency=instruction.instrument.currency,
             security_type=instruction.instrument.security_type.value,
+            instruction=instruction,
         )
         return _build_virtual_order_submission(
             instruction=instruction,
@@ -881,6 +948,8 @@ def _latest_position_snapshot(
     symbol: str,
     currency: str,
     security_type: str,
+    owner_instruction_id: str | None = None,
+    owner_deployment_key: str | None = None,
 ) -> PositionSnapshotRecord | None:
     return session.execute(
         select(PositionSnapshotRecord)
@@ -889,6 +958,12 @@ def _latest_position_snapshot(
             PositionSnapshotRecord.symbol == symbol,
             PositionSnapshotRecord.currency == currency,
             PositionSnapshotRecord.security_type == security_type,
+            PositionSnapshotRecord.owner_instruction_id.is_(None)
+            if owner_instruction_id is None
+            else PositionSnapshotRecord.owner_instruction_id == owner_instruction_id,
+            PositionSnapshotRecord.owner_deployment_key.is_(None)
+            if owner_deployment_key is None
+            else PositionSnapshotRecord.owner_deployment_key == owner_deployment_key,
         )
         .order_by(
             PositionSnapshotRecord.snapshot_at.desc(),
@@ -918,9 +993,19 @@ def _latest_virtual_position_snapshots_for_account(
         )
     ).scalars()
 
-    latest_by_identity: dict[tuple[str, str, str, str | None], PositionSnapshotRecord] = {}
+    latest_by_identity: dict[
+        tuple[str, str, str, str | None, str | None, str | None],
+        PositionSnapshotRecord,
+    ] = {}
     for row in rows:
-        identity = (row.symbol, row.currency, row.security_type, row.local_symbol)
+        identity = (
+            row.symbol,
+            row.currency,
+            row.security_type,
+            row.local_symbol,
+            row.owner_instruction_id,
+            row.owner_deployment_key,
+        )
         latest_by_identity.setdefault(identity, row)
     return tuple(latest_by_identity.values())
 
@@ -932,6 +1017,63 @@ def _position_unrealized_pnl(position: PositionSnapshotRecord) -> Decimal:
     if quantity == 0 or average_cost is None or market_price is None:
         return Decimal("0")
     return quantity * (market_price - average_cost)
+
+
+def _instruction_trace_metadata(record: InstructionRecord | None) -> dict[str, Any]:
+    if record is None:
+        return {}
+    payload = record.payload if isinstance(record.payload, dict) else {}
+    instruction = payload.get("instruction")
+    if not isinstance(instruction, dict):
+        return {}
+    trace = instruction.get("trace")
+    if not isinstance(trace, dict):
+        return {}
+    metadata = trace.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _owner_instruction_id_from_order_ref(order_ref: str | None) -> str | None:
+    normalized = str(order_ref or "").strip()
+    if not normalized:
+        return None
+    if ":exit:" in normalized:
+        return normalized.split(":exit:", 1)[0] or None
+    return normalized
+
+
+def _virtual_position_owner_from_order(
+    broker_order: BrokerOrderRecord,
+) -> dict[str, str | None]:
+    instruction = broker_order.instruction
+    metadata = _instruction_trace_metadata(instruction)
+    return {
+        "owner_instruction_id": (
+            instruction.instruction_id
+            if instruction is not None
+            else _owner_instruction_id_from_order_ref(broker_order.order_ref)
+        ),
+        "owner_source_instruction_id": (
+            str(metadata.get("rl_source_instruction_id"))
+            if metadata.get("rl_source_instruction_id") not in (None, "")
+            else None
+        ),
+        "owner_deployment_key": (
+            str(metadata.get("rl_deployment_key"))
+            if metadata.get("rl_deployment_key") not in (None, "")
+            else None
+        ),
+        "owner_book_key": instruction.book_key if instruction is not None else None,
+    }
+
+
+def _position_owner_payload(position: PositionSnapshotRecord) -> dict[str, str | None]:
+    return {
+        "owner_instruction_id": position.owner_instruction_id,
+        "owner_source_instruction_id": position.owner_source_instruction_id,
+        "owner_deployment_key": position.owner_deployment_key,
+        "owner_book_key": position.owner_book_key,
+    }
 
 
 def _fill_signed_quantity(fill: ExecutionFillRecord) -> Decimal:
@@ -1146,12 +1288,24 @@ def _persist_virtual_position_snapshot(
 ) -> None:
     fill_quantity = _to_decimal(fill_payload.get("quantity")) or Decimal("1")
     fill_price = _to_decimal(fill_payload.get("price")) or Decimal("0")
+    owner = _virtual_position_owner_from_order(broker_order)
+    if (
+        broker_order.instruction is not None
+        and broker_order.instruction.source_system == "rl-runner"
+        and not owner["owner_deployment_key"]
+    ):
+        raise ValueError(
+            "RL virtual position fills must carry owner_deployment_key before "
+            "a position snapshot can be written."
+        )
     latest_snapshot = _latest_position_snapshot(
         session,
         broker_account_id=broker_account.id,
         symbol=broker_order.symbol,
         currency=broker_order.currency,
         security_type=broker_order.security_type,
+        owner_instruction_id=owner["owner_instruction_id"],
+        owner_deployment_key=owner["owner_deployment_key"],
     )
     current_quantity = (
         _to_decimal(latest_snapshot.quantity)
@@ -1199,8 +1353,13 @@ def _persist_virtual_position_snapshot(
         market_value=str(market_value),
         unrealized_pnl=str(unrealized_pnl),
         realized_pnl=str(realized_pnl),
+        owner_instruction_id=owner["owner_instruction_id"],
+        owner_source_instruction_id=owner["owner_source_instruction_id"],
+        owner_deployment_key=owner["owner_deployment_key"],
+        owner_book_key=owner["owner_book_key"],
         raw_payload=_serialize_for_json({
             "virtual_execution": fill_payload,
+            "owner": owner,
             "previous_quantity": str(current_quantity),
             "delta_quantity": str(delta),
         }),
@@ -1221,61 +1380,101 @@ def _quote_mark_price(quote: VirtualMarketQuoteRecord) -> Decimal | None:
     return None
 
 
-def _persist_virtual_position_mark_snapshot(
+def _latest_position_snapshots_for_quote(
+    session: Session,
+    *,
+    broker_account_id: int,
+    quote: VirtualMarketQuoteRecord,
+) -> tuple[PositionSnapshotRecord, ...]:
+    rows = session.execute(
+        select(PositionSnapshotRecord)
+        .where(
+            PositionSnapshotRecord.broker_account_id == broker_account_id,
+            PositionSnapshotRecord.symbol == quote.symbol,
+            PositionSnapshotRecord.currency == quote.currency,
+            PositionSnapshotRecord.security_type == quote.security_type,
+        )
+        .order_by(
+            PositionSnapshotRecord.snapshot_at.desc(),
+            PositionSnapshotRecord.id.desc(),
+        )
+    ).scalars()
+    latest_by_owner: dict[
+        tuple[str | None, str | None, str | None, str | None],
+        PositionSnapshotRecord,
+    ] = {}
+    for row in rows:
+        owner_key = (
+            row.owner_instruction_id,
+            row.owner_deployment_key,
+            row.owner_source_instruction_id,
+            row.owner_book_key,
+        )
+        latest_by_owner.setdefault(owner_key, row)
+    return tuple(latest_by_owner.values())
+
+
+def _persist_virtual_position_mark_snapshots(
     session: Session,
     *,
     broker_account: BrokerAccountRecord,
     quote: VirtualMarketQuoteRecord,
-) -> PositionSnapshotRecord | None:
-    latest_snapshot = _latest_position_snapshot(
+) -> tuple[PositionSnapshotRecord, ...]:
+    marked_snapshots: list[PositionSnapshotRecord] = []
+    for latest_snapshot in _latest_position_snapshots_for_quote(
         session,
         broker_account_id=broker_account.id,
-        symbol=quote.symbol,
-        currency=quote.currency,
-        security_type=quote.security_type,
-    )
-    if latest_snapshot is None:
-        return None
-    quantity = _to_decimal(latest_snapshot.quantity) or Decimal("0")
-    if quantity == 0:
-        return None
-    mark_price = _quote_mark_price(quote)
-    if mark_price is None:
-        return None
-    average_cost = _to_decimal(latest_snapshot.average_cost)
-    market_value = quantity * mark_price
-    unrealized_pnl = (
-        quantity * (mark_price - average_cost)
-        if average_cost is not None
-        else Decimal("0")
-    )
-    snapshot = PositionSnapshotRecord(
-        broker_account_id=broker_account.id,
-        is_virtual=True,
-        snapshot_at=quote.observed_at,
-        source="virtual_market_mark",
-        symbol=latest_snapshot.symbol,
-        exchange=latest_snapshot.exchange,
-        currency=latest_snapshot.currency,
-        security_type=latest_snapshot.security_type,
-        primary_exchange=latest_snapshot.primary_exchange,
-        local_symbol=latest_snapshot.local_symbol,
-        quantity=str(quantity),
-        average_cost=str(average_cost) if average_cost is not None else None,
-        market_price=str(mark_price),
-        market_value=str(market_value),
-        unrealized_pnl=str(unrealized_pnl),
-        realized_pnl=latest_snapshot.realized_pnl,
-        raw_payload=_serialize_for_json(
-            {
-                "virtual_market_mark": True,
-                "quote": serialize_virtual_quote(quote),
-                "previous_snapshot_id": latest_snapshot.id,
-            }
-        ),
-    )
-    session.add(snapshot)
-    return snapshot
+        quote=quote,
+    ):
+        if not _quote_matches_position_owner(quote, latest_snapshot):
+            continue
+        quantity = _to_decimal(latest_snapshot.quantity) or Decimal("0")
+        if quantity == 0:
+            continue
+        mark_price = _quote_mark_price(quote)
+        if mark_price is None:
+            continue
+        average_cost = _to_decimal(latest_snapshot.average_cost)
+        market_value = quantity * mark_price
+        unrealized_pnl = (
+            quantity * (mark_price - average_cost)
+            if average_cost is not None
+            else Decimal("0")
+        )
+        owner = _position_owner_payload(latest_snapshot)
+        snapshot = PositionSnapshotRecord(
+            broker_account_id=broker_account.id,
+            is_virtual=True,
+            snapshot_at=quote.observed_at,
+            source="virtual_market_mark",
+            symbol=latest_snapshot.symbol,
+            exchange=latest_snapshot.exchange,
+            currency=latest_snapshot.currency,
+            security_type=latest_snapshot.security_type,
+            primary_exchange=latest_snapshot.primary_exchange,
+            local_symbol=latest_snapshot.local_symbol,
+            quantity=str(quantity),
+            average_cost=str(average_cost) if average_cost is not None else None,
+            market_price=str(mark_price),
+            market_value=str(market_value),
+            unrealized_pnl=str(unrealized_pnl),
+            realized_pnl=latest_snapshot.realized_pnl,
+            owner_instruction_id=owner["owner_instruction_id"],
+            owner_source_instruction_id=owner["owner_source_instruction_id"],
+            owner_deployment_key=owner["owner_deployment_key"],
+            owner_book_key=owner["owner_book_key"],
+            raw_payload=_serialize_for_json(
+                {
+                    "virtual_market_mark": True,
+                    "quote": serialize_virtual_quote(quote),
+                    "previous_snapshot_id": latest_snapshot.id,
+                    "owner": owner,
+                }
+            ),
+        )
+        session.add(snapshot)
+        marked_snapshots.append(snapshot)
+    return tuple(marked_snapshots)
 
 
 def _cancel_open_virtual_exit_siblings_after_fill(
@@ -1476,7 +1675,34 @@ def _quote_matches_order(
         return False
     if quote.security_type != broker_order.security_type:
         return False
+    quote_scope = _quote_owner_scope(quote)
+    if quote_scope is not None:
+        owner = _virtual_position_owner_from_order(broker_order)
+        if not _owner_scope_matches_quote_scope(
+            {
+                "deployment_key": owner["owner_deployment_key"],
+                "source_instruction_id": owner["owner_source_instruction_id"],
+            },
+            quote_scope,
+        ):
+            return False
     return True
+
+
+def _quote_matches_position_owner(
+    quote: VirtualMarketQuoteRecord,
+    position: PositionSnapshotRecord,
+) -> bool:
+    quote_scope = _quote_owner_scope(quote)
+    if quote_scope is None:
+        return True
+    return _owner_scope_matches_quote_scope(
+        {
+            "deployment_key": position.owner_deployment_key,
+            "source_instruction_id": position.owner_source_instruction_id,
+        },
+        quote_scope,
+    )
 
 
 def _build_fill_from_quote_for_order(
@@ -1641,7 +1867,7 @@ def record_virtual_market_quote(
         )
         session.add(quote)
         session.flush()
-        _persist_virtual_position_mark_snapshot(
+        _persist_virtual_position_mark_snapshots(
             session,
             broker_account=broker_account,
             quote=quote,
@@ -1913,7 +2139,7 @@ def record_virtual_market_quotes_from_stream_snapshot(
             )
             session.add(quote)
             session.flush()
-            _persist_virtual_position_mark_snapshot(
+            _persist_virtual_position_mark_snapshots(
                 session,
                 broker_account=broker_account,
                 quote=quote,

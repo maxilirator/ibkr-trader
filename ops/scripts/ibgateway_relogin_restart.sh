@@ -8,6 +8,7 @@ IBC_COMMAND_PORT="${IBC_COMMAND_PORT:-}"
 RELOGIN_AFTER_TWOFA_TIMEOUT="${RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}"
 LEGACY_EXIT_AFTER_TWOFA_TIMEOUT="${LEGACY_EXIT_AFTER_TWOFA_TIMEOUT:-no}"
 FALLBACK_SYSTEMCTL_RESTART="${FALLBACK_SYSTEMCTL_RESTART:-no}"
+IBC_COMMAND_TIMEOUT_SECONDS="${IBC_COMMAND_TIMEOUT_SECONDS:-10}"
 
 log() {
   printf '%s %s\n' "$(date --iso-8601=seconds)" "$*"
@@ -36,18 +37,19 @@ send_ibc_command() {
   local host="$1"
   local port="$2"
   local command="$3"
-  python3 - "$host" "$port" "$command" <<'PY'
+  python3 - "$host" "$port" "$command" "$IBC_COMMAND_TIMEOUT_SECONDS" <<'PY'
 from __future__ import annotations
 
 import socket
 import sys
 
-host, raw_port, command = sys.argv[1:4]
+host, raw_port, command, raw_timeout = sys.argv[1:5]
 port = int(raw_port)
+timeout = float(raw_timeout)
 payload = f"{command}\nEXIT\n".encode("utf-8")
 
-with socket.create_connection((host, port), timeout=10) as sock:
-    sock.settimeout(10)
+with socket.create_connection((host, port), timeout=timeout) as sock:
+    sock.settimeout(timeout)
     sock.sendall(payload)
     try:
         response = sock.recv(4096)
@@ -55,7 +57,10 @@ with socket.create_connection((host, port), timeout=10) as sock:
         response = b""
 
 if response:
-    sys.stdout.write(response.decode("utf-8", errors="replace"))
+    text = response.decode("utf-8", errors="replace")
+    sys.stdout.write(text)
+    if "ERROR" in text.upper():
+        raise SystemExit(2)
 PY
 }
 

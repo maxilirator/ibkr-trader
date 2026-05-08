@@ -363,6 +363,167 @@ class OperatorDashboardReadModelTests(unittest.TestCase):
             "RESOLVED",
         )
 
+    def test_recent_exit_fill_includes_per_fill_realized_pnl(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="instr-saab-long-1",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="long_risk_book",
+                symbol="SAAB",
+                exchange="SMART",
+                currency="SEK",
+                state="COMPLETED",
+                submit_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 4, 19, 15, 30, tzinfo=timezone.utc),
+                order_type="LIMIT",
+                side="BUY",
+                payload={
+                    "instruction": {
+                        "intent": {"side": "BUY", "position_side": "LONG"}
+                    }
+                },
+            )
+            session.add(instruction)
+            session.flush()
+
+            entry_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="ENTRY",
+                external_order_id="entry-1",
+                external_perm_id="entry-perm-1",
+                external_client_id="0",
+                order_ref=instruction.instruction_id,
+                symbol="SAAB",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SAAB B",
+                side="BUY",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Filled",
+                total_quantity="10",
+                limit_price="100.00",
+                stop_price=None,
+                submitted_at=datetime(2026, 4, 19, 7, 0, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 19, 7, 1, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            exit_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="exit-1",
+                external_perm_id="exit-perm-1",
+                external_client_id="0",
+                order_ref="manual-saab-close",
+                symbol="SAAB",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SAAB B",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Filled",
+                total_quantity="4",
+                limit_price="105.00",
+                stop_price=None,
+                submitted_at=datetime(2026, 4, 19, 8, 0, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 4, 19, 8, 1, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add_all([entry_order, exit_order])
+            session.flush()
+
+            session.add_all(
+                [
+                    ExecutionFillRecord(
+                        broker_order_id=entry_order.id,
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        external_execution_id="entry-fill-1",
+                        external_order_id="entry-1",
+                        external_perm_id="entry-perm-1",
+                        order_ref=instruction.instruction_id,
+                        symbol="SAAB",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        side="BOT",
+                        quantity="10",
+                        price="100.00",
+                        commission="2.00",
+                        commission_currency="SEK",
+                        executed_at=datetime(2026, 4, 19, 7, 1, tzinfo=timezone.utc),
+                        raw_payload={},
+                    ),
+                    ExecutionFillRecord(
+                        broker_order_id=exit_order.id,
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        external_execution_id="exit-fill-1",
+                        external_order_id="exit-1",
+                        external_perm_id="exit-perm-1",
+                        order_ref="manual-saab-close",
+                        symbol="SAAB",
+                        exchange="SMART",
+                        currency="SEK",
+                        security_type="STK",
+                        side="SLD",
+                        quantity="4",
+                        price="105.00",
+                        commission="1.00",
+                        commission_currency="SEK",
+                        executed_at=datetime(2026, 4, 19, 8, 1, tzinfo=timezone.utc),
+                        raw_payload={},
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            fill_limit=10,
+        )
+
+        exit_fill = snapshot.recent_fills[0]
+        self.assertEqual(exit_fill.external_execution_id, "exit-fill-1")
+        self.assertEqual(exit_fill.order_role, "EXIT")
+        self.assertEqual(exit_fill.position_side, "LONG")
+        self.assertEqual(exit_fill.realized_pnl, "+18.20")
+        self.assertEqual(exit_fill.realized_pnl_gross, "+20.00")
+        self.assertEqual(exit_fill.realized_pnl_currency, "SEK")
+        self.assertEqual(exit_fill.realized_pnl_basis_price, "100")
+
     def test_build_operator_dashboard_snapshot_includes_account_day_performance(self) -> None:
         self._seed_operator_data()
 

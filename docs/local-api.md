@@ -681,6 +681,8 @@ Accepts the canonical instruction batch, validates it, computes the Stockholm ru
 It currently:
 
 - validates the instruction batch
+- cancels older active entry instructions in the same intent group before
+  accepting a replacement
 - computes runtime schedule metadata, including next-session-open for Stockholm instruments
 - persists the instruction in `ENTRY_PENDING` state
 - writes an initial `instruction_submitted` lifecycle event
@@ -690,8 +692,45 @@ Important current behavior:
 
 - this endpoint does **not** place a broker order yet
 - it is a durable control-plane submit, not a live execution submit
+- if an open position already owns the same account/book/side/symbol group, the
+  endpoint rejects the fresh entry rather than adding or crossing risk
 - virtual account instructions are persisted with `is_virtual=true` and are
   later submitted through the virtual adapter
+
+### `POST /v1/instructions/intent-cleanup`
+
+Plans or applies cleanup for active instructions competing in the same intent
+group:
+
+- `account_key`
+- `book_key`
+- `book_side`
+- `symbol`
+- `exchange`
+- `currency`
+
+At least one selector is required. With `"apply": false`, the endpoint returns
+the cancellation plan without mutating state. With `"apply": true`, it cancels
+stale `ENTRY_PENDING` rows locally and stale `ENTRY_SUBMITTED` rows through the
+normal broker/virtual cancellation path. It never cancels `POSITION_OPEN` or
+`EXIT_PENDING` rows; those are returned as blockers so the runtime can manage
+position exits with broker-position checks.
+
+Example dry run:
+
+```bash
+curl -sS -X POST "$API/v1/instructions/intent-cleanup" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requested_by": "operator",
+    "reason": "Clean duplicate NIBE entries before tomorrow.",
+    "apply": false,
+    "account_key": "U25245596",
+    "symbol": "NIBE B",
+    "exchange": "XSTO",
+    "currency": "SEK"
+  }'
+```
 
 ### `GET /v1/instructions`
 

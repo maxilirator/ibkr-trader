@@ -83,6 +83,10 @@ Recommended repo usage:
 - keep the market-stream subscription cap explicit; the current default is 120
   symbols, with the runner reporting overflow instead of silently dropping names
 - keep dashboard-triggered broker status refresh throttled so operator pages can notice stale state without creating extra Gateway pressure
+- keep IBC `ExistingSessionDetectedAction=primary` on the dedicated live
+  Gateway machine. The `primaryoverride` behavior can make IBC abandon the
+  visible session and enter a stuck shutdown path when a stale broker session
+  is detected.
 
 When the API host is running with `EXECUTION_RUNTIME_ENABLED=true`, that same colocated process now hosts the long-lived execution loop. The runtime takes a durable Postgres lease before it starts cycling, and the dashboard can show whether the execution loop is running, degraded, stale, blocked on startup reconciliation, or stopped.
 
@@ -260,7 +264,16 @@ requirement, so the weekly restart should be planned for a time when the
 operator can approve it.
 
 - it writes recent Gateway log context to
-  `/run/ibgateway-api-watchdog.last-journal`
+  `/run/ibgateway-api-watchdog.last-journal` on every failed broker probe,
+  including deadlock monitor, market-data farm, shutdown, 2FA, and
+  CommandServer clues when present
+- it treats IBC CommandServer `ERROR` responses, such as
+  `RESTART already in progress`, as failed restart commands and backs off
+  before retrying
+- after an accepted restart command, it observes the Gateway process and only
+  records a completed restart if the process changes or the API probe recovers
+- by default it does not restart Gateway automatically; set
+  `WATCHDOG_RESTART_ENABLED=yes` only for an operator-approved restart window
 - it resets its failure counter after a successful probe or restart
 
 Tune the timer or threshold by editing
@@ -277,6 +290,9 @@ Environment=RESTART_WINDOW_TZ=Europe/Stockholm
 Environment=RESTART_ALLOWED_DAYS=Mon,Tue,Wed,Thu,Fri
 Environment=STARTUP_GRACE_SECONDS=900
 Environment=RESTART_COOLDOWN_SECONDS=3600
+Environment=RESTART_FAILURE_COOLDOWN_SECONDS=3600
+Environment=RESTART_OBSERVE_SECONDS=120
+Environment=WATCHDOG_RESTART_ENABLED=no
 # Optional generic JSON webhook: {"text": "..."}
 # Environment=OPERATOR_ALERT_WEBHOOK_URL=https://example.invalid/webhook
 # Optional mobile push through ntfy.

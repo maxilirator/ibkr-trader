@@ -29,10 +29,12 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by runner import smo
 
 from ibkr_trader.rl.inference_vector import RunnerSymbolState
 from ibkr_trader.rl.inference_vector import assemble_dqn_observation_vector
+from ibkr_trader.rl.inference_vector import has_pending_entry
 from ibkr_trader.rl.inference_vector import valid_action_mask
 from ibkr_trader.rl.model_artifacts import PromotedRLModelArtifact
 from ibkr_trader.rl.model_artifacts import promoted_rl_models
 from ibkr_trader.rl.model_artifacts import read_static_feature_names
+from ibkr_trader.rl.observations import HISTORY_FEATURE_NAMES
 from ibkr_trader.rl.observations import build_history_override_from_source_bars
 
 
@@ -76,6 +78,13 @@ class LoadedDeployment:
     book_key: str
     mode: str
     loaded: LoadedModel
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStateContext:
+    states: dict[str, RunnerSymbolState]
+    blocked_symbols: dict[str, Mapping[str, Any]]
+    source: str
 
 
 class ApiError(RuntimeError):
@@ -271,6 +280,25 @@ def main() -> int:
     )
     parser.add_argument("--history-bar-size", default="1 min")
     parser.add_argument("--history-timeout", type=int, default=45)
+    parser.add_argument(
+        "--allow-metadata-history-fallback",
+        action="store_true",
+        help=(
+            "Allow live RL observations to use candidate trace.metadata.yesterday_close "
+            "with neutral history features when IBKR historical bars are unavailable. "
+            "Intended for virtual/live-feed continuity only; prefer real historical bars."
+        ),
+    )
+    parser.add_argument(
+        "--metadata-history-only",
+        action="store_true",
+        help=(
+            "Do not call IBKR historical bars from the live RL loop. Use candidate "
+            "trace.metadata.history_features when present, otherwise require "
+            "--allow-metadata-history-fallback to use yesterday_close with neutral "
+            "history features."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument(
         "--benchmark-symbols",
@@ -307,6 +335,7 @@ def main() -> int:
     if str(history_cache_path.parent) not in {"", "."}:
         history_cache_path.parent.mkdir(parents=True, exist_ok=True)
     history_cache = _load_history_cache(history_cache_path)
+    stream_subscription_state: dict[str, Any] = {}
     model_configs = {artifact.model_key: artifact for artifact in promoted_rl_models()}
     loaded_models = {key: load_model(config) for key, config in model_configs.items()}
     print(
@@ -340,9 +369,12 @@ def main() -> int:
                 candidate_reason_codes=parse_reason_code_filter(args.candidate_reason_code),
                 trade_date=args.trade_date or datetime.now(STOCKHOLM_TZ).date().isoformat(),
                 history_cache=history_cache,
+                stream_subscription_state=stream_subscription_state,
                 history_duration=args.history_duration,
                 history_bar_size=args.history_bar_size,
                 history_timeout=args.history_timeout,
+                allow_metadata_history_fallback=args.allow_metadata_history_fallback,
+                metadata_history_only=args.metadata_history_only,
                 benchmark_symbols=parse_symbol_list(args.benchmark_symbols),
                 max_stream_symbols=args.max_stream_symbols,
                 stream_warning_symbols=args.stream_warning_symbols,
@@ -373,12 +405,15 @@ def run_once(
     candidate_reason_codes: set[str],
     trade_date: str,
     history_cache: dict[str, Any],
+    stream_subscription_state: dict[str, Any] | None = None,
     history_duration: str,
     history_bar_size: str,
     history_timeout: int,
     benchmark_symbols: list[str],
     max_stream_symbols: int = DEFAULT_MAX_STREAM_SYMBOLS,
     stream_warning_symbols: int = DEFAULT_STREAM_WARNING_SYMBOLS,
+    allow_metadata_history_fallback: bool = False,
+    metadata_history_only: bool = False,
 ) -> None:
     active_deployments = dict(
         loaded_deployments
@@ -424,6 +459,7 @@ def run_once(
                     api_base,
                     benchmark_symbols,
                     market_data_type=market_data_type,
+                    subscription_state=stream_subscription_state,
                 )
             except ApiError as exc:
                 print(f"Benchmark stream unavailable: {exc}", flush=True)
@@ -447,11 +483,29 @@ def run_once(
     )
     stream_symbols = stream_plan["stream_symbols"]
     try:
-        subscribe_symbols(api_base, stream_symbols, market_data_type=market_data_type)
+        subscribe_symbols(
+            api_base,
+            stream_symbols,
+            market_data_type=market_data_type,
+            subscription_state=stream_subscription_state,
+        )
         stream = get_json(
             f"{api_base}/v1/market-data/stream/snapshot?"
             + urllib.parse.urlencode({"symbols": ",".join(stream_symbols), "bar_limit": "390"})
         )["stream"]
+        if stream_subscription_needs_repair(stream, stream_symbols):
+            if stream_subscription_state is not None:
+                stream_subscription_state.pop("signature", None)
+            subscribe_symbols(
+                api_base,
+                stream_symbols,
+                market_data_type=market_data_type,
+                subscription_state=stream_subscription_state,
+            )
+            stream = get_json(
+                f"{api_base}/v1/market-data/stream/snapshot?"
+                + urllib.parse.urlencode({"symbols": ",".join(stream_symbols), "bar_limit": "390"})
+            )["stream"]
     except ApiError as exc:
         heartbeat_stream_failure(
             api_base=api_base,
@@ -504,6 +558,8 @@ def run_once(
             history_duration=history_duration,
             history_bar_size=history_bar_size,
             history_timeout=history_timeout,
+            allow_metadata_history_fallback=allow_metadata_history_fallback,
+            metadata_history_only=metadata_history_only,
             stream_bar_ready_symbols=symbols_with_bars,
             stream_plan=stream_plan,
             trade_date=trade_date,
@@ -523,6 +579,8 @@ def run_model_candidates(
     history_duration: str,
     history_bar_size: str,
     history_timeout: int,
+    allow_metadata_history_fallback: bool = False,
+    metadata_history_only: bool = False,
     stream_bar_ready_symbols: set[str] | None = None,
     stream_plan: Mapping[str, Any] | None = None,
     trade_date: str | None = None,
@@ -531,20 +589,44 @@ def run_model_candidates(
     timing_metrics: dict[str, Any] = {}
     symbols = sorted({str(candidate["symbol"]).upper() for candidate in candidates})
     stage_started = time.perf_counter()
-    runtime_states = load_runtime_states_from_instructions(
+    runtime_context = load_runtime_state_context(
         api_base=api_base,
         deployment_key=deployment_key,
         symbols=symbols,
         side=loaded.config.side,
     )
+    runtime_states = runtime_context.states
     timing_metrics["load_runtime_states_seconds"] = _elapsed_seconds(stage_started)
     active_candidates: list[Mapping[str, Any]] = []
     static_features: dict[str, Any] = {}
     history_overrides: dict[str, Any] = {}
     skipped_candidates: list[dict[str, Any]] = []
+    stream_ready_symbols = {
+        str(symbol).upper() for symbol in (stream_bar_ready_symbols or set())
+    }
     stage_started = time.perf_counter()
     for candidate in candidates:
         symbol = str(candidate["symbol"]).upper()
+        if stream_bar_ready_symbols is not None and symbol not in stream_ready_symbols:
+            skipped_candidates.append(
+                {
+                    "symbol": symbol,
+                    "status": "waiting_for_stream_bars",
+                    "reason": "market stream has no 1-minute bars for symbol yet",
+                }
+            )
+            continue
+        runtime_block = runtime_context.blocked_symbols.get(symbol)
+        if runtime_block is not None:
+            skipped_candidates.append(
+                {
+                    "symbol": symbol,
+                    "status": "runtime_state_blocked",
+                    "reason": "authoritative runtime state is ambiguous",
+                    "runtime_state": dict(runtime_block),
+                }
+            )
+            continue
         trace = candidate.get("trace", {})
         cutoff = trace.get("data_cutoff_date") if isinstance(trace, Mapping) else None
         trade_date = trace.get("trade_date") if isinstance(trace, Mapping) else None
@@ -582,6 +664,8 @@ def run_model_candidates(
                 duration=history_duration,
                 bar_size=history_bar_size,
                 timeout=history_timeout,
+                allow_metadata_fallback=allow_metadata_history_fallback,
+                metadata_history_only=metadata_history_only,
             )
         except Exception as exc:
             skipped_candidates.append(
@@ -596,6 +680,23 @@ def run_model_candidates(
     timing_metrics["prepare_features_history_seconds"] = _elapsed_seconds(stage_started)
 
     if not active_candidates:
+        runtime_blocked_candidate_count = sum(
+            1
+            for candidate in skipped_candidates
+            if candidate.get("status") == "runtime_state_blocked"
+        )
+        runtime_error = (
+            "authoritative runtime state blocked all RL candidates"
+            if candidates and runtime_blocked_candidate_count == len(candidates)
+            else "market stream has no bars for active RL candidates"
+            if candidates
+            and skipped_candidates
+            and all(
+                candidate.get("status") == "waiting_for_stream_bars"
+                for candidate in skipped_candidates
+            )
+            else "no candidates had complete static features and history overrides"
+        )
         _finalize_timing_metrics(
             timing_metrics,
             started_at=run_started,
@@ -605,11 +706,20 @@ def run_model_candidates(
             api_base,
             deployment_key,
             "degraded",
-            runtime_error="no candidates had complete static features and history overrides",
+            runtime_error=runtime_error,
             metrics={
                 "candidate_count": len(candidates),
+                "active_candidate_count": 0,
                 "symbols": symbols,
                 "skipped_candidates": skipped_candidates,
+                "waiting_for_stream_bar_candidate_count": sum(
+                    1
+                    for candidate in skipped_candidates
+                    if candidate.get("status") == "waiting_for_stream_bars"
+                ),
+                "runtime_state_source": runtime_context.source,
+                "runtime_state_blocked_symbol_count": len(runtime_context.blocked_symbols),
+                "runtime_state_blocked_candidate_count": runtime_blocked_candidate_count,
                 "timing": timing_metrics,
             },
         )
@@ -642,7 +752,7 @@ def run_model_candidates(
                 "fetch": {
                     "mode": "market_stream",
                     "bar_limit": 390,
-                    "backfill_missing": True,
+                    "backfill_missing": False,
                     "backfill_duration": "1 D",
                     "backfill_bar_size": "1 min",
                     "instruments": {
@@ -777,21 +887,44 @@ def run_model_candidates(
         state_before = translation_state_before(runner_state, loaded.config.side)
         observed_at = decision_observed_at(symbol_observation)
         translate_started = time.perf_counter()
-        translation = post_json(
-            f"{api_base}/v1/rl/actions/translate",
-            {
-                "deployment_key": deployment_key,
-                "source_instruction_id": candidate["instruction_id"],
-                "action_name": action_name,
-                "state_before": state_before,
-                "observed_at": observed_at,
-                "previous_close": previous_close,
-                "decision_id": decision_id,
-                "submit": bool(execute_actions and _is_executable_action(action_name)),
-                "log_action": True,
-                "model_diagnostics": diagnostics,
-            },
-        )
+        try:
+            translation = post_json(
+                f"{api_base}/v1/rl/actions/translate",
+                {
+                    "deployment_key": deployment_key,
+                    "source_instruction_id": candidate["instruction_id"],
+                    "action_name": action_name,
+                    "state_before": state_before,
+                    "observed_at": observed_at,
+                    "previous_close": previous_close,
+                    "decision_id": decision_id,
+                    "submit": bool(execute_actions and _is_executable_action(action_name)),
+                    "log_action": True,
+                    "model_diagnostics": diagnostics,
+                },
+            )
+        except ApiError as exc:
+            translate_seconds += time.perf_counter() - translate_started
+            if _api_error_is_conflict(exc):
+                processed_decisions.add(dedupe_key)
+            last_action_at = datetime.now(timezone.utc).isoformat()
+            actions.append(
+                {
+                    "symbol": symbol,
+                    "decision_id": decision_id,
+                    "action_name": action_name,
+                    "state_before": state_before,
+                    "runner_state": asdict(runner_state),
+                    "q_values": q_values,
+                    "action_margin": diagnostics.get("action_margin"),
+                    "submitted": False,
+                    "action_status": "translate_error",
+                    "status": "translate_error",
+                    "retryable": not _api_error_is_conflict(exc),
+                    "error": str(exc),
+                }
+            )
+            continue
         translate_seconds += time.perf_counter() - translate_started
         virtual_quote_result = None
         if deployment_mode == "virtual":
@@ -851,6 +984,11 @@ def run_model_candidates(
     elif action_distribution.get("warning"):
         heartbeat_status = "degraded"
         runtime_error = str(action_distribution.get("warning_detail") or action_distribution["warning"])
+    elif status_counts.get("translate_error", 0):
+        heartbeat_status = "degraded"
+        runtime_error = (
+            f"{status_counts['translate_error']} RL action translation request(s) failed"
+        )
     elif timing_metrics.get("cadence_over_budget"):
         heartbeat_status = "degraded"
         runtime_error = "RL runner processing exceeded the 5-minute decision cadence"
@@ -868,7 +1006,7 @@ def run_model_candidates(
                 {
                     str(candidate["symbol"]).upper()
                     for candidate in active_candidates
-                    if str(candidate["symbol"]).upper() in (stream_bar_ready_symbols or set())
+                    if str(candidate["symbol"]).upper() in stream_ready_symbols
                 }
             ),
             "stream_bar_ready_candidate_count": coverage_counts.get("fresh_bar", 0),
@@ -895,6 +1033,10 @@ def run_model_candidates(
             "deployment_mode": deployment_mode,
             "execute_actions": execute_actions,
             "history_cache_count": len(history_cache),
+            "metadata_history_fallback_allowed": allow_metadata_history_fallback,
+            "metadata_history_only": metadata_history_only,
+            "runtime_state_source": runtime_context.source,
+            "runtime_state_blocked_symbol_count": len(runtime_context.blocked_symbols),
             "timing": timing_metrics,
         },
     )
@@ -1287,6 +1429,28 @@ def decision_observed_at(symbol_observation: Mapping[str, Any]) -> str:
     )
 
 
+def load_runtime_state_context(
+    *,
+    api_base: str,
+    deployment_key: str,
+    symbols: list[str],
+    side: str,
+) -> RuntimeStateContext:
+    states = load_runtime_states_from_instructions(
+        api_base=api_base,
+        deployment_key=deployment_key,
+        symbols=symbols,
+        side=side,
+    )
+    blocked = getattr(load_runtime_states_from_instructions, "_last_blocked_symbols", {})
+    source = getattr(load_runtime_states_from_instructions, "_last_source", "instructions")
+    return RuntimeStateContext(
+        states=states,
+        blocked_symbols=dict(blocked if isinstance(blocked, Mapping) else {}),
+        source=str(source),
+    )
+
+
 def load_runtime_states_from_instructions(
     *,
     api_base: str,
@@ -1294,10 +1458,24 @@ def load_runtime_states_from_instructions(
     symbols: list[str],
     side: str,
 ) -> dict[str, RunnerSymbolState]:
-    """Recover per-symbol runner state from translated RL instructions."""
+    """Recover per-symbol runner state from the API runtime-state contract."""
 
     symbol_set = {symbol.upper() for symbol in symbols}
-    payload = get_json(f"{api_base}/v1/instructions?limit=500")
+    runtime_payload = get_json(
+        f"{api_base}/v1/rl/runtime-state?"
+        + urllib.parse.urlencode(
+            {
+                "deployment_key": deployment_key,
+                "symbols": ",".join(sorted(symbol_set)),
+            }
+        )
+    )
+    if isinstance(runtime_payload.get("runtime_state"), Mapping):
+        return _runtime_states_from_runtime_state_payload(runtime_payload)
+
+    load_runtime_states_from_instructions._last_blocked_symbols = {}
+    load_runtime_states_from_instructions._last_source = "instructions"
+    payload = runtime_payload
     latest_by_symbol: dict[str, Mapping[str, Any]] = {}
     for instruction in payload.get("instructions", []):
         if not isinstance(instruction, Mapping):
@@ -1321,14 +1499,11 @@ def load_runtime_states_from_instructions(
         state_name = str(instruction.get("state") or "").upper()
         metadata = _instruction_metadata(instruction)
         if state_name in {"ENTRY_PENDING", "ENTRY_SUBMITTED"}:
+            action_name = str(metadata.get("rl_action_name") or "")
             states[symbol] = RunnerSymbolState(
                 in_position=False,
-                pending_entry_anchor=(
-                    "prev_close"
-                    if str(metadata.get("rl_action_name") or "").startswith("entry_prevclose_")
-                    else None
-                ),
-                pending_entry_rel_bp=_entry_rel_bp(metadata.get("rl_action_name")),
+                pending_entry_anchor=_pending_entry_anchor(action_name),
+                pending_entry_rel_bp=_entry_rel_bp(action_name),
                 bars_since_entry_order=1,
             )
         elif state_name in {"POSITION_OPEN", "EXIT_PENDING"}:
@@ -1343,14 +1518,74 @@ def load_runtime_states_from_instructions(
     return states
 
 
+def _runtime_states_from_runtime_state_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, RunnerSymbolState]:
+    runtime_state = payload.get("runtime_state")
+    if not isinstance(runtime_state, Mapping):
+        raise ValueError("runtime_state payload must be an object")
+    blocked_symbols: dict[str, Mapping[str, Any]] = {}
+    states: dict[str, RunnerSymbolState] = {}
+    for item in runtime_state.get("symbols", []):
+        if not isinstance(item, Mapping):
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        if str(item.get("status") or "").lower() != "ready":
+            blocked_symbols[symbol] = item
+            continue
+        runner_state_payload = item.get("runner_state")
+        if not isinstance(runner_state_payload, Mapping):
+            blocked_symbols[symbol] = {
+                **dict(item),
+                "status": "blocked",
+                "blockers": [
+                    {
+                        "reason": "missing_runner_state",
+                        "message": "Runtime-state endpoint did not return a runner_state.",
+                    }
+                ],
+            }
+            continue
+        states[symbol] = RunnerSymbolState(
+            in_position=bool(runner_state_payload.get("in_position")),
+            pending_entry_anchor=_str_or_none(
+                runner_state_payload.get("pending_entry_anchor")
+            ),
+            pending_entry_rel_bp=_int_or_none(
+                runner_state_payload.get("pending_entry_rel_bp")
+            ),
+            pending_exit_tp_bp=_int_or_none(
+                runner_state_payload.get("pending_exit_tp_bp")
+            ),
+            entry_price=_float_or_none(runner_state_payload.get("entry_price")),
+            entry_bar_idx=_int_or_none(runner_state_payload.get("entry_bar_idx")),
+            bars_since_entry_order=int(
+                runner_state_payload.get("bars_since_entry_order") or 0
+            ),
+            bars_since_exit_order=int(
+                runner_state_payload.get("bars_since_exit_order") or 0
+            ),
+        )
+
+    load_runtime_states_from_instructions._last_blocked_symbols = blocked_symbols
+    load_runtime_states_from_instructions._last_source = "runtime-state"
+    return states
+
+
 def translation_state_before(state: RunnerSymbolState, side: str) -> str:
     if state.in_position:
         if state.pending_exit_tp_bp is not None:
             return "EXIT_PENDING"
         return "SHORT_OPEN" if side.upper() == "SHORT" else "LONG_OPEN"
-    if state.pending_entry_anchor is not None:
+    if has_pending_entry(state):
         return "ENTRY_PENDING"
     return "FLAT"
+
+
+def _api_error_is_conflict(exc: ApiError) -> bool:
+    return "HTTP 409:" in str(exc)
 
 
 def _instruction_metadata(instruction: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1379,6 +1614,17 @@ def _entry_rel_bp(action_name: Any) -> int | None:
         return None
 
 
+def _pending_entry_anchor(action_name: Any) -> str:
+    raw = str(action_name or "")
+    if raw == "market_entry":
+        return "market"
+    if raw.startswith("entry_prevclose_"):
+        return "prev_close"
+    if raw.startswith("entry_sessionopen_"):
+        return "session_open"
+    return "unknown"
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -1386,6 +1632,22 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _require_torch() -> tuple[Any, Any]:
@@ -1663,6 +1925,8 @@ def history_override_payload(
     duration: str,
     bar_size: str,
     timeout: int,
+    allow_metadata_fallback: bool = False,
+    metadata_history_only: bool = False,
 ) -> dict[str, Any]:
     request_payload = build_historical_bars_payload(
         candidate,
@@ -1670,6 +1934,13 @@ def history_override_payload(
         duration=duration,
         bar_size=bar_size,
     )
+    if metadata_history_only:
+        return candidate_metadata_history_override_payload(
+            candidate,
+            trade_date=trade_date,
+            allow_neutral_fallback=allow_metadata_fallback,
+        )
+
     cache_key = _history_cache_key(
         loaded.config.model_key,
         request_payload,
@@ -1682,6 +1953,8 @@ def history_override_payload(
     failure_key = f"{cache_key}:failure"
     recent_failure = history_cache.get(failure_key)
     if isinstance(recent_failure, Mapping) and _is_recent_failure(recent_failure):
+        if allow_metadata_fallback:
+            return metadata_history_override_payload(candidate, trade_date=trade_date)
         raise RuntimeError(
             "recent history backfill failure still cooling down: "
             f"{recent_failure.get('error')}"
@@ -1715,6 +1988,12 @@ def history_override_payload(
             "failed_at": datetime.now(timezone.utc).isoformat(),
             "error": str(exc),
         }
+        if allow_metadata_fallback:
+            return candidate_metadata_history_override_payload(
+                candidate,
+                trade_date=trade_date,
+                allow_neutral_fallback=True,
+            )
         raise
 
     history_cache[cache_key] = {
@@ -1725,6 +2004,177 @@ def history_override_payload(
     }
     history_cache.pop(failure_key, None)
     return override
+
+
+def candidate_metadata_history_override_payload(
+    candidate: Mapping[str, Any],
+    *,
+    trade_date: str,
+    allow_neutral_fallback: bool = False,
+) -> dict[str, Any]:
+    metadata = candidate_trace_metadata(candidate)
+    for key in (
+        "history_override",
+        "rl_history_override",
+        "history_features_override",
+    ):
+        raw_override = metadata.get(key)
+        if isinstance(raw_override, Mapping):
+            return _metadata_history_payload_from_mapping(
+                raw_override,
+                trade_date=trade_date,
+                source=f"candidate_metadata.{key}",
+            )
+
+    prev_close = (
+        metadata.get("yesterday_close")
+        or metadata.get("previous_close")
+        or metadata.get("prev_close")
+    )
+    for key in ("history_features", "rl_history_features", "source_history_features"):
+        raw_history = metadata.get(key)
+        if raw_history is not None:
+            return _metadata_history_payload_from_parts(
+                prev_close=prev_close,
+                raw_history=raw_history,
+                trade_date=trade_date,
+                source=f"candidate_metadata.{key}",
+            )
+
+    if allow_neutral_fallback:
+        return metadata_history_override_payload(candidate, trade_date=trade_date)
+    raise RuntimeError(
+        "candidate metadata has no complete history override; refusing to call "
+        "IBKR historical bars because metadata_history_only is enabled"
+    )
+
+
+def _metadata_history_payload_from_mapping(
+    override: Mapping[str, Any],
+    *,
+    trade_date: str,
+    source: str,
+) -> dict[str, Any]:
+    prev_close = (
+        override.get("prev_close")
+        or override.get("previous_close")
+        or override.get("yesterday_close")
+        or (
+            override.get("previous_session", {}).get("close")
+            if isinstance(override.get("previous_session"), Mapping)
+            else None
+        )
+    )
+    raw_history = override.get("history_features", override)
+    return _metadata_history_payload_from_parts(
+        prev_close=prev_close,
+        raw_history=raw_history,
+        trade_date=trade_date,
+        source=source,
+    )
+
+
+def _metadata_history_payload_from_parts(
+    *,
+    prev_close: Any,
+    raw_history: Any,
+    trade_date: str,
+    source: str,
+) -> dict[str, Any]:
+    if prev_close is None:
+        raise RuntimeError(f"{source} is missing prev_close")
+    history_features = _metadata_history_features(raw_history, source=source)
+    return {
+        "prev_close": str(prev_close),
+        "history_features": history_features,
+        "source": source,
+        "source_bar_interval": None,
+        "target_bar_interval": "5m",
+        "target_date": trade_date,
+    }
+
+
+def _metadata_history_features(raw_history: Any, *, source: str) -> dict[str, float]:
+    if isinstance(raw_history, Mapping):
+        history = {
+            name: float(raw_history[name])
+            for name in HISTORY_FEATURE_NAMES
+            if raw_history.get(name) is not None
+        }
+    elif isinstance(raw_history, list):
+        if len(raw_history) != len(HISTORY_FEATURE_NAMES):
+            raise RuntimeError(
+                f"{source} history_features vector must have "
+                f"{len(HISTORY_FEATURE_NAMES)} values"
+            )
+        history = {
+            name: float(raw_history[idx])
+            for idx, name in enumerate(HISTORY_FEATURE_NAMES)
+        }
+    else:
+        raise RuntimeError(f"{source} history_features must be an object or vector")
+    missing = [name for name in HISTORY_FEATURE_NAMES if name not in history]
+    if missing:
+        raise RuntimeError(f"{source} history_features missing features: {missing}")
+    return history
+
+
+def metadata_history_override_payload(
+    candidate: Mapping[str, Any],
+    *,
+    trade_date: str,
+) -> dict[str, Any]:
+    metadata = candidate_trace_metadata(candidate)
+    prev_close = (
+        metadata.get("yesterday_close")
+        or metadata.get("previous_close")
+        or metadata.get("prev_close")
+    )
+    if prev_close is None:
+        raise RuntimeError(
+            "IBKR historical backfill failed and candidate metadata has no yesterday_close"
+        )
+    return {
+        "prev_close": str(prev_close),
+        "history_features": {name: 0.0 for name in HISTORY_FEATURE_NAMES},
+        "source": "candidate_metadata_yesterday_close_fallback",
+        "source_bar_interval": None,
+        "target_bar_interval": "5m",
+        "target_date": trade_date,
+        "warning": (
+            "IBKR historical bars were unavailable; neutral history features were "
+            "used with candidate trace.metadata.yesterday_close."
+        ),
+    }
+
+
+def candidate_trace_metadata(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+    trace = candidate.get("trace")
+    if isinstance(trace, Mapping):
+        metadata = trace.get("metadata")
+        if isinstance(metadata, Mapping):
+            return metadata
+    nested = candidate.get("candidate")
+    if isinstance(nested, Mapping):
+        payload = nested.get("payload")
+        if isinstance(payload, Mapping):
+            instruction = payload.get("instruction")
+            if isinstance(instruction, Mapping):
+                trace = instruction.get("trace")
+                if isinstance(trace, Mapping):
+                    metadata = trace.get("metadata")
+                    if isinstance(metadata, Mapping):
+                        return metadata
+    payload = candidate.get("payload")
+    if isinstance(payload, Mapping):
+        instruction = payload.get("instruction")
+        if isinstance(instruction, Mapping):
+            trace = instruction.get("trace")
+            if isinstance(trace, Mapping):
+                metadata = trace.get("metadata")
+                if isinstance(metadata, Mapping):
+                    return metadata
+    return {}
 
 
 def build_historical_bars_payload(
@@ -1835,7 +2285,13 @@ def _is_recent_failure(payload: Mapping[str, Any], *, cooldown_seconds: int = 60
     return age_seconds < cooldown_seconds
 
 
-def subscribe_symbols(api_base: str, symbols: list[str], *, market_data_type: str) -> None:
+def subscribe_symbols(
+    api_base: str,
+    symbols: list[str],
+    *,
+    market_data_type: str,
+    subscription_state: dict[str, Any] | None = None,
+) -> bool:
     contracts: list[dict[str, Any]] = []
     for symbol in symbols:
         normalized_symbol = str(symbol).strip().upper()
@@ -1852,14 +2308,83 @@ def subscribe_symbols(api_base: str, symbols: list[str], *, market_data_type: st
                 "currency": "SEK",
             }
         )
+    signature = _stream_subscription_signature(
+        contracts,
+        market_data_type=market_data_type,
+        replace=True,
+    )
+    if subscription_state is not None:
+        if subscription_state.get("signature") == signature:
+            return False
     post_json(
         f"{api_base}/v1/market-data/stream/subscribe",
         {
             "contracts": contracts,
             "market_data_type": market_data_type,
-            "replace": False,
+            "replace": True,
         },
     )
+    if subscription_state is not None:
+        subscription_state["signature"] = signature
+    return True
+
+
+def _stream_subscription_signature(
+    contracts: list[Mapping[str, Any]],
+    *,
+    market_data_type: str,
+    replace: bool,
+) -> str:
+    normalized_contracts = sorted(
+        (
+            {
+                str(key): value
+                for key, value in contract.items()
+                if value is not None
+            }
+            for contract in contracts
+        ),
+        key=lambda contract: (
+            str(contract.get("symbol") or "").upper(),
+            str(contract.get("security_type") or "").upper(),
+            str(contract.get("exchange") or "").upper(),
+            str(contract.get("primary_exchange") or "").upper(),
+            str(contract.get("currency") or "").upper(),
+        ),
+    )
+    return json.dumps(
+        {
+            "contracts": normalized_contracts,
+            "market_data_type": market_data_type,
+            "replace": replace,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def stream_subscription_needs_repair(
+    stream: Mapping[str, Any],
+    stream_symbols: list[str],
+) -> bool:
+    expected_symbols = {str(symbol).strip().upper() for symbol in stream_symbols if symbol}
+    if not expected_symbols:
+        return False
+    desired_symbols = {
+        str(symbol).strip().upper()
+        for symbol in stream.get("desired_symbols", [])
+        if symbol
+    }
+    subscribed_symbols = {
+        str(subscription.get("contract", {}).get("symbol") or "").strip().upper()
+        for subscription in stream.get("subscriptions", [])
+        if isinstance(subscription, Mapping)
+    }
+    if not expected_symbols.issubset(desired_symbols):
+        return True
+    if not expected_symbols.issubset(subscribed_symbols):
+        return True
+    return False
 
 
 def heartbeat_stream_failure(

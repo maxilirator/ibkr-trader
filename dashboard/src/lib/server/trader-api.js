@@ -102,6 +102,14 @@ export function buildFallbackHealth(apiBaseUrl, errorMessage = null) {
       per_operation: {},
       recent_operations: []
     },
+    ibgateway: {
+      status: 'unavailable',
+      severity: 'warn',
+      summary: 'Gateway diagnostics unavailable.',
+      latest_event_at: null,
+      latest_dialog: null,
+      error: unavailableMessage
+    },
     broker_monitor: {
       status_checked_at: null,
       running: false,

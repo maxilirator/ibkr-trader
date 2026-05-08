@@ -628,6 +628,8 @@ class PositionSnapshotRecord(TimestampMixin, Base):
         Index("ix_position_snapshot_broker_account_id", "broker_account_id"),
         Index("ix_position_snapshot_snapshot_at", "snapshot_at"),
         Index("ix_position_snapshot_symbol", "symbol"),
+        Index("ix_position_snapshot_owner_deployment_key", "owner_deployment_key"),
+        Index("ix_position_snapshot_owner_instruction_id", "owner_instruction_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -650,6 +652,10 @@ class PositionSnapshotRecord(TimestampMixin, Base):
     market_value: Mapped[str | None] = mapped_column(String(64))
     unrealized_pnl: Mapped[str | None] = mapped_column(String(64))
     realized_pnl: Mapped[str | None] = mapped_column(String(64))
+    owner_instruction_id: Mapped[str | None] = mapped_column(String(128))
+    owner_source_instruction_id: Mapped[str | None] = mapped_column(String(128))
+    owner_deployment_key: Mapped[str | None] = mapped_column(String(128))
+    owner_book_key: Mapped[str | None] = mapped_column(String(64))
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     broker_account: Mapped[BrokerAccountRecord] = relationship(

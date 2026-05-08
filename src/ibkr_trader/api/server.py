@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import date, datetime, time
 from datetime import timedelta
 from decimal import Decimal
+from decimal import InvalidOperation
 from enum import Enum
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -45,6 +46,7 @@ from ibkr_trader.domain.execution_payloads import parse_datetime
 from ibkr_trader.domain.execution_payloads import parse_decimal
 from ibkr_trader.domain.execution_payloads import parse_date
 from ibkr_trader.domain.execution_payloads import parse_execution_batch_payload
+from ibkr_trader.domain.execution_payloads import parse_execution_instruction_payload
 from ibkr_trader.ibkr.account_summary import (
     DEFAULT_ACCOUNT_SUMMARY_TAGS,
     read_account_summary,
@@ -54,6 +56,7 @@ from ibkr_trader.ibkr.contracts import (
     serialize_contract_resolve_result,
 )
 from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.market_stream import MarketStreamContract
@@ -103,6 +106,13 @@ from ibkr_trader.orchestration.instruction_status import InstructionStatusNotFou
 from ibkr_trader.orchestration.instruction_status import list_instruction_statuses
 from ibkr_trader.orchestration.instruction_status import read_instruction_status
 from ibkr_trader.orchestration.instruction_status import serialize_instruction_status
+from ibkr_trader.orchestration.intent_replacement import (
+    IntentCleanupSelectorError,
+    IntentReplacementConflictError,
+    cleanup_intent_groups,
+    serialize_intent_cleanup_result,
+    supersede_batch_intent_entries,
+)
 from ibkr_trader.orchestration.operator_controls import (
     InstructionSetCancellationNotFoundError,
     InstructionSetCancellationSelectorError,
@@ -121,6 +131,9 @@ from ibkr_trader.orchestration.operator_reviews import (
     serialize_reconciliation_issue_archive_result,
     serialize_operator_review_status,
 )
+from ibkr_trader.orchestration.rl_candidate_lifecycle import (
+    retire_completed_rl_candidates,
+)
 from ibkr_trader.orchestration.rl_candidate_rollover import (
     archive_expired_rl_candidates,
     serialize_rl_candidate_rollover_result,
@@ -136,6 +149,7 @@ from ibkr_trader.orchestration.runtime_worker import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_worker import run_startup_reconciliation
 from ibkr_trader.orchestration.runtime_worker import serialize_runtime_cycle_result
 from ibkr_trader.orchestration.scheduling import build_batch_runtime_schedule
+from ibkr_trader.orchestration.scheduling import build_instruction_runtime_schedule
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.submission import SubmissionConflictError
 from ibkr_trader.orchestration.submission import submit_execution_batch
@@ -1104,6 +1118,82 @@ def parse_instruction_set_cancellation_payload(
         raise ValueError("timeout must be positive")
 
     return requested_by, reason, batch_id, account_key, book_key, instruction_ids, timeout
+
+
+def parse_intent_cleanup_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    requested_by = str(payload.get("requested_by", "api")).strip()
+    if not requested_by:
+        raise ValueError("requested_by must be a non-empty string")
+
+    reason = payload.get("reason")
+    if reason is not None:
+        reason = str(reason).strip() or None
+
+    raw_instruction_ids = payload.get("instruction_ids")
+    instruction_ids: tuple[str, ...] | None = None
+    if raw_instruction_ids is not None:
+        if not isinstance(raw_instruction_ids, list) or not raw_instruction_ids:
+            raise ValueError("instruction_ids must be a non-empty array of strings")
+        parsed_instruction_ids = tuple(str(item).strip() for item in raw_instruction_ids)
+        if not all(parsed_instruction_ids):
+            raise ValueError("instruction_ids must contain only non-empty strings")
+        if len(set(parsed_instruction_ids)) != len(parsed_instruction_ids):
+            raise ValueError("instruction_ids must not contain duplicates")
+        instruction_ids = parsed_instruction_ids
+
+    keep_instruction_id = (
+        str(payload["keep_instruction_id"]).strip()
+        if payload.get("keep_instruction_id") is not None
+        else None
+    )
+    if keep_instruction_id == "":
+        raise ValueError("keep_instruction_id must be a non-empty string")
+
+    timeout = int(payload.get("timeout", 10))
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+
+    return {
+        "requested_by": requested_by,
+        "reason": reason,
+        "apply": bool(payload.get("apply", False)),
+        "account_key": (
+            str(payload["account_key"]).strip()
+            if payload.get("account_key") is not None
+            else None
+        ),
+        "book_key": (
+            str(payload["book_key"]).strip()
+            if payload.get("book_key") is not None
+            else None
+        ),
+        "book_side": (
+            str(payload["book_side"]).strip()
+            if payload.get("book_side") is not None
+            else None
+        ),
+        "symbol": (
+            str(payload["symbol"]).strip()
+            if payload.get("symbol") is not None
+            else None
+        ),
+        "exchange": (
+            str(payload["exchange"]).strip()
+            if payload.get("exchange") is not None
+            else None
+        ),
+        "currency": (
+            str(payload["currency"]).strip()
+            if payload.get("currency") is not None
+            else None
+        ),
+        "instruction_ids": instruction_ids,
+        "keep_instruction_id": keep_instruction_id,
+        "cancel_all_entries": bool(payload.get("cancel_all_entries", False)),
+        "timeout": timeout,
+    }
 
 
 def parse_instruction_archive_payload(
@@ -2106,6 +2196,509 @@ def serialize_execution_batch(batch: ExecutionInstructionBatch) -> dict[str, Any
     return payload
 
 
+_RL_RUNTIME_ACTIVE_STATES = {
+    ExecutionState.ENTRY_PENDING.value,
+    ExecutionState.ENTRY_SUBMITTED.value,
+    ExecutionState.POSITION_OPEN.value,
+    ExecutionState.EXIT_PENDING.value,
+}
+
+
+def build_rl_runtime_state_snapshot(
+    session_factory: Any,
+    *,
+    deployment_key: str,
+    symbols: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build the runner's authoritative per-symbol portfolio state."""
+
+    normalized_deployment_key = deployment_key.strip()
+    if not normalized_deployment_key:
+        raise ValueError("deployment_key is required")
+    symbol_set = {symbol.strip().upper() for symbol in symbols or [] if symbol.strip()}
+
+    generated_at = utc_now()
+    with session_scope(session_factory) as session:
+        deployment = session.execute(
+            select(TraderDeploymentRecord)
+            .join(TraderModelRecord)
+            .where(TraderDeploymentRecord.deployment_key == normalized_deployment_key)
+        ).scalar_one_or_none()
+        if deployment is None:
+            raise TraderDeploymentNotFoundError(
+                f"Trader deployment '{normalized_deployment_key}' was not found."
+            )
+
+        side = str(deployment.trader_model.side or "").upper()
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError(
+                f"Trader deployment '{normalized_deployment_key}' has unsupported side '{side}'."
+            )
+
+        active_statement = select(InstructionRecord).where(
+            InstructionRecord.account_key == deployment.account_key,
+            InstructionRecord.book_key == deployment.book_key,
+            InstructionRecord.source_system == "rl-runner",
+            InstructionRecord.state.in_(_RL_RUNTIME_ACTIVE_STATES),
+            InstructionRecord.archived_at.is_(None),
+        )
+        if symbol_set:
+            active_statement = active_statement.where(
+                func.upper(InstructionRecord.symbol).in_(symbol_set)
+            )
+        active_records = tuple(
+            record
+            for record in session.execute(active_statement).scalars()
+            if _rl_runtime_instruction_deployment_key(record)
+            == normalized_deployment_key
+        )
+
+        if not symbol_set:
+            symbol_set = {record.symbol.upper() for record in active_records}
+
+        latest_positions_by_symbol = _latest_position_snapshots_by_symbol(
+            session,
+            account_key=deployment.account_key,
+            deployment_key=normalized_deployment_key,
+            symbols=symbol_set,
+        )
+        symbol_set.update(latest_positions_by_symbol)
+
+        records_by_symbol: dict[str, list[InstructionRecord]] = {}
+        for record in active_records:
+            records_by_symbol.setdefault(record.symbol.upper(), []).append(record)
+
+        symbol_states = [
+            _build_rl_runtime_symbol_state(
+                symbol=symbol,
+                deployment_key=normalized_deployment_key,
+                side=side,
+                active_records=tuple(records_by_symbol.get(symbol, ())),
+                position_snapshot=latest_positions_by_symbol.get(symbol),
+            )
+            for symbol in sorted(symbol_set)
+        ]
+        snapshot = {
+            "generated_at": generated_at,
+            "deployment_key": normalized_deployment_key,
+            "account_key": deployment.account_key,
+            "book_key": deployment.book_key,
+            "mode": deployment.mode,
+            "is_virtual": deployment.is_virtual,
+            "side": side,
+            "symbols": symbol_states,
+        }
+
+    return _serialize_for_json(snapshot)
+
+
+def _latest_position_snapshots_by_symbol(
+    session: Any,
+    *,
+    account_key: str,
+    deployment_key: str,
+    symbols: set[str],
+) -> dict[str, tuple[PositionSnapshotRecord, BrokerAccountRecord]]:
+    if not symbols:
+        return {}
+    rows = session.execute(
+        select(PositionSnapshotRecord, BrokerAccountRecord)
+        .join(
+            BrokerAccountRecord,
+            BrokerAccountRecord.id == PositionSnapshotRecord.broker_account_id,
+        )
+        .where(
+            BrokerAccountRecord.account_key == account_key,
+            func.upper(PositionSnapshotRecord.symbol).in_(symbols),
+        )
+        .order_by(
+            PositionSnapshotRecord.snapshot_at.desc(),
+            PositionSnapshotRecord.id.desc(),
+        )
+    ).all()
+    latest_by_owner: dict[
+        tuple[str, str | None, str | None],
+        tuple[PositionSnapshotRecord, BrokerAccountRecord],
+    ] = {}
+    for position_snapshot, broker_account in rows:
+        symbol = position_snapshot.symbol.upper()
+        owner_key = (
+            symbol,
+            position_snapshot.owner_deployment_key,
+            position_snapshot.owner_instruction_id,
+        )
+        latest_by_owner.setdefault(owner_key, (position_snapshot, broker_account))
+
+    latest: dict[str, tuple[PositionSnapshotRecord, BrokerAccountRecord]] = {}
+    unowned_virtual: dict[str, tuple[PositionSnapshotRecord, BrokerAccountRecord]] = {}
+    for (
+        symbol,
+        owner_deployment_key,
+        _owner_instruction_id,
+    ), snapshot in latest_by_owner.items():
+        position_snapshot, broker_account = snapshot
+        quantity = _decimal_or_zero(position_snapshot.quantity)
+        if (
+            quantity != 0
+            and (position_snapshot.is_virtual or broker_account.is_virtual)
+            and not owner_deployment_key
+        ):
+            unowned_virtual.setdefault(symbol, snapshot)
+        if owner_deployment_key == deployment_key:
+            latest.setdefault(symbol, snapshot)
+        elif not (position_snapshot.is_virtual or broker_account.is_virtual):
+            latest.setdefault(symbol, snapshot)
+
+    for symbol, snapshot in unowned_virtual.items():
+        latest[symbol] = snapshot
+    return latest
+
+
+def _build_rl_runtime_symbol_state(
+    *,
+    symbol: str,
+    deployment_key: str,
+    side: str,
+    active_records: tuple[InstructionRecord, ...],
+    position_snapshot: tuple[PositionSnapshotRecord, BrokerAccountRecord] | None,
+) -> dict[str, Any]:
+    blockers: list[dict[str, Any]] = []
+    entry_records = tuple(
+        record
+        for record in active_records
+        if record.state
+        in {
+            ExecutionState.ENTRY_PENDING.value,
+            ExecutionState.ENTRY_SUBMITTED.value,
+        }
+    )
+    position_records = tuple(
+        record
+        for record in active_records
+        if record.state
+        in {
+            ExecutionState.POSITION_OPEN.value,
+            ExecutionState.EXIT_PENDING.value,
+        }
+    )
+    if len(entry_records) > 1:
+        blockers.append(
+            {
+                "reason": "duplicate_active_entries",
+                "instruction_ids": [record.instruction_id for record in entry_records],
+            }
+        )
+    if len(position_records) > 1:
+        blockers.append(
+            {
+                "reason": "duplicate_active_positions",
+                "instruction_ids": [
+                    record.instruction_id for record in position_records
+                ],
+            }
+        )
+
+    position_payload = None
+    position_quantity = Decimal("0")
+    if position_snapshot is not None:
+        position_record, broker_account = position_snapshot
+        position_payload = _serialize_rl_runtime_position(
+            position_record,
+            broker_account,
+        )
+        position_quantity = _decimal_or_zero(position_record.quantity)
+        if position_quantity != 0 and not _quantity_matches_side(
+            position_quantity,
+            side,
+        ):
+            blockers.append(
+                {
+                    "reason": "position_side_mismatch",
+                    "quantity": str(position_quantity),
+                    "expected_side": side,
+                }
+            )
+        if position_quantity != 0 and (
+            position_record.is_virtual or broker_account.is_virtual
+        ):
+            owner_instruction_id = str(position_record.owner_instruction_id or "")
+            owner_deployment_key = str(position_record.owner_deployment_key or "")
+            if not owner_instruction_id or not owner_deployment_key:
+                blockers.append(
+                    {
+                        "reason": "virtual_position_missing_owner",
+                        "quantity": str(position_quantity),
+                        "position_snapshot_id": position_record.id,
+                        "message": (
+                            "Latest virtual holdings show a position, but the "
+                            "position snapshot does not carry a durable RL owner."
+                        ),
+                    }
+                )
+            elif owner_deployment_key != deployment_key:
+                blockers.append(
+                    {
+                        "reason": "virtual_position_owner_mismatch",
+                        "quantity": str(position_quantity),
+                        "position_snapshot_id": position_record.id,
+                        "owner_deployment_key": owner_deployment_key,
+                        "expected_deployment_key": deployment_key,
+                    }
+                )
+            elif position_records and owner_instruction_id not in {
+                record.instruction_id for record in position_records
+            }:
+                blockers.append(
+                    {
+                        "reason": "virtual_position_owner_instruction_mismatch",
+                        "quantity": str(position_quantity),
+                        "position_snapshot_id": position_record.id,
+                        "owner_instruction_id": owner_instruction_id,
+                        "active_instruction_ids": [
+                            record.instruction_id for record in position_records
+                        ],
+                    }
+                )
+
+    if position_quantity != 0 and not position_records:
+        blockers.append(
+            {
+                "reason": "unowned_current_holding",
+                "quantity": str(position_quantity),
+                "message": (
+                    "Latest account holdings show a position, but no active "
+                    "RL-owned instruction for this deployment owns it."
+                ),
+            }
+        )
+    if position_records and position_quantity == 0:
+        blockers.append(
+            {
+                "reason": "owned_position_missing_current_holding",
+                "instruction_ids": [
+                    record.instruction_id for record in position_records
+                ],
+                "message": (
+                    "Active RL instruction says a position is open, but the "
+                    "latest account holdings are flat or missing."
+                ),
+            }
+        )
+
+    active_payloads = [
+        _serialize_rl_runtime_instruction(record) for record in active_records
+    ]
+    if blockers:
+        return {
+            "symbol": symbol,
+            "status": "blocked",
+            "state_before": "INCONSISTENT",
+            "runner_state": None,
+            "blockers": blockers,
+            "position_snapshot": position_payload,
+            "active_instructions": active_payloads,
+        }
+
+    if entry_records:
+        entry = entry_records[0]
+        action_name = _rl_runtime_instruction_action_name(entry)
+        return {
+            "symbol": symbol,
+            "status": "ready",
+            "state_before": "ENTRY_PENDING",
+            "runner_state": {
+                "in_position": False,
+                "pending_entry_anchor": _rl_runtime_pending_entry_anchor(action_name),
+                "pending_entry_rel_bp": _rl_runtime_entry_rel_bp(action_name),
+                "pending_exit_tp_bp": None,
+                "entry_price": None,
+                "entry_bar_idx": None,
+                "bars_since_entry_order": 1,
+                "bars_since_exit_order": 0,
+            },
+            "blockers": [],
+            "position_snapshot": position_payload,
+            "active_instructions": active_payloads,
+        }
+
+    if position_records:
+        position_record = position_records[0]
+        entry_price = (
+            _decimal_or_none(
+                position_payload.get("average_cost") if position_payload else None
+            )
+            or _decimal_or_none(position_record.entry_avg_fill_price)
+        )
+        exit_pending = position_record.state == ExecutionState.EXIT_PENDING.value
+        return {
+            "symbol": symbol,
+            "status": "ready",
+            "state_before": "EXIT_PENDING"
+            if exit_pending
+            else ("SHORT_OPEN" if side == "SHORT" else "LONG_OPEN"),
+            "runner_state": {
+                "in_position": True,
+                "pending_entry_anchor": None,
+                "pending_entry_rel_bp": None,
+                "pending_exit_tp_bp": (180 if side == "SHORT" else 200)
+                if exit_pending
+                else None,
+                "entry_price": entry_price,
+                "entry_bar_idx": None,
+                "bars_since_entry_order": 0,
+                "bars_since_exit_order": 1 if exit_pending else 0,
+            },
+            "blockers": [],
+            "position_snapshot": position_payload,
+            "active_instructions": active_payloads,
+        }
+
+    return {
+        "symbol": symbol,
+        "status": "ready",
+        "state_before": "FLAT",
+        "runner_state": {
+            "in_position": False,
+            "pending_entry_anchor": None,
+            "pending_entry_rel_bp": None,
+            "pending_exit_tp_bp": None,
+            "entry_price": None,
+            "entry_bar_idx": None,
+            "bars_since_entry_order": 0,
+            "bars_since_exit_order": 0,
+        },
+        "blockers": [],
+        "position_snapshot": position_payload,
+        "active_instructions": active_payloads,
+    }
+
+
+def _serialize_rl_runtime_instruction(record: InstructionRecord) -> dict[str, Any]:
+    return {
+        "instruction_id": record.instruction_id,
+        "record_id": record.id,
+        "state": record.state,
+        "symbol": record.symbol,
+        "account_key": record.account_key,
+        "book_key": record.book_key,
+        "is_virtual": record.is_virtual,
+        "side": record.side,
+        "order_type": record.order_type,
+        "broker_order_id": record.broker_order_id,
+        "broker_order_status": record.broker_order_status,
+        "exit_order_id": record.exit_order_id,
+        "exit_order_status": record.exit_order_status,
+        "entry_filled_quantity": record.entry_filled_quantity,
+        "entry_avg_fill_price": record.entry_avg_fill_price,
+        "activity_at": record.updated_at,
+        "metadata": _rl_runtime_instruction_runtime_metadata(record),
+    }
+
+
+def _serialize_rl_runtime_position(
+    record: PositionSnapshotRecord,
+    broker_account: BrokerAccountRecord,
+) -> dict[str, Any]:
+    return {
+        "position_snapshot_id": record.id,
+        "account_key": broker_account.account_key,
+        "broker_kind": broker_account.broker_kind,
+        "is_virtual": record.is_virtual or broker_account.is_virtual,
+        "snapshot_at": record.snapshot_at,
+        "source": record.source,
+        "symbol": record.symbol,
+        "exchange": record.exchange,
+        "currency": record.currency,
+        "security_type": record.security_type,
+        "primary_exchange": record.primary_exchange,
+        "local_symbol": record.local_symbol,
+        "quantity": record.quantity,
+        "average_cost": record.average_cost,
+        "market_price": record.market_price,
+        "market_value": record.market_value,
+        "unrealized_pnl": record.unrealized_pnl,
+        "realized_pnl": record.realized_pnl,
+        "owner_instruction_id": record.owner_instruction_id,
+        "owner_source_instruction_id": record.owner_source_instruction_id,
+        "owner_deployment_key": record.owner_deployment_key,
+        "owner_book_key": record.owner_book_key,
+    }
+
+
+def _rl_runtime_instruction_metadata(record: InstructionRecord) -> Mapping[str, Any]:
+    payload = record.payload if isinstance(record.payload, Mapping) else {}
+    instruction = payload.get("instruction", {})
+    if not isinstance(instruction, Mapping):
+        return {}
+    trace = instruction.get("trace", {})
+    if not isinstance(trace, Mapping):
+        return {}
+    metadata = trace.get("metadata", {})
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _rl_runtime_instruction_runtime_metadata(record: InstructionRecord) -> dict[str, Any]:
+    metadata = _rl_runtime_instruction_metadata(record)
+    return {
+        key: metadata[key]
+        for key in (
+            "rl_deployment_key",
+            "rl_action_name",
+            "rl_decision_id",
+            "rl_source_instruction_id",
+        )
+        if key in metadata
+    }
+
+
+def _rl_runtime_instruction_deployment_key(record: InstructionRecord) -> str:
+    return str(
+        _rl_runtime_instruction_metadata(record).get("rl_deployment_key") or ""
+    )
+
+
+def _rl_runtime_instruction_action_name(record: InstructionRecord) -> str:
+    return str(_rl_runtime_instruction_metadata(record).get("rl_action_name") or "")
+
+
+def _rl_runtime_pending_entry_anchor(action_name: str) -> str:
+    if action_name == "market_entry":
+        return "market"
+    if action_name.startswith("entry_prevclose_"):
+        return "prev_close"
+    if action_name.startswith("entry_sessionopen_"):
+        return "session_open"
+    return "unknown"
+
+
+def _rl_runtime_entry_rel_bp(action_name: str) -> int | None:
+    prefix = "entry_prevclose_"
+    suffix = "bp"
+    if not action_name.startswith(prefix) or not action_name.endswith(suffix):
+        return None
+    try:
+        return int(action_name.removeprefix(prefix).removesuffix(suffix))
+    except ValueError:
+        return None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _decimal_or_zero(value: Any) -> Decimal:
+    return _decimal_or_none(value) or Decimal("0")
+
+
+def _quantity_matches_side(quantity: Decimal, side: str) -> bool:
+    return quantity > 0 if side == "LONG" else quantity < 0
+
+
 def serialize_rl_candidate_status(payload: Any) -> dict[str, Any]:
     serialized_instruction = serialize_instruction_status(payload)
     stored_payload = serialized_instruction.get("payload", {})
@@ -2172,6 +2765,35 @@ def serialize_rl_candidate_status(payload: Any) -> dict[str, Any]:
 def serialize_runtime_schedule_preview(payload: Any) -> dict[str, Any]:
     serialized = asdict(payload)
     return _serialize_for_json(serialized)
+
+
+def serialize_operator_instruction_status(payload: Any, app_config: AppConfig) -> dict[str, Any]:
+    serialized_instruction = serialize_instruction_status(payload)
+    raw_instruction = (
+        payload.payload.get("instruction")
+        if isinstance(payload.payload, dict)
+        else None
+    )
+    if not isinstance(raw_instruction, dict):
+        serialized_instruction["runtime_schedule_error"] = (
+            "persisted payload does not contain instruction object"
+        )
+        return serialized_instruction
+
+    try:
+        instruction = parse_execution_instruction_payload(raw_instruction)
+        schedule = build_instruction_runtime_schedule(
+            instruction,
+            runtime_timezone=app_config.timezone,
+            session_calendar_path=app_config.session_calendar_path,
+        )
+    except (KeyError, ValueError) as exc:
+        serialized_instruction["runtime_schedule_error"] = str(exc)
+    else:
+        serialized_instruction["runtime_schedule"] = serialize_runtime_schedule_preview(
+            schedule
+        )
+    return serialized_instruction
 
 
 def serialize_submitted_batch(payload: Any) -> dict[str, Any]:
@@ -2388,7 +3010,9 @@ def create_app(config: AppConfig | None = None) -> Any:
         )
 
     def drain_broker_callbacks_with_primary() -> list[dict[str, Any]]:
-        return broker_sessions.primary.drain_broker_callback_events()
+        return broker_sessions.primary.drain_broker_callback_events(
+            connect_if_needed=False,
+        )
 
     def run_diagnostic_heartbeat_probe() -> Any:
         return with_diagnostic_session(
@@ -2398,7 +3022,6 @@ def create_app(config: AppConfig | None = None) -> Any:
                 timeout=app_config.broker_heartbeat_timeout_seconds,
                 app=broker_app,
             ),
-            ignore_cooldown=True,
         )
 
     def fetch_background_runtime_snapshot() -> Any:
@@ -2547,6 +3170,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
             "broker_sessions": broker_sessions.status_snapshot(blocking=False),
+            "ibgateway": read_ibgateway_diagnostics(),
             "broker_operations": broker_sessions.activity_tracker.snapshot(recent_limit=10),
             "broker_monitor": serialize_broker_monitor_status(broker_monitor.status()),
             "execution_runtime": (
@@ -2572,7 +3196,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         }
 
     @app.post("/v1/ibkr/probe")
-    def run_ibkr_probe(timeout: int = 5) -> dict[str, Any]:
+    def run_ibkr_probe(timeout: int = 5, force: bool = False) -> dict[str, Any]:
         try:
             result = with_diagnostic_session(
                 "probe",
@@ -2581,13 +3205,31 @@ def create_app(config: AppConfig | None = None) -> Any:
                     timeout=timeout,
                     app=broker_app,
                 ),
-                ignore_cooldown=True,
+                ignore_cooldown=force,
             )
         except IbkrDependencyError as exc:
+            LOGGER.warning(
+                "IBKR probe failed: timeout=%s force=%s error=%s",
+                timeout,
+                force,
+                exc,
+            )
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ConnectionError as exc:
+            LOGGER.warning(
+                "IBKR probe failed: timeout=%s force=%s error=%s",
+                timeout,
+                force,
+                exc,
+            )
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except TimeoutError as exc:
+            LOGGER.warning(
+                "IBKR probe failed: timeout=%s force=%s error=%s",
+                timeout,
+                force,
+                exc,
+            )
             raise HTTPException(status_code=504, detail=str(exc)) from exc
 
         return json.loads(result.to_json())
@@ -3288,6 +3930,7 @@ def create_app(config: AppConfig | None = None) -> Any:
 
         if not include_expired:
             archive_expired_rl_candidates(session_factory)
+            retire_completed_rl_candidates(session_factory)
 
         candidates = list_instruction_statuses(
             session_factory,
@@ -3375,6 +4018,8 @@ def create_app(config: AppConfig | None = None) -> Any:
                 parsed["source_instruction_id"],
                 include_events=False,
             )
+            if source_status.archived_at is not None:
+                raise ValueError("source_instruction_id references an archived candidate")
             if source_status.state != ExecutionState.MODEL_ROUTED_PENDING.value:
                 raise ValueError(
                     "source_instruction_id must reference a MODEL_ROUTED_PENDING instruction"
@@ -3445,6 +4090,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             submitted_batch = None
             generated_instruction_id = None
             action_execution = None
+            intent_cleanup = None
             if translation.instruction_payload is not None:
                 generated_instruction_id = str(
                     translation.instruction_payload["instructions"][0]["instruction_id"]
@@ -3453,6 +4099,18 @@ def create_app(config: AppConfig | None = None) -> Any:
             if parsed["submit"] and translation.instruction_payload is not None:
                 deterministic_batch = parse_execution_batch_payload(
                     translation.instruction_payload
+                )
+                intent_cleanup = supersede_batch_intent_entries(
+                    session_factory,
+                    app_config.ibkr.primary_session(),
+                    deterministic_batch,
+                    requested_by="rl_action_translate",
+                    reason=(
+                        "RL translated entry superseded older active entries for "
+                        "the same intent group."
+                    ),
+                    timeout=10,
+                    canceler=cancel_order_with_primary,
                 )
                 submitted_batch = submit_execution_batch(
                     session_factory,
@@ -3520,6 +4178,13 @@ def create_app(config: AppConfig | None = None) -> Any:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except TraderDeploymentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except IntentReplacementConflictError as exc:
+            detail: dict[str, Any] = {"message": str(exc)}
+            if exc.result is not None:
+                detail["intent_cleanup"] = serialize_intent_cleanup_result(exc.result)
+            raise HTTPException(status_code=409, detail=detail) from exc
+        except IntentCleanupSelectorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RLActionOwnershipError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RLActionStateError as exc:
@@ -3544,6 +4209,11 @@ def create_app(config: AppConfig | None = None) -> Any:
             "submitted_batch": (
                 serialize_submitted_batch(submitted_batch)
                 if submitted_batch is not None
+                else None
+            ),
+            "intent_cleanup": (
+                serialize_intent_cleanup_result(intent_cleanup)
+                if intent_cleanup is not None
                 else None
             ),
             "action_execution": (
@@ -3883,6 +4553,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             )
             if not include_expired_candidates:
                 archive_expired_rl_candidates(session_factory)
+                retire_completed_rl_candidates(session_factory)
             snapshot = build_rl_trader_dashboard_snapshot(
                 session_factory,
                 model_limit=validated_model_limit,
@@ -3957,6 +4628,27 @@ def create_app(config: AppConfig | None = None) -> Any:
             "rl_dashboard": dashboard_payload,
         }
 
+    @app.get("/v1/rl/runtime-state")
+    def get_rl_runtime_state(
+        deployment_key: str,
+        symbols: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            runtime_state = build_rl_runtime_state_snapshot(
+                session_factory,
+                deployment_key=deployment_key,
+                symbols=parse_market_stream_symbols(symbols) or None,
+            )
+        except TraderDeploymentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "runtime_state": runtime_state,
+        }
+
     @app.get("/v1/read/operator-snapshot")
     def get_operator_snapshot(
         request: FastAPIRequest,
@@ -4003,6 +4695,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             )
             if not include_expired_candidates:
                 archive_expired_rl_candidates(session_factory)
+                retire_completed_rl_candidates(session_factory)
             operator_snapshot = build_operator_dashboard_snapshot(
                 session_factory,
                 include_flat_positions=include_flat_positions,
@@ -4089,7 +4782,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             "operator_snapshot": {
                 **operator_snapshot_payload,
                 "instructions": [
-                    serialize_instruction_status(instruction)
+                    serialize_operator_instruction_status(instruction, app_config)
                     for instruction in (*rl_candidates, *instructions)
                 ],
             },
@@ -4257,18 +4950,43 @@ def create_app(config: AppConfig | None = None) -> Any:
 
     @app.post("/v1/instructions/submit")
     def submit_instruction(payload: dict[str, Any]) -> dict[str, Any]:
+        intent_cleanup = None
         try:
             batch = parse_execution_batch_payload(payload)
+            intent_cleanup = supersede_batch_intent_entries(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                batch,
+                requested_by="instruction_submit",
+                reason="Incoming instruction batch superseded older active entries.",
+                timeout=10,
+                canceler=cancel_order_with_primary,
+            )
             result = submit_execution_batch(
                 session_factory,
                 batch,
                 runtime_timezone=app_config.timezone,
                 session_calendar_path=app_config.session_calendar_path,
             )
+        except IntentReplacementConflictError as exc:
+            detail: dict[str, Any] = {"message": str(exc)}
+            if exc.result is not None:
+                detail["intent_cleanup"] = serialize_intent_cleanup_result(exc.result)
+            raise HTTPException(status_code=409, detail=detail) from exc
+        except IntentCleanupSelectorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SubmissionConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KillSwitchActiveError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4278,6 +4996,41 @@ def create_app(config: AppConfig | None = None) -> Any:
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
             "submitted": serialize_submitted_batch(result),
+            "intent_cleanup": (
+                serialize_intent_cleanup_result(intent_cleanup)
+                if intent_cleanup is not None
+                else None
+            ),
+        }
+
+    @app.post("/v1/instructions/intent-cleanup")
+    def cleanup_instruction_intents(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_intent_cleanup_payload(payload)
+            result = cleanup_intent_groups(
+                session_factory,
+                app_config.ibkr.primary_session(),
+                canceler=cancel_order_with_primary,
+                **parsed,
+            )
+        except IntentCleanupSelectorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PersistedInstructionStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "intent_cleanup": serialize_intent_cleanup_result(result),
         }
 
     @app.post("/v1/instructions/cancel-set")

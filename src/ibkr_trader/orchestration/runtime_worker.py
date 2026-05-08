@@ -50,8 +50,13 @@ from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
 from ibkr_trader.ibkr.order_execution import submit_exit_order_from_instruction
 from ibkr_trader.ibkr.runtime_snapshot import BrokerExecution
+from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder
+from ibkr_trader.ibkr.runtime_snapshot import BrokerPortfolioItem
+from ibkr_trader.ibkr.runtime_snapshot import BrokerPosition
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.ibkr.runtime_snapshot import fetch_broker_runtime_snapshot
+from ibkr_trader.ibkr.gateway_diagnostics import format_gateway_diagnostic_hint
+from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.session_manager import CanonicalSyncSessions
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
 from ibkr_trader.ledger.persistence import persist_broker_callback_events
@@ -93,6 +98,13 @@ DEFAULT_BROKER_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 DEFAULT_SUBMISSION_LEAD_TIME = timedelta(seconds=60)
 PROTECTIVE_EXIT_RETRY_COOLDOWN = timedelta(minutes=15)
 PROTECTIVE_EXIT_SUBMISSION_CLAIM_WINDOW = timedelta(minutes=15)
+FORCED_EXIT_TERMINAL_RETRY_SUPPRESSION = timedelta(hours=12)
+FORCED_EXIT_POSITION_BLOCK_LOG_COOLDOWN = timedelta(minutes=5)
+_FORCED_EXIT_TERMINAL_STATUSES = {
+    "ERROR",
+    "INACTIVE",
+    "REJECTED",
+}
 BROKER_OUTAGE_RECONCILIATION_SUPPRESSION_WINDOW = timedelta(minutes=10)
 BROKER_RUNTIME_SESSION_OPEN_GRACE = timedelta(minutes=10)
 BROKER_RUNTIME_SESSION_CLOSE_GRACE = timedelta(minutes=10)
@@ -371,6 +383,21 @@ def _build_protective_exit_specs(
         )
 
     return protective_exits
+
+
+def _desired_protective_exit_order_refs(
+    *,
+    instruction_id: str,
+    instruction: ExecutionInstruction,
+) -> set[str]:
+    refs: set[str] = set()
+    if instruction.exit.stop_loss_pct is not None:
+        refs.add(f"{instruction_id}:exit:stop_loss")
+    if instruction.exit.catastrophic_stop_loss_pct is not None:
+        refs.add(f"{instruction_id}:exit:catastrophic_stop")
+    if instruction.exit.take_profit_pct is not None:
+        refs.add(f"{instruction_id}:exit:take_profit")
+    return refs
 
 
 def _runtime_exit_submitter(
@@ -937,6 +964,17 @@ def _normalise_broker_outage_message(message: str) -> str:
     if "heartbeat" in lowered:
         return "broker heartbeat failed"
     return "broker api unavailable"
+
+
+def _broker_snapshot_unavailable_message(error: Exception) -> str:
+    message = str(error)
+    normalized = message.lower()
+    if not any(marker in normalized for marker in BROKER_OUTAGE_MESSAGE_MARKERS):
+        return message
+    hint = format_gateway_diagnostic_hint(read_ibgateway_diagnostics())
+    if hint is None or hint in message:
+        return message
+    return f"{message} {hint}"
 
 
 def _is_broker_outage_issue(issue: RuntimeCycleIssue) -> bool:
@@ -1915,6 +1953,73 @@ def _open_order_refs_with_ref_prefix(
     }
 
 
+def _has_live_open_forced_exit_order(
+    snapshot: BrokerRuntimeSnapshot,
+    *,
+    instruction_id: str,
+) -> bool:
+    expected_order_ref = f"{instruction_id}:exit:forced"
+    return any(
+        open_order.order_ref == expected_order_ref
+        and _is_open_broker_order_status(open_order.status)
+        for open_order in snapshot.open_orders.values()
+    )
+
+
+def _has_live_matching_exit_order(
+    snapshot: BrokerRuntimeSnapshot,
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+    remaining_quantity: Decimal,
+) -> bool:
+    account_candidates = _broker_account_candidates(
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    expected_exit_side = _exit_side_for_instruction(instruction)
+    required_quantity = remaining_quantity.copy_abs()
+
+    for open_order in snapshot.open_orders.values():
+        if not _is_open_broker_order_status(open_order.status):
+            continue
+        if not _is_market_broker_order(open_order.order_type):
+            continue
+        if _normalize_broker_identity(open_order.action) != expected_exit_side:
+            continue
+        if not _matches_optional_identity(
+            open_order.account,
+            account_candidates,
+            default_when_missing=True,
+        ):
+            continue
+        if not _matches_exit_cleanup_instrument(
+            symbol=open_order.symbol,
+            local_symbol=open_order.local_symbol,
+            currency=open_order.currency,
+            security_type=open_order.security_type,
+            record=record,
+            instruction=instruction,
+        ):
+            continue
+        if open_order.total_quantity is not None:
+            try:
+                open_quantity = _parse_decimal(str(open_order.total_quantity))
+            except ValueError:
+                open_quantity = Decimal("0")
+            if open_quantity < required_quantity:
+                continue
+        return True
+    return False
+
+
+def _is_market_broker_order(order_type: str | None) -> bool:
+    normalized = _normalize_broker_identity(order_type)
+    return normalized in {"MKT", "MARKET"}
+
+
 def _normalize_broker_order_status(status: str | None) -> str | None:
     if status is None:
         return None
@@ -1922,6 +2027,696 @@ def _normalize_broker_order_status(status: str | None) -> str | None:
     if not normalized:
         return None
     return normalized.upper()
+
+
+def _normalize_broker_identity(value: object | None) -> str | None:
+    if value in (None, ""):
+        return None
+    normalized = " ".join(str(value).strip().upper().split())
+    return normalized or None
+
+
+def _is_open_broker_order_status(status: str | None) -> bool:
+    return _normalize_broker_order_status(status) not in _CLOSED_BROKER_ORDER_STATUSES
+
+
+def _exit_side_for_instruction(instruction: ExecutionInstruction) -> str:
+    entry_side = str(instruction.intent.side).strip().upper()
+    if entry_side == "BUY":
+        return "SELL"
+    if entry_side == "SELL":
+        return "BUY"
+    raise ValueError(f"Unsupported instruction side for exit cleanup: {entry_side!r}")
+
+
+def _broker_account_candidates(
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> set[str]:
+    return {
+        normalized
+        for normalized in (
+            _normalize_broker_identity(broker_config.account_id),
+            _normalize_broker_identity(record.account_key),
+            _normalize_broker_identity(instruction.account.account_key),
+        )
+        if normalized is not None
+    }
+
+
+def _instrument_symbol_candidates(
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> set[str]:
+    values: list[object | None] = [
+        record.symbol,
+        instruction.instrument.symbol,
+        *instruction.instrument.aliases,
+    ]
+    return {
+        normalized
+        for normalized in (_normalize_broker_identity(value) for value in values)
+        if normalized is not None
+    }
+
+
+def _matches_optional_identity(
+    observed: object | None,
+    candidates: set[str],
+    *,
+    default_when_missing: bool,
+) -> bool:
+    normalized_observed = _normalize_broker_identity(observed)
+    if normalized_observed is None:
+        return default_when_missing
+    if not candidates:
+        return True
+    return normalized_observed in candidates
+
+
+def _matches_exit_cleanup_instrument(
+    *,
+    symbol: object | None,
+    local_symbol: object | None,
+    currency: object | None,
+    security_type: object | None,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> bool:
+    symbol_candidates = _instrument_symbol_candidates(record, instruction)
+    observed_symbols = {
+        normalized
+        for normalized in (
+            _normalize_broker_identity(symbol),
+            _normalize_broker_identity(local_symbol),
+        )
+        if normalized is not None
+    }
+    if not observed_symbols or observed_symbols.isdisjoint(symbol_candidates):
+        return False
+
+    currency_candidates = {
+        normalized
+        for normalized in (
+            _normalize_broker_identity(record.currency),
+            _normalize_broker_identity(instruction.instrument.currency),
+        )
+        if normalized is not None
+    }
+    if not _matches_optional_identity(
+        currency,
+        currency_candidates,
+        default_when_missing=True,
+    ):
+        return False
+
+    security_type_candidates = {
+        normalized
+        for normalized in (
+            _normalize_broker_identity(instruction.instrument.security_type),
+        )
+        if normalized is not None
+    }
+    return _matches_optional_identity(
+        security_type,
+        security_type_candidates,
+        default_when_missing=True,
+    )
+
+
+def _sum_matching_broker_position_items(
+    items: tuple[BrokerPosition, ...] | tuple[BrokerPortfolioItem, ...],
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> Decimal | None:
+    account_candidates = _broker_account_candidates(
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    quantity = Decimal("0")
+    matched = False
+    for item in items:
+        if item.position is None:
+            continue
+        if not _matches_optional_identity(
+            item.account,
+            account_candidates,
+            default_when_missing=False,
+        ):
+            continue
+        if not _matches_exit_cleanup_instrument(
+            symbol=item.symbol,
+            local_symbol=item.local_symbol,
+            currency=item.currency,
+            security_type=item.security_type,
+            record=record,
+            instruction=instruction,
+        ):
+            continue
+        quantity += item.position
+        matched = True
+    return quantity if matched else None
+
+
+def _matching_broker_position_quantity(
+    snapshot: BrokerRuntimeSnapshot,
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> Decimal | None:
+    position_quantity = _sum_matching_broker_position_items(
+        snapshot.positions,
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    if position_quantity is not None:
+        return position_quantity
+    return _sum_matching_broker_position_items(
+        snapshot.portfolio,
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+
+
+def _forced_exit_broker_position_block(
+    snapshot: BrokerRuntimeSnapshot,
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+    remaining_quantity: Decimal,
+) -> dict[str, Any] | None:
+    if record.is_virtual or is_virtual_account_key(instruction.account.account_key):
+        return None
+
+    observed_quantity = _matching_broker_position_quantity(
+        snapshot,
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    entry_side = str(instruction.intent.side).strip().upper()
+    required_quantity = remaining_quantity.copy_abs()
+    base_payload = {
+        "instruction_id": record.instruction_id,
+        "account_candidates": sorted(
+            _broker_account_candidates(
+                broker_config,
+                record=record,
+                instruction=instruction,
+            )
+        ),
+        "symbol_candidates": sorted(_instrument_symbol_candidates(record, instruction)),
+        "entry_side": entry_side,
+        "required_quantity": str(required_quantity),
+        "observed_quantity": (
+            str(observed_quantity) if observed_quantity is not None else None
+        ),
+        "position_source_counts": {
+            "positions": len(snapshot.positions),
+            "portfolio": len(snapshot.portfolio),
+        },
+    }
+    if observed_quantity is None:
+        return {
+            **base_payload,
+            "reason": "missing_broker_position",
+            "message": (
+                "Skipped forced exit because no matching live broker position "
+                "was present in the broker snapshot."
+            ),
+        }
+    if entry_side == "BUY" and observed_quantity < required_quantity:
+        return {
+            **base_payload,
+            "reason": "insufficient_long_broker_position",
+            "message": (
+                "Skipped forced exit because the live broker long position was "
+                "smaller than the remaining instruction quantity."
+            ),
+        }
+    if entry_side == "SELL" and observed_quantity > -required_quantity:
+        return {
+            **base_payload,
+            "reason": "insufficient_short_broker_position",
+            "message": (
+                "Skipped forced exit because the live broker short position was "
+                "smaller than the remaining instruction quantity."
+            ),
+        }
+    if entry_side not in {"BUY", "SELL"}:
+        return {
+            **base_payload,
+            "reason": "unsupported_entry_side",
+            "message": "Skipped forced exit because the instruction side is unsupported.",
+        }
+    return None
+
+
+def _record_forced_exit_position_blocked(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    position_block: dict[str, Any],
+    cycle_at: datetime,
+) -> None:
+    cutoff = cycle_at.astimezone(timezone.utc) - FORCED_EXIT_POSITION_BLOCK_LOG_COOLDOWN
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if record is None:
+            return
+        recent_event = session.execute(
+            select(InstructionEventRecord.id).where(
+                InstructionEventRecord.instruction_id == record.id,
+                InstructionEventRecord.event_type
+                == "forced_exit_blocked_broker_position_mismatch",
+                InstructionEventRecord.event_at >= cutoff,
+            )
+        ).first()
+        if recent_event is not None:
+            return
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type="forced_exit_blocked_broker_position_mismatch",
+                source="runtime_cycle",
+                event_at=cycle_at,
+                state_before=record.state,
+                state_after=record.state,
+                payload=position_block,
+                note=(
+                    "Runtime skipped a forced market exit because the live broker "
+                    "position snapshot did not match the instruction quantity."
+                ),
+            )
+        )
+
+
+def _merge_forced_exit_conflict_detail(
+    details: dict[int, dict[str, Any]],
+    *,
+    order_id: int,
+    source: str,
+    order_ref: str | None,
+    status: str | None,
+    symbol: str | None,
+    local_symbol: str | None,
+    action: str | None,
+) -> None:
+    detail = details.setdefault(
+        order_id,
+        {
+            "broker_order_id": order_id,
+            "sources": [],
+        },
+    )
+    sources = detail.setdefault("sources", [])
+    if source not in sources:
+        sources.append(source)
+    for key, value in {
+        "order_ref": order_ref,
+        "status": status,
+        "symbol": symbol,
+        "local_symbol": local_symbol,
+        "action": action,
+    }.items():
+        if value not in (None, "") and key not in detail:
+            detail[key] = value
+
+
+def _open_order_is_forced_exit_for_instruction(
+    open_order: BrokerOpenOrder,
+    *,
+    instruction_id: str,
+) -> bool:
+    return open_order.order_ref == f"{instruction_id}:exit:forced"
+
+
+def _live_conflicting_exit_order_details_for_forced_exit(
+    snapshot: BrokerRuntimeSnapshot,
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> dict[int, dict[str, Any]]:
+    account_candidates = _broker_account_candidates(
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    expected_exit_side = _exit_side_for_instruction(instruction)
+    details: dict[int, dict[str, Any]] = {}
+
+    for order_id, open_order in snapshot.open_orders.items():
+        if not _is_open_broker_order_status(open_order.status):
+            continue
+        if _open_order_is_forced_exit_for_instruction(
+            open_order,
+            instruction_id=record.instruction_id,
+        ):
+            continue
+        if _normalize_broker_identity(open_order.action) != expected_exit_side:
+            continue
+        if not _matches_optional_identity(
+            open_order.account,
+            account_candidates,
+            default_when_missing=True,
+        ):
+            continue
+        if not _matches_exit_cleanup_instrument(
+            symbol=open_order.symbol,
+            local_symbol=open_order.local_symbol,
+            currency=open_order.currency,
+            security_type=open_order.security_type,
+            record=record,
+            instruction=instruction,
+        ):
+            continue
+        if open_order.order_ref in (None, "") or ":exit:" not in str(open_order.order_ref):
+            continue
+        _merge_forced_exit_conflict_detail(
+            details,
+            order_id=order_id,
+            source="broker_snapshot",
+            order_ref=open_order.order_ref,
+            status=open_order.status,
+            symbol=open_order.symbol,
+            local_symbol=open_order.local_symbol,
+            action=open_order.action,
+        )
+
+    return details
+
+
+def _persisted_conflicting_exit_order_details_for_forced_exit(
+    session_factory: sessionmaker[Session],
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> dict[int, dict[str, Any]]:
+    account_candidates = _broker_account_candidates(
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    expected_exit_side = _exit_side_for_instruction(instruction)
+    details: dict[int, dict[str, Any]] = {}
+
+    with session_scope(session_factory) as session:
+        broker_orders = session.execute(
+            select(BrokerOrderRecord).where(
+                BrokerOrderRecord.order_role == "EXIT",
+                or_(
+                    BrokerOrderRecord.status.is_(None),
+                    func.upper(BrokerOrderRecord.status).not_in(
+                        _CLOSED_BROKER_ORDER_STATUSES
+                    ),
+                ),
+                BrokerOrderRecord.external_order_id.is_not(None),
+                BrokerOrderRecord.external_order_id != "",
+            )
+        ).scalars().all()
+
+    for broker_order in broker_orders:
+        if broker_order.order_ref == f"{record.instruction_id}:exit:forced":
+            continue
+        if _normalize_broker_identity(broker_order.side) != expected_exit_side:
+            continue
+        if not _matches_optional_identity(
+            broker_order.account_key,
+            account_candidates,
+            default_when_missing=False,
+        ):
+            continue
+        if not _matches_exit_cleanup_instrument(
+            symbol=broker_order.symbol,
+            local_symbol=broker_order.local_symbol,
+            currency=broker_order.currency,
+            security_type=broker_order.security_type,
+            record=record,
+            instruction=instruction,
+        ):
+            continue
+        if _broker_order_has_matching_execution_fill(
+            session_factory,
+            broker_order=broker_order,
+        ):
+            continue
+        try:
+            order_id = int(str(broker_order.external_order_id))
+        except ValueError:
+            continue
+        _merge_forced_exit_conflict_detail(
+            details,
+            order_id=order_id,
+            source="persisted_open_exit",
+            order_ref=broker_order.order_ref,
+            status=broker_order.status,
+            symbol=broker_order.symbol,
+            local_symbol=broker_order.local_symbol,
+            action=broker_order.side,
+        )
+
+    return details
+
+
+def _conflicting_exit_order_details_for_forced_exit(
+    session_factory: sessionmaker[Session],
+    snapshot: BrokerRuntimeSnapshot,
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    instruction: ExecutionInstruction,
+) -> dict[int, dict[str, Any]]:
+    details = _live_conflicting_exit_order_details_for_forced_exit(
+        snapshot,
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    persisted_details = _persisted_conflicting_exit_order_details_for_forced_exit(
+        session_factory,
+        broker_config,
+        record=record,
+        instruction=instruction,
+    )
+    for order_id, persisted_detail in persisted_details.items():
+        for source in persisted_detail.get("sources", []):
+            _merge_forced_exit_conflict_detail(
+                details,
+                order_id=order_id,
+                source=str(source),
+                order_ref=persisted_detail.get("order_ref"),
+                status=persisted_detail.get("status"),
+                symbol=persisted_detail.get("symbol"),
+                local_symbol=persisted_detail.get("local_symbol"),
+                action=persisted_detail.get("action"),
+            )
+    return details
+
+
+def _live_obsolete_exit_order_details_for_current_intent(
+    snapshot: BrokerRuntimeSnapshot,
+    *,
+    instruction_id: str,
+    desired_order_refs: set[str],
+) -> dict[int, dict[str, Any]]:
+    details: dict[int, dict[str, Any]] = {}
+    order_ref_prefix = f"{instruction_id}:exit:"
+    for order_id, open_order in snapshot.open_orders.items():
+        if not _is_open_broker_order_status(open_order.status):
+            continue
+        order_ref = str(open_order.order_ref or "").strip()
+        if not order_ref.startswith(order_ref_prefix):
+            continue
+        if order_ref in desired_order_refs:
+            continue
+        _merge_forced_exit_conflict_detail(
+            details,
+            order_id=order_id,
+            source="broker_snapshot",
+            order_ref=open_order.order_ref,
+            status=open_order.status,
+            symbol=open_order.symbol,
+            local_symbol=open_order.local_symbol,
+            action=open_order.action,
+        )
+    return details
+
+
+def _persisted_obsolete_exit_order_details_for_current_intent(
+    session_factory: sessionmaker[Session],
+    *,
+    record: InstructionRecord,
+    desired_order_refs: set[str],
+) -> dict[int, dict[str, Any]]:
+    details: dict[int, dict[str, Any]] = {}
+    with session_scope(session_factory) as session:
+        broker_orders = session.execute(
+            select(BrokerOrderRecord).where(
+                BrokerOrderRecord.instruction_id == record.id,
+                BrokerOrderRecord.order_role == "EXIT",
+                or_(
+                    BrokerOrderRecord.status.is_(None),
+                    func.upper(BrokerOrderRecord.status).not_in(
+                        _CLOSED_BROKER_ORDER_STATUSES
+                    ),
+                ),
+                BrokerOrderRecord.external_order_id.is_not(None),
+                BrokerOrderRecord.external_order_id != "",
+            )
+        ).scalars().all()
+
+    for broker_order in broker_orders:
+        order_ref = str(broker_order.order_ref or "").strip()
+        if order_ref in desired_order_refs:
+            continue
+        if _broker_order_has_matching_execution_fill(
+            session_factory,
+            broker_order=broker_order,
+        ):
+            continue
+        try:
+            order_id = int(str(broker_order.external_order_id))
+        except ValueError:
+            continue
+        _merge_forced_exit_conflict_detail(
+            details,
+            order_id=order_id,
+            source="persisted_open_exit",
+            order_ref=broker_order.order_ref,
+            status=broker_order.status,
+            symbol=broker_order.symbol,
+            local_symbol=broker_order.local_symbol,
+            action=broker_order.side,
+        )
+    return details
+
+
+def _obsolete_exit_order_details_for_current_intent(
+    session_factory: sessionmaker[Session],
+    snapshot: BrokerRuntimeSnapshot,
+    *,
+    record: InstructionRecord,
+    desired_order_refs: set[str],
+) -> dict[int, dict[str, Any]]:
+    details = _live_obsolete_exit_order_details_for_current_intent(
+        snapshot,
+        instruction_id=record.instruction_id,
+        desired_order_refs=desired_order_refs,
+    )
+    persisted_details = _persisted_obsolete_exit_order_details_for_current_intent(
+        session_factory,
+        record=record,
+        desired_order_refs=desired_order_refs,
+    )
+    for order_id, persisted_detail in persisted_details.items():
+        for source in persisted_detail.get("sources", []):
+            _merge_forced_exit_conflict_detail(
+                details,
+                order_id=order_id,
+                source=str(source),
+                order_ref=persisted_detail.get("order_ref"),
+                status=persisted_detail.get("status"),
+                symbol=persisted_detail.get("symbol"),
+                local_symbol=persisted_detail.get("local_symbol"),
+                action=persisted_detail.get("action"),
+            )
+    return details
+
+
+def _record_exit_intent_cleanup_started(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    desired_order_refs: set[str],
+    obsolete_details: dict[int, dict[str, Any]],
+    cycle_at: datetime,
+) -> None:
+    if not obsolete_details:
+        return
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if record is None:
+            return
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type="exit_intent_obsolete_orders_cleanup_started",
+                source="runtime_cycle",
+                event_at=cycle_at,
+                state_before=record.state,
+                state_after=record.state,
+                payload={
+                    "desired_order_refs": sorted(desired_order_refs),
+                    "obsolete_orders": [
+                        obsolete_details[order_id]
+                        for order_id in sorted(obsolete_details)
+                    ],
+                },
+                note=(
+                    "Runtime found open exit orders that do not match the current "
+                    "exit intent and will cancel them before submitting replacement "
+                    "orders."
+                ),
+            )
+        )
+
+
+def _record_forced_exit_conflict_cleanup_started(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    conflict_details: dict[int, dict[str, Any]],
+    cycle_at: datetime,
+) -> None:
+    if not conflict_details:
+        return
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if record is None:
+            return
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type="forced_exit_conflicting_orders_cleanup_started",
+                source="runtime_cycle",
+                event_at=cycle_at,
+                state_before=record.state,
+                state_after=record.state,
+                payload={
+                    "conflicting_orders": [
+                        conflict_details[order_id]
+                        for order_id in sorted(conflict_details)
+                    ],
+                },
+                note=(
+                    "Runtime found open close-side exit orders for this account and "
+                    "symbol before submitting the forced next-session exit."
+                ),
+            )
+        )
 
 
 def _persisted_open_order_ids_by_instruction(
@@ -2005,12 +2800,25 @@ def _has_persisted_open_forced_exit_order(
     *,
     record: InstructionRecord,
 ) -> bool:
+    return _has_persisted_open_exit_order_ref(
+        session_factory,
+        record=record,
+        order_ref=f"{record.instruction_id}:exit:forced",
+    )
+
+
+def _has_persisted_open_exit_order_ref(
+    session_factory: sessionmaker[Session],
+    *,
+    record: InstructionRecord,
+    order_ref: str,
+) -> bool:
     with session_scope(session_factory) as session:
-        forced_exit_order = session.execute(
+        exit_order = session.execute(
             select(BrokerOrderRecord.id).where(
                 BrokerOrderRecord.instruction_id == record.id,
                 BrokerOrderRecord.order_role == "EXIT",
-                BrokerOrderRecord.order_ref == f"{record.instruction_id}:exit:forced",
+                BrokerOrderRecord.order_ref == order_ref,
                 or_(
                     BrokerOrderRecord.status.is_(None),
                     func.upper(BrokerOrderRecord.status).not_in(
@@ -2019,7 +2827,92 @@ def _has_persisted_open_forced_exit_order(
                 ),
             )
         ).first()
-    return forced_exit_order is not None
+    return exit_order is not None
+
+
+def _recent_terminal_forced_exit_failure(
+    session_factory: sessionmaker[Session],
+    *,
+    record: InstructionRecord,
+    cycle_at: datetime,
+) -> dict[str, Any] | None:
+    cutoff = cycle_at.astimezone(timezone.utc) - FORCED_EXIT_TERMINAL_RETRY_SUPPRESSION
+    with session_scope(session_factory) as session:
+        broker_order = session.execute(
+            select(BrokerOrderRecord).where(
+                BrokerOrderRecord.instruction_id == record.id,
+                BrokerOrderRecord.order_role == "EXIT",
+                BrokerOrderRecord.order_ref == f"{record.instruction_id}:exit:forced",
+                func.upper(BrokerOrderRecord.status).in_(
+                    _FORCED_EXIT_TERMINAL_STATUSES
+                ),
+                BrokerOrderRecord.last_status_at.is_not(None),
+                BrokerOrderRecord.last_status_at >= cutoff,
+            ).order_by(
+                BrokerOrderRecord.last_status_at.desc(),
+                BrokerOrderRecord.id.desc(),
+            )
+        ).scalars().first()
+
+    if broker_order is None:
+        return None
+    return {
+        "broker_order_id": broker_order.external_order_id,
+        "broker_order_status": broker_order.status,
+        "last_status_at": (
+            broker_order.last_status_at.isoformat()
+            if broker_order.last_status_at is not None
+            else None
+        ),
+    }
+
+
+def _record_forced_exit_retry_blocked(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    failure: dict[str, Any],
+    cycle_at: datetime,
+) -> None:
+    cutoff = cycle_at.astimezone(timezone.utc) - FORCED_EXIT_TERMINAL_RETRY_SUPPRESSION
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(InstructionRecord)
+            .where(InstructionRecord.instruction_id == instruction_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if record is None:
+            return
+        recent_event = session.execute(
+            select(InstructionEventRecord.id).where(
+                InstructionEventRecord.instruction_id == record.id,
+                InstructionEventRecord.event_type
+                == "forced_exit_retry_blocked_terminal_failure",
+                InstructionEventRecord.event_at >= cutoff,
+            )
+        ).first()
+        if recent_event is not None:
+            return
+        session.add(
+            InstructionEventRecord(
+                instruction_id=record.id,
+                event_type="forced_exit_retry_blocked_terminal_failure",
+                source="runtime_cycle",
+                event_at=cycle_at,
+                state_before=record.state,
+                state_after=record.state,
+                payload={
+                    "terminal_failure": failure,
+                    "suppression_seconds": int(
+                        FORCED_EXIT_TERMINAL_RETRY_SUPPRESSION.total_seconds()
+                    ),
+                },
+                note=(
+                    "Runtime skipped a forced exit retry because a recent forced "
+                    "market exit reached a terminal broker status."
+                ),
+            )
+        )
 
 
 def _broker_order_has_matching_execution_fill(
@@ -2110,6 +3003,108 @@ def _cancel_broker_order_and_persist(
         note=note,
     )
     return broker_cancellation
+
+
+def _require_confirmed_forced_exit_cleanup_cancel(
+    broker_cancellation: dict[str, Any],
+    *,
+    order_id: int,
+) -> None:
+    broker_status = broker_cancellation.get("broker_order_status")
+    if not isinstance(broker_status, dict):
+        raise RuntimeError(
+            "Forced exit cleanup could not confirm cancellation of broker "
+            f"order {order_id}: missing broker order status."
+        )
+    status = _normalize_broker_order_status(
+        str(broker_status.get("status"))
+        if broker_status.get("status") not in (None, "")
+        else None
+    )
+    if status not in _CLOSED_BROKER_ORDER_STATUSES:
+        raise RuntimeError(
+            "Forced exit cleanup could not confirm cancellation of broker "
+            f"order {order_id}; broker status was {status or 'UNKNOWN'}."
+        )
+
+
+def _require_confirmed_exit_intent_cleanup_cancel(
+    broker_cancellation: dict[str, Any],
+    *,
+    order_id: int,
+) -> None:
+    broker_status = broker_cancellation.get("broker_order_status")
+    if not isinstance(broker_status, dict):
+        raise RuntimeError(
+            "Exit intent cleanup could not confirm cancellation of broker "
+            f"order {order_id}: missing broker order status."
+        )
+    status = _normalize_broker_order_status(
+        str(broker_status.get("status"))
+        if broker_status.get("status") not in (None, "")
+        else None
+    )
+    if status not in _CLOSED_BROKER_ORDER_STATUSES:
+        raise RuntimeError(
+            "Exit intent cleanup could not confirm cancellation of broker "
+            f"order {order_id}; broker status was {status or 'UNKNOWN'}."
+        )
+
+
+def _cancel_obsolete_exit_orders_for_current_intent(
+    session_factory: sessionmaker[Session],
+    snapshot: BrokerRuntimeSnapshot,
+    broker_config: IbkrConnectionConfig,
+    *,
+    record: InstructionRecord,
+    desired_order_refs: set[str],
+    cycle_at: datetime,
+    timeout: int,
+    canceler: Callable[..., dict[str, Any]],
+    broker_retry_delays: tuple[float, ...],
+    sleep_fn: Callable[[float], None],
+) -> tuple[int, ...]:
+    obsolete_details = _obsolete_exit_order_details_for_current_intent(
+        session_factory,
+        snapshot,
+        record=record,
+        desired_order_refs=desired_order_refs,
+    )
+    if not obsolete_details:
+        return ()
+
+    _record_exit_intent_cleanup_started(
+        session_factory,
+        instruction_id=record.instruction_id,
+        desired_order_refs=desired_order_refs,
+        obsolete_details=obsolete_details,
+        cycle_at=cycle_at,
+    )
+    cancelled_order_ids: list[int] = []
+    for obsolete_order_id in sorted(obsolete_details):
+        broker_cancellation = _run_with_broker_retries(
+            lambda order_id=obsolete_order_id: _cancel_broker_order_and_persist(
+                session_factory,
+                broker_config,
+                order_id=order_id,
+                timeout=timeout,
+                canceler=canceler,
+                event_type="exit_order_cancelled_for_current_intent",
+                note=(
+                    "Persisted broker cancellation for an obsolete exit order "
+                    "before submitting the current exit intent."
+                ),
+            ),
+            retry_delays=broker_retry_delays,
+            sleep_fn=sleep_fn,
+        )
+        _require_confirmed_exit_intent_cleanup_cancel(
+            broker_cancellation,
+            order_id=obsolete_order_id,
+        )
+        cancelled_order_ids.append(obsolete_order_id)
+
+    return tuple(cancelled_order_ids)
 
 
 def _record_entry_fill_and_optional_exit(
@@ -2535,6 +3530,39 @@ def _is_next_session_exit_due(
     return due_at <= cycle_at.astimezone(timezone.utc)
 
 
+def _has_due_real_forced_exit_candidate(
+    records: list[InstructionRecord],
+    *,
+    runtime_timezone: str,
+    session_calendar_path: Path,
+    cycle_at: datetime,
+    submission_lead_time: timedelta,
+) -> bool:
+    for record in records:
+        if record.is_virtual:
+            continue
+        if record.state not in {
+            ExecutionState.POSITION_OPEN.value,
+            ExecutionState.EXIT_PENDING.value,
+        }:
+            continue
+        if _parse_decimal(record.entry_filled_quantity) <= 0:
+            continue
+        try:
+            instruction = _instruction_payload(record)
+            if _is_next_session_exit_due(
+                instruction,
+                runtime_timezone=runtime_timezone,
+                session_calendar_path=session_calendar_path,
+                cycle_at=cycle_at,
+                submission_lead_time=submission_lead_time,
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _submit_due_pending_entries(
     session_factory: sessionmaker[Session],
     broker_config: IbkrConnectionConfig,
@@ -2869,6 +3897,24 @@ def run_runtime_cycle(
             issues=issues,
         )
 
+    with session_scope(session_factory) as session:
+        records = session.execute(
+            select(InstructionRecord).where(
+                InstructionRecord.instruction_id.in_(active_instruction_ids)
+            )
+        ).scalars().all()
+
+    records_by_instruction_id = {
+        record.instruction_id: record for record in records
+    }
+    forced_exit_snapshot_required = _has_due_real_forced_exit_candidate(
+        records,
+        runtime_timezone=runtime_timezone,
+        session_calendar_path=session_calendar_path,
+        cycle_at=cycle_started_at,
+        submission_lead_time=submission_lead_time,
+    )
+
     real_broker_work = has_real_broker_work(
         session_factory,
         instruction_ids=instruction_ids,
@@ -2879,6 +3925,10 @@ def run_runtime_cycle(
                 lambda: runtime_snapshot_fetch(
                     broker_config,
                     timeout=timeout,
+                    include_open_orders=forced_exit_snapshot_required,
+                    include_executions=forced_exit_snapshot_required,
+                    include_account_updates=False,
+                    include_positions=forced_exit_snapshot_required,
                 ),
                 retry_delays=broker_retry_delays,
                 sleep_fn=sleep_fn,
@@ -2889,7 +3939,7 @@ def run_runtime_cycle(
                 issues,
                 instruction_id=None,
                 stage="broker_snapshot",
-                message=str(exc),
+                message=_broker_snapshot_unavailable_message(exc),
             )
             if broker_callback_fetcher is not None:
                 try:
@@ -2982,16 +4032,6 @@ def run_runtime_cycle(
             issues=issues,
         )
 
-    with session_scope(session_factory) as session:
-        records = session.execute(
-            select(InstructionRecord).where(
-                InstructionRecord.instruction_id.in_(active_instruction_ids)
-            )
-        ).scalars().all()
-
-    records_by_instruction_id = {
-        record.instruction_id: record for record in records
-    }
     persisted_open_exit_order_ids_by_instruction = _persisted_open_order_ids_by_instruction(
         session_factory,
         records=records,
@@ -3271,7 +4311,161 @@ def run_runtime_cycle(
                     )
                     continue
 
+                next_session_exit_due = (
+                    remaining_quantity > 0
+                    and _is_next_session_exit_due(
+                        instruction,
+                        runtime_timezone=runtime_timezone,
+                        session_calendar_path=session_calendar_path,
+                        cycle_at=cycle_started_at,
+                        submission_lead_time=submission_lead_time,
+                    )
+                )
+                if next_session_exit_due:
+                    blocking_due_exit_instruction_ids.append(instruction_id)
+                    blocking_due_exit_account_keys.add(record.account_key)
+                    if _has_live_matching_exit_order(
+                        snapshot,
+                        broker_config,
+                        record=record,
+                        instruction=instruction,
+                        remaining_quantity=remaining_quantity,
+                    ):
+                        continue
+                    terminal_forced_exit = _recent_terminal_forced_exit_failure(
+                        session_factory,
+                        record=record,
+                        cycle_at=cycle_started_at,
+                    )
+                    if terminal_forced_exit is not None:
+                        _append_issue(
+                            issues,
+                            instruction_id=instruction_id,
+                            stage="forced_exit_retry",
+                            message=(
+                                "Skipped forced exit retry because a recent forced "
+                                "market exit reached terminal broker status "
+                                f"{terminal_forced_exit['broker_order_status']}."
+                            ),
+                        )
+                        _record_forced_exit_retry_blocked(
+                            session_factory,
+                            instruction_id=instruction_id,
+                            failure=terminal_forced_exit,
+                            cycle_at=cycle_started_at,
+                        )
+                        continue
+                    if _has_persisted_open_forced_exit_order(
+                        session_factory,
+                        record=record,
+                    ) or _has_live_open_forced_exit_order(
+                        snapshot,
+                        instruction_id=instruction_id,
+                    ):
+                        continue
+                    position_block = _forced_exit_broker_position_block(
+                        snapshot,
+                        broker_config,
+                        record=record,
+                        instruction=instruction,
+                        remaining_quantity=remaining_quantity,
+                    )
+                    if position_block is not None:
+                        _append_issue(
+                            issues,
+                            instruction_id=instruction_id,
+                            stage="forced_exit_position_check",
+                            message=(
+                                f"{position_block['message']} "
+                                f"Required {position_block['required_quantity']}; "
+                                f"observed {position_block['observed_quantity'] or 'none'}."
+                            ),
+                        )
+                        _record_forced_exit_position_blocked(
+                            session_factory,
+                            instruction_id=instruction_id,
+                            position_block=position_block,
+                            cycle_at=cycle_started_at,
+                        )
+                        continue
+                    forced_exit_conflicts = (
+                        _conflicting_exit_order_details_for_forced_exit(
+                            session_factory,
+                            snapshot,
+                            broker_config,
+                            record=record,
+                            instruction=instruction,
+                        )
+                    )
+                    for open_exit_order_id in combined_exit_open_order_ids:
+                        forced_exit_conflicts.setdefault(
+                            open_exit_order_id,
+                            {
+                                "broker_order_id": open_exit_order_id,
+                                "sources": ["current_instruction_open_exit"],
+                            },
+                        )
+                    _record_forced_exit_conflict_cleanup_started(
+                        session_factory,
+                        instruction_id=instruction_id,
+                        conflict_details=forced_exit_conflicts,
+                        cycle_at=cycle_started_at,
+                    )
+                    for open_exit_order_id in sorted(forced_exit_conflicts):
+                        broker_cancellation = _run_with_broker_retries(
+                            lambda order_id=open_exit_order_id: _cancel_broker_order_and_persist(
+                                session_factory,
+                                broker_config,
+                                order_id=order_id,
+                                timeout=timeout,
+                                canceler=runtime_order_canceler,
+                                event_type="exit_order_cancelled_before_forced_exit",
+                                note=(
+                                    "Persisted broker cancellation before submitting the "
+                                    "next-session forced exit."
+                                ),
+                            ),
+                            retry_delays=broker_retry_delays,
+                            sleep_fn=sleep_fn,
+                        )
+                        _require_confirmed_forced_exit_cleanup_cancel(
+                            broker_cancellation,
+                            order_id=open_exit_order_id,
+                        )
+                    submitted_exits.append(
+                        _run_with_broker_retries(
+                            lambda: _submit_forced_exit(
+                                session_factory,
+                                broker_config,
+                                instruction_id,
+                                quantity=remaining_quantity,
+                                timeout=timeout,
+                                exit_submitter=exit_submitter,
+                            ),
+                            retry_delays=broker_retry_delays,
+                            sleep_fn=sleep_fn,
+                        )
+                    )
+                    continue
+
                 if remaining_quantity > 0:
+                    protective_order_refs = _desired_protective_exit_order_refs(
+                        instruction_id=instruction_id,
+                        instruction=instruction,
+                    )
+                    if protective_order_refs:
+                        _cancel_obsolete_exit_orders_for_current_intent(
+                            session_factory,
+                            snapshot,
+                            broker_config,
+                            record=record,
+                            desired_order_refs=protective_order_refs,
+                            cycle_at=cycle_started_at,
+                            timeout=timeout,
+                            canceler=runtime_order_canceler,
+                            broker_retry_delays=broker_retry_delays,
+                            sleep_fn=sleep_fn,
+                        )
                     repaired_exits = _run_with_broker_retries(
                         lambda: _submit_missing_protective_exits(
                             session_factory,
@@ -3298,8 +4492,30 @@ def run_runtime_cycle(
                         submission_lead_time=submission_lead_time,
                     )
                     and remaining_quantity > 0
-                    and not exit_open
                 ):
+                    delayed_exit_order_ref = f"{instruction_id}:exit:delayed_limit"
+                    delayed_exit_order_refs = {delayed_exit_order_ref}
+                    _cancel_obsolete_exit_orders_for_current_intent(
+                        session_factory,
+                        snapshot,
+                        broker_config,
+                        record=record,
+                        desired_order_refs=delayed_exit_order_refs,
+                        cycle_at=cycle_started_at,
+                        timeout=timeout,
+                        canceler=runtime_order_canceler,
+                        broker_retry_delays=broker_retry_delays,
+                        sleep_fn=sleep_fn,
+                    )
+                    if (
+                        delayed_exit_order_ref in exit_open_order_refs
+                        or _has_persisted_open_exit_order_ref(
+                            session_factory,
+                            record=record,
+                            order_ref=delayed_exit_order_ref,
+                        )
+                    ):
+                        continue
                     runtime_market_price_reader = market_price_reader
                     if (
                         runtime_market_price_reader is None
@@ -3349,57 +4565,6 @@ def run_runtime_cycle(
                         )
                     )
                     continue
-
-                if not _is_next_session_exit_due(
-                    instruction,
-                    runtime_timezone=runtime_timezone,
-                    session_calendar_path=session_calendar_path,
-                    cycle_at=cycle_started_at,
-                    submission_lead_time=submission_lead_time,
-                ):
-                    continue
-
-                if remaining_quantity <= 0:
-                    continue
-
-                blocking_due_exit_instruction_ids.append(instruction_id)
-                blocking_due_exit_account_keys.add(record.account_key)
-                if _has_persisted_open_forced_exit_order(
-                    session_factory,
-                    record=record,
-                ):
-                    continue
-                for open_exit_order_id in combined_exit_open_order_ids:
-                    _run_with_broker_retries(
-                        lambda order_id=open_exit_order_id: _cancel_broker_order_and_persist(
-                            session_factory,
-                            broker_config,
-                            order_id=order_id,
-                            timeout=timeout,
-                            canceler=runtime_order_canceler,
-                            event_type="exit_order_cancelled_before_forced_exit",
-                            note=(
-                                "Persisted broker cancellation before submitting the "
-                                "next-session forced exit."
-                            ),
-                        ),
-                        retry_delays=broker_retry_delays,
-                        sleep_fn=sleep_fn,
-                    )
-                submitted_exits.append(
-                    _run_with_broker_retries(
-                        lambda: _submit_forced_exit(
-                            session_factory,
-                            broker_config,
-                            instruction_id,
-                            quantity=remaining_quantity,
-                            timeout=timeout,
-                            exit_submitter=exit_submitter,
-                        ),
-                        retry_delays=broker_retry_delays,
-                        sleep_fn=sleep_fn,
-                    )
-                )
 
         except Exception as exc:  # pragma: no cover - broad by design for runtime safety
             _append_issue(
@@ -3661,6 +4826,10 @@ def _build_runtime_broker_operations(
         broker_config: IbkrConnectionConfig,
         *,
         timeout: int = 10,
+        include_open_orders: bool = False,
+        include_executions: bool = False,
+        include_account_updates: bool = False,
+        include_positions: bool = False,
     ) -> BrokerRuntimeSnapshot:
         if session_factory is not None and not has_real_broker_work(session_factory):
             return BrokerRuntimeSnapshot(
@@ -3675,10 +4844,10 @@ def _build_runtime_broker_operations(
             lambda broker_app: fetch_broker_runtime_snapshot(
                 broker_config,
                 timeout=timeout,
-                include_open_orders=False,
-                include_executions=False,
-                include_account_updates=False,
-                include_positions=False,
+                include_open_orders=include_open_orders,
+                include_executions=include_executions,
+                include_account_updates=include_account_updates,
+                include_positions=include_positions,
                 app=broker_app,
             ),
         )
@@ -3687,6 +4856,10 @@ def _build_runtime_broker_operations(
         broker_config: IbkrConnectionConfig,
         *,
         timeout: int = 10,
+        include_open_orders: bool = True,
+        include_executions: bool = True,
+        include_account_updates: bool = False,
+        include_positions: bool = True,
     ) -> BrokerRuntimeSnapshot:
         if session_factory is not None and not has_real_broker_work(session_factory):
             return BrokerRuntimeSnapshot(
@@ -3703,7 +4876,7 @@ def _build_runtime_broker_operations(
                 timeout=timeout,
                 include_open_orders=True,
                 include_executions=True,
-                include_account_updates=False,
+                include_account_updates=include_account_updates,
                 include_positions=True,
                 app=broker_app,
             ),
@@ -3712,7 +4885,9 @@ def _build_runtime_broker_operations(
     def drain_callbacks_with_primary() -> list[dict[str, Any]]:
         if session_factory is not None and not has_real_broker_work(session_factory):
             return []
-        return broker_sessions.primary.drain_broker_callback_events()
+        return broker_sessions.primary.drain_broker_callback_events(
+            connect_if_needed=False,
+        )
 
     def cancel_order_with_primary(
         broker_config: IbkrConnectionConfig,

@@ -208,6 +208,13 @@ class LiveMarketDataStreamService:
         self._bars_by_key: dict[str, dict[datetime, MarketStreamBar]] = {}
         self._errors: list[dict[str, Any]] = []
         self._started_at: datetime | None = None
+        self._last_subscribe_request_at: datetime | None = None
+        self._last_subscription_change_at: datetime | None = None
+        self._subscribe_request_count = 0
+        self._subscribe_noop_count = 0
+        self._actual_subscription_count = 0
+        self._actual_unsubscription_count = 0
+        self._market_data_type_request_count = 0
         self._connect_attempt_count = 0
         self._connect_success_count = 0
         self._consecutive_failures = 0
@@ -496,16 +503,53 @@ class LiveMarketDataStreamService:
             raise ValueError("symbols are required")
         for contract in contracts:
             contract.validate()
+        no_op = False
         with self._lock:
-            if replace:
-                self._desired_contracts_by_key = {
-                    contract.key: contract for contract in contracts
+            self._last_subscribe_request_at = _utc_now()
+            self._subscribe_request_count += 1
+            requested_contracts_by_key = {
+                contract.key: contract for contract in contracts
+            }
+            desired_contracts_by_key = (
+                requested_contracts_by_key
+                if replace
+                else {
+                    **self._desired_contracts_by_key,
+                    **requested_contracts_by_key,
                 }
+            )
+            desired_market_data_type = (
+                market_data_type
+                if market_data_type is not None
+                else self._desired_market_data_type
+            )
+            connected = self._client is not None and self._client.isConnected()
+            active_matches_desired = (
+                connected
+                and set(self._subscriptions_by_key) == set(desired_contracts_by_key)
+                and all(
+                    subscription.status != "error"
+                    and subscription.contract == desired_contracts_by_key[key]
+                    for key, subscription in self._subscriptions_by_key.items()
+                )
+            )
+            no_op = (
+                desired_contracts_by_key == self._desired_contracts_by_key
+                and desired_market_data_type == self._desired_market_data_type
+                and active_matches_desired
+            )
+            if no_op:
+                self._subscribe_noop_count += 1
             else:
-                for contract in contracts:
-                    self._desired_contracts_by_key[contract.key] = contract
+                self._last_subscription_change_at = self._last_subscribe_request_at
+            if replace:
+                self._desired_contracts_by_key = desired_contracts_by_key
+            else:
+                self._desired_contracts_by_key = desired_contracts_by_key
             if market_data_type is not None:
-                self._desired_market_data_type = market_data_type
+                self._desired_market_data_type = desired_market_data_type
+        if no_op:
+            return self.snapshot()
         self.connect_and_start()
         with self._lock:
             client = self._client
@@ -513,14 +557,16 @@ class LiveMarketDataStreamService:
                 raise ConnectionError("market stream client is not connected")
             if market_data_type is not None:
                 client.reqMarketDataType(_market_data_type_code(market_data_type))
+                self._market_data_type_request_count += 1
 
-            target_keys = {contract.key for contract in contracts}
+            contracts_to_apply = list(self._desired_contracts_by_key.values())
+            target_keys = {contract.key for contract in contracts_to_apply}
             if replace:
                 for key in list(self._subscriptions_by_key):
                     if key not in target_keys:
                         self._unsubscribe_key_locked(key)
 
-            for contract in contracts:
+            for contract in contracts_to_apply:
                 existing = self._subscriptions_by_key.get(contract.key)
                 if existing is not None and (
                     existing.status != "error"
@@ -639,6 +685,21 @@ class LiveMarketDataStreamService:
                 "desired_subscription_count": len(self._desired_contracts_by_key),
                 "desired_symbols": sorted(self._desired_contracts_by_key),
                 "subscribed_count": len(self._subscriptions_by_key),
+                "last_subscribe_request_at": (
+                    self._last_subscribe_request_at.isoformat()
+                    if self._last_subscribe_request_at is not None
+                    else None
+                ),
+                "last_subscription_change_at": (
+                    self._last_subscription_change_at.isoformat()
+                    if self._last_subscription_change_at is not None
+                    else None
+                ),
+                "subscribe_request_count": self._subscribe_request_count,
+                "subscribe_noop_count": self._subscribe_noop_count,
+                "actual_subscription_count": self._actual_subscription_count,
+                "actual_unsubscription_count": self._actual_unsubscription_count,
+                "market_data_type_request_count": self._market_data_type_request_count,
                 "subscriptions": subscriptions,
                 "quote_count": len(quotes),
                 "quotes": quotes,
@@ -732,6 +793,7 @@ class LiveMarketDataStreamService:
             subscribed_at=_utc_now(),
         )
         self._subscription_keys_by_req_id[request_id] = contract.key
+        self._actual_subscription_count += 1
         self._quotes_by_key.setdefault(
             contract.key,
             MarketStreamQuote(
@@ -749,6 +811,7 @@ class LiveMarketDataStreamService:
         if subscription is None:
             return
         self._subscription_keys_by_req_id.pop(subscription.request_id, None)
+        self._actual_unsubscription_count += 1
         client = self._client
         if client is not None and client.isConnected():
             client.cancelMktData(subscription.request_id)

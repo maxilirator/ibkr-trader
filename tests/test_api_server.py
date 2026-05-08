@@ -11,6 +11,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from ibkr_trader.api.server import (
+    build_rl_runtime_state_snapshot,
     create_app,
     enforce_loopback_binding,
     enrich_operator_snapshot_with_market_stream,
@@ -146,6 +147,344 @@ class ApiServerTests(TestCase):
             parse_positive_limit(0, field_name="limit", maximum=10)
         with self.assertRaisesRegex(ValueError, "at most 10"):
             parse_positive_limit(11, field_name="limit", maximum=10)
+
+    def test_build_rl_runtime_state_uses_current_holding_snapshot(self) -> None:
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+        session = session_factory()
+        try:
+            model = TraderModelRecord(
+                model_key="long_trial_106_v1",
+                display_name="Long Trial 106",
+                strategy_family="canonical_long",
+                side="LONG",
+                action_space_json=[],
+                observation_contract_json={},
+                metadata_json={},
+            )
+            session.add(model)
+            session.flush()
+            session.add(
+                TraderDeploymentRecord(
+                    trader_model_id=model.id,
+                    deployment_key="long_trial_106_virtual_shared_01",
+                    account_key="VIRTUALRL01",
+                    book_key="rl_shared_long_trial_106_virtual_01",
+                    mode="virtual",
+                    status="running",
+                    is_virtual=True,
+                    allowed_symbols_json=["SHB A"],
+                    risk_limits_json={},
+                    action_constraints_json={},
+                    metadata_json={},
+                )
+            )
+            account = BrokerAccountRecord(
+                broker_kind="virtual",
+                account_key="VIRTUALRL01",
+                base_currency="SEK",
+                is_virtual=True,
+                metadata_json={},
+            )
+            session.add(account)
+            session.flush()
+            session.add(
+                InstructionRecord(
+                    instruction_id="owned-shb",
+                    schema_version="2026-04-10",
+                    source_system="rl-runner",
+                    batch_id="batch-1",
+                    account_key="VIRTUALRL01",
+                    book_key="rl_shared_long_trial_106_virtual_01",
+                    is_virtual=True,
+                    symbol="SHB A",
+                    exchange="XSTO",
+                    currency="SEK",
+                    state="POSITION_OPEN",
+                    submit_at=datetime(2026, 5, 7, 13, 35, tzinfo=timezone.utc),
+                    expire_at=datetime(2026, 5, 7, 15, 30, tzinfo=timezone.utc),
+                    order_type="MARKET",
+                    side="BUY",
+                    entry_filled_quantity="88",
+                    entry_avg_fill_price="130.45",
+                    payload={
+                        "instruction": {
+                            "trace": {
+                                "metadata": {
+                                    "rl_deployment_key": "long_trial_106_virtual_shared_01",
+                                    "rl_action_name": "market_entry",
+                                    "rl_decision_id": "decision-001",
+                                    "static_features": {"values": [1, 2, 3]},
+                                }
+                            }
+                        }
+                    },
+                )
+            )
+            session.add(
+                PositionSnapshotRecord(
+                    broker_account_id=account.id,
+                    is_virtual=True,
+                    snapshot_at=datetime(2026, 5, 7, 13, 40, tzinfo=timezone.utc),
+                    source="virtual_execution",
+                    symbol="SHB A",
+                    exchange="XSTO",
+                    currency="SEK",
+                    security_type="STK",
+                    quantity="88",
+                    average_cost="130.50",
+                    market_price="131.00",
+                    owner_instruction_id="owned-shb",
+                    owner_source_instruction_id="candidate-shb",
+                    owner_deployment_key="long_trial_106_virtual_shared_01",
+                    owner_book_key="rl_shared_long_trial_106_virtual_01",
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        try:
+            snapshot = build_rl_runtime_state_snapshot(
+                session_factory,
+                deployment_key="long_trial_106_virtual_shared_01",
+                symbols=["SHB A"],
+            )
+        finally:
+            engine.dispose()
+
+        row = snapshot["symbols"][0]
+        self.assertEqual(row["status"], "ready")
+        self.assertEqual(row["state_before"], "LONG_OPEN")
+        self.assertTrue(row["runner_state"]["in_position"])
+        self.assertEqual(row["runner_state"]["entry_price"], "130.50")
+        self.assertEqual(row["position_snapshot"]["quantity"], "88")
+        self.assertEqual(
+            row["position_snapshot"]["owner_deployment_key"],
+            "long_trial_106_virtual_shared_01",
+        )
+        self.assertEqual(
+            row["active_instructions"][0]["metadata"],
+            {
+                "rl_deployment_key": "long_trial_106_virtual_shared_01",
+                "rl_action_name": "market_entry",
+                "rl_decision_id": "decision-001",
+            },
+        )
+
+    def test_build_rl_runtime_state_blocks_virtual_holding_without_owner(self) -> None:
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+        session = session_factory()
+        try:
+            model = TraderModelRecord(
+                model_key="long_trial_106_v1",
+                display_name="Long Trial 106",
+                strategy_family="canonical_long",
+                side="LONG",
+                action_space_json=[],
+                observation_contract_json={},
+                metadata_json={},
+            )
+            session.add(model)
+            session.flush()
+            session.add(
+                TraderDeploymentRecord(
+                    trader_model_id=model.id,
+                    deployment_key="long_trial_106_virtual_shared_01",
+                    account_key="VIRTUALRL01",
+                    book_key="rl_shared_long_trial_106_virtual_01",
+                    mode="virtual",
+                    status="running",
+                    is_virtual=True,
+                    allowed_symbols_json=["SHB A"],
+                    risk_limits_json={},
+                    action_constraints_json={},
+                    metadata_json={},
+                )
+            )
+            account = BrokerAccountRecord(
+                broker_kind="virtual",
+                account_key="VIRTUALRL01",
+                base_currency="SEK",
+                is_virtual=True,
+                metadata_json={},
+            )
+            session.add(account)
+            session.flush()
+            session.add(
+                InstructionRecord(
+                    instruction_id="owned-shb",
+                    schema_version="2026-04-10",
+                    source_system="rl-runner",
+                    batch_id="batch-1",
+                    account_key="VIRTUALRL01",
+                    book_key="rl_shared_long_trial_106_virtual_01",
+                    is_virtual=True,
+                    symbol="SHB A",
+                    exchange="XSTO",
+                    currency="SEK",
+                    state="POSITION_OPEN",
+                    submit_at=datetime(2026, 5, 7, 13, 35, tzinfo=timezone.utc),
+                    expire_at=datetime(2026, 5, 7, 15, 30, tzinfo=timezone.utc),
+                    order_type="MARKET",
+                    side="BUY",
+                    entry_filled_quantity="88",
+                    entry_avg_fill_price="130.45",
+                    payload={
+                        "instruction": {
+                            "trace": {
+                                "metadata": {
+                                    "rl_deployment_key": "long_trial_106_virtual_shared_01",
+                                    "rl_action_name": "market_entry",
+                                }
+                            }
+                        }
+                    },
+                )
+            )
+            session.add(
+                PositionSnapshotRecord(
+                    broker_account_id=account.id,
+                    is_virtual=True,
+                    snapshot_at=datetime(2026, 5, 7, 13, 40, tzinfo=timezone.utc),
+                    source="virtual_execution",
+                    symbol="SHB A",
+                    exchange="XSTO",
+                    currency="SEK",
+                    security_type="STK",
+                    quantity="88",
+                    average_cost="130.50",
+                    market_price="131.00",
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        try:
+            snapshot = build_rl_runtime_state_snapshot(
+                session_factory,
+                deployment_key="long_trial_106_virtual_shared_01",
+                symbols=["SHB A"],
+            )
+        finally:
+            engine.dispose()
+
+        row = snapshot["symbols"][0]
+        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["state_before"], "INCONSISTENT")
+        self.assertEqual(row["blockers"][0]["reason"], "virtual_position_missing_owner")
+
+    def test_build_rl_runtime_state_blocks_duplicate_active_positions(self) -> None:
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+        session = session_factory()
+        try:
+            model = TraderModelRecord(
+                model_key="long_trial_106_v1",
+                display_name="Long Trial 106",
+                strategy_family="canonical_long",
+                side="LONG",
+                action_space_json=[],
+                observation_contract_json={},
+                metadata_json={},
+            )
+            session.add(model)
+            session.flush()
+            session.add(
+                TraderDeploymentRecord(
+                    trader_model_id=model.id,
+                    deployment_key="long_trial_106_virtual_shared_01",
+                    account_key="VIRTUALRL01",
+                    book_key="rl_shared_long_trial_106_virtual_01",
+                    mode="virtual",
+                    status="running",
+                    is_virtual=True,
+                    allowed_symbols_json=["BALD B"],
+                    risk_limits_json={},
+                    action_constraints_json={},
+                    metadata_json={},
+                )
+            )
+            account = BrokerAccountRecord(
+                broker_kind="virtual",
+                account_key="VIRTUALRL01",
+                base_currency="SEK",
+                is_virtual=True,
+                metadata_json={},
+            )
+            session.add(account)
+            session.flush()
+            for idx in range(2):
+                session.add(
+                    InstructionRecord(
+                        instruction_id=f"owned-bald-{idx}",
+                        schema_version="2026-04-10",
+                        source_system="rl-runner",
+                        batch_id=f"batch-{idx}",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        is_virtual=True,
+                        symbol="BALD B",
+                        exchange="XSTO",
+                        currency="SEK",
+                        state="POSITION_OPEN",
+                        submit_at=datetime(2026, 5, 7, 14, 30, tzinfo=timezone.utc),
+                        expire_at=datetime(2026, 5, 7, 15, 30, tzinfo=timezone.utc),
+                        order_type="MARKET",
+                        side="BUY",
+                        entry_filled_quantity="205",
+                        entry_avg_fill_price="56.00",
+                        payload={
+                            "instruction": {
+                                "trace": {
+                                    "metadata": {
+                                        "rl_deployment_key": "long_trial_106_virtual_shared_01",
+                                        "rl_action_name": "market_entry",
+                                    }
+                                }
+                            }
+                        },
+                    )
+                )
+            session.add(
+                PositionSnapshotRecord(
+                    broker_account_id=account.id,
+                    is_virtual=True,
+                    snapshot_at=datetime(2026, 5, 7, 14, 40, tzinfo=timezone.utc),
+                    source="virtual_execution",
+                    symbol="BALD B",
+                    exchange="XSTO",
+                    currency="SEK",
+                    security_type="STK",
+                    quantity="410",
+                    average_cost="56.00",
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        try:
+            snapshot = build_rl_runtime_state_snapshot(
+                session_factory,
+                deployment_key="long_trial_106_virtual_shared_01",
+                symbols=["BALD B"],
+            )
+        finally:
+            engine.dispose()
+
+        row = snapshot["symbols"][0]
+        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["state_before"], "INCONSISTENT")
+        self.assertEqual(row["blockers"][0]["reason"], "duplicate_active_positions")
 
     def test_parse_contract_resolve_payload_normalizes_values(self) -> None:
         query = parse_contract_resolve_payload(
@@ -1941,6 +2280,209 @@ class ApiServerTests(TestCase):
                 candidate["candidate"]["instruction_id"],
                 "candidate-AXFO",
             )
+
+    def test_rl_candidates_endpoint_retires_completed_lifecycle_candidates(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "rl_candidate_lifecycle.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                model = TraderModelRecord(
+                    model_key="long_trial_106_v1",
+                    display_name="Long Trial 106",
+                    strategy_family="bucket_booster",
+                    side="LONG",
+                )
+                session.add(model)
+                session.flush()
+                session.add(
+                    TraderDeploymentRecord(
+                        trader_model_id=model.id,
+                        deployment_key="long_trial_106_virtual_shared_01",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        mode="virtual",
+                        status="running",
+                        is_virtual=True,
+                        allowed_symbols_json=["AXFO"],
+                        risk_limits_json={},
+                        action_constraints_json={},
+                        metadata_json={},
+                    )
+                )
+                session.add(
+                    InstructionRecord(
+                        instruction_id="candidate-AXFO",
+                        schema_version="2026-04-25",
+                        source_system="upstream-agent",
+                        batch_id="candidate-batch-001",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        is_virtual=True,
+                        symbol="AXFO",
+                        exchange="XSTO",
+                        currency="SEK",
+                        state="MODEL_ROUTED_PENDING",
+                        submit_at=datetime(2099, 4, 28, 7, 0, tzinfo=timezone.utc),
+                        expire_at=datetime(2099, 4, 28, 15, 30, tzinfo=timezone.utc),
+                        order_type="MODEL_ROUTED",
+                        side="BUY",
+                        payload={
+                            "schema_version": "2026-04-25",
+                            "source": {
+                                "system": "upstream-agent",
+                                "batch_id": "candidate-batch-001",
+                                "generated_at": "2099-04-28T06:30:00Z",
+                            },
+                            "instruction": {
+                                "instruction_id": "candidate-AXFO",
+                                "account": {
+                                    "account_key": "VIRTUALRL01",
+                                    "book_key": "rl_shared_long_trial_106_virtual_01",
+                                },
+                                "instrument": {
+                                    "symbol": "AXFO",
+                                    "security_type": "STK",
+                                    "exchange": "XSTO",
+                                    "currency": "SEK",
+                                },
+                                "intent": {
+                                    "side": "BUY",
+                                    "position_side": "LONG",
+                                },
+                                "sizing": {
+                                    "mode": "target_notional",
+                                    "target_notional": "1000",
+                                },
+                                "execution": {
+                                    "mode": "model_routed",
+                                    "model_id": "long_trial_106_v1",
+                                    "window": {
+                                        "start_at": "2099-04-28T09:00:00+02:00",
+                                        "end_at": "2099-04-28T17:30:00+02:00",
+                                    },
+                                },
+                                "lifecycle": {
+                                    "trade_date": "2099-04-28",
+                                    "scope": "account_book_side_symbol_trade_date",
+                                    "max_entry_orders": 1,
+                                    "max_exit_orders": 1,
+                                    "allow_reentry_after_exit": False,
+                                    "allow_reentry_after_cancel": False,
+                                    "retire_from_active_universe_when_flat": True,
+                                },
+                                "trace": {
+                                    "reason_code": "rl_model_routed_candidate",
+                                    "trade_date": "2099-04-28",
+                                },
+                            },
+                        },
+                    )
+                )
+                session.add(
+                    InstructionRecord(
+                        instruction_id="generated-roundtrip-001",
+                        schema_version="2026-04-10",
+                        source_system="rl-runner",
+                        batch_id="generated-batch-001",
+                        account_key="VIRTUALRL01",
+                        book_key="rl_shared_long_trial_106_virtual_01",
+                        is_virtual=True,
+                        symbol="AXFO",
+                        exchange="XSTO",
+                        currency="SEK",
+                        state="COMPLETED",
+                        submit_at=datetime(2099, 4, 28, 7, 5, tzinfo=timezone.utc),
+                        expire_at=datetime(2099, 4, 28, 15, 30, tzinfo=timezone.utc),
+                        order_type="MARKET",
+                        side="BUY",
+                        entry_filled_quantity="10",
+                        exit_filled_quantity="10",
+                        payload={
+                            "instruction": {
+                                "instruction_id": "generated-roundtrip-001",
+                                "trace": {
+                                    "metadata": {
+                                        "rl_source_instruction_id": "candidate-AXFO"
+                                    }
+                                },
+                            }
+                        },
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="U25245596",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                response = client.get(
+                    "/v1/rl/candidates",
+                    params={"deployment_key": "long_trial_106_virtual_shared_01"},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertTrue(body["accepted"])
+            self.assertEqual(body["candidate_count"], 0)
+
+            session = session_factory()
+            try:
+                candidate = session.query(InstructionRecord).filter_by(
+                    instruction_id="candidate-AXFO"
+                ).one()
+                generated = session.query(InstructionRecord).filter_by(
+                    instruction_id="generated-roundtrip-001"
+                ).one()
+                events = session.query(InstructionEventRecord).filter_by(
+                    instruction_id=candidate.id,
+                    event_type="rl_candidate_lifecycle_retired",
+                ).all()
+                self.assertIsNotNone(candidate.archived_at)
+                self.assertIsNone(generated.archived_at)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(
+                    events[0].payload["retirement_detail"]["retirement_trigger"],
+                    "completed_entry_and_exit",
+                )
+            finally:
+                session.close()
+                engine.dispose()
 
     def test_rl_dashboard_archives_expired_candidate_sources(self) -> None:
         try:

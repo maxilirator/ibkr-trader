@@ -155,6 +155,35 @@ class SessionManagerTests(TestCase):
         self.assertEqual(telemetry["failed_operations"], 1)
         self.assertEqual(telemetry["per_operation"]["probe"]["failure"], 1)
 
+    def test_broker_timeout_disconnects_poisoned_session(self) -> None:
+        session = ManagedSyncSession(
+            "diagnostic",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FakeSyncWrapper,
+            initial_connect_backoff_seconds=60,
+            max_connect_backoff_seconds=60,
+        )
+
+        with self.assertRaisesRegex(TimeoutError, "stuck"):
+            session.execute(
+                "historical_bars",
+                lambda app: (_ for _ in ()).throw(TimeoutError("stuck")),
+            )
+
+        wrapper = _FakeSyncWrapper.instances[0]
+        self.assertEqual(wrapper.disconnect_calls, 1)
+        status = session.status()
+        self.assertFalse(status.connected)
+        self.assertEqual(status.consecutive_failures, 1)
+        self.assertIsNotNone(status.cooldown_until)
+        self.assertEqual(status.last_error, "stuck")
+
     def test_drain_broker_callback_events_uses_managed_session(self) -> None:
         session = ManagedSyncSession(
             "primary",
@@ -173,6 +202,49 @@ class SessionManagerTests(TestCase):
         self.assertEqual(events, [{"event_type": "order_status"}])
         status = session.status()
         self.assertEqual(status.metrics.checkout_count, 1)
+
+    def test_passive_callback_drain_does_not_connect_disconnected_session(self) -> None:
+        session = ManagedSyncSession(
+            "primary",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=0,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FakeSyncWrapper,
+        )
+
+        events = session.drain_broker_callback_events(connect_if_needed=False)
+
+        self.assertEqual(events, [])
+        self.assertEqual(_FakeSyncWrapper.instances, [])
+        status = session.status()
+        self.assertEqual(status.metrics.connect_attempt_count, 0)
+        self.assertEqual(status.metrics.checkout_count, 0)
+
+    def test_passive_callback_drain_uses_existing_connected_session(self) -> None:
+        session = ManagedSyncSession(
+            "primary",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=0,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FakeSyncWrapper,
+        )
+        session.warmup()
+
+        events = session.drain_broker_callback_events(connect_if_needed=False)
+
+        self.assertEqual(events, [{"event_type": "order_status"}])
+        self.assertEqual(len(_FakeSyncWrapper.instances), 1)
+        self.assertEqual(_FakeSyncWrapper.instances[0].connect_calls, 1)
+        status = session.status()
+        self.assertEqual(status.metrics.checkout_count, 0)
 
     def test_failed_connect_enters_cooldown_without_repeated_socket_attempts(self) -> None:
         session = ManagedSyncSession(
@@ -216,6 +288,7 @@ class SessionManagerTests(TestCase):
             wrapper_cls=_FailingSyncWrapperWithReason,
             initial_connect_backoff_seconds=60,
             max_connect_backoff_seconds=60,
+            gateway_diagnostics_reader=lambda: {},
         )
 
         with self.assertRaisesRegex(ConnectionError, "nextValidId"):
@@ -226,6 +299,46 @@ class SessionManagerTests(TestCase):
             status.last_error,
             "socket connected but API startup did not return nextValidId",
         )
+
+    def test_next_valid_id_failure_uses_stuck_gateway_slow_probe_circuit(self) -> None:
+        session = ManagedSyncSession(
+            "diagnostic",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FailingSyncWrapperWithReason,
+            initial_connect_backoff_seconds=5,
+            max_connect_backoff_seconds=60,
+            api_startup_failure_slow_probe_seconds=900,
+            gateway_diagnostics_reader=lambda: {
+                "status": "stuck_shutdown_after_existing_session",
+                "severity": "bad",
+                "summary": (
+                    "IB Gateway is stuck shutting down after an "
+                    "existing-session conflict."
+                ),
+                "latest_dialog": "Shutdown progress",
+                "latest_event_at": "2026-05-08T13:50:57+00:00",
+                "existing_session_detected_at": "2026-05-08T13:50:57+00:00",
+                "existing_session_action": "Click button: Cancel",
+                "configured_existing_session_action": "primaryoverride",
+            },
+        )
+
+        with self.assertRaisesRegex(ConnectionError, "IB Gateway diagnostic"):
+            session.execute("heartbeat_probe", lambda app: app.connection_args)
+
+        status = session.status()
+        self.assertFalse(status.connected)
+        self.assertIn("IB Gateway diagnostic", status.last_error or "")
+        self.assertIn("stuck_shutdown_after_existing_session", status.circuit_breaker_reason or "")
+        self.assertIsNotNone(status.circuit_breaker_until)
+        self.assertIsNotNone(status.cooldown_seconds_remaining)
+        self.assertGreaterEqual(status.cooldown_seconds_remaining or 0, 800)
 
     def test_execute_can_ignore_cooldown_for_explicit_health_checks(self) -> None:
         session = ManagedSyncSession(

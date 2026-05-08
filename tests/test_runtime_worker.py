@@ -135,6 +135,24 @@ def _sive_payload() -> dict[str, object]:
     }
 
 
+def _sive_broker_position(
+    quantity: str = "100",
+    *,
+    account: str = "DU1234567",
+) -> BrokerPosition:
+    return BrokerPosition(
+        account=account,
+        symbol="SIVE",
+        local_symbol="SIVE",
+        security_type="STK",
+        exchange="SMART",
+        primary_exchange="SFB",
+        currency="SEK",
+        position=Decimal(quantity),
+        average_cost=Decimal("11.3131"),
+    )
+
+
 def _duplicate_take_profit_open_orders() -> dict[int, BrokerOpenOrder]:
     return {
         42: BrokerOpenOrder(
@@ -336,6 +354,68 @@ class RuntimeWorkerTests(TestCase):
         finally:
             session.close()
 
+    def _insert_exit_broker_order(
+        self,
+        *,
+        instruction_id: str,
+        external_order_id: str,
+        order_ref: str,
+        symbol: str,
+        currency: str,
+        status: str = "Submitted",
+        side: str = "SELL",
+        order_type: str = "LMT",
+        limit_price: str | None = None,
+        stop_price: str | None = None,
+    ) -> None:
+        session = self.session_factory()
+        try:
+            instruction_record = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == instruction_id
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency=currency,
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction_record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="EXIT",
+                    external_order_id=external_order_id,
+                    external_perm_id=str(9000 + int(external_order_id)),
+                    external_client_id="0",
+                    order_ref=order_ref,
+                    symbol=symbol,
+                    exchange="SMART",
+                    currency=currency,
+                    security_type="STK",
+                    primary_exchange="NASDAQ" if currency == "USD" else "SFB",
+                    local_symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    time_in_force="DAY",
+                    status=status,
+                    total_quantity="1",
+                    limit_price=limit_price,
+                    stop_price=stop_price,
+                    submitted_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
     def test_runtime_broker_operations_keep_normal_cycle_snapshot_light(self) -> None:
         recorded_operations: list[str] = []
 
@@ -389,7 +469,13 @@ class RuntimeWorkerTests(TestCase):
             ),
         ) as snapshot_fetch:
             broker_ops = _build_runtime_broker_operations(_FakeSessions())
-            broker_ops.fetch_reconciliation_snapshot(self.config, timeout=23)
+            broker_ops.fetch_reconciliation_snapshot(
+                self.config,
+                timeout=23,
+                include_open_orders=False,
+                include_executions=False,
+                include_positions=False,
+            )
 
         self.assertEqual(recorded_operations, ["runtime_reconciliation_snapshot"])
         self.assertEqual(snapshot_fetch.call_args.kwargs["timeout"], 23)
@@ -699,7 +785,7 @@ class RuntimeWorkerTests(TestCase):
                     open_orders={},
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
@@ -825,7 +911,7 @@ class RuntimeWorkerTests(TestCase):
                     open_orders={},
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
@@ -911,7 +997,7 @@ class RuntimeWorkerTests(TestCase):
                     open_orders={},
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
@@ -2518,6 +2604,230 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
         self.assertEqual(record.exit_order_id, 41)
 
+    def test_run_runtime_cycle_cancels_obsolete_exit_before_protective_repair(
+        self,
+    ) -> None:
+        payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+            payload=payload,
+            broker_order_id=11,
+            exit_order_id=41,
+            entry_filled_quantity="1",
+            entry_avg_fill_price="200.00",
+        )
+        self._insert_exit_broker_order(
+            instruction_id="runtime-aapl-1",
+            external_order_id="41",
+            order_ref="runtime-aapl-1:exit:delayed_limit",
+            symbol="AAPL",
+            currency="USD",
+            limit_price="199.00",
+        )
+
+        operations: list[str] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            del broker_config, timeout
+            operations.append(f"cancel:{order_id}")
+            return {"broker_order_status": {"orderId": order_id, "status": "Cancelled"}}
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: Decimal,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: Decimal | None = None,
+            stop_price: Decimal | None = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            del broker_config, instruction, timeout, order_type, stop_price, oca_group, oca_type
+            operations.append(f"submit:{order_ref}")
+            return {
+                "instruction_id": "runtime-aapl-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 265598, "symbol": "AAPL"},
+                "order": {
+                    "order_ref": order_ref,
+                    "action": "SELL",
+                    "order_type": "LMT",
+                    "time_in_force": "DAY",
+                    "limit_price": str(limit_price),
+                    "total_quantity": str(quantity),
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 42,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": str(quantity),
+                    "avgFillPrice": 0.0,
+                    "permId": 9042,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 5, tzinfo=timezone.utc),
+            exit_submitter=fake_exit_submitter,
+            broker_order_canceler=fake_canceler,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={
+                    41: BrokerOpenOrder(
+                        order_id=41,
+                        perm_id=9041,
+                        client_id=0,
+                        status="Submitted",
+                        order_ref="runtime-aapl-1:exit:delayed_limit",
+                        action="SELL",
+                        total_quantity=Decimal("1"),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        order_type="LMT",
+                        limit_price=Decimal("199.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(
+            operations,
+            ["cancel:41", "submit:runtime-aapl-1:exit:take_profit"],
+        )
+        self.assertEqual(len(result.submitted_exits), 1)
+        session = self.session_factory()
+        try:
+            cleanup_event = session.execute(
+                select(InstructionEventRecord).where(
+                    InstructionEventRecord.event_type
+                    == "exit_intent_obsolete_orders_cleanup_started"
+                )
+            ).scalar_one()
+            self.assertEqual(
+                cleanup_event.payload["desired_order_refs"],
+                ["runtime-aapl-1:exit:take_profit"],
+            )
+            self.assertEqual(
+                cleanup_event.payload["obsolete_orders"][0]["broker_order_id"],
+                41,
+            )
+        finally:
+            session.close()
+
+    def test_run_runtime_cycle_blocks_protective_repair_when_obsolete_cancel_unconfirmed(
+        self,
+    ) -> None:
+        payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 19, 59, tzinfo=timezone.utc),
+            payload=payload,
+            broker_order_id=11,
+            exit_order_id=41,
+            entry_filled_quantity="1",
+            entry_avg_fill_price="200.00",
+        )
+
+        submitted_refs: list[str] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            del broker_config, timeout
+            return {"broker_order_status": {"orderId": order_id, "status": "PendingCancel"}}
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            del broker_config, instruction
+            submitted_refs.append(str(kwargs["order_ref"]))
+            raise AssertionError("replacement exit must wait for confirmed cancellation")
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 5, tzinfo=timezone.utc),
+            exit_submitter=fake_exit_submitter,
+            broker_order_canceler=fake_canceler,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={
+                    41: BrokerOpenOrder(
+                        order_id=41,
+                        perm_id=9041,
+                        client_id=0,
+                        status="Submitted",
+                        order_ref="runtime-aapl-1:exit:delayed_limit",
+                        action="SELL",
+                        total_quantity=Decimal("1"),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        order_type="LMT",
+                        limit_price=Decimal("199.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(submitted_refs, [])
+        self.assertEqual(result.submitted_exits, ())
+        self.assertEqual(len(result.issues), 1)
+        self.assertIn("broker status was PENDINGCANCEL", result.issues[0].message)
+
     def test_run_runtime_cycle_marks_missing_protective_exits_stale_and_repairs(
         self,
     ) -> None:
@@ -3213,6 +3523,154 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(record.exit_order_id, 41)
         self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
 
+    def test_run_runtime_cycle_cancels_obsolete_protective_before_delayed_exit(self) -> None:
+        payload = _sive_payload()
+        payload["instruction"]["exit"] = {
+            "delayed_limit": {
+                "submit_at": "2026-04-10T10:30:00+02:00",
+                "limit_offset_pct": "0.05",
+            }
+        }
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="1",
+            exit_order_id=21,
+        )
+        self._insert_exit_broker_order(
+            instruction_id="runtime-sive-1",
+            external_order_id="21",
+            order_ref="runtime-sive-1:exit:take_profit",
+            symbol="SIVE",
+            currency="SEK",
+            limit_price="21.00",
+        )
+
+        operations: list[str] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            del broker_config, timeout
+            operations.append(f"cancel:{order_id}")
+            return {"broker_order_status": {"orderId": order_id, "status": "Cancelled"}}
+
+        def fake_market_price_reader(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            at: datetime,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            del broker_config, instruction, at, timeout
+            operations.append("market")
+            return {
+                "price": "20.00",
+                "observed_at": "20260410 10:29:00",
+                "currency": "SEK",
+                "source": "test_latest_trade_price",
+            }
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            del broker_config, instruction, timeout, order_type, stop_price, oca_group, oca_type
+            operations.append(f"submit:{order_ref}")
+            return {
+                "instruction_id": "runtime-sive-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 489000, "symbol": "SIVE"},
+                "order": {
+                    "order_ref": order_ref,
+                    "action": "SELL",
+                    "order_type": "LMT",
+                    "time_in_force": "DAY",
+                    "limit_price": str(limit_price),
+                    "total_quantity": str(quantity),
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 41,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": str(quantity),
+                    "avgFillPrice": 0.0,
+                    "permId": 9141,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+            exit_submitter=fake_exit_submitter,
+            market_price_reader=fake_market_price_reader,
+            broker_order_canceler=fake_canceler,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={
+                    21: BrokerOpenOrder(
+                        order_id=21,
+                        perm_id=9021,
+                        client_id=0,
+                        status="Submitted",
+                        order_ref="runtime-sive-1:exit:take_profit",
+                        action="SELL",
+                        total_quantity=Decimal("1"),
+                        symbol="SIVE",
+                        account="DU1234567",
+                        security_type="STK",
+                        exchange="SMART",
+                        primary_exchange="SFB",
+                        currency="SEK",
+                        local_symbol="SIVE",
+                        order_type="LMT",
+                        limit_price=Decimal("21.00"),
+                    )
+                },
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(
+            operations,
+            ["cancel:21", "market", "submit:runtime-sive-1:exit:delayed_limit"],
+        )
+        self.assertEqual(len(result.submitted_exits), 1)
+        record = self._read_record("runtime-sive-1")
+        self.assertEqual(record.exit_order_id, 41)
+        self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
+
     def test_run_runtime_cycle_submits_forced_exit_when_next_session_is_due(self) -> None:
         payload = _sive_payload()
         self._insert_instruction(
@@ -3274,6 +3732,203 @@ class RuntimeWorkerTests(TestCase):
                 },
             }
 
+        snapshot_kwargs: dict[str, object] = {}
+
+        def fake_snapshot_fetcher(*args: object, **kwargs: object) -> BrokerRuntimeSnapshot:
+            del args
+            snapshot_kwargs.update(kwargs)
+            return BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(_sive_broker_position(),),
+                account_values={},
+            )
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=fake_snapshot_fetcher,
+            )
+
+        self.assertEqual(len(result.submitted_exits), 1)
+        self.assertTrue(snapshot_kwargs["include_open_orders"])
+        self.assertTrue(snapshot_kwargs["include_executions"])
+        self.assertTrue(snapshot_kwargs["include_positions"])
+        record = self._read_record("runtime-sive-1")
+        self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
+        self.assertEqual(record.exit_order_id, 31)
+        self.assertEqual(record.exit_submitted_quantity, "100")
+
+    def test_run_runtime_cycle_blocks_forced_exit_without_broker_position(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.POSITION_OPEN.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+        )
+
+        def fake_exit_submitter(*args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("forced exit must wait for a matching broker position")
+
+        def fake_canceler(*args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("open exits must not be cancelled before position check")
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                broker_order_canceler=fake_canceler,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={
+                        21: BrokerOpenOrder(
+                            order_id=21,
+                            perm_id=9001,
+                            client_id=0,
+                            status="Submitted",
+                            order_ref="runtime-sive-1:exit:take_profit",
+                            action="SELL",
+                            total_quantity="100",
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="LMT",
+                        ),
+                    },
+                    executions=(),
+                    portfolio=(),
+                    positions=(),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(result.submitted_exits, ())
+        self.assertEqual(len(result.issues), 1)
+        self.assertEqual(result.issues[0].stage, "forced_exit_position_check")
+        self.assertIn("observed none", result.issues[0].message)
+        session = self.session_factory()
+        try:
+            event = session.execute(
+                select(InstructionEventRecord).where(
+                    InstructionEventRecord.event_type
+                    == "forced_exit_blocked_broker_position_mismatch"
+                )
+            ).scalar_one()
+            self.assertEqual(event.payload["reason"], "missing_broker_position")
+            self.assertEqual(event.payload["required_quantity"], "100")
+            self.assertIsNone(event.payload["observed_quantity"])
+        finally:
+            session.close()
+
+    def test_run_runtime_cycle_prioritizes_due_forced_exit_over_protective_repair(self) -> None:
+        payload = _sive_payload()
+        payload["instruction"]["exit"]["take_profit_pct"] = "0.02"
+        payload["instruction"]["exit"]["catastrophic_stop_loss_pct"] = "0.15"
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.POSITION_OPEN.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+        )
+
+        calls: list[str] = []
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            del broker_config, instruction, timeout, limit_price, stop_price
+            del oca_group, oca_type
+            calls.append(order_ref)
+            return {
+                "instruction_id": "runtime-sive-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 489000, "symbol": "SIVE"},
+                "order": {
+                    "order_ref": order_ref,
+                    "action": "SELL",
+                    "order_type": "MKT",
+                    "time_in_force": "DAY",
+                    "limit_price": None,
+                    "total_quantity": str(quantity),
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 31,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": str(quantity),
+                    "avgFillPrice": 0.0,
+                    "permId": 9101,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
         with TemporaryDirectory() as temp_dir:
             schedule_path = Path(temp_dir) / "day_sessions.parquet"
             schedule_path.with_suffix(".csv").write_text(
@@ -3299,16 +3954,196 @@ class RuntimeWorkerTests(TestCase):
                     open_orders={},
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
 
+        self.assertEqual(calls, ["runtime-sive-1:exit:forced"])
         self.assertEqual(len(result.submitted_exits), 1)
-        record = self._read_record("runtime-sive-1")
-        self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
-        self.assertEqual(record.exit_order_id, 31)
-        self.assertEqual(record.exit_submitted_quantity, "100")
+
+    def test_run_runtime_cycle_skips_forced_exit_when_matching_live_exit_order_exists(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+        )
+
+        def fake_exit_submitter(*args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("matching live exit order should suppress duplicate forced exit")
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={
+                        77: BrokerOpenOrder(
+                            order_id=77,
+                            perm_id=9077,
+                            client_id=13,
+                            status="PreSubmitted",
+                            order_ref="manual-sive-close-open",
+                            action="SELL",
+                            total_quantity=Decimal("100"),
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="MKT",
+                        ),
+                    },
+                    executions=(),
+                    portfolio=(),
+                    positions=(_sive_broker_position(),),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(result.submitted_exits, ())
+        self.assertEqual(result.issues, ())
+
+    def test_run_runtime_cycle_suppresses_recent_terminal_forced_exit_retry(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.EXIT_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+            exit_order_id=31,
+        )
+
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-sive-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="SEK",
+                metadata_json={},
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="EXIT",
+                    external_order_id="31",
+                    external_perm_id="9031",
+                    external_client_id="0",
+                    order_ref="runtime-sive-1:exit:forced",
+                    symbol="SIVE",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="SIVE",
+                    side="SELL",
+                    order_type="MKT",
+                    time_in_force="DAY",
+                    status="Inactive",
+                    total_quantity="100",
+                    submitted_at=datetime(2026, 4, 13, 6, 58, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 13, 6, 58, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        def fake_exit_submitter(*args: object, **kwargs: object) -> dict[str, object]:
+            raise AssertionError("recent terminal forced exit must suppress retries")
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={},
+                    executions=(),
+                    portfolio=(),
+                    positions=(_sive_broker_position(),),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(result.submitted_exits, ())
+        self.assertEqual(
+            [(issue.instruction_id, issue.stage) for issue in result.issues],
+            [("runtime-sive-1", "forced_exit_retry")],
+        )
+        session = self.session_factory()
+        try:
+            event_type = session.execute(
+                select(InstructionEventRecord.event_type)
+                .join(InstructionRecord)
+                .where(
+                    InstructionRecord.instruction_id == "runtime-sive-1",
+                    InstructionEventRecord.event_type
+                    == "forced_exit_retry_blocked_terminal_failure",
+                )
+            ).scalar_one()
+        finally:
+            session.close()
+        self.assertEqual(event_type, "forced_exit_retry_blocked_terminal_failure")
 
     def test_run_runtime_cycle_blocks_due_entries_while_next_session_exit_is_active(self) -> None:
         exit_payload = _sive_payload()
@@ -3416,7 +4251,7 @@ class RuntimeWorkerTests(TestCase):
                     open_orders={},
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
@@ -3569,7 +4404,7 @@ class RuntimeWorkerTests(TestCase):
                     open_orders={},
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
@@ -3719,13 +4554,399 @@ class RuntimeWorkerTests(TestCase):
                     },
                     executions=(),
                     portfolio=(),
-                    positions=(),
+                    positions=(_sive_broker_position(),),
                     account_values={},
                 ),
             )
 
         self.assertEqual(cancelled_ids, [21, 22])
         self.assertEqual(len(result.submitted_exits), 1)
+
+    def test_run_runtime_cycle_cleans_same_symbol_exit_orders_before_forced_exit(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.POSITION_OPEN.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=None,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="EXIT",
+                    external_order_id="41",
+                    external_perm_id="9141",
+                    external_client_id="0",
+                    order_ref="old-sive:exit:take_profit",
+                    symbol="SIVE",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="SIVE",
+                    side="SELL",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Submitted",
+                    total_quantity="100",
+                    limit_price="21.00",
+                    stop_price=None,
+                    submitted_at=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        cancelled_ids: list[int] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            cancelled_ids.append(order_id)
+            return {"broker_order_status": {"orderId": order_id, "status": "Cancelled"}}
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            self.assertEqual(order_ref, "runtime-sive-1:exit:forced")
+            return {
+                "instruction_id": "runtime-sive-1",
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 489000, "symbol": "SIVE"},
+                "order": {
+                    "order_ref": order_ref,
+                    "action": "SELL",
+                    "order_type": "MKT",
+                    "time_in_force": "DAY",
+                    "limit_price": None,
+                    "total_quantity": "100",
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 51,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": "100",
+                    "avgFillPrice": 0.0,
+                    "permId": 9151,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                broker_order_canceler=fake_canceler,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={
+                        41: BrokerOpenOrder(
+                            order_id=41,
+                            perm_id=9141,
+                            client_id=0,
+                            status="Submitted",
+                            order_ref=None,
+                            action="SELL",
+                            total_quantity="100",
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="LMT",
+                        ),
+                        42: BrokerOpenOrder(
+                            order_id=42,
+                            perm_id=9142,
+                            client_id=0,
+                            status="Submitted",
+                            order_ref="old-sive:exit:catastrophic_stop",
+                            action="SELL",
+                            total_quantity="100",
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="STP",
+                        ),
+                    },
+                    executions=(),
+                    portfolio=(),
+                    positions=(_sive_broker_position(),),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(cancelled_ids, [41, 42])
+        self.assertEqual(len(result.submitted_exits), 1)
+        session = self.session_factory()
+        try:
+            cleanup_event = session.execute(
+                select(InstructionEventRecord).where(
+                    InstructionEventRecord.event_type
+                    == "forced_exit_conflicting_orders_cleanup_started"
+                )
+            ).scalar_one()
+            self.assertEqual(
+                [
+                    order["broker_order_id"]
+                    for order in cleanup_event.payload["conflicting_orders"]
+                ],
+                [41, 42],
+            )
+        finally:
+            session.close()
+
+    def test_run_runtime_cycle_blocks_forced_exit_when_conflict_cancel_fails(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.POSITION_OPEN.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+        )
+
+        submitted_refs: list[str] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            raise RuntimeError(f"cancel failed for {order_id}")
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            submitted_refs.append(order_ref)
+            return {}
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                broker_order_canceler=fake_canceler,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={
+                        42: BrokerOpenOrder(
+                            order_id=42,
+                            perm_id=9142,
+                            client_id=0,
+                            status="Submitted",
+                            order_ref="old-sive:exit:catastrophic_stop",
+                            action="SELL",
+                            total_quantity="100",
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="STP",
+                        ),
+                    },
+                    executions=(),
+                    portfolio=(),
+                    positions=(_sive_broker_position(),),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(submitted_refs, [])
+        self.assertEqual(len(result.submitted_exits), 0)
+        self.assertEqual(len(result.issues), 1)
+        self.assertIn("cancel failed for 42", result.issues[0].message)
+
+    def test_run_runtime_cycle_blocks_forced_exit_when_conflict_cancel_is_unconfirmed(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.POSITION_OPEN.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            entry_filled_quantity="100",
+        )
+
+        submitted_refs: list[str] = []
+
+        def fake_canceler(
+            broker_config: IbkrConnectionConfig,
+            order_id: int,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            return {"broker_order_status": {"orderId": order_id, "status": "PendingCancel"}}
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: object,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: object = None,
+            stop_price: object = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            submitted_refs.append(order_ref)
+            return {}
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=schedule_path,
+                now=datetime(2026, 4, 13, 6, 59, tzinfo=timezone.utc),
+                exit_submitter=fake_exit_submitter,
+                broker_order_canceler=fake_canceler,
+                submission_lead_time=timedelta(minutes=1),
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={
+                        42: BrokerOpenOrder(
+                            order_id=42,
+                            perm_id=9142,
+                            client_id=0,
+                            status="Submitted",
+                            order_ref="old-sive:exit:catastrophic_stop",
+                            action="SELL",
+                            total_quantity="100",
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="STP",
+                        ),
+                    },
+                    executions=(),
+                    portfolio=(),
+                    positions=(_sive_broker_position(),),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(submitted_refs, [])
+        self.assertEqual(len(result.submitted_exits), 0)
+        self.assertEqual(len(result.issues), 1)
+        self.assertIn("broker status was PENDINGCANCEL", result.issues[0].message)
 
     def test_run_runtime_cycle_keeps_existing_forced_exit_order(self) -> None:
         payload = _sive_payload()

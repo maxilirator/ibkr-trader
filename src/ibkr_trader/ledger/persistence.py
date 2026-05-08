@@ -191,6 +191,155 @@ def _infer_order_role(order_ref: str | None) -> str:
     return "ENTRY"
 
 
+def _normalize_symbol_key(value: str | None) -> str | None:
+    normalized = _normalize_text(value)
+    if normalized is None:
+        return None
+    return (
+        normalized.upper()
+        .replace(".", "-")
+        .replace("_", "-")
+        .replace(" ", "-")
+    )
+
+
+def _instruction_symbol_keys(instruction_record: InstructionRecord) -> set[str]:
+    keys = {_normalize_symbol_key(instruction_record.symbol)}
+    payload = instruction_record.payload if isinstance(instruction_record.payload, dict) else {}
+    instruction_payload = payload.get("instruction", {})
+    if isinstance(instruction_payload, dict):
+        instrument_payload = instruction_payload.get("instrument", {})
+        if isinstance(instrument_payload, dict):
+            keys.add(_normalize_symbol_key(instrument_payload.get("symbol")))
+            keys.add(_normalize_symbol_key(instrument_payload.get("local_symbol")))
+            aliases = instrument_payload.get("aliases")
+            if isinstance(aliases, list):
+                keys.update(_normalize_symbol_key(str(alias)) for alias in aliases)
+    return {key for key in keys if key is not None}
+
+
+def _execution_symbol_keys(
+    *,
+    symbol: str | None,
+    local_symbol: str | None,
+) -> set[str]:
+    return {
+        key
+        for key in (
+            _normalize_symbol_key(symbol),
+            _normalize_symbol_key(local_symbol),
+        )
+        if key is not None
+    }
+
+
+def _execution_side_is_exit_for_instruction(
+    execution_side: str | None,
+    instruction_record: InstructionRecord,
+) -> bool:
+    normalized_execution_side = (_normalize_text(execution_side) or "").upper()
+    normalized_entry_side = (_normalize_text(instruction_record.side) or "").upper()
+    if normalized_entry_side == "BUY":
+        return normalized_execution_side in {"SELL", "SLD"}
+    if normalized_entry_side == "SELL":
+        return normalized_execution_side in {"BUY", "BOT"}
+    return False
+
+
+def _positive_decimal(value: str | None) -> Decimal:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return Decimal("0")
+    return abs(parsed)
+
+
+def _instruction_remaining_exit_quantity(instruction_record: InstructionRecord) -> Decimal:
+    entry_quantity = _positive_decimal(instruction_record.entry_filled_quantity)
+    exit_quantity = _positive_decimal(instruction_record.exit_filled_quantity)
+    remaining = entry_quantity - exit_quantity
+    return remaining if remaining > 0 else Decimal("0")
+
+
+def _find_active_exit_instruction_for_execution(
+    session: Session,
+    *,
+    account_key: str,
+    symbol: str | None,
+    local_symbol: str | None,
+    currency: str | None,
+    security_type: str | None,
+    execution_side: str | None,
+) -> InstructionRecord | None:
+    execution_keys = _execution_symbol_keys(symbol=symbol, local_symbol=local_symbol)
+    if not execution_keys:
+        return None
+
+    statement = (
+        select(InstructionRecord)
+        .where(
+            InstructionRecord.account_key == account_key,
+            InstructionRecord.state.in_(("POSITION_OPEN", "EXIT_PENDING")),
+            InstructionRecord.archived_at.is_(None),
+        )
+        .order_by(InstructionRecord.updated_at.desc(), InstructionRecord.id.desc())
+    )
+    normalized_currency = _normalize_text(currency)
+    if normalized_currency is not None:
+        statement = statement.where(InstructionRecord.currency == normalized_currency)
+
+    candidates: list[InstructionRecord] = []
+    for instruction_record in session.execute(statement).scalars():
+        if not _execution_side_is_exit_for_instruction(execution_side, instruction_record):
+            continue
+        if normalized_currency is not None and instruction_record.currency != normalized_currency:
+            continue
+        normalized_security_type = _normalize_text(security_type)
+        instruction_payload = (
+            instruction_record.payload.get("instruction", {})
+            if isinstance(instruction_record.payload, dict)
+            else {}
+        )
+        instrument_payload = (
+            instruction_payload.get("instrument", {})
+            if isinstance(instruction_payload, dict)
+            else {}
+        )
+        instruction_security_type = (
+            _normalize_text(instrument_payload.get("security_type"))
+            if isinstance(instrument_payload, dict)
+            else None
+        )
+        if (
+            normalized_security_type is not None
+            and instruction_security_type is not None
+            and instruction_security_type != normalized_security_type
+        ):
+            continue
+        if _instruction_symbol_keys(instruction_record).isdisjoint(execution_keys):
+            continue
+        if _instruction_remaining_exit_quantity(instruction_record) <= 0:
+            continue
+        candidates.append(instruction_record)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _order_role_for_execution(
+    *,
+    execution_order_ref: str | None,
+    execution_side: str | None,
+    instruction_record: InstructionRecord | None,
+) -> str:
+    if (
+        instruction_record is not None
+        and _execution_side_is_exit_for_instruction(execution_side, instruction_record)
+    ):
+        return "EXIT"
+    return _infer_order_role(execution_order_ref)
+
+
 def _instruction_id_from_order_ref(order_ref: str | None) -> str | None:
     normalized = _normalize_text(order_ref)
     if normalized is None:
@@ -388,6 +537,13 @@ def _open_order_status_clause():
     )
 
 
+def _is_open_order_status(status: str | None) -> bool:
+    normalized = _normalize_text(status)
+    if normalized is None:
+        return True
+    return normalized.upper() not in _OPEN_ORDER_CLOSED_STATUSES
+
+
 def _snapshot_account_scope(
     snapshot: BrokerRuntimeSnapshot,
     *,
@@ -454,6 +610,12 @@ def _mark_missing_open_orders_closed(
         for open_order in snapshot.open_orders.values()
         if str(open_order.order_ref or "").strip()
     }
+    if (
+        not observed_external_order_ids
+        and not observed_external_perm_ids
+        and not observed_order_refs
+    ):
+        return
 
     rows = session.execute(
         select(BrokerOrderRecord)
@@ -1518,6 +1680,32 @@ def _upsert_open_order(
     payload = _serialize_for_json(asdict(open_order))
     previous_status = broker_order.status if broker_order is not None else None
     previous_payload = broker_order.raw_payload if broker_order is not None else None
+    previous_perm_id = broker_order.external_perm_id if broker_order is not None else None
+    previous_order_ref = broker_order.order_ref if broker_order is not None else None
+    previous_symbol_key = (
+        (
+            _normalize_symbol_key(broker_order.local_symbol)
+            or _normalize_symbol_key(broker_order.symbol)
+        )
+        if broker_order is not None
+        else None
+    )
+    incoming_order_ref = _normalize_text(open_order.order_ref)
+    incoming_symbol_key = _normalize_symbol_key(open_order.local_symbol) or _normalize_symbol_key(
+        symbol
+    )
+    lineage_changed = broker_order is not None and (
+        (external_perm_id is not None and previous_perm_id not in (None, external_perm_id))
+        or (
+            previous_order_ref not in (None, incoming_order_ref)
+            and incoming_order_ref is not None
+        )
+        or (
+            previous_symbol_key is not None
+            and incoming_symbol_key is not None
+            and previous_symbol_key != incoming_symbol_key
+        )
+    )
     is_virtual = _is_virtual_ledger_identity(
         broker_kind=broker_kind,
         account_key=account_key,
@@ -1585,10 +1773,24 @@ def _upsert_open_order(
         broker_order.total_quantity = _decimal_to_string(open_order.total_quantity)
         broker_order.limit_price = _decimal_to_string(open_order.limit_price)
         broker_order.stop_price = _decimal_to_string(open_order.aux_price)
+        if lineage_changed:
+            broker_order.submitted_at = observed_at
         broker_order.last_status_at = observed_at
         broker_order.raw_payload = payload
 
-    metadata = dict(broker_order.metadata_json)
+    metadata = {} if lineage_changed else dict(broker_order.metadata_json)
+    for key in (
+        "missing_from_runtime_snapshot",
+        "missing_from_runtime_snapshot_at",
+        "missing_from_runtime_snapshot_account_scope",
+        "missing_from_runtime_snapshot_open_order_count",
+    ):
+        metadata.pop(key, None)
+    if previous_perm_id not in (None, external_perm_id) or (
+        _is_open_order_status(status)
+        and _normalize_text(open_order.reject_reason) is None
+    ):
+        metadata.pop("last_order_error_callback", None)
     metadata.update(
         {
             "outside_rth": open_order.outside_rth,
@@ -2006,6 +2208,21 @@ def _persist_executions(
         primary_exchange = _normalize_text(execution.primary_exchange) or (
             broker_order.primary_exchange if broker_order is not None else None
         )
+        if instruction_record is None:
+            instruction_record = _find_active_exit_instruction_for_execution(
+                session,
+                account_key=account_key,
+                symbol=symbol,
+                local_symbol=local_symbol,
+                currency=currency,
+                security_type=security_type,
+                execution_side=execution.side,
+            )
+        resolved_order_role = _order_role_for_execution(
+            execution_order_ref=execution.order_ref,
+            execution_side=execution.side,
+            instruction_record=instruction_record,
+        )
 
         if broker_order is None:
             if external_order_id is None:
@@ -2021,7 +2238,7 @@ def _persist_executions(
                     broker_kind=broker_kind,
                     account_key=account_key,
                 ),
-                order_role=_infer_order_role(execution.order_ref),
+                order_role=resolved_order_role,
                 external_order_id=external_order_id,
                 external_perm_id=external_perm_id,
                 external_client_id=(
@@ -2073,6 +2290,16 @@ def _persist_executions(
         else:
             if instruction_record is not None:
                 broker_order.instruction_id = instruction_record.id
+            if broker_order.order_role != resolved_order_role:
+                metadata = dict(broker_order.metadata_json or {})
+                metadata["order_role_reclassified_at"] = captured_at.isoformat()
+                metadata["order_role_reclassified_from"] = broker_order.order_role
+                metadata["order_role_reclassified_to"] = resolved_order_role
+                metadata["order_role_reclassified_reason"] = (
+                    "Execution matched an active instruction exit side."
+                )
+                broker_order.metadata_json = _serialize_for_json(metadata)
+                broker_order.order_role = resolved_order_role
             previous_status = broker_order.status
             broker_order.status = "FILLED"
             broker_order.last_status_at = execution.executed_at or captured_at

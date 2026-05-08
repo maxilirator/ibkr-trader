@@ -20,7 +20,7 @@ def main() -> int:
     )
     parser.add_argument("--api-base", default="http://quant.geisler.se:8000")
     parser.add_argument("--account-key", default=DEFAULT_SHARED_VIRTUAL_ACCOUNT)
-    parser.add_argument("--cash-balance", default="200000")
+    parser.add_argument("--cash-balance", default="500000")
     parser.add_argument("--mode", choices=("virtual", "paper", "live"), default="virtual")
     parser.add_argument("--status", default="running")
     parser.add_argument(
@@ -81,7 +81,7 @@ def main() -> int:
                     {
                         "account_key": args.account_key,
                         "base_currency": "SEK",
-                        "account_label": "Shared RL virtual account",
+                        "account_label": "RL V02",
                         "cash_balance": str(args.cash_balance),
                     },
                 ),

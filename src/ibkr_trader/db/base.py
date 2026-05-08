@@ -96,6 +96,21 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
                 f"ALTER TABLE {table_name} ADD COLUMN archive_reason TEXT"
             )
 
+    def add_varchar_if_missing(
+        table_name: str,
+        column_name: str,
+        length: int,
+    ) -> None:
+        if table_name not in table_names:
+            return
+        table_columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        if column_name not in table_columns:
+            upgrade_statements.append(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} VARCHAR({length})"
+            )
+
     def widen_varchar_if_short(
         table_name: str,
         column_name: str,
@@ -137,6 +152,10 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
     add_boolean_if_missing("execution_fill", "is_virtual")
     add_boolean_if_missing("account_snapshot", "is_virtual")
     add_boolean_if_missing("position_snapshot", "is_virtual")
+    add_varchar_if_missing("position_snapshot", "owner_instruction_id", 128)
+    add_varchar_if_missing("position_snapshot", "owner_source_instruction_id", 128)
+    add_varchar_if_missing("position_snapshot", "owner_deployment_key", 128)
+    add_varchar_if_missing("position_snapshot", "owner_book_key", 64)
     add_archive_columns_if_missing("broker_order_event")
     add_archive_columns_if_missing("reconciliation_issue")
     widen_varchar_if_short("broker_order", "order_ref", 512)
@@ -278,5 +297,17 @@ def _upgrade_control_plane_schema(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_execution_fill_is_virtual "
                 "ON execution_fill (is_virtual)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_position_snapshot_owner_deployment_key "
+                "ON position_snapshot (owner_deployment_key)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_position_snapshot_owner_instruction_id "
+                "ON position_snapshot (owner_instruction_id)"
             )
         )

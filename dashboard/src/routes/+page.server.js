@@ -39,6 +39,83 @@ function parsePositiveIntegerIdsFromForm(formData, fieldName) {
   return parsePositiveIntegerIds(readOptionalField(formData, fieldName));
 }
 
+function readBooleanField(formData, fieldName, defaultValue = false) {
+  const value = readOptionalField(formData, fieldName);
+  if (value === null) {
+    return defaultValue;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+function readIntentCleanupSelector(formData) {
+  const selector = {};
+  for (const fieldName of [
+    'account_key',
+    'book_key',
+    'book_side',
+    'symbol',
+    'exchange',
+    'currency',
+    'keep_instruction_id'
+  ]) {
+    const value = readOptionalField(formData, fieldName);
+    if (value !== null) {
+      selector[fieldName] = value;
+    }
+  }
+  const instructionIds = readOptionalField(formData, 'instruction_ids');
+  if (instructionIds !== null) {
+    selector.instruction_ids = [
+      ...new Set(
+        instructionIds
+          .split(/[\s,]+/)
+          .map((value) => value.trim())
+          .filter(Boolean)
+      )
+    ];
+  }
+  return selector;
+}
+
+function intentCleanupSummary(cleanup, scopeLabel = 'Intent cleanup') {
+  if (!cleanup) {
+    return `${scopeLabel}: response missing intent_cleanup.`;
+  }
+  const actionCount = Number(cleanup.action_count ?? 0);
+  const appliedCount = Number(cleanup.applied_action_count ?? 0);
+  const pendingCount = Number(cleanup.cancelled_pending_count ?? 0);
+  const submittedCount = Number(cleanup.cancelled_submitted_count ?? 0);
+  const blockerCount = Number(cleanup.blocked_count ?? 0);
+  const failedCount = Number(cleanup.failed_count ?? 0);
+  const preserved = blockerCount > 0 ? `, ${blockerCount} position owner(s) preserved` : '';
+  const failed = failedCount > 0 ? `, ${failedCount} failed` : '';
+  return (
+    `${scopeLabel}: ${cleanup.status ?? 'UNKNOWN'}; ${appliedCount}/${actionCount} ` +
+    `action(s) applied, ${pendingCount} pending and ${submittedCount} submitted entry row(s) cancelled` +
+    `${preserved}${failed}.`
+  );
+}
+
+function intentCleanupOk(cleanup) {
+  return cleanup !== null && cleanup !== undefined && Number(cleanup.failed_count ?? 0) === 0;
+}
+
+function virtualAccountKeysFromSnapshot(snapshot) {
+  const accountKeys = new Set();
+  const addVirtualAccount = (row) => {
+    const accountKey = String(row?.account_key ?? '').trim();
+    if (row?.is_virtual === true && accountKey) {
+      accountKeys.add(accountKey);
+    }
+  };
+
+  for (const row of snapshot?.accounts ?? []) addVirtualAccount(row);
+  for (const row of snapshot?.positions ?? []) addVirtualAccount(row);
+  for (const row of snapshot?.open_orders ?? []) addVirtualAccount(row);
+  for (const row of snapshot?.instructions ?? []) addVirtualAccount(row);
+  return [...accountKeys].sort();
+}
+
 function operatorSnapshotUrl(apiBaseUrl) {
   return (
     `${apiBaseUrl}/v1/read/operator-snapshot` +
@@ -53,42 +130,6 @@ function omxBenchmarkSnapshotUrl(apiBaseUrl) {
     bar_limit: '390'
   });
   return `${apiBaseUrl}/v1/market-data/stream/snapshot?${params.toString()}`;
-}
-
-function omxBenchmarkSubscribeUrl(apiBaseUrl) {
-  return `${apiBaseUrl}/v1/market-data/stream/subscribe`;
-}
-
-function omxBenchmarkHistoricalUrl(apiBaseUrl) {
-  return `${apiBaseUrl}/v1/market-data/historical-bars`;
-}
-
-function omxBenchmarkSubscribePayload() {
-  return {
-    replace: false,
-    contracts: [
-      {
-        symbol: 'OMXS30',
-        security_type: 'IND',
-        exchange: 'OMS',
-        currency: 'SEK',
-        primary_exchange: ''
-      }
-    ]
-  };
-}
-
-function omxBenchmarkHistoricalPayload() {
-  return {
-    symbol: 'OMXS30',
-    security_type: 'IND',
-    exchange: 'OMS',
-    currency: 'SEK',
-    duration: '1 D',
-    bar_size: '5 mins',
-    what_to_show: 'TRADES',
-    use_rth: true
-  };
 }
 
 function parseFiniteNumber(value) {
@@ -211,14 +252,6 @@ function buildOmxBenchmarkFromBars(rawBars, { source = 'stream' } = {}) {
   };
 }
 
-function buildOmxBenchmarkFromHistorical(result) {
-  if (!result.ok) {
-    return null;
-  }
-  const bars = result.body?.bars ?? result.body?.historical_bars?.bars ?? [];
-  return buildOmxBenchmarkFromBars(bars, { source: 'historical_bars' });
-}
-
 function buildOmxBenchmark(result) {
   const fallback = {
     label: 'OMX',
@@ -266,17 +299,6 @@ function buildOmxBenchmark(result) {
   return fallback;
 }
 
-async function postJsonWithTimeout(fetch, url, body, timeoutMs) {
-  return readJson(fetch, url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify(body),
-    timeoutMs
-  });
-}
-
 let omxBenchmarkCache = {
   fetchedAt: 0,
   value: null
@@ -297,16 +319,8 @@ async function readOmxBenchmark(fetch, apiBaseUrl) {
     return streamBenchmark;
   }
 
-  const historicalResult = await postJsonWithTimeout(
-    fetch,
-    omxBenchmarkHistoricalUrl(apiBaseUrl),
-    omxBenchmarkHistoricalPayload(),
-    8000
-  );
-  const historicalBenchmark = buildOmxBenchmarkFromHistorical(historicalResult);
-  const benchmark = historicalBenchmark ?? streamBenchmark;
-  omxBenchmarkCache = { fetchedAt: now, value: benchmark };
-  return benchmark;
+  omxBenchmarkCache = { fetchedAt: now, value: streamBenchmark };
+  return streamBenchmark;
 }
 
 function requireResponseBody(result, endpointName) {
@@ -358,10 +372,9 @@ export async function load({ fetch }) {
   const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
   const healthUrl = `${apiBaseUrl}/healthz`;
 
-  const [health, operatorSnapshot, omxBenchmarkSubscribe] = await Promise.all([
+  const [health, operatorSnapshot] = await Promise.all([
     readJson(fetch, healthUrl, { timeoutMs: 2500 }),
-    readJson(fetch, operatorSnapshotUrl(apiBaseUrl)),
-    postJson(fetch, omxBenchmarkSubscribeUrl(apiBaseUrl), omxBenchmarkSubscribePayload())
+    readJson(fetch, operatorSnapshotUrl(apiBaseUrl))
   ]);
   const omxBenchmark = await readOmxBenchmark(fetch, apiBaseUrl);
 
@@ -370,8 +383,7 @@ export async function load({ fetch }) {
     apiBaseUrl,
     errors: buildEndpointErrorMap({
       health,
-      operatorSnapshot,
-      omxBenchmarkSubscribe
+      operatorSnapshot
     }),
     health: health.ok
       ? requireResponseBody(health, 'healthz')
@@ -733,6 +745,155 @@ export const actions = {
           `${runtimeResult.issue_count} issues, ${runtimeResult.action_count} actions.`
       }
     };
+  },
+
+  async intentCleanup({ fetch, request }) {
+    const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
+    const formData = await request.formData();
+    const scope = readOptionalField(formData, 'scope') ?? 'group';
+    const apply = readBooleanField(formData, 'apply', true);
+    const cancelAllEntries = readBooleanField(formData, 'cancel_all_entries', true);
+    const reason =
+      readOptionalField(formData, 'reason') ??
+      (scope === 'virtual_total'
+        ? 'Dashboard total virtual intent cleanup; preserve position-owning close state.'
+        : 'Dashboard per-item intent cleanup; preserve position-owning close state.');
+
+    if (scope === 'virtual_total') {
+      const snapshotResult = await readOperatorSnapshot(fetch, apiBaseUrl);
+      if (!snapshotResult.ok) {
+        return fail(snapshotResult.status || 500, {
+          intentCleanupResult: {
+            ok: false,
+            message: snapshotResult.error
+          }
+        });
+      }
+
+      const accountKeys = virtualAccountKeysFromSnapshot(snapshotResult.snapshot);
+      if (accountKeys.length === 0) {
+        return {
+          intentCleanupResult: {
+            ok: true,
+            message: 'Virtual intent cleanup: no virtual accounts were visible in the operator snapshot.'
+          }
+        };
+      }
+
+      const totals = {
+        actionCount: 0,
+        appliedCount: 0,
+        pendingCount: 0,
+        submittedCount: 0,
+        blockerCount: 0,
+        failedCount: 0
+      };
+      let processedCount = 0;
+      for (const accountKey of accountKeys) {
+        const result = await postJson(fetch, `${apiBaseUrl}/v1/instructions/intent-cleanup`, {
+          requested_by: 'dashboard',
+          reason,
+          apply,
+          cancel_all_entries: cancelAllEntries,
+          account_key: accountKey,
+          timeout: 10
+        });
+
+        if (!result.ok) {
+          return fail(result.status || 500, {
+            intentCleanupResult: {
+              ok: false,
+              message:
+                `Cleaned ${processedCount}/${accountKeys.length} virtual account(s) before failing ` +
+                `${accountKey}: ${result.error}`
+            }
+          });
+        }
+
+        const cleanup = result.body?.intent_cleanup;
+        if (!cleanup) {
+          return fail(502, {
+            intentCleanupResult: {
+              ok: false,
+              message: `Virtual intent cleanup response for ${accountKey} was missing intent_cleanup.`
+            }
+          });
+        }
+
+        totals.actionCount += Number(cleanup.action_count ?? 0);
+        totals.appliedCount += Number(cleanup.applied_action_count ?? 0);
+        totals.pendingCount += Number(cleanup.cancelled_pending_count ?? 0);
+        totals.submittedCount += Number(cleanup.cancelled_submitted_count ?? 0);
+        totals.blockerCount += Number(cleanup.blocked_count ?? 0);
+        totals.failedCount += Number(cleanup.failed_count ?? 0);
+        processedCount += 1;
+      }
+
+      const message =
+        `Virtual intent cleanup: ${processedCount} account(s); ` +
+        `${totals.appliedCount}/${totals.actionCount} action(s) applied, ` +
+        `${totals.pendingCount} pending and ${totals.submittedCount} submitted entry row(s) cancelled` +
+        (totals.blockerCount > 0 ? `, ${totals.blockerCount} position owner(s) preserved` : '') +
+        (totals.failedCount > 0 ? `, ${totals.failedCount} failed` : '') +
+        '.';
+      return totals.failedCount > 0
+        ? fail(500, {
+            intentCleanupResult: {
+              ok: false,
+              message
+            }
+          })
+        : {
+            intentCleanupResult: {
+              ok: true,
+              message
+            }
+          };
+    }
+
+    const selector = readIntentCleanupSelector(formData);
+    if (Object.keys(selector).length === 0) {
+      return fail(400, {
+        intentCleanupResult: {
+          ok: false,
+          message: 'Intent cleanup needs an account, symbol, or instruction selector.'
+        }
+      });
+    }
+
+    const result = await postJson(fetch, `${apiBaseUrl}/v1/instructions/intent-cleanup`, {
+      requested_by: 'dashboard',
+      reason,
+      apply,
+      cancel_all_entries: cancelAllEntries,
+      ...selector,
+      timeout: 10
+    });
+
+    if (!result.ok) {
+      return fail(result.status || 500, {
+        intentCleanupResult: {
+          ok: false,
+          message: result.error
+        }
+      });
+    }
+
+    const cleanup = result.body?.intent_cleanup;
+    const cleanupOk = intentCleanupOk(cleanup);
+    return cleanupOk
+      ? {
+          intentCleanupResult: {
+            ok: true,
+            message: intentCleanupSummary(cleanup, 'Intent group cleanup')
+          }
+        }
+      : fail(500, {
+          intentCleanupResult: {
+            ok: false,
+            message: intentCleanupSummary(cleanup, 'Intent group cleanup')
+          }
+        });
   },
 
   async archiveDashboardNoise({ fetch }) {

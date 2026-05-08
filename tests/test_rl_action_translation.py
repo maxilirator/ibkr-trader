@@ -213,6 +213,43 @@ class RLActionTranslationTests(TestCase):
         self.assertEqual(instruction["entry"]["order_type"], "MARKET")
         self.assertNotIn("limit_price", instruction["entry"])
 
+    def test_entry_translation_preserves_source_lifecycle_policy(self) -> None:
+        payload = _model_routed_payload(
+            instruction_id="long-lifecycle-1",
+            model_id="long_trial_106_v1",
+            symbol="AZN",
+            side="LONG",
+        )
+        payload["instructions"][0]["lifecycle"] = {
+            "trade_date": "2026-04-27",
+            "scope": "account_book_side_symbol_trade_date",
+            "max_entry_orders": 1,
+            "max_exit_orders": 1,
+            "allow_reentry_after_exit": False,
+            "allow_reentry_after_cancel": False,
+            "retire_from_active_universe_when_flat": True,
+        }
+
+        result = _translate(
+            payload,
+            deployment_key="long_trial_106_virtual_shared_01",
+            action_name="market_entry",
+        )
+
+        instruction = result.instruction_payload["instructions"][0]
+        self.assertEqual(
+            instruction["lifecycle"],
+            {
+                "trade_date": "2026-04-27",
+                "scope": "account_book_side_symbol_trade_date",
+                "max_entry_orders": 1,
+                "max_exit_orders": 1,
+                "allow_reentry_after_exit": False,
+                "allow_reentry_after_cancel": False,
+                "retire_from_active_universe_when_flat": True,
+            },
+        )
+
     def test_short_market_entry_maps_to_sell_and_has_no_limit_price(self) -> None:
         result = _translate(
             _model_routed_payload(

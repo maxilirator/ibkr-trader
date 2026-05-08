@@ -268,6 +268,15 @@ Example instruction:
       "end_at": "2026-04-28T17:30:00+02:00"
     }
   },
+  "lifecycle": {
+    "trade_date": "2026-04-28",
+    "scope": "account_book_side_symbol_trade_date",
+    "max_entry_orders": 1,
+    "max_exit_orders": 1,
+    "allow_reentry_after_exit": false,
+    "allow_reentry_after_cancel": false,
+    "retire_from_active_universe_when_flat": true
+  },
   "trace": {
     "reason_code": "rl_model_routed_candidate",
     "trade_date": "2026-04-28",
@@ -291,6 +300,14 @@ For RL candidates, `trace.metadata.static_features` is the preferred per-name
 static feature vector. `feature_names` must be in the exact order expected by
 the promoted model's `static_feature_cols.csv`, `values` must be finite numbers,
 and `normalized` must be `true`.
+
+`lifecycle` defines how long a model-routed candidate remains in the active RL
+universe. The current live default is one entry order and one exit order per
+account/book/side/symbol/trade-date. When the generated RL-owned instruction
+has completed its entry and exit, or when the single entry order ends cancelled
+without a fill and re-entry is disallowed, the API archives the source
+candidate. Archived candidates remain in the audit trail but disappear from
+`GET /v1/rl/candidates`, letting the runner drop the symbol from its stream set.
 
 ### RL Sizing And Capital Allocation
 

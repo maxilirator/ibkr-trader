@@ -9,10 +9,20 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from scripts.submit_rl_candidate_lists import CandidateBatchConfig
+from scripts.submit_rl_candidate_lists import CONFIGS
 from scripts.submit_rl_candidate_lists import build_candidate_payload
 from scripts.submit_rl_candidate_lists import load_identity_map
 from scripts.submit_rl_candidate_lists import load_selected_rows
 from scripts.submit_rl_candidate_lists import resolve_capital_plan
+
+
+def test_default_virtual02_configs_use_live_short_book_keys() -> None:
+    configs = {config.side: config for config in CONFIGS}
+
+    assert configs["LONG"].deployment_key == "long_trial_106_virtual_shared_01"
+    assert configs["LONG"].book_key == "bb_long_02"
+    assert configs["SHORT"].deployment_key == "short_trial_36_virtual_shared_01"
+    assert configs["SHORT"].book_key == "bb_short_02"
 
 
 def test_load_selected_rows_uses_latest_selected_sorted_by_score() -> None:
@@ -149,6 +159,15 @@ def test_build_candidate_payload_creates_per_symbol_model_routed_instructions() 
     assert instruction["intent"] == {"side": "SELL", "position_side": "SHORT"}
     assert instruction["execution"]["mode"] == "model_routed"
     assert instruction["execution"]["model_id"] == "short_trial36_v1"
+    assert instruction["lifecycle"] == {
+        "trade_date": "2026-04-29",
+        "scope": "account_book_side_symbol_trade_date",
+        "max_entry_orders": 1,
+        "max_exit_orders": 1,
+        "allow_reentry_after_exit": False,
+        "allow_reentry_after_cancel": False,
+        "retire_from_active_universe_when_flat": True,
+    }
     assert instruction["sizing"] == {
         "mode": "target_notional",
         "target_notional": "1000",

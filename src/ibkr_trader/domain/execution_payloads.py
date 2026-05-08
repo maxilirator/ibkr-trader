@@ -18,6 +18,8 @@ from ibkr_trader.domain.execution_contract import (
     FundingBasis,
     InstrumentRef,
     IntentSpec,
+    LifecyclePolicy,
+    LifecycleScope,
     ModelRoutedExecutionSpec,
     OrderType,
     PositionSide,
@@ -93,6 +95,18 @@ def parse_metadata_value(value: Any, field_name: str) -> Any:
     raise ValueError(
         f"{field_name} must be a JSON-compatible value"
     )
+
+
+def parse_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    raise ValueError(f"{field_name} must be a boolean")
 
 
 def _string_or_none(value: Any) -> str | None:
@@ -193,6 +207,76 @@ def _parse_model_routed_execution(
             or _string_or_none(root_model_payload.get("artifact_id"))
         ),
         window=_parse_execution_window(execution_payload),
+    )
+
+
+def _parse_positive_int_or_none(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return parsed
+
+
+def _parse_lifecycle_policy(payload: Mapping[str, Any]) -> LifecyclePolicy | None:
+    lifecycle_payload = payload.get("lifecycle")
+    if lifecycle_payload is None:
+        return None
+    if not isinstance(lifecycle_payload, Mapping):
+        raise ValueError("lifecycle must be an object")
+
+    return LifecyclePolicy(
+        trade_date=(
+            parse_date(lifecycle_payload["trade_date"], "lifecycle.trade_date")
+            if lifecycle_payload.get("trade_date") is not None
+            else None
+        ),
+        scope=LifecycleScope(
+            str(
+                lifecycle_payload.get(
+                    "scope",
+                    LifecycleScope.ACCOUNT_BOOK_SIDE_SYMBOL_TRADE_DATE.value,
+                )
+            )
+        ),
+        max_entry_orders=_parse_positive_int_or_none(
+            lifecycle_payload.get("max_entry_orders"),
+            "lifecycle.max_entry_orders",
+        ),
+        max_exit_orders=_parse_positive_int_or_none(
+            lifecycle_payload.get("max_exit_orders"),
+            "lifecycle.max_exit_orders",
+        ),
+        allow_reentry_after_exit=(
+            parse_bool(
+                lifecycle_payload["allow_reentry_after_exit"],
+                "lifecycle.allow_reentry_after_exit",
+            )
+            if lifecycle_payload.get("allow_reentry_after_exit") is not None
+            else False
+        ),
+        allow_reentry_after_cancel=(
+            parse_bool(
+                lifecycle_payload["allow_reentry_after_cancel"],
+                "lifecycle.allow_reentry_after_cancel",
+            )
+            if lifecycle_payload.get("allow_reentry_after_cancel") is not None
+            else False
+        ),
+        retire_from_active_universe_when_flat=(
+            parse_bool(
+                lifecycle_payload["retire_from_active_universe_when_flat"],
+                "lifecycle.retire_from_active_universe_when_flat",
+            )
+            if lifecycle_payload.get("retire_from_active_universe_when_flat") is not None
+            else False
+        ),
     )
 
 
@@ -406,6 +490,7 @@ def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> Execution
             metadata=parse_metadata_map(trace_payload.get("metadata"), "trace.metadata"),
         ),
         execution=model_routed_execution,
+        lifecycle=_parse_lifecycle_policy(payload),
     )
     instruction.validate()
     return instruction

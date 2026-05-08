@@ -336,6 +336,33 @@ def _build_entry_payload(
     if limit_price is not None:
         entry["limit_price"] = str(limit_price)
 
+    instruction_payload = {
+        "instruction_id": deterministic_instruction_id,
+        "account": account,
+        "instrument": _serialize_ref(source_instruction.instrument),
+        "intent": {
+            "side": _entry_side(source_instruction.intent.position_side),
+            "position_side": source_instruction.intent.position_side.value,
+        },
+        "sizing": _serialize_ref(source_instruction.sizing),
+        "entry": entry,
+        "exit": {
+            "force_exit_next_session_open": True,
+        },
+        "trace": {
+            "reason_code": "rl_action_translated",
+            "execution_policy": source_instruction.trace.execution_policy,
+            "trade_date": _serialize_value(source_instruction.trace.trade_date),
+            "data_cutoff_date": _serialize_value(
+                source_instruction.trace.data_cutoff_date
+            ),
+            "company_name": source_instruction.trace.company_name,
+            "metadata": metadata,
+        },
+    }
+    if source_instruction.lifecycle is not None:
+        instruction_payload["lifecycle"] = _serialize_ref(source_instruction.lifecycle)
+
     return {
         "schema_version": "2026-04-10",
         "source": {
@@ -346,32 +373,7 @@ def _build_entry_payload(
             "strategy_id": deployment_key,
             "policy_id": source_instruction.execution.model_id,
         },
-        "instructions": [
-            {
-                "instruction_id": deterministic_instruction_id,
-                "account": account,
-                "instrument": _serialize_ref(source_instruction.instrument),
-                "intent": {
-                    "side": _entry_side(source_instruction.intent.position_side),
-                    "position_side": source_instruction.intent.position_side.value,
-                },
-                "sizing": _serialize_ref(source_instruction.sizing),
-                "entry": entry,
-                "exit": {
-                    "force_exit_next_session_open": True,
-                },
-                "trace": {
-                    "reason_code": "rl_action_translated",
-                    "execution_policy": source_instruction.trace.execution_policy,
-                    "trade_date": _serialize_value(source_instruction.trace.trade_date),
-                    "data_cutoff_date": _serialize_value(
-                        source_instruction.trace.data_cutoff_date
-                    ),
-                    "company_name": source_instruction.trace.company_name,
-                    "metadata": metadata,
-                },
-            }
-        ],
+        "instructions": [instruction_payload],
     }
 
 
