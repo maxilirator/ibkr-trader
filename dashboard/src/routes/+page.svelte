@@ -1,12 +1,14 @@
 <script>
   import { browser } from '$app/environment';
   import { applyAction, enhance } from '$app/forms';
-  import { invalidateAll } from '$app/navigation';
   import { onMount } from 'svelte';
 
   export let data;
   export let form;
 
+  let liveHealth = data.health;
+  let liveGeneratedAt = data.generatedAt;
+  let liveErrors = data.errors;
   let operatorSnapshot = data.operatorSnapshot;
   let killSwitch = operatorSnapshot.kill_switch;
   let accounts = operatorSnapshot.accounts;
@@ -16,10 +18,10 @@
   let brokerAttention = operatorSnapshot.recent_broker_attention;
   let reconciliationRuns = operatorSnapshot.recent_reconciliation_runs;
   let instructions = operatorSnapshot.instructions;
-  let marketTimeZone = data.health.runtime_timezone;
-  let brokerMonitor = data.health.broker_monitor;
-  let ibGateway = data.health.ibgateway ?? null;
-  let executionRuntime = data.health.execution_runtime;
+  let marketTimeZone = liveHealth.runtime_timezone;
+  let brokerMonitor = liveHealth.broker_monitor;
+  let ibGateway = liveHealth.ibgateway ?? null;
+  let executionRuntime = liveHealth.execution_runtime;
   let omxBenchmark = data.omxBenchmark;
   let marketStreamSnapshot = null;
   let marketStreamMarks = new Map();
@@ -43,7 +45,11 @@
   let acknowledgeAllLogsResult = null;
   let reconciliationClearResult = null;
   let referenceNow = new Date();
-  let refreshInFlight = false;
+  let liveSnapshotStatus = {
+    connected: false,
+    received_at: null,
+    last_error: null
+  };
   let dashboardFilters = defaultDashboardFilters();
   let filtersLoaded = false;
   let buttonStates = {};
@@ -226,7 +232,6 @@
     return `${uniqueValues.slice(0, 2).join(', ')} +${uniqueValues.length - 2} more`;
   }
 
-  $: operatorSnapshot = data.operatorSnapshot;
   $: marketStreamMarks = buildMarketStreamMarks(marketStreamSnapshot);
   $: killSwitch = operatorSnapshot.kill_switch;
   $: accounts = applyMarketStreamToAccounts(
@@ -240,12 +245,12 @@
   $: brokerAttention = operatorSnapshot.recent_broker_attention;
   $: reconciliationRuns = operatorSnapshot.recent_reconciliation_runs;
   $: instructions = operatorSnapshot.instructions;
-  $: marketTimeZone = data.health.runtime_timezone;
-  $: brokerMonitor = data.health.broker_monitor;
-  $: ibGateway = data.health.ibgateway ?? null;
-  $: executionRuntime = data.health.execution_runtime;
+  $: marketTimeZone = liveHealth.runtime_timezone;
+  $: brokerMonitor = liveHealth.broker_monitor;
+  $: ibGateway = liveHealth.ibgateway ?? null;
+  $: executionRuntime = liveHealth.execution_runtime;
   $: omxBenchmark = buildLiveOmxBenchmark(data.omxBenchmark, marketStreamSnapshot);
-  $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
+  $: endpointErrors = Object.entries(liveErrors).filter(([, value]) => value);
   $: warningRuns = reconciliationRuns.filter((run) => Number(run.issue_count) > 0);
   $: killSwitchResult = form?.killSwitchResult ?? null;
   $: startupReconcileResult = form?.startupReconcileResult ?? null;
@@ -269,11 +274,11 @@
   });
 
   function brokerConnected(role) {
-    return data.health.broker_sessions[role].connected === true;
+    return liveHealth.broker_sessions[role].connected === true;
   }
 
   function sessionStatus(role) {
-    const session = data.health.broker_sessions[role] ?? {};
+    const session = liveHealth.broker_sessions[role] ?? {};
     const heartbeat = brokerMonitor?.heartbeat ?? {};
     if (heartbeat.is_stale) {
       return { label: 'Stale check', className: 'warn' };
@@ -1453,21 +1458,6 @@
     return formatPrice(value, { zeroAsUnavailable: true });
   }
 
-  async function refreshDashboard() {
-    if (refreshInFlight) {
-      return;
-    }
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
-      return;
-    }
-    refreshInFlight = true;
-    try {
-      await invalidateAll();
-    } finally {
-      refreshInFlight = false;
-    }
-  }
-
   function marketStreamStatusClass() {
     if (marketStreamStatus.last_error) {
       return marketStreamStatus.connected ? 'warn' : 'bad';
@@ -1571,18 +1561,94 @@
     return source;
   }
 
+  function openOperatorEvents() {
+    if (!browser || !window.EventSource) {
+      return null;
+    }
+    const source = new EventSource('/api/operator/events?interval_ms=1000');
+    source.onopen = () => {
+      liveSnapshotStatus = {
+        ...liveSnapshotStatus,
+        connected: true,
+        last_error: null
+      };
+    };
+    source.addEventListener('operator', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        liveHealth = payload.health ?? liveHealth;
+        liveErrors = payload.errors ?? liveErrors;
+        liveGeneratedAt = payload.received_at ?? new Date().toISOString();
+        if (payload.operatorSnapshot) {
+          operatorSnapshot = payload.operatorSnapshot;
+        }
+        liveSnapshotStatus = {
+          connected: true,
+          received_at: payload.received_at ?? new Date().toISOString(),
+          last_error: null
+        };
+      } catch (error) {
+        liveSnapshotStatus = {
+          ...liveSnapshotStatus,
+          connected: true,
+          last_error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    });
+    source.addEventListener('operator-error', (event) => {
+      let message = 'Operator live state unavailable';
+      try {
+        message = JSON.parse(event.data)?.message ?? message;
+      } catch {
+        // Keep the generic message.
+      }
+      liveSnapshotStatus = {
+        connected: false,
+        received_at: new Date().toISOString(),
+        last_error: message
+      };
+    });
+    source.onerror = () => {
+      liveSnapshotStatus = {
+        ...liveSnapshotStatus,
+        connected: false,
+        last_error: 'Operator live event stream disconnected.'
+      };
+    };
+    return source;
+  }
+
+  function liveSnapshotStatusClass() {
+    if (liveSnapshotStatus.last_error) return liveSnapshotStatus.connected ? 'warn' : 'bad';
+    return liveSnapshotStatus.connected ? 'ok' : 'warn';
+  }
+
+  function liveSnapshotStatusLabel() {
+    if (liveSnapshotStatus.last_error && !liveSnapshotStatus.connected) return 'Disconnected';
+    if (liveSnapshotStatus.last_error) return 'Degraded';
+    return liveSnapshotStatus.connected ? 'Live' : 'Connecting';
+  }
+
+  function liveSnapshotStatusDetail() {
+    if (liveSnapshotStatus.last_error) return liveSnapshotStatus.last_error;
+    if (liveSnapshotStatus.received_at) return `Snapshot pushed ${formatTimestamp(liveSnapshotStatus.received_at)}`;
+    return 'Opening live dashboard stream';
+  }
+
   onMount(() => {
     if (browser) {
       dashboardFilters = parseStoredFilters(window.localStorage.getItem(FILTER_STORAGE_KEY));
       filtersLoaded = true;
     }
 
+    const operatorEvents = openOperatorEvents();
     const marketStreamEvents = openMarketStreamEvents();
     const clockIntervalId = window.setInterval(() => {
       referenceNow = new Date();
     }, 5000);
 
     return () => {
+      operatorEvents?.close();
       marketStreamEvents?.close();
       window.clearInterval(clockIntervalId);
     };
@@ -2549,7 +2615,6 @@
 
         if (result.type === 'success') {
           setButtonState(actionKey, 'success');
-          await refreshDashboard();
           window.setTimeout(() => clearButtonState(actionKey), BUTTON_SUCCESS_RESET_MS);
           return;
         }
@@ -2661,10 +2726,8 @@
       </div>
       <div>
         <span>Page updated</span>
-        <strong>{formatTimestamp(data.generatedAt)}</strong>
-        <button class="inline-button neutral hero-refresh" type="button" on:click={refreshDashboard} disabled={refreshInFlight}>
-          {refreshInFlight ? 'Refreshing...' : 'Refresh Snapshot'}
-        </button>
+        <strong>{formatTimestamp(liveGeneratedAt)}</strong>
+        <small class={liveSnapshotStatusClass()}>{liveSnapshotStatusLabel()} · {liveSnapshotStatusDetail()}</small>
       </div>
       <div>
         <span>Snapshot generated</span>
@@ -2686,13 +2749,13 @@
     <article class="stat-card">
       <span>Primary Broker Session</span>
       <strong class={classForConnection('primary')}>{connectionLabel('primary')}</strong>
-      <small>Client ID {data.health.broker_sessions.primary.client_id}, on demand</small>
+      <small>Client ID {liveHealth.broker_sessions.primary.client_id}, on demand</small>
     </article>
 
     <article class="stat-card">
       <span>Diagnostic Session</span>
       <strong class={classForConnection('diagnostic')}>{connectionLabel('diagnostic')}</strong>
-      <small>Client ID {data.health.broker_sessions.diagnostic.client_id}</small>
+      <small>Client ID {liveHealth.broker_sessions.diagnostic.client_id}</small>
     </article>
 
     <article class="stat-card">
@@ -4012,17 +4075,9 @@
     font-size: 0.85rem;
     font-weight: 600;
     transition:
-      transform 120ms ease,
       border-color 120ms ease,
       background 120ms ease,
       color 120ms ease;
-  }
-
-  .inline-button:hover {
-    transform: translateY(-1px);
-    border-color: var(--border-strong);
-    background: var(--surface-strong);
-    color: var(--text-primary);
   }
 
   .hero {
@@ -4653,12 +4708,10 @@
     letter-spacing: 0.02em;
     color: #fffaf0;
     background: linear-gradient(135deg, #0e7a49 0%, #199d61 100%);
-    cursor: pointer;
   }
 
   .action-button:disabled,
   .inline-button:disabled {
-    cursor: wait;
     opacity: 0.8;
   }
 
@@ -4691,7 +4744,6 @@
     letter-spacing: 0.02em;
     color: #fffaf0;
     background: linear-gradient(135deg, #0e7a49 0%, #199d61 100%);
-    cursor: pointer;
     white-space: nowrap;
   }
 

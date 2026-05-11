@@ -62,6 +62,7 @@ from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.db.models import VirtualMarketQuoteRecord
+from ibkr_trader.ibkr.market_data_backfill import list_market_data_backfill_requests
 from ibkr_trader.ibkr.shortability import ShortabilityMarketDataType
 from ibkr_trader.ibkr.shortability import ShortabilitySource
 from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder
@@ -802,6 +803,7 @@ class ApiServerTests(TestCase):
         self.assertEqual(body["summary"]["requested_symbol_count"], 2)
         self.assertEqual(body["universe"]["next_cursor"], "sive")
         collect_mock.assert_called_once()
+        self.assertEqual(collect_mock.call_args.args[0].client_id, 8)
 
     def test_rl_registry_endpoints_round_trip(self) -> None:
         try:
@@ -1709,6 +1711,132 @@ class ApiServerTests(TestCase):
             1,
         )
 
+    def test_rl_observation_endpoint_pauses_missing_stream_symbol_and_enqueues_backfill(
+        self,
+    ) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        class FakeMarketStreamService:
+            def snapshot(self, *, symbols=None, bar_limit=390):
+                _ = bar_limit
+                return {"bars_by_symbol": {symbol: [] for symbol in symbols or []}}
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "stream_missing_observation.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                client.app.state.market_stream_service = FakeMarketStreamService()
+                self.assertEqual(
+                    client.post(
+                        "/v1/rl/models/register",
+                        json={
+                            "model_key": "long_trial_106_v1",
+                            "display_name": "Long Trial 106 V1",
+                            "strategy_family": "canonical_long_live_execution_policy",
+                            "side": "LONG",
+                            "action_space": ["skip", "wait", "market_entry"],
+                            "observation_contract": {
+                                "bar_family": "phase1_intraday_ohlc_v1",
+                                "bar_interval": "5m",
+                                "session_timezone": "Europe/Stockholm",
+                                "session_open_local": "09:00",
+                                "session_close_local": "17:30",
+                                "include_market_context": False,
+                            },
+                        },
+                    ).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    client.post(
+                        "/v1/rl/deployments",
+                        json={
+                            "deployment_key": "long_trial_106_virtual_shared_01",
+                            "model_key": "long_trial_106_v1",
+                            "account_key": "VIRTUALRL01",
+                            "book_key": "rl_shared_long_trial_106_virtual_01",
+                            "mode": "virtual",
+                            "status": "running",
+                            "allowed_symbols": ["AXFO"],
+                        },
+                    ).status_code,
+                    200,
+                )
+                response = client.post(
+                    "/v1/rl/observations/build",
+                    json={
+                        "deployment_key": "long_trial_106_virtual_shared_01",
+                        "symbols": ["AXFO"],
+                        "as_of": "2026-04-28T09:07:30+02:00",
+                        "fetch": {
+                            "mode": "market_stream",
+                            "backfill_missing": True,
+                            "instruments": {
+                                "AXFO": {
+                                    "exchange": "XSTO",
+                                    "currency": "SEK",
+                                    "primary_exchange": "SFB",
+                                }
+                            },
+                        },
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            decision = body["rl_observation"]["observations"]["AXFO"]["model_decision"]
+            self.assertFalse(decision["ready"])
+            self.assertEqual(
+                decision["reason"],
+                "paused_market_stream_bars_missing_backfill_pending",
+            )
+            self.assertEqual(body["backfill_request_count"], 1)
+            check_engine = build_engine(database_url)
+            try:
+                requests = list_market_data_backfill_requests(
+                    create_session_factory(check_engine)
+                )
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["symbol"], "AXFO")
+                self.assertEqual(requests[0]["status"], "PENDING")
+            finally:
+                check_engine.dispose()
+
     def test_market_stream_endpoints_use_persistent_service(self) -> None:
         try:
             from fastapi.testclient import TestClient
@@ -1718,12 +1846,27 @@ class ApiServerTests(TestCase):
         class FakeMarketStreamService:
             def __init__(self) -> None:
                 self.calls = []
+                self.desired_calls = []
 
             def subscribe_many(self, contracts, *, replace, market_data_type):
                 self.calls.append((contracts, replace, market_data_type))
                 return {
                     "running": True,
                     "subscribed_count": len(contracts),
+                    "subscriptions": [],
+                    "quote_count": 0,
+                    "quotes": [],
+                    "bars_by_symbol": {contract.symbol: [] for contract in contracts},
+                    "errors": [],
+                }
+
+            def set_desired_many(self, contracts, *, replace, market_data_type):
+                self.desired_calls.append((contracts, replace, market_data_type))
+                return {
+                    "running": False,
+                    "desired_subscription_count": len(contracts),
+                    "desired_symbols": sorted(contract.symbol for contract in contracts),
+                    "subscribed_count": 0,
                     "subscriptions": [],
                     "quote_count": 0,
                     "quotes": [],
@@ -1777,6 +1920,10 @@ class ApiServerTests(TestCase):
             TestClient(app) as client,
         ):
             client.app.state.market_stream_service = fake_service
+            desired_response = client.post(
+                "/v1/market-data/stream/desired",
+                json={"symbols": ["axfo", "azn"], "market_data_type": "delayed"},
+            )
             subscribe_response = client.post(
                 "/v1/market-data/stream/subscribe",
                 json={"symbols": ["axfo", "azn"], "market_data_type": "delayed"},
@@ -1785,8 +1932,22 @@ class ApiServerTests(TestCase):
                 "/v1/market-data/stream/snapshot?symbols=AXFO,AZN&bar_limit=10"
             )
 
+        self.assertEqual(desired_response.status_code, 200)
         self.assertEqual(subscribe_response.status_code, 200)
         self.assertEqual(snapshot_response.status_code, 200)
+        self.assertEqual(
+            desired_response.json()["mode"],
+            "streaming_market_data_desired",
+        )
+        desired_contracts, desired_replace, desired_market_data_type = (
+            fake_service.desired_calls[0]
+        )
+        self.assertEqual(
+            [contract.symbol for contract in desired_contracts],
+            ["AXFO", "AZN"],
+        )
+        self.assertTrue(desired_replace)
+        self.assertEqual(desired_market_data_type, "DELAYED")
         self.assertEqual(subscribe_response.json()["stream"]["subscribed_count"], 2)
         contracts, replace, market_data_type = fake_service.calls[0]
         self.assertEqual([contract.symbol for contract in contracts], ["AXFO", "AZN"])
@@ -1969,6 +2130,25 @@ class ApiServerTests(TestCase):
                         payload={"instruction": {"instruction_id": "instr-001"}},
                     )
                 )
+                session.add(
+                    InstructionRecord(
+                        instruction_id="instr-terminal",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="batch-001",
+                        account_key="U25245596",
+                        book_key="long_risk_book",
+                        symbol="SINCH",
+                        exchange="SMART",
+                        currency="SEK",
+                        state="ENTRY_CANCELLED",
+                        submit_at=datetime(2026, 4, 19, 8, 20, tzinfo=timezone.utc),
+                        expire_at=datetime(2026, 4, 19, 15, 30, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        payload={"instruction": {"instruction_id": "instr-terminal"}},
+                    )
+                )
                 session.commit()
             finally:
                 session.close()
@@ -2004,6 +2184,9 @@ class ApiServerTests(TestCase):
                 TestClient(app) as client,
             ):
                 response = client.get("/v1/read/operator-snapshot")
+                response_with_terminal = client.get(
+                    "/v1/read/operator-snapshot?include_terminal_instructions=true"
+                )
 
             self.assertEqual(response.status_code, 200)
             body = response.json()
@@ -2013,6 +2196,17 @@ class ApiServerTests(TestCase):
                 body["operator_snapshot"]["instructions"][0]["instruction_id"],
                 "instr-001",
             )
+            default_instruction_ids = {
+                instruction["instruction_id"]
+                for instruction in body["operator_snapshot"]["instructions"]
+            }
+            self.assertNotIn("instr-terminal", default_instruction_ids)
+            body_with_terminal = response_with_terminal.json()
+            with_terminal_instruction_ids = {
+                instruction["instruction_id"]
+                for instruction in body_with_terminal["operator_snapshot"]["instructions"]
+            }
+            self.assertIn("instr-terminal", with_terminal_instruction_ids)
 
     def test_operator_snapshot_default_keeps_more_than_fifty_instruction_owners(
         self,

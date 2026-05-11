@@ -125,11 +125,15 @@ Suggested responsibilities:
 - fills, order events, and account snapshots
 
 For RL candidate lists, the live path is a persistent market-data stream:
-subscribe the active names once, maintain an in-memory 1-minute OHLC buffer from
-last-price ticks, and let the RL observation builder aggregate those source bars
-into the 5-minute `phase1_intraday_ohlc_v1` contract. The active name count is
-dynamic per booster run, so a 5-name day and a 30-name day use the same stream
-path. Do not implement this as one historical-bar request per name every minute.
+the runner publishes the desired active names, the API-owned stream client
+applies broker subscription diffs, and the stream maintains an in-memory
+1-minute OHLC buffer from last-price ticks. The RL observation builder
+aggregates those source bars into the 5-minute `phase1_intraday_ohlc_v1`
+contract. The active name count is dynamic per booster run, so a 5-name day and
+a 30-name day use the same stream path. Do not implement this as one historical
+bar request per name every minute.
+The broker usage rewrite is tracked in
+[IBKR Broker Usage Rewrite](ibkr-broker-usage-rewrite.md).
 
 ### 5A. Stockholm Intraday Backfill
 
@@ -278,7 +282,7 @@ Current response shape:
 
 Implementation notes:
 
-- use one dedicated diagnostic client ID for the collector
+- use the dedicated historical/backfill client ID for the collector
 - pace requests gently and keep the job single-session
 - use `max_runtime_seconds` so a nightly page returns partial results with a
   resumable cursor instead of timing out at the HTTP client

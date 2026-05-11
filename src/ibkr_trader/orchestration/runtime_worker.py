@@ -1353,6 +1353,7 @@ def _should_touch_real_broker_for_runtime_cycle(
     session_calendar_path: Path,
     instruction_ids: tuple[str, ...] | None,
     due_instruction_ids: list[str],
+    expired_submitted_entry_instruction_ids: list[str],
 ) -> bool:
     if run_kind not in SESSION_GATED_RECONCILIATION_RUN_KINDS:
         return has_real_broker_work(session_factory, instruction_ids=instruction_ids)
@@ -1362,6 +1363,12 @@ def _should_touch_real_broker_for_runtime_cycle(
         due_instruction_ids,
     )
     if real_due_instruction_ids:
+        return True
+    _, real_expired_entry_instruction_ids = _split_instruction_ids_by_virtual(
+        session_factory,
+        expired_submitted_entry_instruction_ids,
+    )
+    if real_expired_entry_instruction_ids:
         return True
 
     if not has_real_broker_work(session_factory, instruction_ids=instruction_ids):
@@ -1381,10 +1388,13 @@ def _should_reconcile_active_runtime_instructions(
     runtime_timezone: str,
     session_calendar_path: Path,
     due_instruction_ids: list[str],
+    expired_submitted_entry_instruction_ids: list[str],
 ) -> bool:
     if run_kind not in SESSION_GATED_RECONCILIATION_RUN_KINDS:
         return True
     if due_instruction_ids:
+        return True
+    if expired_submitted_entry_instruction_ids:
         return True
     return _is_runtime_broker_session_window(
         cycle_at=cycle_at,
@@ -1478,6 +1488,81 @@ def _fetch_due_entry_instruction_ids(
     ]
 
 
+def _effective_entry_expire_at(
+    record: InstructionRecord,
+    *,
+    session_calendar_path: Path,
+) -> datetime:
+    try:
+        instruction = _instruction_payload(record)
+        return resolve_effective_entry_expire_at_for_schedule(
+            instruction,
+            submit_at=_ensure_utc(record.submit_at) or record.submit_at,
+            expire_at=_ensure_utc(record.expire_at) or record.expire_at,
+            session_calendar_path=session_calendar_path,
+        )
+    except Exception:
+        return record.expire_at
+
+
+def _is_entry_record_expired(
+    record: InstructionRecord,
+    *,
+    cycle_at: datetime,
+    session_calendar_path: Path,
+) -> bool:
+    normalized_expire_at = _ensure_utc(
+        _effective_entry_expire_at(
+            record,
+            session_calendar_path=session_calendar_path,
+        )
+    )
+    if normalized_expire_at is None:
+        return False
+    return normalized_expire_at <= cycle_at
+
+
+def _should_cancel_submitted_entry_at_expiry(record: InstructionRecord) -> bool:
+    try:
+        instruction = _instruction_payload(record)
+    except Exception:
+        return True
+    return bool(instruction.entry.cancel_unfilled_at_expiry)
+
+
+def _fetch_expired_submitted_entry_instruction_ids(
+    session_factory: sessionmaker[Session],
+    *,
+    cycle_at: datetime,
+    session_calendar_path: Path,
+    instruction_ids: tuple[str, ...] | None = None,
+) -> list[str]:
+    with session_scope(session_factory) as session:
+        query = select(InstructionRecord).where(
+            InstructionRecord.state == ExecutionState.ENTRY_SUBMITTED.value,
+            InstructionRecord.expire_at <= cycle_at,
+            InstructionRecord.archived_at.is_(None),
+        )
+        if instruction_ids:
+            query = query.where(InstructionRecord.instruction_id.in_(instruction_ids))
+        records = list(
+            session.execute(
+                query.order_by(InstructionRecord.expire_at, InstructionRecord.id)
+            ).scalars()
+        )
+
+    return [
+        record.instruction_id
+        for record in records
+        if _should_cancel_submitted_entry_at_expiry(record)
+        and _is_entry_record_expired(
+            record,
+            cycle_at=cycle_at,
+            session_calendar_path=session_calendar_path,
+        )
+    ]
+
+
 def _is_pending_entry_expired(
     session_factory: sessionmaker[Session],
     *,
@@ -1493,20 +1578,11 @@ def _is_pending_entry_expired(
         ).scalar_one_or_none()
     if record is None:
         return False
-    try:
-        instruction = _instruction_payload(record)
-        expire_at = resolve_effective_entry_expire_at_for_schedule(
-            instruction,
-            submit_at=_ensure_utc(record.submit_at) or record.submit_at,
-            expire_at=_ensure_utc(record.expire_at) or record.expire_at,
-            session_calendar_path=session_calendar_path,
-        )
-    except Exception:
-        expire_at = record.expire_at
-    normalized_expire_at = _ensure_utc(expire_at)
-    if normalized_expire_at is None:
-        return False
-    return normalized_expire_at <= cycle_at
+    return _is_entry_record_expired(
+        record,
+        cycle_at=cycle_at,
+        session_calendar_path=session_calendar_path,
+    )
 
 
 def _mark_pending_entry_cancelled(
@@ -3228,6 +3304,17 @@ def _mark_unfilled_entry_cancelled(
 
         previous_state = record.state
         record.state = ExecutionState.ENTRY_CANCELLED.value
+        latest_entry_order_status = session.execute(
+            select(BrokerOrderRecord.status)
+            .where(
+                BrokerOrderRecord.instruction_id == record.id,
+                BrokerOrderRecord.order_role == "ENTRY",
+            )
+            .order_by(BrokerOrderRecord.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if latest_entry_order_status not in (None, ""):
+            record.broker_order_status = str(latest_entry_order_status)
         session.add(
             InstructionEventRecord(
                 instruction_id=record.id,
@@ -3737,6 +3824,7 @@ def run_runtime_cycle(
             )
     else:
         runtime_order_canceler = broker_order_canceler
+    runtime_entry_canceler = entry_canceler or runtime_order_canceler
     due_instruction_count = 0
     active_instruction_count = 0
     snapshot: BrokerRuntimeSnapshot | None = None
@@ -3757,6 +3845,14 @@ def run_runtime_cycle(
         submission_lead_time=submission_lead_time,
         instruction_ids=instruction_ids,
     )
+    expired_submitted_entry_instruction_ids = (
+        _fetch_expired_submitted_entry_instruction_ids(
+            session_factory,
+            cycle_at=cycle_started_at,
+            session_calendar_path=session_calendar_path,
+            instruction_ids=instruction_ids,
+        )
+    )
     due_instruction_count = len(due_instruction_ids)
 
     active_instruction_ids = _fetch_instruction_ids(
@@ -3775,6 +3871,7 @@ def run_runtime_cycle(
         runtime_timezone=runtime_timezone,
         session_calendar_path=session_calendar_path,
         due_instruction_ids=due_instruction_ids,
+        expired_submitted_entry_instruction_ids=expired_submitted_entry_instruction_ids,
     )
 
     if virtual_market_sync is not None and active_reconciliation_enabled:
@@ -3795,6 +3892,7 @@ def run_runtime_cycle(
         session_calendar_path=session_calendar_path,
         instruction_ids=instruction_ids,
         due_instruction_ids=due_instruction_ids,
+        expired_submitted_entry_instruction_ids=expired_submitted_entry_instruction_ids,
     )
 
     if broker_callback_fetcher is not None and real_broker_cycle_enabled:
@@ -3914,6 +4012,7 @@ def run_runtime_cycle(
         cycle_at=cycle_started_at,
         submission_lead_time=submission_lead_time,
     )
+    open_orders_snapshot_required = bool(records)
 
     real_broker_work = has_real_broker_work(
         session_factory,
@@ -3925,7 +4024,7 @@ def run_runtime_cycle(
                 lambda: runtime_snapshot_fetch(
                     broker_config,
                     timeout=timeout,
-                    include_open_orders=forced_exit_snapshot_required,
+                    include_open_orders=open_orders_snapshot_required,
                     include_executions=forced_exit_snapshot_required,
                     include_account_updates=False,
                     include_positions=forced_exit_snapshot_required,
@@ -3991,7 +4090,9 @@ def run_runtime_cycle(
                 real_broker_work
                 and real_broker_cycle_enabled
                 and not broker_snapshot_unavailable
+                and open_orders_snapshot_required
             ),
+            empty_open_orders_authoritative=open_orders_snapshot_required,
         )
     except Exception as exc:  # pragma: no cover - broad by design for runtime safety
         _append_issue(
@@ -4172,7 +4273,7 @@ def run_runtime_cycle(
                                 broker_config,
                                 instruction_id,
                                 timeout=timeout,
-                                canceler=entry_canceler,
+                                canceler=runtime_entry_canceler,
                             ),
                             retry_delays=broker_retry_delays,
                             sleep_fn=sleep_fn,
@@ -4252,7 +4353,7 @@ def run_runtime_cycle(
                                 broker_config,
                                 instruction_id,
                                 timeout=timeout,
-                                canceler=entry_canceler,
+                                canceler=runtime_entry_canceler,
                             ),
                             retry_delays=broker_retry_delays,
                             sleep_fn=sleep_fn,

@@ -728,6 +728,44 @@ class MarketStreamBarRecord(TimestampMixin, Base):
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class MarketDataBackfillRequestRecord(TimestampMixin, Base):
+    """Coalesced day-level historical backfill request for live RL bar coverage."""
+
+    __tablename__ = "market_data_backfill_request"
+    __table_args__ = (
+        UniqueConstraint("request_key", name="uq_market_data_backfill_request_key"),
+        Index("ix_market_data_backfill_status_next_retry", "status", "next_retry_at"),
+        Index("ix_market_data_backfill_symbol_trade_date", "symbol", "trade_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    security_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    primary_exchange: Mapped[str | None] = mapped_column(String(32))
+    local_symbol: Mapped[str | None] = mapped_column(String(64))
+    isin: Mapped[str | None] = mapped_column(String(32))
+    trade_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    requested_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    covered_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration: Mapped[str] = mapped_column(String(32), nullable=False)
+    bar_size: Mapped[str] = mapped_column(String(32), nullable=False)
+    what_to_show: Mapped[str] = mapped_column(String(32), nullable=False)
+    use_rth: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(128))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    leased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    request_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
 class ReconciliationRunRecord(TimestampMixin, Base):
     """Durable record of each runtime or startup reconciliation pass."""
 

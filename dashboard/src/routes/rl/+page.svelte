@@ -1,15 +1,15 @@
 <script>
   import { applyAction, enhance } from '$app/forms';
-  import { invalidateAll } from '$app/navigation';
   import { onMount } from 'svelte';
 
   export let data;
 
-  const AUTO_REFRESH_INTERVAL_MS = 30000;
+  const LIVE_SNAPSHOT_INTERVAL_MS = 1000;
   const BUTTON_CLICK_TO_WORK_MS = 120;
   const BUTTON_SUCCESS_RESET_MS = 1600;
   const BUTTON_ERROR_RESET_MS = 2200;
 
+  let liveErrors = data.errors;
   let rlDashboard = data.rlDashboard;
   let summary = rlDashboard.summary;
   let models = rlDashboard.models;
@@ -17,16 +17,19 @@
   let candidates = rlDashboard.candidates ?? [];
   let recentActions = rlDashboard.recent_actions;
   let endpointErrors = [];
-  let refreshInFlight = false;
   let buttonStates = {};
+  let liveSnapshotStatus = {
+    connected: false,
+    received_at: null,
+    last_error: null
+  };
 
-  $: rlDashboard = data.rlDashboard;
   $: summary = rlDashboard.summary;
   $: models = rlDashboard.models;
   $: deployments = rlDashboard.deployments;
   $: candidates = rlDashboard.candidates ?? [];
   $: recentActions = rlDashboard.recent_actions;
-  $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
+  $: endpointErrors = Object.entries(liveErrors).filter(([, value]) => value);
 
   function setButtonState(buttonKey, phase, message = null) {
     buttonStates = {
@@ -59,23 +62,28 @@
   }
 
   function formEnhancer(buttonKey) {
-    return enhance(async ({ result }) => {
+    return () => {
       setButtonState(buttonKey, 'clicked');
-      await new Promise((resolve) => setTimeout(resolve, BUTTON_CLICK_TO_WORK_MS));
-      setButtonState(buttonKey, 'working');
+      const transitionTimer = window.setTimeout(() => {
+        if (getButtonState(buttonKey).phase === 'clicked') {
+          setButtonState(buttonKey, 'working');
+        }
+      }, BUTTON_CLICK_TO_WORK_MS);
 
-      await applyAction(result);
+      return async ({ result }) => {
+        window.clearTimeout(transitionTimer);
+        await applyAction(result);
 
-      if (result.type === 'success') {
-        setButtonState(buttonKey, 'done');
-        await invalidateAll();
-        scheduleButtonReset(buttonKey, BUTTON_SUCCESS_RESET_MS);
-        return;
-      }
+        if (result.type === 'success') {
+          setButtonState(buttonKey, 'done');
+          scheduleButtonReset(buttonKey, BUTTON_SUCCESS_RESET_MS);
+          return;
+        }
 
-      setButtonState(buttonKey, 'error');
-      scheduleButtonReset(buttonKey, BUTTON_ERROR_RESET_MS);
-    });
+        setButtonState(buttonKey, 'error');
+        scheduleButtonReset(buttonKey, BUTTON_ERROR_RESET_MS);
+      };
+    };
   }
 
   function formatTimestamp(value) {
@@ -144,21 +152,73 @@
     return notional ? `${notional} ${candidate.currency ?? ''}`.trim() : 'n/a';
   }
 
-  async function refreshNow() {
-    refreshInFlight = true;
-    try {
-      await invalidateAll();
-    } finally {
-      refreshInFlight = false;
+  onMount(() => {
+    if (!window.EventSource) {
+      return;
     }
+    const source = new EventSource(`/api/rl/events?interval_ms=${LIVE_SNAPSHOT_INTERVAL_MS}`);
+    source.onopen = () => {
+      liveSnapshotStatus = { ...liveSnapshotStatus, connected: true, last_error: null };
+    };
+    source.addEventListener('rl', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        liveErrors = payload.errors ?? liveErrors;
+        if (payload.rlDashboard) {
+          rlDashboard = payload.rlDashboard;
+        }
+        liveSnapshotStatus = {
+          connected: true,
+          received_at: payload.received_at ?? new Date().toISOString(),
+          last_error: null
+        };
+      } catch (error) {
+        liveSnapshotStatus = {
+          ...liveSnapshotStatus,
+          connected: true,
+          last_error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    });
+    source.addEventListener('rl-error', (event) => {
+      let message = 'RL live state unavailable';
+      try {
+        message = JSON.parse(event.data)?.message ?? message;
+      } catch {
+        // Keep the generic message.
+      }
+      liveSnapshotStatus = {
+        connected: false,
+        received_at: new Date().toISOString(),
+        last_error: message
+      };
+    });
+    source.onerror = () => {
+      liveSnapshotStatus = {
+        ...liveSnapshotStatus,
+        connected: false,
+        last_error: 'RL live event stream disconnected.'
+      };
+    };
+    return () => source.close();
+  });
+
+  function liveSnapshotStatusClass() {
+    if (liveSnapshotStatus.last_error) return liveSnapshotStatus.connected ? 'degraded' : 'stopped';
+    return liveSnapshotStatus.connected ? 'running' : 'paused';
   }
 
-  onMount(() => {
-    const interval = setInterval(() => {
-      invalidateAll();
-    }, AUTO_REFRESH_INTERVAL_MS);
-    return () => clearInterval(interval);
-  });
+  function liveSnapshotStatusLabel() {
+    if (liveSnapshotStatus.last_error && !liveSnapshotStatus.connected) return 'Disconnected';
+    if (liveSnapshotStatus.last_error) return 'Degraded';
+    return liveSnapshotStatus.connected ? 'Live' : 'Connecting';
+  }
+
+  function liveSnapshotStatusDetail() {
+    if (liveSnapshotStatus.last_error) return liveSnapshotStatus.last_error;
+    if (liveSnapshotStatus.received_at) return `Snapshot pushed ${formatTimestamp(liveSnapshotStatus.received_at)}`;
+    return 'Opening live RL stream';
+  }
 </script>
 
 <svelte:head>
@@ -177,9 +237,8 @@
     </div>
 
     <div class="hero-actions">
-      <button type="button" class="secondary" on:click={refreshNow} disabled={refreshInFlight}>
-        {refreshInFlight ? 'Refreshing...' : 'Refresh'}
-      </button>
+      <span class={`status ${liveSnapshotStatusClass()}`}>{liveSnapshotStatusLabel()}</span>
+      <small>{liveSnapshotStatusDetail()}</small>
     </div>
   </header>
 
@@ -362,9 +421,9 @@
                 <button
                   type="submit"
                   class="secondary {getButtonState(`updateDeployment-${deployment.deployment_key}`).phase}"
-                  disabled={getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'working'}
+                  disabled={['clicked', 'working'].includes(getButtonState(`updateDeployment-${deployment.deployment_key}`).phase)}
                 >
-                  {#if getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'working'}
+                  {#if ['clicked', 'working'].includes(getButtonState(`updateDeployment-${deployment.deployment_key}`).phase)}
                     Updating...
                   {:else if getButtonState(`updateDeployment-${deployment.deployment_key}`).phase === 'done'}
                     Updated
@@ -671,20 +730,13 @@
     border: 1px solid transparent;
     border-radius: 999px;
     padding: 0.72rem 1rem;
-    cursor: pointer;
     transition:
-      transform 140ms ease,
       opacity 140ms ease,
       background 140ms ease,
       border-color 140ms ease;
   }
 
-  button:hover:not(:disabled) {
-    transform: translateY(-1px);
-  }
-
   button:disabled {
-    cursor: wait;
     opacity: 0.7;
   }
 
@@ -809,7 +861,6 @@
   }
 
   .deployment-edit summary {
-    cursor: pointer;
     color: var(--muted);
     font-weight: 700;
   }
@@ -860,7 +911,6 @@
   }
 
   details summary {
-    cursor: pointer;
     font-weight: 700;
   }
 

@@ -75,6 +75,9 @@ This document is the operational snapshot of where the repo is right now.
 - `POST /v1/market-data/historical-bars`
 - `POST /v1/market-data/shortability-snapshot`
 - `POST /v1/market-data/tick-stream-sample`
+- `POST /v1/market-data/stream/desired`
+- `POST /v1/market-data/stream/subscribe`
+- `GET /v1/market-data/stream/snapshot`
 - `POST /v1/orders/preview`
 - `POST /v1/orders/submit`
 - `POST /v1/orders/{order_id}/cancel`

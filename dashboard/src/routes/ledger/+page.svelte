@@ -1,13 +1,16 @@
 <script>
-  import { invalidateAll } from '$app/navigation';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
   export let data;
 
-  const AUTO_REFRESH_INTERVAL_MS = 30000;
+  const LIVE_SNAPSHOT_INTERVAL_MS = 1000;
 
+  let liveHealth = data.health;
+  let liveGeneratedAt = data.generatedAt;
+  let liveErrors = data.errors;
   let ledgerSnapshot = data.ledgerSnapshot;
-  let brokerMonitor = data.health.broker_monitor;
+  let brokerMonitor = liveHealth.broker_monitor;
   let summary = ledgerSnapshot.summary;
   let focusInstruction = ledgerSnapshot.focus_instruction;
   let instructionEvents = ledgerSnapshot.instruction_events;
@@ -17,10 +20,13 @@
   let instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations;
   let reconciliationIssues = ledgerSnapshot.reconciliation_issues;
   let endpointErrors = [];
-  let refreshInFlight = false;
+  let liveSnapshotStatus = {
+    connected: false,
+    received_at: null,
+    last_error: null
+  };
 
-  $: ledgerSnapshot = data.ledgerSnapshot;
-  $: brokerMonitor = data.health.broker_monitor;
+  $: brokerMonitor = liveHealth.broker_monitor;
   $: summary = ledgerSnapshot.summary;
   $: focusInstruction = ledgerSnapshot.focus_instruction;
   $: instructionEvents = ledgerSnapshot.instruction_events;
@@ -29,40 +35,76 @@
   $: controlEvents = ledgerSnapshot.control_events;
   $: instructionSetCancellations = ledgerSnapshot.instruction_set_cancellations;
   $: reconciliationIssues = ledgerSnapshot.reconciliation_issues;
-  $: endpointErrors = Object.entries(data.errors).filter(([, value]) => value);
-
-  async function refreshLedger() {
-    if (refreshInFlight) {
-      return;
-    }
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
-      return;
-    }
-    refreshInFlight = true;
-    try {
-      await invalidateAll();
-    } finally {
-      refreshInFlight = false;
-    }
-  }
+  $: endpointErrors = Object.entries(liveErrors).filter(([, value]) => value);
 
   onMount(() => {
-    const intervalId = window.setInterval(() => {
-      void refreshLedger();
-    }, AUTO_REFRESH_INTERVAL_MS);
+    if (!window.EventSource) {
+      return;
+    }
+    const params = new URLSearchParams({ interval_ms: String(LIVE_SNAPSHOT_INTERVAL_MS) });
+    const focusInstructionId = $page.url.searchParams.get('instruction_id')?.trim();
+    if (focusInstructionId) {
+      params.set('instruction_id', focusInstructionId);
+    }
+    const source = new EventSource(`/api/ledger/events?${params.toString()}`);
+    source.onopen = () => {
+      liveSnapshotStatus = { ...liveSnapshotStatus, connected: true, last_error: null };
+    };
+    source.addEventListener('ledger', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        liveHealth = payload.health ?? liveHealth;
+        liveErrors = payload.errors ?? liveErrors;
+        liveGeneratedAt = payload.received_at ?? new Date().toISOString();
+        if (payload.ledgerSnapshot) {
+          ledgerSnapshot = payload.ledgerSnapshot;
+        }
+        liveSnapshotStatus = {
+          connected: true,
+          received_at: payload.received_at ?? new Date().toISOString(),
+          last_error: null
+        };
+      } catch (error) {
+        liveSnapshotStatus = {
+          ...liveSnapshotStatus,
+          connected: true,
+          last_error: error instanceof Error ? error.message : String(error)
+        };
+      }
+    });
+    source.addEventListener('ledger-error', (event) => {
+      let message = 'Ledger live state unavailable';
+      try {
+        message = JSON.parse(event.data)?.message ?? message;
+      } catch {
+        // Keep the generic message.
+      }
+      liveSnapshotStatus = {
+        connected: false,
+        received_at: new Date().toISOString(),
+        last_error: message
+      };
+    });
+    source.onerror = () => {
+      liveSnapshotStatus = {
+        ...liveSnapshotStatus,
+        connected: false,
+        last_error: 'Ledger live event stream disconnected.'
+      };
+    };
 
     return () => {
-      window.clearInterval(intervalId);
+      source.close();
     };
   });
 
   function brokerConnected(role) {
-    return data.health.broker_sessions[role].connected === true;
+    return liveHealth.broker_sessions[role].connected === true;
   }
 
   function connectionLabel(role) {
     const heartbeat = brokerMonitor?.heartbeat ?? {};
-    const session = data.health.broker_sessions[role] ?? {};
+    const session = liveHealth.broker_sessions[role] ?? {};
     if (heartbeat.is_stale) return 'Stale check';
     if (heartbeat.ok === false) return 'Gateway failing';
     if (session.connected === true) return 'Connected';
@@ -77,7 +119,7 @@
 
   function connectionClass(role) {
     const heartbeat = brokerMonitor?.heartbeat ?? {};
-    const session = data.health.broker_sessions[role] ?? {};
+    const session = liveHealth.broker_sessions[role] ?? {};
     if (heartbeat.is_stale) return 'warn';
     if (heartbeat.ok === false) return 'bad';
     if (session.connected === true) return 'ok';
@@ -88,6 +130,23 @@
       return 'ok';
     }
     return 'bad';
+  }
+
+  function liveSnapshotStatusClass() {
+    if (liveSnapshotStatus.last_error) return liveSnapshotStatus.connected ? 'warn' : 'bad';
+    return liveSnapshotStatus.connected ? 'ok' : 'warn';
+  }
+
+  function liveSnapshotStatusLabel() {
+    if (liveSnapshotStatus.last_error && !liveSnapshotStatus.connected) return 'Disconnected';
+    if (liveSnapshotStatus.last_error) return 'Degraded';
+    return liveSnapshotStatus.connected ? 'Live' : 'Connecting';
+  }
+
+  function liveSnapshotStatusDetail() {
+    if (liveSnapshotStatus.last_error) return liveSnapshotStatus.last_error;
+    if (liveSnapshotStatus.received_at) return `Snapshot pushed ${liveSnapshotStatus.received_at}`;
+    return 'Opening live ledger stream';
   }
 </script>
 
@@ -113,7 +172,8 @@
       </div>
       <div>
         <span>Page updated</span>
-        <strong>{data.generatedAt}</strong>
+        <strong>{liveGeneratedAt}</strong>
+        <small class={liveSnapshotStatusClass()}>{liveSnapshotStatusLabel()} · {liveSnapshotStatusDetail()}</small>
       </div>
       <div>
         <span>Snapshot generated</span>
@@ -181,7 +241,7 @@
     <article class="stat-card">
       <span>Primary Broker Session</span>
       <strong class={connectionClass('primary')}>{connectionLabel('primary')}</strong>
-      <small>Client ID {data.health.broker_sessions.primary.client_id}, on demand</small>
+      <small>Client ID {liveHealth.broker_sessions.primary.client_id}, on demand</small>
     </article>
     <article class="stat-card">
       <span>Instruction Rows</span>

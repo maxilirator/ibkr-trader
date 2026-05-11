@@ -14,12 +14,15 @@ from threading import RLock
 from threading import Thread
 from threading import current_thread
 from typing import Any
+from typing import Mapping
 from zoneinfo import ZoneInfo
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
+from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.contracts import build_ibkr_contract
 from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.pacing import BrokerApiPacingGovernor
 
 
 BID_PRICE_TICKS = {1, 66}
@@ -175,6 +178,8 @@ class LiveMarketDataStreamService:
         stale_reconnect_timezone: str | None = None,
         stale_reconnect_start_local: time = time(8, 45),
         stale_reconnect_end_local: time = time(17, 35),
+        pacing_governor: BrokerApiPacingGovernor | None = None,
+        broker_circuit: BrokerHealthCircuit | None = None,
     ) -> None:
         self._config = config
         self._timeout = timeout
@@ -193,6 +198,8 @@ class LiveMarketDataStreamService:
         )
         self._stale_reconnect_start_local = stale_reconnect_start_local
         self._stale_reconnect_end_local = stale_reconnect_end_local
+        self._pacing_governor = pacing_governor
+        self._broker_circuit = broker_circuit
         self._lock = RLock()
         self._request_id_lock = Lock()
         self._connected_event = Event()
@@ -202,6 +209,9 @@ class LiveMarketDataStreamService:
         self._contract_cls: type[Any] | None = None
         self._desired_contracts_by_key: dict[str, MarketStreamContract] = {}
         self._desired_market_data_type: str | None = None
+        self._last_desired_update_at: datetime | None = None
+        self._desired_update_count = 0
+        self._desired_noop_count = 0
         self._subscriptions_by_key: dict[str, MarketStreamSubscription] = {}
         self._subscription_keys_by_req_id: dict[int, str] = {}
         self._quotes_by_key: dict[str, MarketStreamQuote] = {}
@@ -226,7 +236,13 @@ class LiveMarketDataStreamService:
         self._cooldown_until: datetime | None = None
         self._last_stale_detected_at: datetime | None = None
         self._stale_reconnect_count = 0
+        self._last_connectivity_event_at: datetime | None = None
+        self._last_connectivity_event_code: int | None = None
+        self._last_connectivity_event_message: str | None = None
+        self._connectivity_resubscribe_count = 0
+        self._connectivity_maintained_count = 0
         self._supervisor_stop_event = Event()
+        self._desired_changed_event = Event()
         self._supervisor_thread: Thread | None = None
 
     def _record_connect_attempt_locked(self) -> None:
@@ -287,9 +303,19 @@ class LiveMarketDataStreamService:
 
     def connect_and_start(self) -> None:
         with self._lock:
+            if self._broker_circuit is not None:
+                self._broker_circuit.raise_if_open(
+                    operation_name="streaming.connect",
+                    source="market_stream",
+                )
             if self._client is not None and self._client.isConnected():
                 return
             self._raise_if_cooling_down_locked()
+            if self._pacing_governor is not None:
+                self._pacing_governor.acquire_api_request(
+                    "streaming.connect",
+                    permits=1,
+                )
             self._record_connect_attempt_locked()
             self._clear_active_subscriptions_locked()
             eclient_cls, ewrapper_cls, contract_cls = _load_market_data_runtime()
@@ -375,6 +401,8 @@ class LiveMarketDataStreamService:
             raise ConnectionError(error)
         with self._lock:
             self._record_connect_success_locked()
+        if self._broker_circuit is not None:
+            self._broker_circuit.clear(source="market_stream")
 
     def start_auto_reconnect(self, *, interval_seconds: float = 15.0) -> None:
         interval_seconds = max(1.0, interval_seconds)
@@ -396,6 +424,7 @@ class LiveMarketDataStreamService:
 
     def stop(self, *, clear_desired: bool = True) -> None:
         self._supervisor_stop_event.set()
+        self._desired_changed_event.set()
         with self._lock:
             supervisor_thread = self._supervisor_thread
             if clear_desired:
@@ -457,18 +486,34 @@ class LiveMarketDataStreamService:
                     self._last_error = (
                         "market stream connected but stale; reconnecting stream client"
                     )
+                active_mismatch = (
+                    has_desired_contracts
+                    and connected
+                    and not reconnect_stale
+                    and not self._active_matches_desired_locked()
+                )
             if has_desired_contracts and not connected:
                 try:
                     self._restore_desired_subscriptions()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._record_restore_failure(exc)
             elif reconnect_stale:
                 self._disconnect_client()
                 try:
                     self._restore_desired_subscriptions()
-                except Exception:
-                    pass
-            self._supervisor_stop_event.wait(interval_seconds)
+                except Exception as exc:
+                    self._record_restore_failure(exc)
+            elif active_mismatch:
+                try:
+                    self._restore_desired_subscriptions()
+                except Exception as exc:
+                    self._record_restore_failure(exc)
+            self._desired_changed_event.wait(interval_seconds)
+            self._desired_changed_event.clear()
+
+    def _record_restore_failure(self, error: Exception) -> None:
+        with self._lock:
+            self._last_error = str(error)
 
     def _restore_desired_subscriptions(self) -> dict[str, Any]:
         with self._lock:
@@ -479,7 +524,17 @@ class LiveMarketDataStreamService:
         self.connect_and_start()
         with self._lock:
             if market_data_type is not None and self._client is not None:
+                if self._pacing_governor is not None:
+                    self._pacing_governor.acquire_api_request(
+                        "streaming.req_market_data_type",
+                        permits=1,
+                    )
                 self._client.reqMarketDataType(_market_data_type_code(market_data_type))
+                self._market_data_type_request_count += 1
+            target_keys = {contract.key for contract in contracts}
+            for key in list(self._subscriptions_by_key):
+                if key not in target_keys:
+                    self._unsubscribe_key_locked(key)
             for contract in contracts:
                 existing = self._subscriptions_by_key.get(contract.key)
                 if existing is not None and (
@@ -490,6 +545,72 @@ class LiveMarketDataStreamService:
                 if existing is not None:
                     self._unsubscribe_key_locked(contract.key)
                 self._subscribe_locked(contract)
+        return self.snapshot()
+
+    def _active_matches_desired_locked(
+        self,
+        desired_contracts_by_key: Mapping[str, MarketStreamContract] | None = None,
+    ) -> bool:
+        desired_contracts = desired_contracts_by_key or self._desired_contracts_by_key
+        if self._client is None or not self._client.isConnected():
+            return False
+        if set(self._subscriptions_by_key) != set(desired_contracts):
+            return False
+        return all(
+            subscription.status != "error"
+            and subscription.contract == desired_contracts[key]
+            for key, subscription in self._subscriptions_by_key.items()
+        )
+
+    def set_desired_many(
+        self,
+        contracts: list[MarketStreamContract],
+        *,
+        replace: bool = False,
+        market_data_type: str | None = None,
+    ) -> dict[str, Any]:
+        if not contracts:
+            raise ValueError("symbols are required")
+        for contract in contracts:
+            contract.validate()
+        if market_data_type is not None:
+            _market_data_type_code(market_data_type)
+        with self._lock:
+            requested_contracts_by_key = {
+                contract.key: contract for contract in contracts
+            }
+            desired_contracts_by_key = (
+                requested_contracts_by_key
+                if replace
+                else {
+                    **self._desired_contracts_by_key,
+                    **requested_contracts_by_key,
+                }
+            )
+            desired_market_data_type = (
+                market_data_type
+                if market_data_type is not None
+                else self._desired_market_data_type
+            )
+            if self._pacing_governor is not None:
+                self._pacing_governor.check_market_data_line_limit(
+                    requested_line_count=len(desired_contracts_by_key),
+                    operation_name="streaming.set_desired_many",
+                )
+            self._last_desired_update_at = _utc_now()
+            no_op = (
+                desired_contracts_by_key == self._desired_contracts_by_key
+                and desired_market_data_type == self._desired_market_data_type
+            )
+            if no_op:
+                self._desired_noop_count += 1
+                return self.snapshot()
+            self._desired_contracts_by_key = desired_contracts_by_key
+            if market_data_type is not None:
+                self._desired_market_data_type = desired_market_data_type
+            self._desired_update_count += 1
+            self._last_subscription_change_at = self._last_desired_update_at
+            self._desired_changed_event.set()
         return self.snapshot()
 
     def subscribe_many(
@@ -523,15 +644,13 @@ class LiveMarketDataStreamService:
                 if market_data_type is not None
                 else self._desired_market_data_type
             )
-            connected = self._client is not None and self._client.isConnected()
-            active_matches_desired = (
-                connected
-                and set(self._subscriptions_by_key) == set(desired_contracts_by_key)
-                and all(
-                    subscription.status != "error"
-                    and subscription.contract == desired_contracts_by_key[key]
-                    for key, subscription in self._subscriptions_by_key.items()
+            if self._pacing_governor is not None:
+                self._pacing_governor.check_market_data_line_limit(
+                    requested_line_count=len(desired_contracts_by_key),
+                    operation_name="streaming.subscribe_many",
                 )
+            active_matches_desired = self._active_matches_desired_locked(
+                desired_contracts_by_key
             )
             no_op = (
                 desired_contracts_by_key == self._desired_contracts_by_key
@@ -677,6 +796,20 @@ class LiveMarketDataStreamService:
                 "stale_reconnect_enabled": self._stale_reconnect_enabled,
                 "stale_reconnect_allowed": self._stale_reconnect_allowed_locked(now),
                 "stale_reconnect_count": self._stale_reconnect_count,
+                "last_connectivity_event_at": (
+                    self._last_connectivity_event_at.isoformat()
+                    if self._last_connectivity_event_at is not None
+                    else None
+                ),
+                "last_connectivity_event_code": self._last_connectivity_event_code,
+                "last_connectivity_event_message": self._last_connectivity_event_message,
+                "connectivity_resubscribe_count": self._connectivity_resubscribe_count,
+                "connectivity_maintained_count": self._connectivity_maintained_count,
+                "market_data_line_limit": (
+                    self._pacing_governor.config.max_market_data_lines
+                    if self._pacing_governor is not None
+                    else None
+                ),
                 "last_stale_detected_at": (
                     self._last_stale_detected_at.isoformat()
                     if self._last_stale_detected_at is not None
@@ -684,6 +817,13 @@ class LiveMarketDataStreamService:
                 ),
                 "desired_subscription_count": len(self._desired_contracts_by_key),
                 "desired_symbols": sorted(self._desired_contracts_by_key),
+                "last_desired_update_at": (
+                    self._last_desired_update_at.isoformat()
+                    if self._last_desired_update_at is not None
+                    else None
+                ),
+                "desired_update_count": self._desired_update_count,
+                "desired_noop_count": self._desired_noop_count,
                 "subscribed_count": len(self._subscriptions_by_key),
                 "last_subscribe_request_at": (
                     self._last_subscribe_request_at.isoformat()
@@ -804,6 +944,11 @@ class LiveMarketDataStreamService:
                 primary_exchange=contract.primary_exchange,
             ),
         )
+        if self._pacing_governor is not None:
+            self._pacing_governor.acquire_api_request(
+                "streaming.req_mkt_data",
+                permits=1,
+            )
         client.reqMktData(request_id, ib_contract, "", False, False, [])
 
     def _unsubscribe_key_locked(self, key: str) -> None:
@@ -814,6 +959,11 @@ class LiveMarketDataStreamService:
         self._actual_unsubscription_count += 1
         client = self._client
         if client is not None and client.isConnected():
+            if self._pacing_governor is not None:
+                self._pacing_governor.acquire_api_request(
+                    "streaming.cancel_mkt_data",
+                    permits=1,
+                )
             client.cancelMktData(subscription.request_id)
 
     def _on_connected(self) -> None:
@@ -840,6 +990,28 @@ class LiveMarketDataStreamService:
                 "observed_at": _utc_now().isoformat(),
             }
             self._errors.append(payload)
+            if error_code == 1101:
+                observed_at = _utc_now()
+                self._last_connectivity_event_at = observed_at
+                self._last_connectivity_event_code = error_code
+                self._last_connectivity_event_message = error_string
+                self._connectivity_resubscribe_count += 1
+                self._last_error = (
+                    f"[{error_code}] {error_string}; desired streams need resubscribe"
+                )
+                for subscription in self._subscriptions_by_key.values():
+                    subscription.status = "error"
+                    subscription.last_error = f"[{error_code}] {error_string}"
+                self._desired_changed_event.set()
+                return
+            if error_code == 1102:
+                observed_at = _utc_now()
+                self._last_connectivity_event_at = observed_at
+                self._last_connectivity_event_code = error_code
+                self._last_connectivity_event_message = error_string
+                self._connectivity_maintained_count += 1
+                self._last_error = None
+                return
             if key is not None and key in self._subscriptions_by_key:
                 self._subscriptions_by_key[key].status = "error"
                 self._subscriptions_by_key[key].last_error = (

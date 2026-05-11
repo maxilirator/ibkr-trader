@@ -587,6 +587,7 @@ def _mark_missing_open_orders_closed(
     snapshot: BrokerRuntimeSnapshot,
     observed_at: datetime,
     default_account_key: str | None,
+    empty_open_orders_authoritative: bool = False,
 ) -> None:
     account_scope = _snapshot_account_scope(
         snapshot,
@@ -614,6 +615,7 @@ def _mark_missing_open_orders_closed(
         not observed_external_order_ids
         and not observed_external_perm_ids
         and not observed_order_refs
+        and not empty_open_orders_authoritative
     ):
         return
 
@@ -2862,6 +2864,7 @@ def persist_broker_runtime_snapshot(
     captured_at: datetime,
     default_account_key: str | None = None,
     close_missing_open_orders: bool = False,
+    empty_open_orders_authoritative: bool = False,
 ) -> None:
     """Persist a real broker runtime snapshot into durable ledger tables."""
 
@@ -2914,6 +2917,7 @@ def persist_broker_runtime_snapshot(
                 snapshot=snapshot,
                 observed_at=captured_at,
                 default_account_key=default_account_key,
+                empty_open_orders_authoritative=empty_open_orders_authoritative,
             )
 
         _persist_executions(

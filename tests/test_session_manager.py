@@ -5,6 +5,7 @@ import time
 from unittest import TestCase
 
 from ibkr_trader.config import IbkrConnectionConfig
+from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.session_manager import ManagedSyncSession
 
 
@@ -339,6 +340,48 @@ class SessionManagerTests(TestCase):
         self.assertIsNotNone(status.circuit_breaker_until)
         self.assertIsNotNone(status.cooldown_seconds_remaining)
         self.assertGreaterEqual(status.cooldown_seconds_remaining or 0, 800)
+
+    def test_next_valid_id_failure_trips_global_broker_circuit(self) -> None:
+        circuit = BrokerHealthCircuit(default_open_seconds=900)
+        failing_session = ManagedSyncSession(
+            "diagnostic",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FailingSyncWrapperWithReason,
+            initial_connect_backoff_seconds=5,
+            max_connect_backoff_seconds=60,
+            api_startup_failure_slow_probe_seconds=900,
+            gateway_diagnostics_reader=lambda: {},
+            broker_circuit=circuit,
+        )
+
+        with self.assertRaisesRegex(ConnectionError, "nextValidId"):
+            failing_session.execute("heartbeat_probe", lambda app: app.connection_args)
+
+        healthy_session = ManagedSyncSession(
+            "primary",
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4001,
+                client_id=0,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            wrapper_cls=_FakeSyncWrapper,
+            broker_circuit=circuit,
+        )
+        with self.assertRaisesRegex(ConnectionError, "Global IBKR broker circuit"):
+            healthy_session.execute("runtime_snapshot", lambda app: app.connection_args)
+
+        snapshot = circuit.snapshot()
+        self.assertTrue(snapshot["open"])
+        self.assertEqual(snapshot["reason"], "api_startup_no_next_valid_id")
+        self.assertEqual(snapshot["source"], "diagnostic")
 
     def test_execute_can_ignore_cooldown_for_explicit_health_checks(self) -> None:
         session = ManagedSyncSession(

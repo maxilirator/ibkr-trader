@@ -10,10 +10,11 @@ Environment=HOST=0.0.0.0
 Environment=PORT=4173
 Environment=ORIGIN=http://quant.geisler.se:4173
 Environment=IBKR_TRADER_API_BASE_URL=http://127.0.0.1:8000
-ExecStart=%h/.local/bin/node %h/ibkr-trader/dashboard/build
+Environment=SHUTDOWN_TIMEOUT=5
+ExecStart=%h/.local/bin/node %h/ibkr-trader/dashboard/build/index.js
 Restart=always
 RestartSec=5
-TimeoutStopSec=20
+TimeoutStopSec=12
 
 [Install]
 WantedBy=default.target

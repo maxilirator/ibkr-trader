@@ -6,11 +6,15 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from ibkr_trader.config import IbkrConnectionConfig
+from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.market_stream import MarketStreamContract
 from ibkr_trader.ibkr.market_stream import MarketStreamQuote
 from ibkr_trader.ibkr.market_stream import MarketStreamSubscription
 from ibkr_trader.ibkr.market_stream import _normalize_ib_error_args
+from ibkr_trader.ibkr.pacing import BrokerApiPacingGovernor
+from ibkr_trader.ibkr.pacing import BrokerPacingConfig
+from ibkr_trader.ibkr.pacing import BrokerPacingLimitExceeded
 
 
 class MarketStreamTests(TestCase):
@@ -287,6 +291,197 @@ class MarketStreamTests(TestCase):
         self.assertEqual(client.market_data_type_requests, 0)
         self.assertEqual(client.market_data_requests, 0)
         self.assertEqual(client.cancel_requests, 0)
+
+    def test_subscribe_respects_configured_market_data_line_limit(self) -> None:
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            pacing_governor=BrokerApiPacingGovernor(
+                BrokerPacingConfig(max_market_data_lines=1)
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            BrokerPacingLimitExceeded,
+            "market data line limit",
+        ):
+            service.subscribe_many(
+                [
+                    MarketStreamContract(symbol="AXFO"),
+                    MarketStreamContract(symbol="VOLV B"),
+                ],
+                replace=True,
+            )
+
+        snapshot = service.snapshot()
+        self.assertEqual(snapshot["desired_subscription_count"], 0)
+        self.assertEqual(snapshot["market_data_line_limit"], 1)
+
+    def test_set_desired_many_does_not_touch_broker_socket(self) -> None:
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+
+        snapshot = service.set_desired_many(
+            [MarketStreamContract(symbol="AXFO")],
+            replace=True,
+            market_data_type="LIVE",
+        )
+        repeated_snapshot = service.set_desired_many(
+            [MarketStreamContract(symbol="AXFO")],
+            replace=True,
+            market_data_type="LIVE",
+        )
+
+        self.assertFalse(snapshot["running"])
+        self.assertEqual(snapshot["desired_subscription_count"], 1)
+        self.assertEqual(snapshot["desired_symbols"], ["AXFO"])
+        self.assertEqual(snapshot["desired_update_count"], 1)
+        self.assertEqual(snapshot["actual_subscription_count"], 0)
+        self.assertEqual(repeated_snapshot["desired_noop_count"], 1)
+
+    def test_restore_desired_subscriptions_cancels_stale_extras(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.cancel_requests: list[int] = []
+
+            def isConnected(self) -> bool:  # noqa: N802
+                return True
+
+            def cancelMktData(self, request_id: int) -> None:  # noqa: N802
+                self.cancel_requests.append(request_id)
+
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        client = FakeClient()
+        keep_contract = MarketStreamContract(symbol="AXFO")
+        stale_contract = MarketStreamContract(symbol="VOLV B")
+        service._client = client
+        service._desired_contracts_by_key["AXFO"] = keep_contract
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=keep_contract,
+            subscribed_at=datetime(2026, 5, 8, 7, 0, tzinfo=UTC),
+        )
+        service._subscriptions_by_key["VOLV B"] = MarketStreamSubscription(
+            request_id=101,
+            contract=stale_contract,
+            subscribed_at=datetime(2026, 5, 8, 7, 0, tzinfo=UTC),
+        )
+        service._subscription_keys_by_req_id[100] = "AXFO"
+        service._subscription_keys_by_req_id[101] = "VOLV B"
+
+        snapshot = service._restore_desired_subscriptions()
+
+        self.assertEqual(client.cancel_requests, [101])
+        self.assertEqual(snapshot["subscribed_count"], 1)
+        self.assertEqual(snapshot["subscriptions"][0]["contract"]["symbol"], "AXFO")
+
+    def test_connectivity_1101_marks_subscriptions_for_resubscribe(self) -> None:
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        contract = MarketStreamContract(symbol="AXFO")
+        service._desired_contracts_by_key["AXFO"] = contract
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=contract,
+            subscribed_at=datetime(2026, 5, 8, 7, 0, tzinfo=UTC),
+        )
+        service._subscription_keys_by_req_id[100] = "AXFO"
+
+        service._on_error(
+            req_id=-1,
+            error_time=None,
+            error_code=1101,
+            error_string="Connectivity between IB and server has been restored - data lost",
+            advanced_order_reject_json="",
+        )
+
+        snapshot = service.snapshot()
+        self.assertEqual(snapshot["connectivity_resubscribe_count"], 1)
+        self.assertEqual(snapshot["last_connectivity_event_code"], 1101)
+        self.assertEqual(snapshot["subscriptions"][0]["status"], "error")
+        self.assertTrue(service._desired_changed_event.is_set())
+
+    def test_connectivity_1102_records_maintained_without_churn(self) -> None:
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        contract = MarketStreamContract(symbol="AXFO")
+        service._desired_contracts_by_key["AXFO"] = contract
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=contract,
+            subscribed_at=datetime(2026, 5, 8, 7, 0, tzinfo=UTC),
+        )
+        service._subscription_keys_by_req_id[100] = "AXFO"
+
+        service._on_error(
+            req_id=-1,
+            error_time=None,
+            error_code=1102,
+            error_string="Connectivity between IB and server has been restored - data maintained",
+            advanced_order_reject_json="",
+        )
+
+        snapshot = service.snapshot()
+        self.assertEqual(snapshot["connectivity_maintained_count"], 1)
+        self.assertEqual(snapshot["last_connectivity_event_code"], 1102)
+        self.assertEqual(snapshot["subscriptions"][0]["status"], "subscribed")
+        self.assertFalse(service._desired_changed_event.is_set())
+
+    def test_global_broker_circuit_blocks_stream_restore(self) -> None:
+        circuit = BrokerHealthCircuit(default_open_seconds=900)
+        circuit.trip(
+            reason="api_startup_no_next_valid_id",
+            source="diagnostic",
+            error="socket connected but API startup did not return nextValidId",
+        )
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            broker_circuit=circuit,
+        )
+        service._desired_contracts_by_key["AXFO"] = MarketStreamContract(symbol="AXFO")
+
+        with self.assertRaisesRegex(ConnectionError, "Global IBKR broker circuit"):
+            service._restore_desired_subscriptions()
 
     def test_snapshot_marks_connected_stream_stale_when_ticks_stop(self) -> None:
         class FakeClient:

@@ -185,7 +185,8 @@ Important visibility limit:
 
 ### `POST /v1/market-data/historical-bars`
 
-Runs a read-only IBKR historical-bars request through the diagnostic client ID.
+Runs a read-only IBKR historical-bars request through the historical/backfill
+client ID.
 
 Use it to:
 
@@ -211,7 +212,8 @@ Example request body:
 
 ### `POST /v1/market-data/stockholm-intraday-backfill`
 
-Collects one paged batch of Stockholm intraday bars through the diagnostic IBKR session.
+Collects one paged batch of Stockholm intraday bars through the
+historical/backfill IBKR session.
 
 Use it to:
 
@@ -349,16 +351,17 @@ Important current behavior:
 - it is intended as the first raw-data primitive for the future parquet ingestion service
 - if IBKR rejects the requested tick-by-tick stream, the endpoint returns the broker error directly
 
-### `POST /v1/market-data/stream/subscribe`
+### `POST /v1/market-data/stream/desired`
 
-Starts or updates the persistent IBKR market-data stream used by the RL runner.
-This is the production path for active candidate names: subscribe once, keep the
-socket open, and build observations from the in-memory 1-minute bar buffer.
+Publishes the desired persistent market-data stream set used by the RL runner.
+This is the normal production path for active candidate names: the runner writes
+desired symbols, the API stream owner applies broker subscription diffs, keeps
+one socket open, and builds observations from the in-memory 1-minute bar buffer.
 
 Example:
 
 ```bash
-curl -sS -X POST "$API/v1/market-data/stream/subscribe" \
+curl -sS -X POST "$API/v1/market-data/stream/desired" \
   -H "Content-Type: application/json" \
   -d '{
     "symbols": ["AXFO", "AZN", "TELIA"],
@@ -371,8 +374,15 @@ curl -sS -X POST "$API/v1/market-data/stream/subscribe" \
 ```
 
 Use `replace=true` for a fresh morning candidate list. Use `replace=false` to
-add names without dropping existing subscriptions. The service keeps top of
-book, last price, and 1-minute OHLC bars from live last-price ticks.
+add names without dropping existing desired symbols. The endpoint does not open
+a broker socket itself; the API stream owner reconciles the desired set.
+
+### `POST /v1/market-data/stream/subscribe`
+
+Operator/API-owner endpoint that applies the requested set to the persistent
+IBKR market-data stream immediately. Prefer `/desired` for automated runners.
+The service keeps top of book, last price, and 1-minute OHLC bars from live
+last-price ticks.
 For Stockholm symbols, the API enriches canonical dash symbols such as `ERIC-B`
 with ticker alias and ISIN from `XSTO_IDENTITY_PATH` before opening the IBKR
 subscription, while snapshots still use the canonical dash symbol keys.

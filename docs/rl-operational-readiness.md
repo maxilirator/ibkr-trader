@@ -7,7 +7,7 @@ This is the morning checklist for making the long and short RL agents real.
 - model registry and deployment registry
 - shared virtual account support with market-watch quotes and virtual fills
 - model-routed candidate intake as `MODEL_ROUTED_PENDING`
-- persistent IBKR market-data stream subscribe/snapshot endpoints
+- persistent IBKR market-data stream desired/subscribe/snapshot endpoints
 - market-stream desired watchlist and automatic reconnect backoff
 - explicit market-stream subscription cap and overflow reporting
 - 1-minute source bars aggregated into model-facing 5-minute OHLC
@@ -43,9 +43,11 @@ The promoted runner is `scripts/run_rl_agents.py`. It is designed to:
 - treat the returned candidate set as the daily dynamic universe; do not assume
   fixed long/short counts
 - require static candidate features from each model-routed instruction payload
-- backfill prior 1-minute bars once per model/name/trade day and cache the
-  previous-session/trailing-volatility override
-- subscribe active names with `POST /v1/market-data/stream/subscribe`
+- use candidate metadata/history features by default for previous-session and
+  trailing-volatility overrides; live historical backfill requires the explicit
+  `--allow-live-historical-backfill` diagnostic flag
+- publish active names with `POST /v1/market-data/stream/desired`; the API
+  stream owner applies broker subscription diffs
 - call `POST /v1/rl/observations/build` every minute from the stream buffer
 - infer only when `model_decision.ready=true` and the `decision_id` is new
 - infer only when the symbol has the current completed 5-minute decision bar;
@@ -118,7 +120,8 @@ Quant API instructions.
 1. Confirm exactly two deployments exist, one long and one short, both on
    `VIRTUALRL01`.
 2. Submit model-routed candidate names for both deployments.
-3. Subscribe the active names with `/v1/market-data/stream/subscribe`.
+3. Publish the active names with `/v1/market-data/stream/desired` and confirm
+   the API stream owner subscribes them.
 4. For each name, build observations from the stream plus static features.
 5. Confirm `model_decision.ready=true` only at completed 5-minute boundaries.
 6. Force or observe one long `entry_prevclose_-50bp` decision and one short
@@ -160,6 +163,13 @@ The trader should not spam IB Gateway during an outage:
 
 - primary and diagnostic broker sessions use exponential connect cooldown
 - market streaming uses the same cooldown and remembers desired symbols
+- the promoted RL runner publishes desired stream state only; it does not force
+  broker subscription repair from the runner process
+- IBKR `1101` marks active stream subscriptions for resubscribe; `1102`
+  records that data was maintained and avoids subscription churn
+- `nextValidId` startup failures trip a shared broker circuit that blocks
+  primary, diagnostic, historical/backfill, and stream repair paths except for
+  an explicit forced health probe
 - market streaming auto-reconnect restores the desired watchlist after recovery
 - broker monitor skips snapshot refresh when the heartbeat already failed
 - background execution runtime retries after broker exceptions with restart backoff
@@ -171,15 +181,18 @@ The API and dashboard should remain available while broker access is degraded.
 The runner and API now use an explicit stream cap. The default is:
 
 ```dotenv
+IBKR_MARKET_DATA_LINE_LIMIT=80
 MARKET_STREAM_MAX_SUBSCRIPTIONS=120
 ```
 
 The runner prioritizes active candidate symbols over dashboard benchmark
 symbols. If the desired set is larger than the cap, overflow symbols are
-reported in the runner heartbeat under `stream_plan`. The operational target is
-to keep normal long plus short RL universes comfortably below the cap; if the
-upstream payload starts producing larger daily universes, raise the cap only
-after checking IBKR market-data line limits and host resource usage.
+reported in the runner heartbeat under `stream_plan`. The API enforces the
+lower of `MARKET_STREAM_MAX_SUBSCRIPTIONS` and `IBKR_MARKET_DATA_LINE_LIMIT`.
+The operational target is to keep normal long plus short RL universes
+comfortably below the line limit; if the upstream payload starts producing
+larger daily universes, raise the limit only after checking IBKR entitlements,
+TWS watchlists, and host resource usage.
 
 Dashboard truth rule:
 

@@ -12,6 +12,9 @@ from typing import Any
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 
+IBKR_INFORMATIONAL_MESSAGE_CODES = {2104, 2106, 2107, 2108, 2119, 2158}
+
+
 class _LocalResponseTimeout(TimeoutError):
     """Fallback timeout class for tests and fake wrappers without ibapi installed."""
 
@@ -708,7 +711,8 @@ def load_sync_wrapper_class() -> type[Any]:
         ) -> None:
             if errorCode == 2100 and "unsubscribed from account data" in errorString.lower():
                 return
-            super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+            if errorCode not in IBKR_INFORMATIONAL_MESSAGE_CODES:
+                super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
             if self._is_callback_suppressed("order_error"):
                 return
             if reqId < 0 or reqId not in self._known_order_ids:

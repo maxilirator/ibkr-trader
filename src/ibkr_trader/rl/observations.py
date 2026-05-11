@@ -130,6 +130,7 @@ class ObservationConfig:
     include_market_context: bool = True
     include_vol_normalized_intraday_state: bool = True
     vol_normalization_floor: float = DEFAULT_VOL_NORMALIZATION_FLOOR
+    min_observed_bar_coverage_ratio: float = 0.8
 
     @property
     def zoneinfo(self) -> ZoneInfo:
@@ -186,6 +187,11 @@ def observation_config_from_contract(
         raise ValueError("decision_cadence must be positive")
     if vol_floor <= 0.0:
         raise ValueError("vol_normalization_floor must be positive")
+    min_coverage_ratio = float(
+        merged.get("min_observed_bar_coverage_ratio", 0.8)
+    )
+    if not 0.0 <= min_coverage_ratio <= 1.0:
+        raise ValueError("min_observed_bar_coverage_ratio must be between 0 and 1")
     return ObservationConfig(
         session_timezone=str(
             merged.get("session_timezone", DEFAULT_SESSION_TIMEZONE)
@@ -207,6 +213,7 @@ def observation_config_from_contract(
             merged.get("include_vol_normalized_intraday_state", True)
         ),
         vol_normalization_floor=vol_floor,
+        min_observed_bar_coverage_ratio=min_coverage_ratio,
     )
 
 
@@ -853,6 +860,60 @@ def _decision_metadata(
     }
 
 
+def _observed_bar_quality_metadata(
+    bars: Sequence[Phase1Bar],
+    *,
+    config: ObservationConfig,
+) -> dict[str, Any]:
+    complete_bars = [bar for bar in bars if bar.complete]
+    if not complete_bars:
+        return {
+            "bar_sequence_policy": "observed_provider_bars_only",
+            "coverage_policy": "complete_5m_bars_since_session_open",
+            "min_coverage_ratio": config.min_observed_bar_coverage_ratio,
+            "expected_complete_bar_count": 0,
+            "observed_complete_bar_count": 0,
+            "missing_complete_bar_count": 0,
+            "coverage_ratio": None,
+            "passes": False,
+            "reason": "waiting_for_first_completed_5m_bar",
+        }
+    latest_complete = complete_bars[-1]
+    session_open, _session_close = _session_bounds(latest_complete.started_at.date(), config)
+    elapsed_minutes = (
+        latest_complete.ended_at - session_open
+    ).total_seconds() / 60.0
+    expected_complete_count = max(
+        1,
+        int(math.ceil(elapsed_minutes / config.target_bar_minutes)),
+    )
+    observed_complete_count = len(complete_bars)
+    coverage_ratio = min(
+        1.0,
+        float(observed_complete_count / expected_complete_count),
+    )
+    missing_complete_count = max(
+        expected_complete_count - observed_complete_count,
+        0,
+    )
+    passes = coverage_ratio >= config.min_observed_bar_coverage_ratio
+    return {
+        "bar_sequence_policy": "observed_provider_bars_only",
+        "coverage_policy": "complete_5m_bars_since_session_open",
+        "min_coverage_ratio": config.min_observed_bar_coverage_ratio,
+        "expected_complete_bar_count": expected_complete_count,
+        "observed_complete_bar_count": observed_complete_count,
+        "missing_complete_bar_count": missing_complete_count,
+        "coverage_ratio": coverage_ratio,
+        "passes": passes,
+        "reason": (
+            "coverage_ok"
+            if passes
+            else "observed_bar_coverage_below_threshold"
+        ),
+    }
+
+
 def _feature_payload_for_symbol(
     *,
     symbol: str,
@@ -1094,6 +1155,24 @@ def build_phase1_observation_payload(
     for symbol, payload in symbol_payloads.items():
         latest_bar = phase1_bars_by_symbol[symbol][-1]
         static_payload = normalized_static_features.get(symbol)
+        data_quality = _observed_bar_quality_metadata(
+            phase1_bars_by_symbol[symbol],
+            config=config,
+        )
+        model_decision = _decision_metadata(
+            deployment_key=deployment_key,
+            symbol=symbol,
+            bars=phase1_bars_by_symbol[symbol],
+            config=config,
+        )
+        if model_decision.get("ready") and not data_quality["passes"]:
+            model_decision = {
+                **model_decision,
+                "ready": False,
+                "reason": "paused_observed_bar_coverage_below_threshold",
+                "decision_id": None,
+                "data_quality": data_quality,
+            }
         observations[symbol] = {
             "symbol": symbol,
             "session_date": target_date.isoformat(),
@@ -1101,12 +1180,8 @@ def build_phase1_observation_payload(
             "latest_bar_started_at": latest_bar.started_at.isoformat(),
             "latest_bar_ended_at": latest_bar.ended_at.isoformat(),
             "latest_bar_complete": latest_bar.complete,
-            "model_decision": _decision_metadata(
-                deployment_key=deployment_key,
-                symbol=symbol,
-                bars=phase1_bars_by_symbol[symbol],
-                config=config,
-            ),
+            "data_quality": data_quality,
+            "model_decision": model_decision,
             "phase1_bars": [
                 _serialize_phase1_bar(bar) for bar in phase1_bars_by_symbol[symbol]
             ],
@@ -1164,6 +1239,10 @@ def build_phase1_observation_payload(
             "update_cadence": "1m",
             "decision_cadence": "5m",
             "decision_policy": "completed_5m_bar_only",
+            "bar_sequence_policy": "observed_provider_bars_only",
+            "min_observed_bar_coverage_ratio": (
+                config.min_observed_bar_coverage_ratio
+            ),
             "source_adapter": "ibkr_1m_trades_to_phase1_5m_ohlc_v1",
             "source_bar_interval": "1m",
             "session_timezone": config.session_timezone,

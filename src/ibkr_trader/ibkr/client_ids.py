@@ -9,4 +9,5 @@ from __future__ import annotations
 # has special order-binding behavior.
 PRIMARY_RUNTIME_CLIENT_ID = 0
 DIAGNOSTIC_CLIENT_ID = 7
+HISTORICAL_CLIENT_ID = 8
 STREAMING_CLIENT_ID = 9

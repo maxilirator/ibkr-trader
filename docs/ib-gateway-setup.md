@@ -53,6 +53,7 @@ IBKR_HOST=127.0.0.1
 IBKR_PORT=4002
 IBKR_CLIENT_ID=0
 IBKR_DIAGNOSTIC_CLIENT_ID=7
+IBKR_HISTORICAL_CLIENT_ID=8
 IBKR_STREAMING_CLIENT_ID=9
 IBKR_ACCOUNT_IDS=U25245595,U25245596
 BROKER_MONITOR_ENABLED=true
@@ -61,6 +62,10 @@ BROKER_CONNECT_BACKOFF_MAX_SECONDS=300
 BROKER_HEARTBEAT_INTERVAL_SECONDS=30
 BROKER_SNAPSHOT_REFRESH_INTERVAL_SECONDS=60
 BROKER_STATUS_REFRESH_MIN_INTERVAL_SECONDS=30
+IBKR_API_STARTUP_FAILURE_SLOW_PROBE_SECONDS=900
+IBKR_API_MAX_REQUESTS_PER_SECOND=45
+IBKR_MARKET_DATA_LINE_LIMIT=80
+IBKR_HISTORICAL_REQUESTS_PER_10_MINUTES=50
 MARKET_STREAM_AUTO_RECONNECT_ENABLED=true
 MARKET_STREAM_RECONNECT_INTERVAL_SECONDS=15
 MARKET_STREAM_MAX_SUBSCRIPTIONS=120
@@ -75,13 +80,19 @@ Recommended repo usage:
 
 - reserve `IBKR_CLIENT_ID=0` for the main long-lived trading runtime
 - reserve `IBKR_DIAGNOSTIC_CLIENT_ID=7` for probe and contract-resolution calls
+- reserve `IBKR_HISTORICAL_CLIENT_ID=8` for historical bars and controlled backfill
 - reserve `IBKR_STREAMING_CLIENT_ID=9` for streaming and market-data sampling
 - set `IBKR_ACCOUNT_IDS` when the colocated runtime should refresh balances and portfolio data for multiple visible accounts without using the more fragile account-summary subscription path
 - do not work around ownership problems by generating fresh client IDs during normal operation
 - keep broker backoff enabled so failed Gateway connects cool down instead of looping
+- keep the API startup slow-probe circuit enabled so a `nextValidId` startup
+  failure blocks broker churn across sessions.
+- keep IBKR API pacing enabled. The live API now exposes pacing state in
+  `/healthz` and `/v1/ibkr/telemetry`.
 - keep market-stream auto reconnect enabled so existing subscribed symbols are restored after a Gateway recovery
-- keep the market-stream subscription cap explicit; the current default is 120
-  symbols, with the runner reporting overflow instead of silently dropping names
+- keep the market-stream subscription cap explicit. `MARKET_STREAM_MAX_SUBSCRIPTIONS`
+  is additionally capped by `IBKR_MARKET_DATA_LINE_LIMIT`, whose default is 80
+  lines.
 - keep dashboard-triggered broker status refresh throttled so operator pages can notice stale state without creating extra Gateway pressure
 - keep IBC `ExistingSessionDetectedAction=primary` on the dedicated live
   Gateway machine. The `primaryoverride` behavior can make IBC abandon the

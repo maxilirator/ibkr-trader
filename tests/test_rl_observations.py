@@ -30,6 +30,28 @@ def _bars_for_day(
     return bars
 
 
+def _bars_for_minutes(
+    day: str,
+    *,
+    start_price: float,
+    minutes: list[int],
+) -> list[dict[str, str]]:
+    bars: list[dict[str, str]] = []
+    for idx, minute in enumerate(minutes):
+        bars.append(
+            {
+                "timestamp": f"{day} 09:{minute:02d}:00",
+                "open": f"{start_price + idx:.2f}",
+                "high": f"{start_price + idx + 1.0:.2f}",
+                "low": f"{start_price + idx - 1.0:.2f}",
+                "close": f"{start_price + idx + 0.5:.2f}",
+                "volume": "1000",
+                "bar_count": "12",
+            }
+        )
+    return bars
+
+
 def _history_override(prev_close: str = "100") -> dict[str, object]:
     return {
         "prev_close": prev_close,
@@ -103,6 +125,81 @@ class RLObservationTests(TestCase):
             axfo["features"]["extra_dynamic_feature_names"],
         )
         self.assertEqual(payload["market_context"]["counts_by_bar"], [2, 2])
+
+    def test_sparse_observed_bars_pause_when_coverage_is_below_threshold(self) -> None:
+        payload = build_phase1_observation_payload(
+            deployment_key="long_trial_106_virtual_shared_01",
+            model_key="long_trial_106_v1",
+            model_side="LONG",
+            observation_contract={
+                "bar_family": "phase1_intraday_ohlc_v1",
+                "bar_interval": "5m",
+                "session_timezone": "Europe/Stockholm",
+                "session_open_local": "09:00",
+                "session_close_local": "17:30",
+                "include_market_context": False,
+                "include_vol_normalized_intraday_state": True,
+            },
+            action_space=["skip", "wait", "market_entry"],
+            as_of=datetime.fromisoformat("2026-04-28T09:20:30+02:00"),
+            symbols=["AXFO"],
+            source_bars_by_symbol={
+                "AXFO": _bars_for_minutes(
+                    "20260428",
+                    start_price=110.0,
+                    minutes=[0, 1, 2, 3, 4, 15, 16, 17, 18, 19],
+                ),
+            },
+            history_overrides={"AXFO": _history_override(prev_close="100")},
+        )
+
+        axfo = payload["observations"]["AXFO"]
+        self.assertEqual(axfo["bar_count"], 2)
+        self.assertFalse(axfo["model_decision"]["ready"])
+        self.assertEqual(
+            axfo["model_decision"]["reason"],
+            "paused_observed_bar_coverage_below_threshold",
+        )
+        self.assertEqual(
+            axfo["data_quality"]["bar_sequence_policy"],
+            "observed_provider_bars_only",
+        )
+        self.assertEqual(axfo["data_quality"]["expected_complete_bar_count"], 4)
+        self.assertEqual(axfo["data_quality"]["observed_complete_bar_count"], 2)
+        self.assertEqual(axfo["data_quality"]["missing_complete_bar_count"], 2)
+        self.assertAlmostEqual(axfo["data_quality"]["coverage_ratio"], 0.5)
+
+    def test_sparse_observed_bars_pass_when_coverage_threshold_allows_it(self) -> None:
+        payload = build_phase1_observation_payload(
+            deployment_key="long_trial_106_virtual_shared_01",
+            model_key="long_trial_106_v1",
+            model_side="LONG",
+            observation_contract={
+                "bar_family": "phase1_intraday_ohlc_v1",
+                "bar_interval": "5m",
+                "include_market_context": False,
+                "include_vol_normalized_intraday_state": True,
+            },
+            action_space=["skip", "wait", "market_entry"],
+            as_of=datetime.fromisoformat("2026-04-28T09:20:30+02:00"),
+            symbols=["AXFO"],
+            source_bars_by_symbol={
+                "AXFO": _bars_for_minutes(
+                    "20260428",
+                    start_price=110.0,
+                    minutes=[0, 1, 2, 3, 4, 15, 16, 17, 18, 19],
+                ),
+            },
+            history_overrides={"AXFO": _history_override(prev_close="100")},
+            config_overrides={"min_observed_bar_coverage_ratio": 0.5},
+        )
+
+        axfo = payload["observations"]["AXFO"]
+        self.assertTrue(axfo["model_decision"]["ready"])
+        self.assertEqual(
+            payload["input_contract"]["bar_sequence_policy"],
+            "observed_provider_bars_only",
+        )
 
     def test_accepts_history_override_when_only_live_day_bars_are_sent(self) -> None:
         payload = build_phase1_observation_payload(

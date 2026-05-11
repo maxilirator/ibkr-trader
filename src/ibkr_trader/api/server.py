@@ -55,9 +55,14 @@ from ibkr_trader.ibkr.contracts import (
     resolve_contracts,
     serialize_contract_resolve_result,
 )
+from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
+from ibkr_trader.ibkr.market_data_backfill import (
+    BackgroundMarketDataBackfillService,
+    enqueue_market_data_backfill_request,
+)
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.market_stream import MarketStreamContract
 from ibkr_trader.ibkr.market_stream_store import list_market_stream_bars
@@ -69,6 +74,9 @@ from ibkr_trader.ibkr.order_execution import submit_order_from_batch
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
 from ibkr_trader.ibkr.order_execution import submit_exit_order_from_instruction
 from ibkr_trader.ibkr.order_preview import preview_execution_batch
+from ibkr_trader.ibkr.pacing import BrokerApiPacingGovernor
+from ibkr_trader.ibkr.pacing import BrokerPacingConfig
+from ibkr_trader.ibkr.pacing import BrokerPacingLimitExceeded
 from ibkr_trader.ibkr.probe import probe_gateway
 from ibkr_trader.ibkr.runtime_snapshot import (
     fetch_broker_runtime_snapshot,
@@ -207,6 +215,11 @@ _BACKGROUND_RECOVERY_INSTRUCTION_STATES = {
     ExecutionState.ENTRY_SUBMITTED.value,
     ExecutionState.POSITION_OPEN.value,
     ExecutionState.EXIT_PENDING.value,
+}
+_OPERATOR_TERMINAL_EXECUTION_STATES = {
+    ExecutionState.ENTRY_CANCELLED.value,
+    ExecutionState.COMPLETED.value,
+    ExecutionState.FAILED.value,
 }
 _BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES = {
     "API_CANCELLED",
@@ -911,6 +924,116 @@ def _ibkr_historical_exchange(
     if raw_exchange in {"", "XSTO", "STO", "STOCKHOLM"}:
         return "SMART", raw_primary or "SFB"
     return raw_exchange, raw_primary or None
+
+
+def _rl_backfill_instrument(
+    *,
+    symbol: str,
+    fetch: Mapping[str, Any],
+    instruments: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_instrument = instruments.get(symbol) if isinstance(instruments, Mapping) else None
+    if not isinstance(raw_instrument, Mapping):
+        raw_instrument = {}
+    historical_exchange, historical_primary_exchange = _ibkr_historical_exchange(
+        exchange=raw_instrument.get("exchange", fetch.get("exchange", "SMART")),
+        primary_exchange=raw_instrument.get(
+            "primary_exchange",
+            fetch.get("primary_exchange", "SFB"),
+        ),
+    )
+    return {
+        "symbol": symbol,
+        "security_type": str(
+            raw_instrument.get("security_type", fetch.get("security_type", "STK"))
+        ).upper(),
+        "exchange": historical_exchange,
+        "currency": str(
+            raw_instrument.get("currency", fetch.get("currency", "SEK"))
+        ).upper(),
+        "primary_exchange": historical_primary_exchange,
+        "local_symbol": (
+            str(raw_instrument["local_symbol"])
+            if raw_instrument.get("local_symbol") is not None
+            else None
+        ),
+        "isin": (
+            str(raw_instrument["isin"])
+            if raw_instrument.get("isin") is not None
+            else None
+        ),
+    }
+
+
+def _paused_market_stream_observation(
+    *,
+    symbol: str,
+    as_of: datetime,
+    session_date: date,
+    reason: str,
+    backfill_request: Mapping[str, Any] | None,
+    min_coverage_ratio: float,
+) -> dict[str, Any]:
+    backfill_status = (
+        str(backfill_request.get("status"))
+        if isinstance(backfill_request, Mapping)
+        else None
+    )
+    data_quality = {
+        "bar_sequence_policy": "observed_provider_bars_only",
+        "coverage_policy": "complete_5m_bars_since_session_open",
+        "min_coverage_ratio": min_coverage_ratio,
+        "expected_complete_bar_count": None,
+        "observed_complete_bar_count": 0,
+        "missing_complete_bar_count": None,
+        "coverage_ratio": None,
+        "passes": False,
+        "reason": reason,
+        "backfill_request": dict(backfill_request or {}),
+    }
+    return {
+        "symbol": symbol,
+        "session_date": session_date.isoformat(),
+        "bar_count": 0,
+        "latest_bar_started_at": None,
+        "latest_bar_ended_at": None,
+        "latest_bar_complete": False,
+        "data_quality": data_quality,
+        "model_decision": {
+            "ready": False,
+            "reason": reason,
+            "decision_policy": "completed_5m_bar_only",
+            "decision_cadence": "5m",
+            "usable_bar_count": 0,
+            "latest_usable_bar_started_at": None,
+            "latest_usable_bar_ended_at": None,
+            "decision_id": None,
+            "ignore_trailing_incomplete_bar": False,
+            "next_decision_at": as_of.isoformat(),
+            "backfill_status": backfill_status,
+            "backfill_request": dict(backfill_request or {}),
+            "data_quality": data_quality,
+        },
+        "phase1_bars": [],
+        "features": {
+            "static_features_ready": False,
+            "static_feature_names": [],
+            "static_features": [],
+            "static_features_normalized": None,
+            "static_features_source": "paused_no_stream_bars",
+            "history_feature_names": [],
+            "history_features": [],
+            "history_features_named": {},
+            "base_dynamic_feature_names": [],
+            "base_dynamic": [],
+            "extra_dynamic_feature_names": [],
+            "extra_dynamic": [],
+            "path_feature_names": [],
+            "path_feature_stack": [],
+        },
+        "pricing_context": {},
+        "source_session_dates": [],
+    }
 
 
 def parse_virtual_account_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -2823,10 +2946,28 @@ def create_app(config: AppConfig | None = None) -> Any:
         require_loopback_only=app_config.api.require_loopback_only,
     )
     FastAPI, HTTPException, Request, JSONResponse = _load_fastapi_runtime()
+    broker_pacing_governor = BrokerApiPacingGovernor(
+        BrokerPacingConfig(
+            max_requests_per_second=app_config.ibkr_api_max_requests_per_second,
+            request_acquire_timeout_seconds=app_config.ibkr_api_pacing_timeout_seconds,
+            max_market_data_lines=app_config.ibkr_market_data_line_limit,
+            max_historical_requests_per_10_minutes=(
+                app_config.ibkr_historical_requests_per_10_minutes
+            ),
+        )
+    )
+    broker_circuit = BrokerHealthCircuit(
+        default_open_seconds=app_config.broker_api_startup_failure_slow_probe_seconds
+    )
     broker_sessions = CanonicalSyncSessions(
         app_config.ibkr,
         initial_connect_backoff_seconds=app_config.broker_connect_backoff_initial_seconds,
         max_connect_backoff_seconds=app_config.broker_connect_backoff_max_seconds,
+        api_startup_failure_slow_probe_seconds=(
+            app_config.broker_api_startup_failure_slow_probe_seconds
+        ),
+        pacing_governor=broker_pacing_governor,
+        broker_circuit=broker_circuit,
     )
 
     def with_primary_session(
@@ -2848,6 +2989,18 @@ def create_app(config: AppConfig | None = None) -> Any:
         ignore_cooldown: bool = False,
     ) -> Any:
         return broker_sessions.diagnostic.execute(
+            operation_name,
+            operation,
+            ignore_cooldown=ignore_cooldown,
+        )
+
+    def with_historical_session(
+        operation_name: str,
+        operation: Any,
+        *,
+        ignore_cooldown: bool = False,
+    ) -> Any:
+        return broker_sessions.historical.execute(
             operation_name,
             operation,
             ignore_cooldown=ignore_cooldown,
@@ -3079,6 +3232,8 @@ def create_app(config: AppConfig | None = None) -> Any:
         stale_data_after_seconds=app_config.market_stream_stale_after_seconds,
         stale_reconnect_enabled=app_config.market_stream_stale_reconnect_enabled,
         stale_reconnect_timezone=app_config.timezone,
+        pacing_governor=broker_pacing_governor,
+        broker_circuit=broker_circuit,
     )
 
     def sync_virtual_market_watch_from_stream(cycle_at: datetime) -> dict[str, Any]:
@@ -3093,6 +3248,14 @@ def create_app(config: AppConfig | None = None) -> Any:
         app_config,
         broker_sessions,
         virtual_market_sync=sync_virtual_market_watch_from_stream,
+    )
+    market_data_backfill_worker = BackgroundMarketDataBackfillService(
+        session_factory,
+        broker_config=app_config.ibkr.historical_session(),
+        execute_historical=with_historical_session,
+        interval_seconds=app_config.market_data_backfill_interval_seconds,
+        batch_size=app_config.market_data_backfill_batch_size,
+        timeout_seconds=app_config.market_data_backfill_timeout_seconds,
     )
     market_stream_identity_map = load_stockholm_identity_map(
         app_config.stockholm_identity_path,
@@ -3119,9 +3282,15 @@ def create_app(config: AppConfig | None = None) -> Any:
                 runtime_key=EXECUTION_RUNTIME_KEY,
                 note="Execution runtime disabled by EXECUTION_RUNTIME_ENABLED=false.",
             )
+        if (
+            app_config.market_data_backfill_worker_enabled
+            and app_config.environment != "test"
+        ):
+            market_data_backfill_worker.start()
         try:
             yield
         finally:
+            market_data_backfill_worker.stop()
             market_stream_service.stop()
             execution_runtime.stop()
             broker_monitor.stop()
@@ -3134,10 +3303,20 @@ def create_app(config: AppConfig | None = None) -> Any:
         lifespan=lifespan,
     )
     app.state.broker_sessions = broker_sessions
+    app.state.broker_pacing_governor = broker_pacing_governor
+    app.state.broker_circuit = broker_circuit
     app.state.broker_monitor = broker_monitor
     app.state.execution_runtime = execution_runtime
+    app.state.market_data_backfill_worker = market_data_backfill_worker
     app.state.market_stream_service = market_stream_service
     app.state.market_stream_identity_map = market_stream_identity_map
+
+    @app.exception_handler(BrokerPacingLimitExceeded)
+    async def broker_pacing_limit_handler(
+        _: FastAPIRequest,
+        exc: BrokerPacingLimitExceeded,
+    ) -> Any:
+        return JSONResponse(status_code=429, content={"detail": str(exc)})
 
     @app.middleware("http")
     async def require_local_client(request: FastAPIRequest, call_next: Any) -> Any:
@@ -3170,6 +3349,8 @@ def create_app(config: AppConfig | None = None) -> Any:
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
             "broker_sessions": broker_sessions.status_snapshot(blocking=False),
+            "broker_circuit": broker_circuit.snapshot(),
+            "broker_pacing": broker_pacing_governor.snapshot(),
             "ibgateway": read_ibgateway_diagnostics(),
             "broker_operations": broker_sessions.activity_tracker.snapshot(recent_limit=10),
             "broker_monitor": serialize_broker_monitor_status(broker_monitor.status()),
@@ -3193,6 +3374,8 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "telemetry": broker_sessions.telemetry_snapshot(recent_limit=recent_limit),
+            "circuit": broker_circuit.snapshot(),
+            "pacing": broker_pacing_governor.snapshot(),
         }
 
     @app.post("/v1/ibkr/probe")
@@ -3325,10 +3508,10 @@ def create_app(config: AppConfig | None = None) -> Any:
     def get_historical_bars(payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
         try:
             query = parse_historical_bars_payload(payload)
-            return with_diagnostic_session(
+            return with_historical_session(
                 "historical_bars",
                 lambda broker_app: read_historical_bars(
-                    app_config.ibkr.diagnostic_session(),
+                    app_config.ibkr.historical_session(),
                     query,
                     timeout=timeout,
                     app=broker_app,
@@ -3352,10 +3535,10 @@ def create_app(config: AppConfig | None = None) -> Any:
     ) -> dict[str, Any]:
         try:
             query = parse_stockholm_intraday_backfill_payload(payload)
-            result = with_diagnostic_session(
+            result = with_historical_session(
                 "stockholm_intraday_backfill",
                 lambda broker_app: collect_stockholm_intraday_backfill(
-                    app_config.ibkr.diagnostic_session(),
+                    app_config.ibkr.historical_session(),
                     query,
                     instruments_path=app_config.stockholm_instruments_path,
                     identity_path=app_config.stockholm_identity_path,
@@ -3413,7 +3596,7 @@ def create_app(config: AppConfig | None = None) -> Any:
             parsed = parse_market_stream_subscribe_payload(
                 payload,
                 stockholm_identity_map=request.app.state.market_stream_identity_map,
-                max_contracts=app_config.market_stream_max_subscriptions,
+                max_contracts=app_config.effective_market_stream_max_subscriptions,
             )
             snapshot = request.app.state.market_stream_service.subscribe_many(
                 parsed["contracts"],
@@ -3430,6 +3613,36 @@ def create_app(config: AppConfig | None = None) -> Any:
         return {
             "accepted": True,
             "mode": "streaming_market_data",
+            "session_client_id": app_config.ibkr.streaming_client_id,
+            "stream": snapshot,
+        }
+
+    @app.post("/v1/market-data/stream/desired")
+    def set_market_data_stream_desired(
+        payload: dict[str, Any],
+        request: FastAPIRequest,
+    ) -> dict[str, Any]:
+        try:
+            parsed = parse_market_stream_subscribe_payload(
+                payload,
+                stockholm_identity_map=request.app.state.market_stream_identity_map,
+                max_contracts=app_config.effective_market_stream_max_subscriptions,
+            )
+            snapshot = request.app.state.market_stream_service.set_desired_many(
+                parsed["contracts"],
+                replace=parsed["replace"],
+                market_data_type=parsed["market_data_type"],
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except IbkrDependencyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        return {
+            "accepted": True,
+            "mode": "streaming_market_data_desired",
             "session_client_id": app_config.ibkr.streaming_client_id,
             "stream": snapshot,
         }
@@ -4313,7 +4526,13 @@ def create_app(config: AppConfig | None = None) -> Any:
 
             fetched_symbols: list[str] = []
             streamed_symbols: list[str] = []
+            backfill_requests: list[dict[str, Any]] = []
             source_mode = "provided"
+            config_overrides = dict(parsed["config_overrides"])
+            config_overrides.setdefault(
+                "min_observed_bar_coverage_ratio",
+                app_config.rl_observed_bar_min_coverage_ratio,
+            )
             if not source_bars:
                 fetch = dict(parsed["fetch"])
                 fetch_mode = (
@@ -4346,98 +4565,162 @@ def create_app(config: AppConfig | None = None) -> Any:
                     missing_stream_bars = [
                         symbol for symbol in requested_symbols if symbol not in stream_bars
                     ]
-                    if missing_stream_bars and bool(fetch.get("backfill_missing", False)):
-                        instruments = (
-                            fetch.get("instruments")
-                            if isinstance(fetch.get("instruments"), Mapping)
-                            else {}
-                        )
-                        backfilled_bars: dict[str, Any] = {}
+                    instruments = (
+                        fetch.get("instruments")
+                        if isinstance(fetch.get("instruments"), Mapping)
+                        else {}
+                    )
+                    backfill_missing = bool(fetch.get("backfill_missing", True))
+                    session_date = parsed["as_of"].astimezone(
+                        ZoneInfo(app_config.timezone)
+                    ).date()
+                    if missing_stream_bars and backfill_missing:
                         for symbol in missing_stream_bars:
-                            instrument = (
-                                instruments.get(symbol)
-                                if isinstance(instruments, Mapping)
-                                else None
-                            )
-                            if not isinstance(instrument, Mapping):
-                                instrument = {}
-                            historical_exchange, historical_primary_exchange = (
-                                _ibkr_historical_exchange(
-                                    exchange=instrument.get(
-                                        "exchange",
-                                        fetch.get("exchange", "SMART"),
-                                    ),
-                                    primary_exchange=instrument.get(
-                                        "primary_exchange",
-                                        fetch.get("primary_exchange", "SFB"),
-                                    ),
-                                )
-                            )
-                            query = HistoricalBarsQuery(
-                                symbol=symbol,
-                                security_type=str(
-                                    instrument.get(
-                                        "security_type",
-                                        fetch.get("security_type", "STK"),
-                                    )
-                                ).upper(),
-                                exchange=historical_exchange,
-                                currency=str(
-                                    instrument.get("currency", fetch.get("currency", "SEK"))
-                                ).upper(),
-                                primary_exchange=historical_primary_exchange,
-                                isin=(
-                                    str(instrument["isin"])
-                                    if instrument.get("isin") is not None
-                                    else None
-                                ),
-                                duration=str(fetch.get("backfill_duration", "1 D")),
-                                bar_size=str(fetch.get("backfill_bar_size", "1 min")),
-                                what_to_show=str(fetch.get("what_to_show", "TRADES")).upper(),
-                                use_rth=bool(fetch.get("use_rth", True)),
-                                end_at=parsed["as_of"],
-                            )
-                            result = with_diagnostic_session(
-                                "rl_observation_stream_backfill",
-                                lambda broker_app, query=query: read_historical_bars(
-                                    app_config.ibkr.diagnostic_session(),
-                                    query,
-                                    timeout=timeout,
-                                    app=broker_app,
-                                ),
-                            )
-                            symbol_bars = result.get("bars", [])
-                            if symbol_bars:
-                                backfilled_bars[symbol] = symbol_bars
-                                source_bars[symbol] = symbol_bars
-                                fetched_symbols.append(symbol)
-                        if backfilled_bars:
-                            try:
-                                persist_market_stream_bars(
+                            backfill_requests.append(
+                                enqueue_market_data_backfill_request(
                                     session_factory,
-                                    bars_by_symbol=backfilled_bars,
-                                    instruments_by_symbol=instruments
-                                    if isinstance(instruments, Mapping)
-                                    else {},
-                                    source="ibkr_historical_backfill_1m",
+                                    symbol=symbol,
+                                    trade_date=session_date.isoformat(),
+                                    requested_until=parsed["as_of"],
+                                    instrument=_rl_backfill_instrument(
+                                        symbol=symbol,
+                                        fetch=fetch,
+                                        instruments=instruments,
+                                    ),
+                                    reason="rl_market_stream_missing_symbol_bars",
+                                    duration=str(fetch.get("backfill_duration", "1 D")),
+                                    bar_size=str(fetch.get("backfill_bar_size", "1 min")),
+                                    what_to_show=str(
+                                        fetch.get("what_to_show", "TRADES")
+                                    ).upper(),
+                                    use_rth=bool(fetch.get("use_rth", True)),
                                 )
-                            except SQLAlchemyError:
-                                pass
-                            stream_bars.update(backfilled_bars)
-                            missing_stream_bars = [
-                                symbol
-                                for symbol in requested_symbols
-                                if symbol not in stream_bars
-                            ]
-                    if missing_stream_bars:
-                        raise ValueError(
-                            "market stream has no 1-minute bars for symbols: "
-                            f"{missing_stream_bars}. Subscribe first with "
-                            "POST /v1/market-data/stream/subscribe and wait for live ticks."
-                        )
+                            )
                     source_bars = stream_bars
                     streamed_symbols = sorted(stream_bars)
                     source_mode = "market_stream"
+                    missing_request_by_symbol = {
+                        str(request_payload["symbol"]).upper(): request_payload
+                        for request_payload in backfill_requests
+                    }
+                    build_symbols = [
+                        symbol for symbol in requested_symbols if symbol in source_bars
+                    ]
+                    if build_symbols:
+                        observation = build_phase1_observation_payload(
+                            deployment_key=deployment_snapshot["deployment_key"],
+                            model_key=deployment_snapshot["model_key"],
+                            model_side=deployment_snapshot["model_side"],
+                            observation_contract=deployment_snapshot[
+                                "observation_contract"
+                            ],
+                            action_space=deployment_snapshot["action_space"],
+                            as_of=parsed["as_of"],
+                            source_bars_by_symbol=source_bars,
+                            symbols=build_symbols,
+                            history_overrides=parsed["history_overrides"],
+                            static_features_by_symbol=parsed["static_features"],
+                            config_overrides=config_overrides,
+                            include_source_bars=parsed["include_source_bars"],
+                        )
+                    else:
+                        observation = {
+                            "deployment_key": deployment_snapshot["deployment_key"],
+                            "model_key": deployment_snapshot["model_key"],
+                            "model_side": str(
+                                deployment_snapshot["model_side"]
+                            ).upper(),
+                            "action_space": [
+                                str(action).lower()
+                                for action in deployment_snapshot["action_space"]
+                            ],
+                            "as_of": parsed["as_of"].astimezone(
+                                ZoneInfo(app_config.timezone)
+                            ).isoformat(),
+                            "symbols": [],
+                            "input_contract": {
+                                "bar_family": "phase1_intraday_ohlc_v1",
+                                "bar_interval": "5m",
+                                "refresh_cadence": "1m",
+                                "update_cadence": "1m",
+                                "decision_cadence": "5m",
+                                "decision_policy": "completed_5m_bar_only",
+                                "bar_sequence_policy": "observed_provider_bars_only",
+                                "source_adapter": (
+                                    "ibkr_1m_trades_to_phase1_5m_ohlc_v1"
+                                ),
+                                "source_bar_interval": "1m",
+                                "session_timezone": app_config.timezone,
+                                "min_observed_bar_coverage_ratio": (
+                                    config_overrides[
+                                        "min_observed_bar_coverage_ratio"
+                                    ]
+                                ),
+                                "growing_day_prefix": True,
+                            },
+                            "feature_schema": {},
+                            "market_context": None,
+                            "observations": {},
+                        }
+                    for symbol in missing_stream_bars:
+                        observation["observations"][symbol] = (
+                            _paused_market_stream_observation(
+                                symbol=symbol,
+                                as_of=parsed["as_of"].astimezone(
+                                    ZoneInfo(app_config.timezone)
+                                ),
+                                session_date=session_date,
+                                reason="paused_market_stream_bars_missing_backfill_pending",
+                                backfill_request=missing_request_by_symbol.get(symbol),
+                                min_coverage_ratio=float(
+                                    config_overrides[
+                                        "min_observed_bar_coverage_ratio"
+                                    ]
+                                ),
+                            )
+                        )
+                    observation["symbols"] = requested_symbols
+                    for symbol, symbol_observation in observation[
+                        "observations"
+                    ].items():
+                        decision = symbol_observation.get("model_decision", {})
+                        if (
+                            isinstance(decision, Mapping)
+                            and decision.get("reason")
+                            == "paused_observed_bar_coverage_below_threshold"
+                            and backfill_missing
+                        ):
+                            backfill_request = enqueue_market_data_backfill_request(
+                                session_factory,
+                                symbol=symbol,
+                                trade_date=session_date.isoformat(),
+                                requested_until=parsed["as_of"],
+                                instrument=_rl_backfill_instrument(
+                                    symbol=symbol,
+                                    fetch=fetch,
+                                    instruments=instruments,
+                                ),
+                                reason="rl_observed_bar_coverage_below_threshold",
+                                duration=str(fetch.get("backfill_duration", "1 D")),
+                                bar_size=str(fetch.get("backfill_bar_size", "1 min")),
+                                what_to_show=str(
+                                    fetch.get("what_to_show", "TRADES")
+                                ).upper(),
+                                use_rth=bool(fetch.get("use_rth", True)),
+                            )
+                            backfill_requests.append(backfill_request)
+                            data_quality = symbol_observation.setdefault(
+                                "data_quality",
+                                {},
+                            )
+                            data_quality["backfill_request"] = backfill_request
+                            decision["backfill_status"] = backfill_request["status"]
+                            decision["backfill_request"] = backfill_request
+                            if isinstance(decision.get("data_quality"), Mapping):
+                                decision["data_quality"] = {
+                                    **decision["data_quality"],
+                                    "backfill_request": backfill_request,
+                                }
                 elif fetch_mode in {"historical", "historical_bars", "ibkr_historical_bars"}:
                     for symbol in requested_symbols:
                         query = HistoricalBarsQuery(
@@ -4461,10 +4744,10 @@ def create_app(config: AppConfig | None = None) -> Any:
                             use_rth=bool(fetch.get("use_rth", True)),
                             end_at=parsed["as_of"],
                         )
-                        result = with_diagnostic_session(
+                        result = with_historical_session(
                             "rl_observation_historical_bars",
                             lambda broker_app, query=query: read_historical_bars(
-                                app_config.ibkr.diagnostic_session(),
+                                app_config.ibkr.historical_session(),
                                 query,
                                 timeout=timeout,
                                 app=broker_app,
@@ -4477,21 +4760,21 @@ def create_app(config: AppConfig | None = None) -> Any:
                     raise ValueError(
                         "fetch.mode must be market_stream or historical_bars"
                     )
-
-            observation = build_phase1_observation_payload(
-                deployment_key=deployment_snapshot["deployment_key"],
-                model_key=deployment_snapshot["model_key"],
-                model_side=deployment_snapshot["model_side"],
-                observation_contract=deployment_snapshot["observation_contract"],
-                action_space=deployment_snapshot["action_space"],
-                as_of=parsed["as_of"],
-                source_bars_by_symbol=source_bars,
-                symbols=requested_symbols,
-                history_overrides=parsed["history_overrides"],
-                static_features_by_symbol=parsed["static_features"],
-                config_overrides=parsed["config_overrides"],
-                include_source_bars=parsed["include_source_bars"],
-            )
+            if source_mode != "market_stream":
+                observation = build_phase1_observation_payload(
+                    deployment_key=deployment_snapshot["deployment_key"],
+                    model_key=deployment_snapshot["model_key"],
+                    model_side=deployment_snapshot["model_side"],
+                    observation_contract=deployment_snapshot["observation_contract"],
+                    action_space=deployment_snapshot["action_space"],
+                    as_of=parsed["as_of"],
+                    source_bars_by_symbol=source_bars,
+                    symbols=requested_symbols,
+                    history_overrides=parsed["history_overrides"],
+                    static_features_by_symbol=parsed["static_features"],
+                    config_overrides=config_overrides,
+                    include_source_bars=parsed["include_source_bars"],
+                )
         except TraderDeploymentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (KeyError, ValueError) as exc:
@@ -4510,6 +4793,8 @@ def create_app(config: AppConfig | None = None) -> Any:
             "source_mode": source_mode,
             "fetched_symbols": fetched_symbols,
             "streamed_symbols": streamed_symbols,
+            "backfill_request_count": len(backfill_requests),
+            "backfill_requests": _serialize_for_json(backfill_requests),
             "account_key": deployment_snapshot["account_key"],
             "book_key": deployment_snapshot["book_key"],
             "mode": deployment_snapshot["mode"],
@@ -4661,6 +4946,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         reconciliation_run_limit: int = 20,
         include_flat_positions: bool = False,
         include_expired_candidates: bool = False,
+        include_terminal_instructions: bool = False,
     ) -> dict[str, Any]:
         try:
             validated_instruction_limit = parse_positive_limit(
@@ -4709,6 +4995,12 @@ def create_app(config: AppConfig | None = None) -> Any:
                 limit=validated_instruction_limit,
                 model_routed=False,
             )
+            if not include_terminal_instructions:
+                instructions = tuple(
+                    instruction
+                    for instruction in instructions
+                    if instruction.state not in _OPERATOR_TERMINAL_EXECUTION_STATES
+                )
             rl_candidates = list_instruction_statuses(
                 session_factory,
                 limit=500,

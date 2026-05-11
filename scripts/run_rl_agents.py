@@ -292,11 +292,22 @@ def main() -> int:
     parser.add_argument(
         "--metadata-history-only",
         action="store_true",
+        default=True,
         help=(
-            "Do not call IBKR historical bars from the live RL loop. Use candidate "
-            "trace.metadata.history_features when present, otherwise require "
-            "--allow-metadata-history-fallback to use yesterday_close with neutral "
-            "history features."
+            "Keep the live RL loop off IBKR historical bars. This is the default: "
+            "use candidate trace.metadata.history_features when present, otherwise "
+            "require --allow-metadata-history-fallback to use yesterday_close with "
+            "neutral history features."
+        ),
+    )
+    parser.add_argument(
+        "--allow-live-historical-backfill",
+        dest="metadata_history_only",
+        action="store_false",
+        help=(
+            "Allow the live RL loop to call /v1/market-data/historical-bars. "
+            "Use only for controlled backfills or diagnostics, not the normal "
+            "market-minute loop."
         ),
     )
     parser.add_argument("--limit", type=int, default=500)
@@ -413,7 +424,7 @@ def run_once(
     max_stream_symbols: int = DEFAULT_MAX_STREAM_SYMBOLS,
     stream_warning_symbols: int = DEFAULT_STREAM_WARNING_SYMBOLS,
     allow_metadata_history_fallback: bool = False,
-    metadata_history_only: bool = False,
+    metadata_history_only: bool = True,
 ) -> None:
     active_deployments = dict(
         loaded_deployments
@@ -455,7 +466,7 @@ def run_once(
     if not candidates:
         if benchmark_symbols:
             try:
-                subscribe_symbols(
+                publish_desired_stream_symbols(
                     api_base,
                     benchmark_symbols,
                     market_data_type=market_data_type,
@@ -483,7 +494,7 @@ def run_once(
     )
     stream_symbols = stream_plan["stream_symbols"]
     try:
-        subscribe_symbols(
+        publish_desired_stream_symbols(
             api_base,
             stream_symbols,
             market_data_type=market_data_type,
@@ -493,10 +504,10 @@ def run_once(
             f"{api_base}/v1/market-data/stream/snapshot?"
             + urllib.parse.urlencode({"symbols": ",".join(stream_symbols), "bar_limit": "390"})
         )["stream"]
-        if stream_subscription_needs_repair(stream, stream_symbols):
+        if stream_desired_state_needs_publish(stream, stream_symbols):
             if stream_subscription_state is not None:
                 stream_subscription_state.pop("signature", None)
-            subscribe_symbols(
+            publish_desired_stream_symbols(
                 api_base,
                 stream_symbols,
                 market_data_type=market_data_type,
@@ -506,6 +517,13 @@ def run_once(
                 f"{api_base}/v1/market-data/stream/snapshot?"
                 + urllib.parse.urlencode({"symbols": ",".join(stream_symbols), "bar_limit": "390"})
             )["stream"]
+        pending_symbols = stream_subscription_pending_symbols(stream, stream_symbols)
+        if pending_symbols:
+            print(
+                "Market stream desired state is published; waiting for API "
+                f"stream owner to subscribe: {', '.join(pending_symbols)}",
+                flush=True,
+            )
     except ApiError as exc:
         heartbeat_stream_failure(
             api_base=api_base,
@@ -580,7 +598,7 @@ def run_model_candidates(
     history_bar_size: str,
     history_timeout: int,
     allow_metadata_history_fallback: bool = False,
-    metadata_history_only: bool = False,
+    metadata_history_only: bool = True,
     stream_bar_ready_symbols: set[str] | None = None,
     stream_plan: Mapping[str, Any] | None = None,
     trade_date: str | None = None,
@@ -752,7 +770,7 @@ def run_model_candidates(
                 "fetch": {
                     "mode": "market_stream",
                     "bar_limit": 390,
-                    "backfill_missing": False,
+                    "backfill_missing": True,
                     "backfill_duration": "1 D",
                     "backfill_bar_size": "1 min",
                     "instruments": {
@@ -1013,7 +1031,17 @@ def run_model_candidates(
             "fresh_decision_bar_candidate_count": coverage_counts.get("fresh_bar", 0),
             "stale_decision_bar_candidate_count": coverage_counts.get("stale_bar", 0),
             "not_ready_candidate_count": coverage_counts.get("not_ready", 0)
-            + coverage_counts.get("waiting_for_target_bar", 0),
+            + coverage_counts.get("waiting_for_target_bar", 0)
+            + coverage_counts.get("paused_backfill_pending", 0)
+            + coverage_counts.get("paused_data_quality", 0),
+            "paused_backfill_candidate_count": coverage_counts.get(
+                "paused_backfill_pending",
+                0,
+            ),
+            "paused_data_quality_candidate_count": coverage_counts.get(
+                "paused_data_quality",
+                0,
+            ),
             "already_processed_candidate_count": status_counts.get("already_processed", 0),
             "evaluated_candidate_count": len(
                 [
@@ -1247,8 +1275,28 @@ def classify_decision_bar_freshness(
 ) -> dict[str, Any]:
     latest_raw = decision.get("latest_usable_bar_ended_at")
     if not decision.get("ready"):
+        reason = str(decision.get("reason") or "")
+        backfill_status = str(decision.get("backfill_status") or "")
+        if reason in {
+            "paused_market_stream_bars_missing_backfill_pending",
+            "paused_observed_bar_coverage_below_threshold",
+        }:
+            status = (
+                "paused_backfill_pending"
+                if backfill_status
+                in {"PENDING", "RUNNING", "FAILED_RETRYABLE"}
+                else "paused_data_quality"
+            )
+            return {
+                "status": status,
+                "reason": reason,
+                "backfill_status": backfill_status or None,
+                "latest_usable_bar_ended_at": latest_raw,
+                "target_decision_bar_ended_at": target_decision_bar_ended_at,
+            }
         return {
             "status": "not_ready",
+            "reason": reason or None,
             "latest_usable_bar_ended_at": latest_raw,
             "target_decision_bar_ended_at": target_decision_bar_ended_at,
         }
@@ -2285,7 +2333,7 @@ def _is_recent_failure(payload: Mapping[str, Any], *, cooldown_seconds: int = 60
     return age_seconds < cooldown_seconds
 
 
-def subscribe_symbols(
+def publish_desired_stream_symbols(
     api_base: str,
     symbols: list[str],
     *,
@@ -2317,7 +2365,7 @@ def subscribe_symbols(
         if subscription_state.get("signature") == signature:
             return False
     post_json(
-        f"{api_base}/v1/market-data/stream/subscribe",
+        f"{api_base}/v1/market-data/stream/desired",
         {
             "contracts": contracts,
             "market_data_type": market_data_type,
@@ -2327,6 +2375,21 @@ def subscribe_symbols(
     if subscription_state is not None:
         subscription_state["signature"] = signature
     return True
+
+
+def subscribe_symbols(
+    api_base: str,
+    symbols: list[str],
+    *,
+    market_data_type: str,
+    subscription_state: dict[str, Any] | None = None,
+) -> bool:
+    return publish_desired_stream_symbols(
+        api_base,
+        symbols,
+        market_data_type=market_data_type,
+        subscription_state=subscription_state,
+    )
 
 
 def _stream_subscription_signature(
@@ -2363,7 +2426,7 @@ def _stream_subscription_signature(
     )
 
 
-def stream_subscription_needs_repair(
+def stream_desired_state_needs_publish(
     stream: Mapping[str, Any],
     stream_symbols: list[str],
 ) -> bool:
@@ -2375,16 +2438,27 @@ def stream_subscription_needs_repair(
         for symbol in stream.get("desired_symbols", [])
         if symbol
     }
+    return not expected_symbols.issubset(desired_symbols)
+
+
+def stream_subscription_pending_symbols(
+    stream: Mapping[str, Any],
+    stream_symbols: list[str],
+) -> list[str]:
+    expected_symbols = {str(symbol).strip().upper() for symbol in stream_symbols if symbol}
     subscribed_symbols = {
         str(subscription.get("contract", {}).get("symbol") or "").strip().upper()
         for subscription in stream.get("subscriptions", [])
         if isinstance(subscription, Mapping)
     }
-    if not expected_symbols.issubset(desired_symbols):
-        return True
-    if not expected_symbols.issubset(subscribed_symbols):
-        return True
-    return False
+    return sorted(expected_symbols - subscribed_symbols)
+
+
+def stream_subscription_needs_repair(
+    stream: Mapping[str, Any],
+    stream_symbols: list[str],
+) -> bool:
+    return stream_desired_state_needs_publish(stream, stream_symbols)
 
 
 def heartbeat_stream_failure(

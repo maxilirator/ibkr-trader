@@ -13,6 +13,9 @@
     }
     return pathname.startsWith(href);
   }
+
+  $: currentNavigationItem =
+    navigationItems.find((item) => isActive(item.href, $page.url.pathname)) ?? navigationItems[0];
 </script>
 
 <div class="layout-shell">
@@ -26,8 +29,13 @@
     </a>
 
     <nav class="page-nav" aria-label="Pages">
+      <span class="selected-dashboard">Selected: {currentNavigationItem.label}</span>
       {#each navigationItems as item}
-        <a href={item.href} class:active={isActive(item.href, $page.url.pathname)}>
+        <a
+          href={item.href}
+          class:active={isActive(item.href, $page.url.pathname)}
+          aria-current={isActive(item.href, $page.url.pathname) ? 'page' : undefined}
+        >
           {item.label}
         </a>
       {/each}
@@ -166,6 +174,12 @@
     flex-wrap: wrap;
   }
 
+  .selected-dashboard {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    font-weight: 700;
+  }
+
   .page-nav a {
     display: inline-flex;
     align-items: center;
@@ -182,18 +196,46 @@
       transform 140ms ease;
   }
 
-  .page-nav a:hover,
   .page-nav a.active {
     color: var(--text);
     border-color: color-mix(in oklab, var(--accent) 45%, var(--panel-border));
-    background: color-mix(in oklab, var(--accent) 18%, transparent);
-    transform: translateY(-1px);
+    background: color-mix(in oklab, var(--accent) 24%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 35%, transparent);
   }
 
   @media (max-width: 820px) {
     .app-header {
       align-items: flex-start;
       flex-direction: column;
+    }
+  }
+
+  :global(button.is-working),
+  :global(button.working),
+  :global(.action-button.is-working),
+  :global(button.inline-button.is-working) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+  }
+
+  :global(button.is-working::before),
+  :global(button.working::before),
+  :global(.action-button.is-working::before),
+  :global(button.inline-button.is-working::before) {
+    content: "";
+    width: 0.9em;
+    height: 0.9em;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 999px;
+    animation: dashboard-spin 0.75s linear infinite;
+  }
+
+  @keyframes dashboard-spin {
+    to {
+      transform: rotate(360deg);
     }
   }
 </style>

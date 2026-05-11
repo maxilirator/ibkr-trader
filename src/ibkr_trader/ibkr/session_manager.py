@@ -12,8 +12,11 @@ from threading import RLock
 from typing import Any, Callable, Iterator
 
 from ibkr_trader.config import IbkrConnectionConfig
+from ibkr_trader.ibkr.broker_circuit import BrokerCircuitOpen
+from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.gateway_diagnostics import format_gateway_diagnostic_hint
 from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
+from ibkr_trader.ibkr.pacing import BrokerApiPacingGovernor
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class
 
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +31,24 @@ STUCK_GATEWAY_CIRCUIT_STATUSES = {
     "existing_session_detected",
     "stuck_shutdown",
     "stuck_shutdown_after_existing_session",
+}
+HISTORICAL_BROKER_OPERATIONS = {
+    "historical_bars",
+    "rl_observation_stream_backfill",
+    "stockholm_intraday_backfill",
+}
+BROKER_OPERATION_API_PERMITS = {
+    "heartbeat_probe": 2,
+    "probe": 2,
+    "historical_bars": 2,
+    "rl_observation_stream_backfill": 2,
+    "stockholm_intraday_backfill": 2,
+    "broker_runtime_snapshot": 5,
+    "runtime_snapshot": 5,
+    "runtime_reconciliation_snapshot": 3,
+    "persisted_entry_submit": 2,
+    "runtime_exit_submit": 2,
+    "broker_cancel": 1,
 }
 
 
@@ -208,6 +229,8 @@ class ManagedSyncSession:
         max_connect_backoff_seconds: float = 300.0,
         api_startup_failure_slow_probe_seconds: float | None = None,
         gateway_diagnostics_reader: Callable[[], dict[str, Any]] | None = None,
+        pacing_governor: BrokerApiPacingGovernor | None = None,
+        broker_circuit: BrokerHealthCircuit | None = None,
     ) -> None:
         self.role = role
         self.config = config
@@ -235,6 +258,8 @@ class ManagedSyncSession:
         self._gateway_diagnostics_reader = gateway_diagnostics_reader or (
             lambda: read_ibgateway_diagnostics()
         )
+        self._pacing_governor = pacing_governor
+        self._broker_circuit = broker_circuit
         self._lock = RLock()
         self._app: Any | None = None
         self._last_error: str | None = None
@@ -253,6 +278,33 @@ class ManagedSyncSession:
         self._last_connect_success_at: datetime | None = None
         self._last_disconnect_at: datetime | None = None
         self._last_checkout_at: datetime | None = None
+
+    def _operation_api_permits(self, operation_name: str) -> int:
+        return BROKER_OPERATION_API_PERMITS.get(operation_name, 1)
+
+    def _pace_connection_attempt_locked(self, operation_name: str) -> None:
+        if self._pacing_governor is None:
+            return
+        self._pacing_governor.acquire_api_request(
+            f"{self.role}.connect.{operation_name}",
+            permits=1,
+        )
+
+    def _pace_operation_locked(self, operation_name: str) -> None:
+        if self._pacing_governor is None:
+            return
+        permits = self._operation_api_permits(operation_name)
+        paced_operation = f"{self.role}.{operation_name}"
+        if operation_name in HISTORICAL_BROKER_OPERATIONS:
+            self._pacing_governor.acquire_historical_request(
+                paced_operation,
+                api_permits=permits,
+            )
+            return
+        self._pacing_governor.acquire_api_request(
+            paced_operation,
+            permits=permits,
+        )
 
     def _prune_times_locked(self, times: deque[datetime], *, now: datetime) -> None:
         cutoff = now.timestamp() - 60
@@ -295,7 +347,7 @@ class ManagedSyncSession:
         if status in STUCK_GATEWAY_CIRCUIT_STATUSES:
             summary = diagnostics.get("summary") or status
             return enhanced_error, f"{status}: {summary}"
-        return enhanced_error, None
+        return enhanced_error, "api_startup_no_next_valid_id"
 
     def _record_gateway_failure_locked(self, error: str) -> str:
         recorded_error, circuit_reason = self._gateway_failure_diagnostics(error)
@@ -318,6 +370,13 @@ class ManagedSyncSession:
             return recorded_error
         self._cooldown_until = _utc_now() + timedelta(seconds=delay)
         self._circuit_breaker_until = self._cooldown_until if circuit_reason else None
+        if circuit_reason is not None and self._broker_circuit is not None:
+            self._broker_circuit.trip(
+                reason=circuit_reason,
+                source=self.role,
+                error=recorded_error,
+                duration_seconds=delay,
+            )
         return recorded_error
 
     def _cooldown_seconds_remaining_locked(self, *, now: datetime) -> int | None:
@@ -326,9 +385,19 @@ class ManagedSyncSession:
         remaining = int((self._cooldown_until - now).total_seconds())
         return max(0, remaining)
 
-    def _raise_if_cooling_down_locked(self, *, ignore_cooldown: bool = False) -> None:
+    def _raise_if_cooling_down_locked(
+        self,
+        *,
+        operation_name: str,
+        ignore_cooldown: bool = False,
+    ) -> None:
         if ignore_cooldown:
             return
+        if self._broker_circuit is not None:
+            self._broker_circuit.raise_if_open(
+                operation_name=operation_name,
+                source=self.role,
+            )
         if self._cooldown_until is None:
             return
         now = _utc_now()
@@ -373,14 +442,23 @@ class ManagedSyncSession:
         finally:
             self._record_disconnect_locked()
 
-    def _ensure_connected_locked(self, *, ignore_cooldown: bool = False) -> None:
+    def _ensure_connected_locked(
+        self,
+        *,
+        operation_name: str,
+        ignore_cooldown: bool = False,
+    ) -> None:
+        self._raise_if_cooling_down_locked(
+            operation_name=operation_name,
+            ignore_cooldown=ignore_cooldown,
+        )
         if self._app is not None and _is_connected(self._app):
             self._last_error = None
             self._circuit_breaker_reason = None
             self._circuit_breaker_until = None
             return
 
-        self._raise_if_cooling_down_locked(ignore_cooldown=ignore_cooldown)
+        self._pace_connection_attempt_locked("connect")
         self._record_connect_attempt_locked()
         self._disconnect_locked()
         app = self._build_app()
@@ -403,12 +481,14 @@ class ManagedSyncSession:
 
         self._app = app
         self._record_connect_success_locked()
+        if self._broker_circuit is not None:
+            self._broker_circuit.clear(source=self.role)
         self._last_error = None
 
     def warmup(self) -> ManagedSessionStatus:
         with self._lock:
             try:
-                self._ensure_connected_locked()
+                self._ensure_connected_locked(operation_name="warmup")
             except Exception as exc:
                 if "cooling down" not in str(exc):
                     self._last_error = str(exc)
@@ -508,7 +588,11 @@ class ManagedSyncSession:
 
         try:
             try:
-                self._ensure_connected_locked(ignore_cooldown=ignore_cooldown)
+                self._ensure_connected_locked(
+                    operation_name=operation_name,
+                    ignore_cooldown=ignore_cooldown,
+                )
+                self._pace_operation_locked(operation_name)
                 self._record_checkout_locked()
                 app = self._app
                 if app is None:
@@ -524,11 +608,13 @@ class ManagedSyncSession:
                     isinstance(exc, ConnectionError)
                     and "cooling down" in str(exc)
                 )
+                is_circuit_open_error = isinstance(exc, BrokerCircuitOpen)
                 if not is_cooldown_error:
                     self._last_error = str(exc)
                 should_open_cooldown = (
                     isinstance(exc, (ConnectionError, TimeoutError))
                     and not is_cooldown_error
+                    and not is_circuit_open_error
                     and previous_last_error != str(exc)
                 )
                 if should_open_cooldown:
@@ -687,6 +773,8 @@ class CanonicalSyncSessions:
         initial_connect_backoff_seconds: float = 5.0,
         max_connect_backoff_seconds: float = 300.0,
         api_startup_failure_slow_probe_seconds: float | None = None,
+        pacing_governor: BrokerApiPacingGovernor | None = None,
+        broker_circuit: BrokerHealthCircuit | None = None,
     ) -> None:
         self.activity_tracker = BrokerActivityTracker()
         self.primary = ManagedSyncSession(
@@ -698,6 +786,8 @@ class CanonicalSyncSessions:
             initial_connect_backoff_seconds=initial_connect_backoff_seconds,
             max_connect_backoff_seconds=max_connect_backoff_seconds,
             api_startup_failure_slow_probe_seconds=api_startup_failure_slow_probe_seconds,
+            pacing_governor=pacing_governor,
+            broker_circuit=broker_circuit,
         )
         self.diagnostic = ManagedSyncSession(
             "diagnostic",
@@ -708,17 +798,33 @@ class CanonicalSyncSessions:
             initial_connect_backoff_seconds=initial_connect_backoff_seconds,
             max_connect_backoff_seconds=max_connect_backoff_seconds,
             api_startup_failure_slow_probe_seconds=api_startup_failure_slow_probe_seconds,
+            pacing_governor=pacing_governor,
+            broker_circuit=broker_circuit,
+        )
+        self.historical = ManagedSyncSession(
+            "historical",
+            connection_config.historical_session(),
+            wrapper_cls=wrapper_cls,
+            default_timeout=default_timeout,
+            activity_tracker=self.activity_tracker,
+            initial_connect_backoff_seconds=initial_connect_backoff_seconds,
+            max_connect_backoff_seconds=max_connect_backoff_seconds,
+            api_startup_failure_slow_probe_seconds=api_startup_failure_slow_probe_seconds,
+            pacing_governor=pacing_governor,
+            broker_circuit=broker_circuit,
         )
 
     def warmup(self) -> dict[str, dict[str, Any]]:
         return {
             "primary": serialize_managed_session_status(self.primary.warmup()),
             "diagnostic": serialize_managed_session_status(self.diagnostic.warmup()),
+            "historical": serialize_managed_session_status(self.historical.status()),
         }
 
     def shutdown(self) -> None:
         self.primary.disconnect()
         self.diagnostic.disconnect()
+        self.historical.disconnect()
 
     def status_snapshot(self, *, blocking: bool = True) -> dict[str, dict[str, Any]]:
         return {
@@ -727,6 +833,9 @@ class CanonicalSyncSessions:
             ),
             "diagnostic": serialize_managed_session_status(
                 self.diagnostic.status(blocking=blocking)
+            ),
+            "historical": serialize_managed_session_status(
+                self.historical.status(blocking=blocking)
             ),
         }
 

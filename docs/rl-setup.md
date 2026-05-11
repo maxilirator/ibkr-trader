@@ -159,6 +159,7 @@ IBKR_HOST=127.0.0.1
 IBKR_PORT=4002
 IBKR_CLIENT_ID=0
 IBKR_DIAGNOSTIC_CLIENT_ID=7
+IBKR_HISTORICAL_CLIENT_ID=8
 IBKR_STREAMING_CLIENT_ID=9
 IBKR_ACCOUNT_ID=UXXXXXXX
 IBKR_ACCOUNT_IDS=UXXXXXXX
@@ -452,11 +453,11 @@ curl -sS -X POST "$API/v1/rl/observations/build" \
   }'
 ```
 
-For production, subscribe once to the live market-data stream and let this repo
-maintain the 1-minute source-bar buffer:
+For production, publish the desired live market-data stream set and let the API
+stream owner maintain the 1-minute source-bar buffer:
 
 ```bash
-curl -sS -X POST "$API/v1/market-data/stream/subscribe" \
+curl -sS -X POST "$API/v1/market-data/stream/desired" \
   -H "Content-Type: application/json" \
   -d '{
     "symbols": ["AXFO", "AZN", "TELIA"],
@@ -839,11 +840,12 @@ The repo now has a promoted-model runner path:
   positions, protective exits, or forced next-open exits; those remain normal
   instruction rows owned by the runtime
 - `scripts/run_rl_agents.py` loads deployed local DQN checkpoints, polls
-  `/v1/rl/candidates`, subscribes active symbols to the market stream, hydrates
-  static features from each instruction's `trace.metadata.static_features`,
-  backfills and caches prior-session volatility/history overrides, runs
-  inference only on new completed 5-minute bars, logs actions, and submits
-  translated virtual entries/cancels/exits when `--execute-virtual` is set
+  `/v1/rl/candidates`, publishes active symbols to the API-owned market stream,
+  hydrates static features from each instruction's
+  `trace.metadata.static_features`, uses candidate metadata/history features by
+  default for prior-session volatility/history overrides, runs inference only
+  on new completed 5-minute bars, logs actions, and submits translated virtual
+  entries/cancels/exits when `--execute-virtual` is set
 
 Runner start shape:
 

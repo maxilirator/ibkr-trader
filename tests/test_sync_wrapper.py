@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from types import SimpleNamespace
 from unittest import TestCase
@@ -8,6 +9,36 @@ from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class
 
 
 class SyncWrapperTests(TestCase):
+    def test_informational_ibkr_messages_do_not_log_as_errors(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        logger = logging.getLogger("ibapi.wrapper")
+        records: list[logging.LogRecord] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _ListHandler()
+        original_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.ERROR)
+        try:
+            app.error(-1, 0, 2104, "Market data farm connection is OK:eufarm")
+            app.error(
+                -1,
+                0,
+                2107,
+                "HMDS data farm connection is inactive but should be available upon demand.euhmds",
+            )
+            app.error(-1, 0, 2119, "Market data farm is connecting:eufarmnj")
+            app.error(-1, 0, 2158, "Sec-def data farm connection is OK:secdefeu")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(original_level)
+
+        self.assertEqual(records, [])
+
     def test_connect_and_start_waits_for_next_valid_id(self) -> None:
         wrapper_cls = load_sync_wrapper_class()
         app = wrapper_cls(timeout=1)

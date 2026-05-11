@@ -64,6 +64,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "instruction_event",
                 "instruction_set_cancellation",
                 "instrument",
+                "market_data_backfill_request",
                 "market_stream_bar",
                 "operator_control",
                 "operator_control_event",

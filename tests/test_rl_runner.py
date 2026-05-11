@@ -810,7 +810,7 @@ def test_runner_groups_same_model_candidates_by_deployment() -> None:
     ]
 
 
-def test_runner_subscribes_omxs30_as_index_contract(monkeypatch) -> None:
+def test_runner_publishes_omxs30_as_desired_index_contract(monkeypatch) -> None:
     posted: list[tuple[str, dict[str, object]]] = []
 
     def fake_post_json(
@@ -825,13 +825,13 @@ def test_runner_subscribes_omxs30_as_index_contract(monkeypatch) -> None:
 
     monkeypatch.setattr(runner, "post_json", fake_post_json)
 
-    runner.subscribe_symbols(
+    runner.publish_desired_stream_symbols(
         "http://127.0.0.1:8000",
         ["AXFO", "OMXS30"],
         market_data_type="LIVE",
     )
 
-    assert posted[0][0] == "http://127.0.0.1:8000/v1/market-data/stream/subscribe"
+    assert posted[0][0] == "http://127.0.0.1:8000/v1/market-data/stream/desired"
     assert posted[0][1]["replace"] is True
     assert posted[0][1]["market_data_type"] == "LIVE"
     assert posted[0][1]["contracts"] == [
@@ -852,7 +852,7 @@ def test_runner_subscribes_omxs30_as_index_contract(monkeypatch) -> None:
     ]
 
 
-def test_runner_skips_duplicate_stream_subscription_posts(monkeypatch) -> None:
+def test_runner_skips_duplicate_desired_stream_posts(monkeypatch) -> None:
     posted: list[tuple[str, dict[str, object]]] = []
 
     def fake_post_json(
@@ -868,13 +868,13 @@ def test_runner_skips_duplicate_stream_subscription_posts(monkeypatch) -> None:
     monkeypatch.setattr(runner, "post_json", fake_post_json)
     subscription_state: dict[str, object] = {}
 
-    first = runner.subscribe_symbols(
+    first = runner.publish_desired_stream_symbols(
         "http://127.0.0.1:8000",
         ["AXFO", "OMXS30"],
         market_data_type="LIVE",
         subscription_state=subscription_state,
     )
-    second = runner.subscribe_symbols(
+    second = runner.publish_desired_stream_symbols(
         "http://127.0.0.1:8000",
         ["OMXS30", "AXFO"],
         market_data_type="LIVE",
@@ -886,8 +886,8 @@ def test_runner_skips_duplicate_stream_subscription_posts(monkeypatch) -> None:
     assert len(posted) == 1
 
 
-def test_runner_repairs_subscription_when_api_stream_lost_state() -> None:
-    assert runner.stream_subscription_needs_repair(
+def test_runner_republishes_only_when_desired_state_is_missing() -> None:
+    assert runner.stream_desired_state_needs_publish(
         {
             "desired_symbols": ["OMXS30"],
             "subscriptions": [
@@ -896,16 +896,33 @@ def test_runner_repairs_subscription_when_api_stream_lost_state() -> None:
         },
         ["OMXS30", "AXFO"],
     )
+    assert not runner.stream_desired_state_needs_publish(
+        {
+            "desired_symbols": ["OMXS30", "AXFO"],
+            "subscriptions": [
+                {"contract": {"symbol": "OMXS30"}},
+            ],
+        },
+        ["AXFO", "OMXS30"],
+    )
     assert not runner.stream_subscription_needs_repair(
         {
             "desired_symbols": ["OMXS30", "AXFO"],
             "subscriptions": [
                 {"contract": {"symbol": "OMXS30"}},
-                {"contract": {"symbol": "AXFO"}},
             ],
         },
         ["AXFO", "OMXS30"],
     )
+    assert runner.stream_subscription_pending_symbols(
+        {
+            "desired_symbols": ["OMXS30", "AXFO"],
+            "subscriptions": [
+                {"contract": {"symbol": "OMXS30"}},
+            ],
+        },
+        ["AXFO", "OMXS30"],
+    ) == ["AXFO"]
 
 
 def test_runner_degrades_heartbeat_when_stream_subscribe_fails(monkeypatch) -> None:
@@ -935,8 +952,8 @@ def test_runner_degrades_heartbeat_when_stream_subscribe_fails(monkeypatch) -> N
         *,
         timeout: int = 30,
     ) -> dict[str, object]:
-        if "/v1/market-data/stream/subscribe" in url:
-            raise runner.ApiError("stream subscribe failed")
+        if "/v1/market-data/stream/desired" in url:
+            raise runner.ApiError("stream desired failed")
         assert "/heartbeat" in url
         heartbeats.append((url, payload))
         return {"accepted": True}
@@ -985,7 +1002,7 @@ def test_runner_degrades_heartbeat_when_stream_subscribe_fails(monkeypatch) -> N
     assert long_heartbeat["runtime_error"] == "market stream unavailable for active RL candidates"
     assert long_heartbeat["metrics"]["candidate_count"] == 1
     assert long_heartbeat["metrics"]["symbols"] == ["AXFO"]
-    assert "stream subscribe failed" in long_heartbeat["metrics"]["stream_error"]
+    assert "stream desired failed" in long_heartbeat["metrics"]["stream_error"]
 
     short_heartbeat = by_url[
         "http://127.0.0.1:8000/v1/rl/deployments/"

@@ -117,6 +117,8 @@ def list_market_stream_bars(
     normalized_symbols = sorted({_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)})
     if not normalized_symbols:
         return {}
+    started_at = _storage_datetime(started_at)
+    ended_at = _storage_datetime(ended_at)
     with session_scope(session_factory) as session:
         rows = session.execute(
             select(MarketStreamBarRecord)
@@ -177,6 +179,7 @@ def _parse_bar_payload(
         or close_price is None
     ):
         return None
+    started_at = _storage_datetime(started_at)
     return {
         "symbol": symbol,
         "exchange": _normalize_text(instrument.get("exchange")) or "SMART",
@@ -272,7 +275,21 @@ def _parse_datetime(value: Any) -> datetime | None:
     try:
         return datetime.fromisoformat(raw)
     except ValueError:
-        return None
+        pass
+    parts = raw.split()
+    if len(parts) >= 2:
+        for fmt in ("%Y%m%d %H:%M:%S", "%Y%m%d %H:%M"):
+            try:
+                return datetime.strptime(f"{parts[0]} {parts[1]}", fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _storage_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc)
 
 
 def _parse_decimal_text(value: Any) -> str | None:

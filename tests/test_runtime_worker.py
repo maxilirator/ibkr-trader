@@ -1462,6 +1462,108 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(result.issues, ())
         self.assertEqual(self._read_reconciliation_runs()[0].status, "CLEAN")
 
+    def test_run_runtime_cycle_cancels_expired_submitted_entry_after_session_close(self) -> None:
+        payload = _sive_payload()
+        self._insert_instruction(
+            instruction_id="runtime-sive-1",
+            symbol="SIVE",
+            exchange="SMART",
+            currency="SEK",
+            state=ExecutionState.ENTRY_SUBMITTED.value,
+            submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+            payload=payload,
+            broker_order_id=11,
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            calendar_path = Path(tmpdir) / "sessions.csv"
+            calendar_path.write_text(
+                "\n".join(
+                    (
+                        "session_date,timezone,open_time,close_time,session_kind",
+                        "2026-04-10,Europe/Stockholm,09:00:00,17:30:00,regular",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            cancelled_order_ids: list[int] = []
+
+            def fake_canceler(
+                broker_config: IbkrConnectionConfig,
+                order_id: int,
+                *,
+                timeout: int = 10,
+            ) -> dict[str, object]:
+                del broker_config, timeout
+                cancelled_order_ids.append(order_id)
+                return {
+                    "broker_order_status": {
+                        "orderId": order_id,
+                        "status": "Cancelled",
+                        "filled": "0",
+                        "remaining": "100",
+                        "avgFillPrice": 0.0,
+                        "permId": 8001,
+                        "parentId": 0,
+                        "lastFillPrice": 0.0,
+                        "clientId": 0,
+                        "whyHeld": "",
+                        "mktCapPrice": 0.0,
+                    }
+                }
+
+            result = run_runtime_cycle(
+                self.session_factory,
+                self.config,
+                runtime_timezone="Europe/Stockholm",
+                session_calendar_path=calendar_path,
+                now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
+                entry_canceler=fake_canceler,
+                broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                    open_orders={
+                        11: BrokerOpenOrder(
+                            order_id=11,
+                            perm_id=8001,
+                            client_id=0,
+                            status="Submitted",
+                            order_ref="runtime-sive-1",
+                            action="BUY",
+                            total_quantity=Decimal("100"),
+                            symbol="SIVE",
+                            account="DU1234567",
+                            security_type="STK",
+                            exchange="SMART",
+                            primary_exchange="SFB",
+                            currency="SEK",
+                            local_symbol="SIVE",
+                            order_type="LMT",
+                            limit_price=Decimal("11.31"),
+                            aux_price=None,
+                            outside_rth=False,
+                            oca_group=None,
+                            oca_type=None,
+                            transmit=True,
+                            warning_text=None,
+                            reject_reason=None,
+                            completed_status=None,
+                            completed_time=None,
+                        )
+                    },
+                    executions=(),
+                    portfolio=(),
+                    positions=(),
+                    account_values={},
+                ),
+            )
+
+        self.assertEqual(cancelled_order_ids, [11])
+        self.assertEqual(len(result.cancelled_entries), 1)
+        self.assertEqual(result.cancelled_entries[0].action, "entry_cancelled_at_expiry")
+        record = self._read_record("runtime-sive-1")
+        self.assertEqual(record.state, ExecutionState.ENTRY_CANCELLED.value)
+        self.assertEqual(record.broker_order_status, "Cancelled")
+
     def test_run_startup_reconciliation_skips_active_scan_after_session_close(self) -> None:
         payload = _sive_payload()
         self._insert_instruction(
@@ -5162,6 +5264,53 @@ class RuntimeWorkerTests(TestCase):
             payload=payload,
             broker_order_id=11,
         )
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-aapl-1"
+                )
+            ).scalar_one()
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="USD",
+                metadata_json={},
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="ENTRY",
+                    external_order_id="11",
+                    external_perm_id="8001",
+                    external_client_id="0",
+                    order_ref="runtime-aapl-1",
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    local_symbol="AAPL",
+                    side="BUY",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Submitted",
+                    total_quantity="1",
+                    limit_price="200.00",
+                    submitted_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
 
         result = run_runtime_cycle(
             self.session_factory,
@@ -5181,6 +5330,7 @@ class RuntimeWorkerTests(TestCase):
         self.assertEqual(len(result.cancelled_entries), 1)
         record = self._read_record("runtime-aapl-1")
         self.assertEqual(record.state, ExecutionState.ENTRY_CANCELLED.value)
+        self.assertEqual(record.broker_order_status, "NOT_FOUND_AT_BROKER")
 
     def test_persisted_open_exit_orders_dedupes_replaced_order_lineage(self) -> None:
         payload = _sive_payload()
