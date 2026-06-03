@@ -6,6 +6,10 @@ export function normalizeBaseUrl(value) {
   return normalized.replace(/\/+$/, '');
 }
 
+export function passiveHealthUrl(apiBaseUrl) {
+  return `${apiBaseUrl}/healthz?refresh_broker_status=false`;
+}
+
 export async function readJson(fetch, url, init = {}) {
   const { headers, signal, timeoutMs, ...fetchInit } = init;
   const timeoutController =

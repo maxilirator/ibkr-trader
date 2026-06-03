@@ -546,8 +546,14 @@ class OrderPreviewTests(TestCase):
         self.assertEqual(preview["status"], "ready")
         self.assertEqual(preview["sizing"]["funding_basis"], "cash")
         self.assertFalse(preview["sizing"]["allow_leverage"])
-        self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("10000.00"))
-        self.assertEqual(preview["order"]["total_quantity"], "100")
+        self.assertEqual(Decimal(preview["sizing"]["target_notional"]), Decimal("9975.000000"))
+        self.assertEqual(preview["order"]["total_quantity"], "99")
+        self.assertEqual(preview["sizing"]["cash_reserve"]["amount"], "25.000000")
+        self.assertEqual(preview["sizing"]["cash_reserve"]["currency"], "USD")
+        self.assertIn(
+            "Cash-backed long sizing reserved 25.000000 USD before computing a full-account entry size.",
+            preview["warnings"],
+        )
 
     def test_preview_requires_explicit_leverage_for_long_nav_sizing(self) -> None:
         class _CashLimitedPreviewSyncWrapper(_FakePreviewSyncWrapper):

@@ -1,0 +1,43 @@
+export let liveHealth = null;
+export let killSwitch = null;
+export let accounts = [];
+export let positions = [];
+export let openOrders = [];
+export let recentFills = [];
+export let brokerAttention = [];
+export let reconciliationRuns = [];
+export let instructions = [];
+export let brokerMonitor = null;
+export let ibGateway = null;
+export let executionRuntime = null;
+export let omxBenchmark = null;
+export let marketStreamMarks = new Map();
+export let marketStreamStatus = null;
+export let liveSnapshotStatus = null;
+export let referenceNow = new Date();
+export let timestampFormatter = null;
+export let executionInstructions = [];
+export let rlCandidateInstructions = [];
+
+export function setDashboardViewState(nextState) {
+  liveHealth = nextState.liveHealth;
+  killSwitch = nextState.killSwitch;
+  accounts = nextState.accounts ?? [];
+  positions = nextState.positions ?? [];
+  openOrders = nextState.openOrders ?? [];
+  recentFills = nextState.recentFills ?? [];
+  brokerAttention = nextState.brokerAttention ?? [];
+  reconciliationRuns = nextState.reconciliationRuns ?? [];
+  instructions = nextState.instructions ?? [];
+  brokerMonitor = nextState.brokerMonitor;
+  ibGateway = nextState.ibGateway;
+  executionRuntime = nextState.executionRuntime;
+  omxBenchmark = nextState.omxBenchmark;
+  marketStreamMarks = nextState.marketStreamMarks ?? new Map();
+  marketStreamStatus = nextState.marketStreamStatus;
+  liveSnapshotStatus = nextState.liveSnapshotStatus;
+  referenceNow = nextState.referenceNow ?? new Date();
+  timestampFormatter = nextState.timestampFormatter;
+  executionInstructions = nextState.executionInstructions ?? [];
+  rlCandidateInstructions = nextState.rlCandidateInstructions ?? [];
+}

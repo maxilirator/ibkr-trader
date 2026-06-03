@@ -226,6 +226,157 @@ class SyncWrapperTests(TestCase):
 
         self.assertEqual(cancelled_request_ids, [41])
 
+    def test_preview_order_sync_marks_whatif_orders_transmitted(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        contract = SimpleNamespace(symbol="HEM", secType="STK")
+        order = SimpleNamespace(whatIf=False, transmit=False)
+        placed: list[tuple[int, object, object]] = []
+
+        app._request_next_order_id_from_broker = lambda timeout=None: 41  # type: ignore[method-assign]
+        app.placeOrder = lambda order_id, contract, order: placed.append(  # type: ignore[method-assign]
+            (order_id, contract, order)
+        )
+        app._wait_for_response = lambda order_id, response_name, timeout: {  # type: ignore[method-assign]
+            "orderId": order_id,
+            "contract": contract,
+            "order": order,
+            "orderState": SimpleNamespace(status="PreSubmitted"),
+        }
+
+        result = app.preview_order_sync(contract, order, timeout=5)
+
+        self.assertEqual(result["orderId"], 41)
+        self.assertEqual(placed, [(41, contract, order)])
+        self.assertTrue(order.whatIf)
+        self.assertTrue(order.transmit)
+
+    def test_place_order_sync_records_outbound_wire_audit(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        contract = SimpleNamespace(
+            conId=483984824,
+            symbol="HEM",
+            localSymbol="HEM",
+            tradingClass="HEM",
+            secType="STK",
+            exchange="SMART",
+            primaryExchange="SFB",
+            currency="SEK",
+            secIdType="ISIN",
+            secId="SE0015671995",
+        )
+        order = SimpleNamespace(
+            account="U25245596",
+            orderRef="wire-audit-entry-1",
+            action="BUY",
+            orderType="LMT",
+            totalQuantity=1,
+            lmtPrice=93.9,
+            auxPrice=None,
+            tif="DAY",
+            outsideRth=False,
+            transmit=True,
+            whatIf=False,
+            ocaGroup=None,
+            ocaType=None,
+        )
+
+        app._request_next_order_id_from_broker = lambda timeout=None: 41  # type: ignore[method-assign]
+        app.serverVersion = lambda: 200  # type: ignore[method-assign]
+        app.sendMsg = lambda message: None  # type: ignore[method-assign]
+        app._wait_for_response = lambda order_id, response_name, timeout: {  # type: ignore[method-assign]
+            "orderId": order_id,
+            "status": "Submitted",
+        }
+
+        app.place_order_sync(contract, order, timeout=5)
+
+        events = app.broker_wire_audit_events_since(0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "outbound_order_request")
+        self.assertEqual(events[0]["request"]["api_method"], "placeOrder")
+        self.assertEqual(events[0]["request"]["stage"], "live_order_submit")
+        self.assertEqual(events[0]["request"]["order_id"], 41)
+        self.assertEqual(events[0]["request"]["order"]["order_ref"], "wire-audit-entry-1")
+        self.assertEqual(events[0]["request"]["order"]["limit_price"], "93.9")
+        self.assertTrue(events[0]["request"]["order"]["transmit"])
+        self.assertFalse(events[0]["request"]["order"]["what_if"])
+        self.assertEqual(events[0]["request"]["contract"]["sec_id"], "SE0015671995")
+
+    def test_cancel_order_sync_records_outbound_wire_audit(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        app.serverVersion = lambda: 200  # type: ignore[method-assign]
+        app.sendMsg = lambda message: None  # type: ignore[method-assign]
+        app._wait_for_response = lambda order_id, response_name, timeout: {  # type: ignore[method-assign]
+            "orderId": order_id,
+            "status": "Cancelled",
+        }
+
+        app.cancel_order_sync(41, timeout=5)
+
+        events = app.broker_wire_audit_events_since(0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "outbound_cancel_request")
+        self.assertEqual(events[0]["request"]["api_method"], "cancelOrder")
+        self.assertEqual(events[0]["request"]["order_id"], 41)
+
+    def test_send_msg_records_raw_order_protocol_payloads(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        sent_messages: list[object] = []
+        app.serverVersion = lambda: 200  # type: ignore[method-assign]
+        app.conn = SimpleNamespace(sendMsg=sent_messages.append)
+
+        app.sendMsg(3, "41\0HEM\0STK\0SMART\0BUY\0")
+        app.sendMsg(99, "ignored\0")
+        app.sendMsgProtoBuf(204, b"\x08\x96&")
+
+        events = app.broker_wire_audit_events_since(0)
+        self.assertEqual(len(sent_messages), 3)
+        self.assertEqual(
+            [event["event_type"] for event in events],
+            ["outbound_ibapi_message", "outbound_ibapi_message"],
+        )
+        self.assertEqual(events[0]["request"]["api_method"], "sendMsg")
+        self.assertEqual(events[0]["request"]["message_id"], 3)
+        self.assertEqual(events[0]["request"]["message_name"], "PLACE_ORDER")
+        self.assertEqual(events[0]["request"]["payload"]["encoding"], "ibapi_field_string")
+        self.assertEqual(events[0]["request"]["payload"]["fields"][:5], ["41", "HEM", "STK", "SMART", "BUY"])
+        self.assertEqual(events[1]["request"]["api_method"], "sendMsgProtoBuf")
+        self.assertEqual(events[1]["request"]["message_id"], 204)
+        self.assertEqual(events[1]["request"]["message_name"], "CANCEL_ORDER_PROTOBUF")
+        self.assertEqual(events[1]["request"]["payload"]["encoding"], "protobuf_bytes_base64")
+        self.assertEqual(events[1]["request"]["payload"]["base64"], "CJYm")
+
+    def test_order_id_allocator_advances_after_whatif_order(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        app._request_next_order_id_from_broker = lambda timeout=None: 41  # type: ignore[method-assign]
+
+        preview_order_id = app._allocate_order_id()
+        live_order_id = app._allocate_order_id()
+
+        self.assertEqual(preview_order_id, 41)
+        self.assertEqual(live_order_id, 42)
+
+    def test_open_order_callback_wakes_whatif_order_waiter(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+        contract = SimpleNamespace(symbol="HEM", secType="STK")
+        order = SimpleNamespace(orderId=41, whatIf=True, transmit=True)
+        order_state = SimpleNamespace(status="PreSubmitted")
+
+        app.openOrder(41, contract, order, order_state)
+
+        result = app._wait_for_response(41, "open_orders", timeout=0.01)
+
+        self.assertEqual(result["orderId"], 41)
+        self.assertIs(result["contract"], contract)
+        self.assertIs(result["order"], order)
+        self.assertIs(result["orderState"], order_state)
+
     def test_get_account_updates_unsubscribes_on_error(self) -> None:
         wrapper_cls = load_sync_wrapper_class()
         app = wrapper_cls(timeout=1)

@@ -259,3 +259,49 @@ class RlCandidateRolloverTests(TestCase):
             finally:
                 session.close()
                 engine.dispose()
+
+    def test_lifecycle_retires_needs_review_entry_without_fill(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{Path(temp_dir) / 'lifecycle.db'}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                session.add(
+                    _candidate_record(
+                        "needs-review-candidate",
+                        expire_at=datetime(2026, 5, 4, 15, 30, tzinfo=timezone.utc),
+                        symbol="EKTA-B",
+                        lifecycle=True,
+                    )
+                )
+                session.add(
+                    _generated_record(
+                        "needs-review-entry",
+                        source_instruction_id="needs-review-candidate",
+                        state="NEEDS_REVIEW",
+                        symbol="EKTA-B",
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+
+            result = retire_completed_rl_candidates(
+                session_factory,
+                requested_by="test",
+            )
+
+            self.assertEqual(result.retired_candidate_count, 1)
+            self.assertEqual(result.candidate_ids, ("needs-review-candidate",))
+
+            session = session_factory()
+            try:
+                row = session.query(InstructionRecord).filter_by(
+                    instruction_id="needs-review-candidate"
+                ).one()
+                self.assertIsNotNone(row.archived_at)
+            finally:
+                session.close()
+                engine.dispose()

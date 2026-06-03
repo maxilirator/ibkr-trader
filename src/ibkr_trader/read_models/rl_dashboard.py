@@ -140,6 +140,48 @@ def _normalize_timestamp(value: datetime) -> datetime:
     return value
 
 
+def _action_account_book(record: TraderActionRecord) -> tuple[str, str]:
+    payload = dict(record.payload or {})
+    account_key = _normalize_optional_upper(payload.get("source_account_key"))
+    book_key = _normalize_optional_text(payload.get("source_book_key"))
+    if account_key and book_key:
+        return account_key, book_key
+
+    parsed_account, parsed_book = _parse_account_book_from_instruction_id(
+        payload.get("source_instruction_id") or record.instruction_id
+    )
+    return (
+        parsed_account or record.trader_deployment.account_key,
+        parsed_book or record.trader_deployment.book_key,
+    )
+
+
+def _parse_account_book_from_instruction_id(value: Any) -> tuple[str | None, str | None]:
+    raw = str(value or "").strip()
+    parts = raw.split("-")
+    if len(parts) < 5:
+        return None, None
+    try:
+        int(parts[0])
+        int(parts[1])
+        int(parts[2])
+    except ValueError:
+        return None, None
+    account_key = _normalize_optional_upper(parts[3])
+    book_key = _normalize_optional_text(parts[4])
+    return account_key, book_key
+
+
+def _normalize_optional_upper(value: Any) -> str | None:
+    normalized = _normalize_optional_text(value)
+    return normalized.upper() if normalized else None
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    return raw or None
+
+
 def build_rl_trader_dashboard_snapshot(
     session_factory: sessionmaker,
     *,
@@ -248,28 +290,33 @@ def build_rl_trader_dashboard_snapshot(
                 )
             )
 
-        recent_actions = tuple(
-            RLTraderAction(
-                action_id=record.id,
-                deployment_key=record.trader_deployment.deployment_key,
-                model_key=record.trader_deployment.trader_model.model_key,
-                model_display_name=record.trader_deployment.trader_model.display_name,
-                account_key=record.trader_deployment.account_key,
-                book_key=record.trader_deployment.book_key,
-                is_virtual=record.trader_deployment.is_virtual,
-                symbol=record.symbol,
-                action_name=record.action_name,
-                state_before=record.state_before,
-                state_after=record.state_after,
-                action_status=record.action_status,
-                observed_at=record.observed_at,
-                action_at=record.action_at,
-                instruction_id=record.instruction_id,
-                note=record.note,
-                payload=dict(record.payload),
+        recent_actions_list: list[RLTraderAction] = []
+        for record in action_records:
+            action_account_key, action_book_key = _action_account_book(record)
+            recent_actions_list.append(
+                RLTraderAction(
+                    action_id=record.id,
+                    deployment_key=record.trader_deployment.deployment_key,
+                    model_key=record.trader_deployment.trader_model.model_key,
+                    model_display_name=(
+                        record.trader_deployment.trader_model.display_name
+                    ),
+                    account_key=action_account_key,
+                    book_key=action_book_key,
+                    is_virtual=record.trader_deployment.is_virtual,
+                    symbol=record.symbol,
+                    action_name=record.action_name,
+                    state_before=record.state_before,
+                    state_after=record.state_after,
+                    action_status=record.action_status,
+                    observed_at=record.observed_at,
+                    action_at=record.action_at,
+                    instruction_id=record.instruction_id,
+                    note=record.note,
+                    payload=dict(record.payload),
+                )
             )
-            for record in action_records
-        )
+        recent_actions = tuple(recent_actions_list)
 
         deployment_count = session.execute(
             select(TraderDeploymentRecord.id)

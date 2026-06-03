@@ -65,6 +65,34 @@ class GatewayDiagnosticsTest(unittest.TestCase):
 
         self.assertIsNone(format_gateway_diagnostic_hint(diagnostics))
 
+    def test_read_ibgateway_diagnostics_detects_api_socket_deadlock(self) -> None:
+        journal = "\n".join(
+            (
+                "2026-05-11T16:12:54+0000 quant run[1]: 2026-05-11 14:12:54.360 ERROR [JTS-DeadlockMonitor-2] -   Thread[ 578]:JTS-EServerSocket-516",
+                "2026-05-11T16:12:54+0000 quant run[1]: 2026-05-11 14:12:54.360 ERROR [JTS-DeadlockMonitor-2] -   - lock name: java.lang.Object@66a217cc",
+                "2026-05-11T16:12:54+0000 quant run[1]: 2026-05-11 14:12:54.361 ERROR [JTS-DeadlockMonitor-2] -   Thread[ 590]:JTS-EServerSocket-528",
+                "2026-05-11T16:12:54+0000 quant run[1]: 2026-05-11 14:12:54.361 ERROR [JTS-DeadlockMonitor-2] -   app//jextend.dD.ao(dD.java:1990)",
+            )
+        )
+        completed = Mock(returncode=0, stdout=journal, stderr="")
+
+        with patch("subprocess.run", return_value=completed):
+            diagnostics = read_ibgateway_diagnostics(
+                unit="ibgateway-ibc.service",
+                use_cache=False,
+            )
+
+        self.assertEqual(diagnostics["status"], "api_socket_deadlock_reported")
+        self.assertEqual(diagnostics["severity"], "bad")
+        self.assertEqual(
+            diagnostics["api_socket_threads_seen"],
+            ("JTS-EServerSocket-516", "JTS-EServerSocket-528"),
+        )
+
+        hint = format_gateway_diagnostic_hint(diagnostics)
+        self.assertIsNotNone(hint)
+        self.assertIn("API socket threads JTS-EServerSocket-516", hint or "")
+
     def test_read_ibgateway_diagnostics_keeps_successful_restart_2fa_context(
         self,
     ) -> None:

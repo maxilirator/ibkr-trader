@@ -18,6 +18,7 @@ from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import MarketDataBackfillRequestRecord
+from ibkr_trader.ibkr.broker_circuit import BrokerCircuitOpen
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery
 from ibkr_trader.ibkr.historical_bars import read_historical_bars
 from ibkr_trader.ibkr.market_stream_store import persist_market_stream_bars
@@ -119,15 +120,31 @@ def enqueue_market_data_backfill_request(
             serialized["enqueue_action"] = "already_pending"
             return serialized
 
+        previous_status = str(row.status or "").upper()
+        previous_next_retry_at = row.next_retry_at
+        previous_result_payload = dict(row.result_payload or {})
+
         row.requested_until = _max_requested_until(row.requested_until, requested_until)
         row.reason = _truncate(reason, 128)
         row.requested_at = now
-        row.completed_at = None
-        row.next_retry_at = None
-        row.last_error = None
-        if row.status != BACKFILL_STATUS_RUNNING:
+
+        retry_deferred = previous_status == BACKFILL_STATUS_FAILED_RETRYABLE
+        if retry_deferred:
+            row.status = BACKFILL_STATUS_FAILED_RETRYABLE
+            row.leased_at = None
+            if previous_next_retry_at is None and previous_result_payload.get(
+                "circuit_open"
+            ):
+                row.next_retry_at = now + timedelta(seconds=900.0)
+            else:
+                row.next_retry_at = previous_next_retry_at
+        elif previous_status != BACKFILL_STATUS_RUNNING:
             row.status = BACKFILL_STATUS_PENDING
             row.leased_at = None
+            row.completed_at = None
+            row.next_retry_at = None
+            row.last_error = None
+            row.result_payload = {}
         row.request_payload = {
             "policy": "coalesced_symbol_day_observed_bar_backfill",
             **normalized,
@@ -135,7 +152,9 @@ def enqueue_market_data_backfill_request(
         }
         session.flush()
         serialized = serialize_market_data_backfill_request(row)
-        serialized["enqueue_action"] = "extended"
+        serialized["enqueue_action"] = (
+            "extended_retry_deferred" if retry_deferred else "extended"
+        )
         return serialized
 
 
@@ -167,21 +186,38 @@ def claim_due_market_data_backfill_requests(
     *,
     limit: int,
     now: datetime | None = None,
+    running_lease_timeout_seconds: float = 300.0,
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     resolved_now = now or utc_now()
+    stale_running_cutoff = resolved_now - timedelta(
+        seconds=max(float(running_lease_timeout_seconds), 0.0),
+    )
     with session_scope(session_factory) as session:
         rows = (
             session.execute(
                 select(MarketDataBackfillRequestRecord)
                 .where(
-                    MarketDataBackfillRequestRecord.status.in_(
-                        RETRYABLE_BACKFILL_STATUSES
-                    ),
                     or_(
-                        MarketDataBackfillRequestRecord.next_retry_at.is_(None),
-                        MarketDataBackfillRequestRecord.next_retry_at <= resolved_now,
+                        (
+                            MarketDataBackfillRequestRecord.status.in_(
+                                RETRYABLE_BACKFILL_STATUSES
+                            )
+                            & or_(
+                                MarketDataBackfillRequestRecord.next_retry_at.is_(None),
+                                MarketDataBackfillRequestRecord.next_retry_at
+                                <= resolved_now,
+                            )
+                        ),
+                        (
+                            MarketDataBackfillRequestRecord.status
+                            == BACKFILL_STATUS_RUNNING
+                        )
+                        & (
+                            MarketDataBackfillRequestRecord.leased_at
+                            <= stale_running_cutoff
+                        ),
                     ),
                 )
                 .order_by(
@@ -307,7 +343,7 @@ def run_due_market_data_backfills(
     )
     completed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    for request in claimed:
+    for index, request in enumerate(claimed):
         request_id = int(request["id"])
         query = HistoricalBarsQuery(
             symbol=request["symbol"],
@@ -356,6 +392,27 @@ def run_due_market_data_backfills(
                     },
                 )
             )
+        except BrokerCircuitOpen as exc:
+            LOGGER.info(
+                "Broker circuit is open; delaying %s claimed market-data backfills.",
+                len(claimed) - index,
+            )
+            result_payload = {
+                "error_type": type(exc).__name__,
+                "circuit_open": True,
+            }
+            for delayed_request in claimed[index:]:
+                failed.append(
+                    mark_market_data_backfill_failed(
+                        session_factory,
+                        request_id=int(delayed_request["id"]),
+                        error=str(exc),
+                        retryable=True,
+                        retry_after_seconds=900.0,
+                        result_payload=result_payload,
+                    )
+                )
+            break
         except Exception as exc:  # pragma: no cover - exercised through tests with fakes.
             LOGGER.warning(
                 "Failed to backfill market data for %s.",

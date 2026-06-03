@@ -32,6 +32,13 @@ from ibkr_trader.ibkr.sync_wrapper import (
 )
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class as _load_sync_wrapper_class
 
+_FULL_CASH_ENTRY_RESERVE_FRACTION = Decimal("0.0025")
+_FULL_CASH_ENTRY_MINIMUM_RESERVE_BY_CURRENCY: dict[str, Decimal] = {
+    "EUR": Decimal("10"),
+    "SEK": Decimal("100"),
+    "USD": Decimal("10"),
+}
+
 
 @runtime_checkable
 class PreviewSyncWrapperProtocol(Protocol):
@@ -170,6 +177,25 @@ def _effective_funding_basis(instruction: ExecutionInstruction) -> FundingBasis:
     if instruction.intent.side == "BUY" and instruction.intent.position_side.value == "LONG":
         return FundingBasis.CASH
     return FundingBasis.ACCOUNT_NAV
+
+
+def _default_cash_entry_reserve(currency: str | None) -> Decimal:
+    normalized_currency = (currency or "").strip().upper()
+    return _FULL_CASH_ENTRY_MINIMUM_RESERVE_BY_CURRENCY.get(
+        normalized_currency,
+        Decimal("10"),
+    )
+
+
+def _full_cash_entry_reserve(
+    *,
+    source_value: Decimal,
+    currency: str | None,
+) -> Decimal:
+    percent_reserve = source_value * _FULL_CASH_ENTRY_RESERVE_FRACTION
+    minimum_reserve = _default_cash_entry_reserve(currency)
+    reserve = max(percent_reserve, minimum_reserve)
+    return min(reserve, source_value)
 
 
 def _map_order_type(order_type: OrderType) -> str:
@@ -386,6 +412,7 @@ def _resolve_sizing_preview(
     estimated_quantity = None
     normalized_quantity = None
     fx_conversion = None
+    cash_reserve = Decimal("0")
     sizing_mode = instruction.sizing.mode
     funding_basis = _effective_funding_basis(instruction)
 
@@ -437,7 +464,30 @@ def _resolve_sizing_preview(
             else:
                 fraction_value = instruction.sizing.target_fraction_of_account
                 if fraction_value is not None:
-                    target_notional = source_value * fraction_value
+                    effective_source_value = source_value
+                    if (
+                        funding_basis is FundingBasis.CASH
+                        and instruction.intent.side == "BUY"
+                        and instruction.intent.position_side.value == "LONG"
+                        and fraction_value >= Decimal("1")
+                    ):
+                        cash_reserve = _full_cash_entry_reserve(
+                            source_value=source_value,
+                            currency=source_currency,
+                        )
+                        effective_source_value = source_value - cash_reserve
+                        if effective_source_value <= 0:
+                            issues.append(
+                                "Cash-backed account sizing could not leave any post-trade cash reserve."
+                            )
+                        else:
+                            reserve_label = f"{cash_reserve} {source_currency or ''}".strip()
+                            warnings.append(
+                                f"Cash-backed long sizing reserved {reserve_label} "
+                                "before computing a full-account entry size."
+                            )
+
+                    target_notional = effective_source_value * fraction_value
                     if source_currency != instruction.instrument.currency:
                         fx_conversion, fx_issues = _resolve_fx_conversion(
                             app=app,
@@ -479,6 +529,7 @@ def _resolve_sizing_preview(
         "normalized_quantity": normalized_quantity,
         "fx_conversion": fx_conversion,
         "funding_basis": funding_basis,
+        "cash_reserve": cash_reserve,
     }
 
 
@@ -591,6 +642,14 @@ def _build_instruction_preview(
             ),
             "account_currency": account_currency,
             "instrument_currency": instruction.instrument.currency,
+            "cash_reserve": (
+                {
+                    "amount": str(sizing_preview["cash_reserve"]),
+                    "currency": sizing_preview["cash_currency"] or account_currency,
+                }
+                if sizing_preview["cash_reserve"] > 0
+                else None
+            ),
             "fx_conversion": _serialize_fx_conversion(sizing_preview["fx_conversion"]),
             "estimated_quantity": str(estimated_quantity) if estimated_quantity is not None else None,
             "normalized_quantity": (

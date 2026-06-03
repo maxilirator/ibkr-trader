@@ -4,6 +4,7 @@ import {
   buildFallbackHealth,
   buildEndpointErrorMap,
   normalizeBaseUrl,
+  passiveHealthUrl,
   patchJson,
   readJson
 } from '$lib/server/trader-api';
@@ -94,7 +95,7 @@ function rlDashboardUrl(apiBaseUrl) {
 
 export async function load({ fetch }) {
   const apiBaseUrl = normalizeBaseUrl(env.IBKR_TRADER_API_BASE_URL);
-  const healthUrl = `${apiBaseUrl}/healthz`;
+  const healthUrl = passiveHealthUrl(apiBaseUrl);
 
   const [health, rlDashboard] = await Promise.all([
     readJson(fetch, healthUrl, { timeoutMs: 2500 }),

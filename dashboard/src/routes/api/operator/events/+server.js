@@ -3,6 +3,7 @@ import {
   buildEndpointErrorMap,
   buildFallbackHealth,
   normalizeBaseUrl,
+  passiveHealthUrl,
   readJson
 } from '$lib/server/trader-api';
 import { createSnapshotEventResponse } from '$lib/server/snapshot-events';
@@ -23,7 +24,7 @@ export function GET({ fetch, request, url }) {
     eventName: 'operator',
     async loadSnapshot() {
       const [health, operatorSnapshot] = await Promise.all([
-        readJson(fetch, `${apiBaseUrl}/healthz`, { timeoutMs: 2500 }),
+        readJson(fetch, passiveHealthUrl(apiBaseUrl), { timeoutMs: 2500 }),
         readJson(fetch, `${apiBaseUrl}/v1/read/operator-snapshot`)
       ]);
 

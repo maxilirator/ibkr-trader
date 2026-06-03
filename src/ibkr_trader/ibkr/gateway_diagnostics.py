@@ -35,12 +35,14 @@ class IbGatewayDiagnostics:
     second_factor_at: str | None = None
     login_completed_at: str | None = None
     deadlock_at: str | None = None
+    api_socket_deadlock_at: str | None = None
     configured_existing_session_action: str | None = None
     recommended_existing_session_action: str | None = None
     configuration_warnings: tuple[str, ...] = ()
     shutdown_progress_age_seconds: int | None = None
     stuck_shutdown_threshold_seconds: int | None = None
     api_client_ids_seen: tuple[int, ...] = ()
+    api_socket_threads_seen: tuple[str, ...] = ()
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,6 +112,12 @@ def _summarize_status(state: dict[str, Any]) -> tuple[str, str, str]:
     if state.get("error"):
         return "unavailable", "warn", "Gateway diagnostics unavailable."
     if state.get("deadlock_at"):
+        if state.get("api_socket_deadlock_at"):
+            return (
+                "api_socket_deadlock_reported",
+                "bad",
+                "IB Gateway reported API socket handler threads in a Java deadlock.",
+            )
         return "deadlock_reported", "bad", "IB Gateway reported a Java deadlock."
     if state.get("shutdown_progress_at"):
         age_seconds = state.get("shutdown_progress_age_seconds")
@@ -179,12 +187,14 @@ def _parse_journal(lines: list[str], *, unit: str) -> dict[str, Any]:
         "second_factor_at": None,
         "login_completed_at": None,
         "deadlock_at": None,
+        "api_socket_deadlock_at": None,
         "configured_existing_session_action": None,
         "recommended_existing_session_action": _DEDICATED_GATEWAY_EXISTING_SESSION_ACTION,
         "configuration_warnings": (),
         "shutdown_progress_age_seconds": None,
         "stuck_shutdown_threshold_seconds": _stuck_shutdown_threshold_seconds(),
         "api_client_ids_seen": set(),
+        "api_socket_threads_seen": set(),
         "error": None,
     }
 
@@ -193,6 +203,7 @@ def _parse_journal(lines: list[str], *, unit: str) -> dict[str, Any]:
         r"(?P<title>[^;]+); event=(?P<event>.+)$"
     )
     client_re = re.compile(r"addLogConsole Client (?P<client_id>\d+)")
+    api_socket_thread_re = re.compile(r"Thread\[\s*\d+\]:JTS-EServerSocket-(?P<id>\d+)")
     configured_action_re = re.compile(r"ExistingSessionDetectedAction=(?P<action>\S+)")
 
     for line in lines:
@@ -243,8 +254,18 @@ def _parse_journal(lines: list[str], *, unit: str) -> dict[str, Any]:
             state["shutdown_progress_at"] = None
             state["command_server_shutdown_at"] = None
             state["deadlock_at"] = None
+            state["api_socket_deadlock_at"] = None
+            state["api_socket_threads_seen"].clear()
         if "JTS-DeadlockMonitor" in line or "DeadlockMonitor" in line:
             state["deadlock_at"] = timestamp or state["deadlock_at"]
+            api_socket_match = api_socket_thread_re.search(line)
+            if api_socket_match is not None:
+                state["api_socket_deadlock_at"] = (
+                    timestamp or state["api_socket_deadlock_at"]
+                )
+                state["api_socket_threads_seen"].add(
+                    f"JTS-EServerSocket-{api_socket_match.group('id')}"
+                )
         client_match = client_re.search(line)
         if client_match is not None:
             state["api_client_ids_seen"].add(int(client_match.group("client_id")))
@@ -259,6 +280,7 @@ def _parse_journal(lines: list[str], *, unit: str) -> dict[str, Any]:
     state["severity"] = severity
     state["summary"] = summary
     state["api_client_ids_seen"] = tuple(sorted(state["api_client_ids_seen"]))
+    state["api_socket_threads_seen"] = tuple(sorted(state["api_socket_threads_seen"]))
     return state
 
 
@@ -352,6 +374,9 @@ def format_gateway_diagnostic_hint(diagnostics: dict[str, Any]) -> str | None:
         )
     if diagnostics.get("existing_session_action"):
         details.append(str(diagnostics["existing_session_action"]))
+    api_socket_threads = diagnostics.get("api_socket_threads_seen") or ()
+    if api_socket_threads:
+        details.append(f"API socket threads {', '.join(api_socket_threads[:5])}")
     if diagnostics.get("configured_existing_session_action"):
         details.append(
             "configured ExistingSessionDetectedAction="

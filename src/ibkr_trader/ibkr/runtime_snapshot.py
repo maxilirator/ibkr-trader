@@ -261,6 +261,8 @@ def _serialize_open_order(raw_payload: Any) -> BrokerOpenOrder | None:
     order = raw_payload.get("order")
     contract = raw_payload.get("contract")
     order_state = raw_payload.get("orderState")
+    if bool(getattr(order, "whatIf", False)):
+        return None
     return BrokerOpenOrder(
         order_id=order_id,
         perm_id=_to_optional_int(getattr(order, "permId", None)),

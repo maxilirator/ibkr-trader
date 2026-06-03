@@ -74,3 +74,25 @@ class InstructionModelTests(TestCase):
         runtime.on_entry_cancelled()
 
         self.assertEqual(runtime.state, ExecutionState.ENTRY_CANCELLED)
+
+    def test_instruction_runtime_can_mark_needs_review(self) -> None:
+        instruction = TradeInstruction(
+            instruction_id="demo-3",
+            created_at=datetime.now(timezone.utc),
+            entry=TimedEntry(
+                symbol="AAPL",
+                side=Side.BUY,
+                quantity=Decimal("10"),
+                order_type=EntryOrderType.LIMIT,
+                activate_at=datetime.now(timezone.utc),
+                limit_price=Decimal("180.50"),
+            ),
+            exit_policy=ExitPolicy(),
+        )
+
+        runtime = InstructionRuntime(instruction=instruction)
+        runtime.schedule_entry()
+        runtime.on_entry_submitted()
+        runtime.on_needs_review()
+
+        self.assertEqual(runtime.state, ExecutionState.NEEDS_REVIEW)

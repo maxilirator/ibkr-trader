@@ -125,6 +125,52 @@ class RLTraderDashboardReadModelTests(TestCase):
         self.assertTrue(snapshot.deployments[0].heartbeat.is_stale)
         self.assertEqual(snapshot.summary.stale_heartbeat_count, 1)
 
+    def test_recent_action_account_uses_source_instruction_snapshot(self) -> None:
+        now_at = datetime(2026, 5, 11, 7, 30, tzinfo=timezone.utc)
+
+        with session_scope(self.session_factory) as session:
+            model = TraderModelRecord(
+                model_key="short_trial36_v1",
+                display_name="Short Trial 36 V1",
+                strategy_family="canonical_short_live_execution_policy",
+                side="SHORT",
+                action_space_json=["skip"],
+                observation_contract_json={},
+            )
+            deployment = TraderDeploymentRecord(
+                trader_model=model,
+                deployment_key="short_trial_36_virtual_shared_01",
+                account_key="VIRTUALRL02",
+                book_key="bb_short_02",
+                mode="virtual",
+                status="running",
+                is_virtual=True,
+            )
+            session.add(
+                TraderActionRecord(
+                    trader_deployment=deployment,
+                    observed_at=now_at,
+                    symbol="BALD B",
+                    action_name="skip",
+                    action_status="translated",
+                    payload={
+                        "source_instruction_id": (
+                            "2026-05-07-VIRTUALRL01-rl_shared_short_trial_36_virtual_01-"
+                            "BALD B-short-model-routed-01"
+                        ),
+                    },
+                )
+            )
+
+        with patch("ibkr_trader.read_models.rl_dashboard.utc_now", return_value=now_at):
+            snapshot = build_rl_trader_dashboard_snapshot(self.session_factory)
+
+        self.assertEqual(snapshot.recent_actions[0].account_key, "VIRTUALRL01")
+        self.assertEqual(
+            snapshot.recent_actions[0].book_key,
+            "rl_shared_short_trial_36_virtual_01",
+        )
+
     def test_stopped_deployments_do_not_count_as_stale(self) -> None:
         now_at = datetime(2026, 4, 25, 7, 30, tzinfo=timezone.utc)
 

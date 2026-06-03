@@ -4,6 +4,7 @@ import {
   buildFallbackHealth,
   buildEndpointErrorMap,
   normalizeBaseUrl,
+  passiveHealthUrl,
   readJson
 } from '$lib/server/trader-api';
 
@@ -42,7 +43,7 @@ export async function load({ fetch, url }) {
   }
 
   const ledgerSnapshotUrl = `${apiBaseUrl}/v1/read/ledger-snapshot?${params.toString()}`;
-  const healthUrl = `${apiBaseUrl}/healthz`;
+  const healthUrl = passiveHealthUrl(apiBaseUrl);
 
   const [health, ledgerSnapshot] = await Promise.all([
     readJson(fetch, healthUrl, { timeoutMs: 2500 }),

@@ -165,6 +165,19 @@ class PersistedEntrySubmissionTests(TestCase):
                         "warning_text": "Order held in TWS pending manual transmit.",
                     },
                 },
+                "ibkr_wire_audit": [
+                    {
+                        "event_type": "outbound_order_request",
+                        "event_at": datetime(
+                            2026, 4, 10, 19, 55, tzinfo=timezone.utc
+                        ),
+                        "request": {
+                            "api_method": "placeOrder",
+                            "stage": "live_order_submit",
+                            "order": {"order_ref": "persisted-aapl-1"},
+                        },
+                    }
+                ],
             }
 
         result = submit_persisted_instruction_entry(
@@ -183,6 +196,10 @@ class PersistedEntrySubmissionTests(TestCase):
         self.assertEqual(
             result.broker_submission["tws_submission"]["order_state"]["warning_text"],
             "Order held in TWS pending manual transmit.",
+        )
+        self.assertEqual(
+            result.broker_submission["ibkr_wire_audit"][0]["event_at"],
+            "2026-04-10T19:55:00+00:00",
         )
 
         session = self.session_factory()
@@ -227,6 +244,12 @@ class PersistedEntrySubmissionTests(TestCase):
             self.assertEqual(
                 events[0].payload["broker_submission"]["tws_submission"]["order_state"]["warning_text"],
                 "Order held in TWS pending manual transmit.",
+            )
+            self.assertEqual(
+                events[0].payload["broker_submission"]["ibkr_wire_audit"][0][
+                    "event_at"
+                ],
+                "2026-04-10T19:55:00+00:00",
             )
         finally:
             session.close()

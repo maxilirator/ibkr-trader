@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
@@ -13,189 +14,18 @@ from ibkr_trader.ibkr.errors import IbkrDependencyError
 
 
 IBKR_INFORMATIONAL_MESSAGE_CODES = {2104, 2106, 2107, 2108, 2119, 2158}
+IBKR_ORDER_OUTBOUND_MESSAGE_NAMES = {
+    3: "PLACE_ORDER",
+    4: "CANCEL_ORDER",
+    203: "PLACE_ORDER_PROTOBUF",
+    204: "CANCEL_ORDER_PROTOBUF",
+}
 
 
-class _LocalResponseTimeout(TimeoutError):
-    """Fallback timeout class for tests and fake wrappers without ibapi installed."""
-
-
-class _FallbackExecutionFilter:
-    """Small stand-in for ibapi.execution.ExecutionFilter used by local tests."""
-
-    def __init__(self) -> None:
-        self.acctCode = ""
-        self.lastNDays = 0
-
-
-class _FallbackOrderCancel:
-    """Small stand-in for ibapi.order_cancel.OrderCancel used by local tests."""
-
-
-class _FallbackTWSSyncWrapper:
-    """A non-networking base with the buffers RepoSyncWrapper extends in tests.
-
-    Production IBKR work still requires the official package: the default
-    ``connect`` raises clearly if somebody tries to use this fallback against
-    a real Gateway. Unit tests monkeypatch connection methods and exercise the
-    repo-owned callback/request logic without needing the proprietary module.
-    """
-
-    def __init__(self, timeout: int = 30) -> None:
-        self.timeout = timeout
-        self.contract_details: dict[int, Any] = {}
-        self.account_summary: dict[int, Any] = {}
-        self.open_orders: dict[int, Any] = {}
-        self.order_status: dict[int, Any] = {}
-        self.historical_data: dict[int, Any] = {}
-        self.market_rule: dict[int, Any] = {}
-        self.executions: dict[int, list[Any]] = {}
-        self.portfolio: list[Any] = []
-        self.next_valid_id_value: int | None = None
-
-    def connect(self, host: str, port: int, client_id: int) -> None:
-        raise IbkrDependencyError(
-            "The official IBKR Python client is not installed. "
-            "Install the current TWS API package from IBKR and make sure "
-            "the `ibapi` module is available in this environment."
-        )
-
-    def isConnected(self) -> bool:  # noqa: N802
-        return False
-
-    def run(self) -> None:
-        return None
-
-    def disconnect(self) -> None:
-        return None
-
-    def get_next_valid_id(self, timeout: int | None = None) -> int:
-        del timeout
-        if self.next_valid_id_value is None:
-            raise _LocalResponseTimeout("nextValidId callback was not received")
-        return self.next_valid_id_value
-
-    def _set_event(self, req_id: int, response_name: str, payload: Any) -> None:
-        getattr(self, response_name)[req_id] = payload
-
-    def _wait_for_response(
-        self,
-        req_id: int,
-        response_name: str,
-        timeout: int | None = None,
-    ) -> Any:
-        del timeout
-        payload = getattr(self, response_name)
-        if isinstance(payload, dict):
-            if req_id in payload:
-                return payload[req_id]
-            if req_id == 0:
-                return payload
-        raise _LocalResponseTimeout(f"{response_name} response was not received")
-
-    def reqContractDetails(self, req_id: int, contract: Any) -> None:  # noqa: N802
-        del req_id, contract
-
-    def placeOrder(self, orderId: int, contract: Any, order: Any) -> None:  # noqa: N802
-        del orderId, contract, order
-
-    def reqAccountSummary(self, req_id: int, group: str, tags: str) -> None:  # noqa: N802
-        del req_id, group, tags
-
-    def cancelAccountSummary(self, req_id: int) -> None:  # noqa: N802
-        del req_id
-
-    def reqAllOpenOrders(self) -> None:  # noqa: N802
-        return None
-
-    def reqHistoricalData(self, *args: Any, **kwargs: Any) -> None:  # noqa: N802
-        del args, kwargs
-
-    def reqMarketRule(self, market_rule_id: int) -> None:  # noqa: N802
-        del market_rule_id
-
-    def reqExecutions(self, req_id: int, exec_filter: Any) -> None:  # noqa: N802
-        del req_id, exec_filter
-
-    def reqAccountUpdates(self, subscribe: bool, account_code: str) -> None:  # noqa: N802
-        del subscribe, account_code
-
-    def cancelOrder(self, order_id: int, orderCancel: Any | None = None) -> None:  # noqa: N802
-        del order_id, orderCancel
-
-    def updateAccountValue(
-        self,
-        key: str,
-        value: str,
-        currency: str,
-        accountName: str,
-    ) -> None:
-        del key, value, currency, accountName
-
-    def commissionAndFeesReport(self, commissionAndFeesReport: Any) -> None:  # noqa: N802
-        del commissionAndFeesReport
-
-    def error(  # noqa: N802
-        self,
-        reqId: int,
-        errorTime: int,
-        errorCode: int,
-        errorString: str,
-        advancedOrderRejectJson: str = "",
-    ) -> None:
-        del reqId, errorTime, errorCode, errorString, advancedOrderRejectJson
-
-    def orderStatus(  # noqa: N802
-        self,
-        orderId: int,
-        status: str,
-        filled: Any,
-        remaining: Any,
-        avgFillPrice: float,
-        permId: int,
-        parentId: int,
-        lastFillPrice: float,
-        clientId: int,
-        whyHeld: str,
-        mktCapPrice: float,
-    ) -> None:
-        self.order_status[orderId] = {
-            "orderId": orderId,
-            "status": status,
-            "filled": filled,
-            "remaining": remaining,
-            "avgFillPrice": avgFillPrice,
-            "permId": permId,
-            "parentId": parentId,
-            "lastFillPrice": lastFillPrice,
-            "clientId": clientId,
-            "whyHeld": whyHeld,
-            "mktCapPrice": mktCapPrice,
-        }
-
-    def execDetails(self, reqId: int, contract: Any, execution: Any) -> None:  # noqa: N802
-        self.executions.setdefault(reqId, []).append(
-            {
-                "contract": contract,
-                "execution": execution,
-            }
-        )
-
-    def execDetailsEnd(self, reqId: int) -> None:  # noqa: N802
-        del reqId
-
-    def openOrder(  # noqa: N802
-        self,
-        orderId: int,
-        contract: Any,
-        order: Any,
-        orderState: Any,
-    ) -> None:
-        self.open_orders[orderId] = {
-            "orderId": orderId,
-            "contract": contract,
-            "order": order,
-            "orderState": orderState,
-        }
+from ibkr_trader.ibkr.sync_wrapper_fallback import _FallbackExecutionFilter
+from ibkr_trader.ibkr.sync_wrapper_fallback import _FallbackOrderCancel
+from ibkr_trader.ibkr.sync_wrapper_fallback import _FallbackTWSSyncWrapper
+from ibkr_trader.ibkr.sync_wrapper_fallback import _LocalResponseTimeout
 
 
 def load_response_timeout_class() -> type[Exception]:
@@ -224,8 +54,12 @@ def load_sync_wrapper_class() -> type[Any]:
             self._local_request_id_lock = threading.Lock()
             self._broker_callback_events: deque[dict[str, Any]] = deque(maxlen=5000)
             self._broker_callback_events_lock = threading.Lock()
+            self._broker_wire_audit_events: deque[dict[str, Any]] = deque(maxlen=5000)
+            self._broker_wire_audit_events_lock = threading.Lock()
             self._suppressed_callback_kinds: dict[str, int] = {}
             self._known_order_ids: set[int] = set()
+            self._next_order_id_floor: int | None = None
+            self._next_order_id_lock = threading.Lock()
             self._closed_execution_request_ids: deque[int] = deque(maxlen=512)
             self._closed_execution_request_ids_lookup: set[int] = set()
             self.account_values: dict[str, dict[str, dict[str, str | None]]] = {}
@@ -283,6 +117,39 @@ def load_sync_wrapper_class() -> type[Any]:
                 self._local_request_id += 1
             return req_id
 
+        def _wait_for_response(
+            self,
+            req_id: int,
+            response_name: str,
+            timeout: int | None = None,
+        ) -> Any:
+            event_key = f"{response_name}_{req_id}"
+            response_data = getattr(self, "response_data", None)
+            if isinstance(response_data, dict) and event_key in response_data:
+                return response_data.pop(event_key)
+            return super()._wait_for_response(req_id, response_name, timeout)
+
+        def _request_next_order_id_from_broker(self, timeout: int | None = None) -> int:
+            return super().get_next_valid_id(timeout)
+
+        def _allocate_order_id(self, timeout: int | None = None) -> int:
+            broker_order_id = int(self._request_next_order_id_from_broker(timeout))
+            with self._next_order_id_lock:
+                if (
+                    self._next_order_id_floor is None
+                    or broker_order_id > self._next_order_id_floor
+                ):
+                    order_id = broker_order_id
+                else:
+                    order_id = self._next_order_id_floor
+                self._next_order_id_floor = order_id + 1
+                if (
+                    self.next_valid_id_value is None
+                    or self.next_valid_id_value <= order_id
+                ):
+                    self.next_valid_id_value = order_id + 1
+                return order_id
+
         def _record_known_order_id(self, order_id: Any) -> None:
             if order_id in (None, ""):
                 return
@@ -291,6 +158,12 @@ def load_sync_wrapper_class() -> type[Any]:
             except (TypeError, ValueError):
                 return
             self._known_order_ids.add(normalized_order_id)
+            with self._next_order_id_lock:
+                if (
+                    self._next_order_id_floor is None
+                    or self._next_order_id_floor <= normalized_order_id
+                ):
+                    self._next_order_id_floor = normalized_order_id + 1
 
         def _mark_execution_request_closed(self, req_id: int) -> None:
             if req_id in self._closed_execution_request_ids_lookup:
@@ -324,11 +197,266 @@ def load_sync_wrapper_class() -> type[Any]:
             with self._broker_callback_events_lock:
                 self._broker_callback_events.append(payload)
 
+        def _append_broker_wire_audit_event(self, payload: dict[str, Any]) -> None:
+            with self._broker_wire_audit_events_lock:
+                self._broker_wire_audit_events.append(payload)
+
         def drain_broker_callback_events(self) -> list[dict[str, Any]]:
             with self._broker_callback_events_lock:
                 events = list(self._broker_callback_events)
                 self._broker_callback_events.clear()
             return events
+
+        def broker_wire_audit_event_count(self) -> int:
+            with self._broker_wire_audit_events_lock:
+                return len(self._broker_wire_audit_events)
+
+        def broker_wire_audit_events_since(self, offset: int = 0) -> list[dict[str, Any]]:
+            with self._broker_wire_audit_events_lock:
+                events = list(self._broker_wire_audit_events)
+            if offset <= 0:
+                return events
+            return events[offset:]
+
+        def _serialize_public_fields(self, payload: Any) -> Any:
+            if payload in (None, ""):
+                return None
+            if isinstance(payload, datetime):
+                return payload.isoformat()
+            if isinstance(payload, (str, int, float, bool)):
+                return payload
+            if isinstance(payload, list | tuple):
+                return [
+                    serialized
+                    for item in payload
+                    if (serialized := self._serialize_public_fields(item)) is not None
+                ]
+            if isinstance(payload, dict):
+                return {
+                    str(key): serialized
+                    for key, value in payload.items()
+                    if (serialized := self._serialize_public_fields(value)) is not None
+                }
+            fields = getattr(payload, "__dict__", None)
+            if isinstance(fields, dict):
+                return {
+                    key: serialized
+                    for key, value in fields.items()
+                    if not key.startswith("_")
+                    and not callable(value)
+                    and (serialized := self._serialize_public_fields(value)) is not None
+                }
+            return str(payload)
+
+        def _serialize_contract_for_wire_audit(self, contract: Any) -> dict[str, Any]:
+            return {
+                "con_id": (
+                    int(getattr(contract, "conId"))
+                    if getattr(contract, "conId", None) not in (None, "")
+                    else None
+                ),
+                "symbol": (
+                    str(getattr(contract, "symbol"))
+                    if getattr(contract, "symbol", None) not in (None, "")
+                    else None
+                ),
+                "local_symbol": (
+                    str(getattr(contract, "localSymbol"))
+                    if getattr(contract, "localSymbol", None) not in (None, "")
+                    else None
+                ),
+                "trading_class": (
+                    str(getattr(contract, "tradingClass"))
+                    if getattr(contract, "tradingClass", None) not in (None, "")
+                    else None
+                ),
+                "security_type": (
+                    str(getattr(contract, "secType"))
+                    if getattr(contract, "secType", None) not in (None, "")
+                    else None
+                ),
+                "exchange": (
+                    str(getattr(contract, "exchange"))
+                    if getattr(contract, "exchange", None) not in (None, "")
+                    else None
+                ),
+                "primary_exchange": (
+                    str(getattr(contract, "primaryExchange"))
+                    if getattr(contract, "primaryExchange", None) not in (None, "")
+                    else None
+                ),
+                "currency": (
+                    str(getattr(contract, "currency"))
+                    if getattr(contract, "currency", None) not in (None, "")
+                    else None
+                ),
+                "sec_id_type": (
+                    str(getattr(contract, "secIdType"))
+                    if getattr(contract, "secIdType", None) not in (None, "")
+                    else None
+                ),
+                "sec_id": (
+                    str(getattr(contract, "secId"))
+                    if getattr(contract, "secId", None) not in (None, "")
+                    else None
+                ),
+                "raw_nonempty_fields": self._serialize_public_fields(contract),
+            }
+
+        def _serialize_order_for_wire_audit(self, order_id: int, order: Any) -> dict[str, Any]:
+            return {
+                "order_id": order_id,
+                "account": (
+                    str(getattr(order, "account"))
+                    if getattr(order, "account", None) not in (None, "")
+                    else None
+                ),
+                "order_ref": (
+                    str(getattr(order, "orderRef"))
+                    if getattr(order, "orderRef", None) not in (None, "")
+                    else None
+                ),
+                "action": (
+                    str(getattr(order, "action"))
+                    if getattr(order, "action", None) not in (None, "")
+                    else None
+                ),
+                "order_type": (
+                    str(getattr(order, "orderType"))
+                    if getattr(order, "orderType", None) not in (None, "")
+                    else None
+                ),
+                "total_quantity": (
+                    str(getattr(order, "totalQuantity"))
+                    if getattr(order, "totalQuantity", None) not in (None, "")
+                    else None
+                ),
+                "limit_price": (
+                    str(getattr(order, "lmtPrice"))
+                    if getattr(order, "lmtPrice", None) not in (None, "")
+                    else None
+                ),
+                "aux_price": (
+                    str(getattr(order, "auxPrice"))
+                    if getattr(order, "auxPrice", None) not in (None, "")
+                    else None
+                ),
+                "time_in_force": (
+                    str(getattr(order, "tif"))
+                    if getattr(order, "tif", None) not in (None, "")
+                    else None
+                ),
+                "outside_rth": (
+                    bool(getattr(order, "outsideRth"))
+                    if getattr(order, "outsideRth", None) is not None
+                    else None
+                ),
+                "transmit": (
+                    bool(getattr(order, "transmit"))
+                    if getattr(order, "transmit", None) is not None
+                    else None
+                ),
+                "what_if": (
+                    bool(getattr(order, "whatIf"))
+                    if getattr(order, "whatIf", None) is not None
+                    else None
+                ),
+                "oca_group": (
+                    str(getattr(order, "ocaGroup"))
+                    if getattr(order, "ocaGroup", None) not in (None, "")
+                    else None
+                ),
+                "oca_type": (
+                    int(getattr(order, "ocaType"))
+                    if getattr(order, "ocaType", None) not in (None, "")
+                    else None
+                ),
+                "parent_id": (
+                    int(getattr(order, "parentId"))
+                    if getattr(order, "parentId", None) not in (None, "")
+                    else None
+                ),
+                "raw_nonempty_fields": self._serialize_public_fields(order),
+            }
+
+        def _serialize_outbound_order_request(
+            self,
+            orderId: int,
+            contract: Any,
+            order: Any,
+        ) -> dict[str, Any]:
+            return {
+                "event_type": "outbound_order_request",
+                "event_at": datetime.now(UTC),
+                "request": {
+                    "api_method": "placeOrder",
+                    "stage": (
+                        "what_if_preflight"
+                        if bool(getattr(order, "whatIf", False))
+                        else "live_order_submit"
+                    ),
+                    "order_id": orderId,
+                    "contract": self._serialize_contract_for_wire_audit(contract),
+                    "order": self._serialize_order_for_wire_audit(orderId, order),
+                },
+            }
+
+        def _serialize_outbound_cancel_request(
+            self,
+            order_id: int,
+            orderCancel: Any | None,
+        ) -> dict[str, Any]:
+            return {
+                "event_type": "outbound_cancel_request",
+                "event_at": datetime.now(UTC),
+                "request": {
+                    "api_method": "cancelOrder",
+                    "order_id": order_id,
+                    "order_cancel": self._serialize_public_fields(orderCancel),
+                },
+            }
+
+        def _serialize_outbound_ibapi_message(
+            self,
+            api_method: str,
+            msg_id: int,
+            msg: str | bytes,
+        ) -> dict[str, Any] | None:
+            try:
+                normalized_msg_id = int(msg_id)
+            except (TypeError, ValueError):
+                return None
+            message_name = IBKR_ORDER_OUTBOUND_MESSAGE_NAMES.get(normalized_msg_id)
+            if message_name is None:
+                return None
+
+            payload: dict[str, Any]
+            if isinstance(msg, bytes | bytearray):
+                raw_bytes = bytes(msg)
+                payload = {
+                    "encoding": "protobuf_bytes_base64",
+                    "byte_length": len(raw_bytes),
+                    "base64": base64.b64encode(raw_bytes).decode("ascii"),
+                }
+            else:
+                raw_text = str(msg)
+                payload = {
+                    "encoding": "ibapi_field_string",
+                    "char_length": len(raw_text),
+                    "fields": raw_text.split("\0"),
+                    "repr": repr(raw_text),
+                }
+
+            return {
+                "event_type": "outbound_ibapi_message",
+                "event_at": datetime.now(UTC),
+                "request": {
+                    "api_method": api_method,
+                    "message_id": normalized_msg_id,
+                    "message_name": message_name,
+                    "payload": payload,
+                },
+            }
 
         def _serialize_open_order_callback(
             self,
@@ -549,7 +677,26 @@ def load_sync_wrapper_class() -> type[Any]:
 
         def placeOrder(self, orderId: int, contract: Any, order: Any) -> None:  # noqa: N802
             self._record_known_order_id(orderId)
+            self._append_broker_wire_audit_event(
+                self._serialize_outbound_order_request(orderId, contract, order)
+            )
             super().placeOrder(orderId, contract, order)
+
+        def sendMsg(self, msgId: int, msg: str) -> None:  # noqa: N802
+            wire_event = self._serialize_outbound_ibapi_message("sendMsg", msgId, msg)
+            if wire_event is not None:
+                self._append_broker_wire_audit_event(wire_event)
+            super().sendMsg(msgId, msg)
+
+        def sendMsgProtoBuf(self, msgId: int, msg: bytes) -> None:  # noqa: N802
+            wire_event = self._serialize_outbound_ibapi_message(
+                "sendMsgProtoBuf",
+                msgId,
+                msg,
+            )
+            if wire_event is not None:
+                self._append_broker_wire_audit_event(wire_event)
+            super().sendMsgProtoBuf(msgId, msg)
 
         def get_contract_details(self, contract: Any, timeout: int = 5) -> list[Any]:
             req_id = self._next_local_request_id()
@@ -567,7 +714,7 @@ def load_sync_wrapper_class() -> type[Any]:
             if timeout is None:
                 timeout = 5 if getattr(order, "orderType", None) in ["LMT", "MKT"] else 2
 
-            order_id = self.get_next_valid_id()
+            order_id = self._allocate_order_id()
             order.orderId = order_id
             self._record_known_order_id(order_id)
 
@@ -576,6 +723,34 @@ def load_sync_wrapper_class() -> type[Any]:
 
             self.placeOrder(order_id, contract, order)
             return self._wait_for_response(order_id, "order_status", timeout)
+
+        def preview_order_sync(
+            self,
+            contract: Any,
+            order: Any,
+            timeout: int | None = None,
+        ) -> dict[str, Any]:
+            if timeout is None:
+                timeout = 5
+
+            order_id = self._allocate_order_id()
+            order.orderId = order_id
+            order.whatIf = True
+            order.transmit = True
+            self._record_known_order_id(order_id)
+
+            if order_id in self.open_orders:
+                del self.open_orders[order_id]
+            if hasattr(self, "errors") and order_id in self.errors:
+                del self.errors[order_id]
+
+            with self._suppress_broker_callback_events(
+                "open_order",
+                "order_status",
+                "order_error",
+            ):
+                self.placeOrder(order_id, contract, order)
+                return self._wait_for_response(order_id, "open_orders", timeout)
 
         def get_account_summary(
             self,
@@ -792,6 +967,8 @@ def load_sync_wrapper_class() -> type[Any]:
         ) -> None:
             super().openOrder(orderId, contract, order, orderState)
             self._record_known_order_id(orderId)
+            if orderId in self.open_orders:
+                self._set_event(orderId, "open_orders", self.open_orders[orderId])
             if self._is_callback_suppressed("open_order"):
                 return
             self._append_broker_callback_event(
@@ -809,5 +986,12 @@ def load_sync_wrapper_class() -> type[Any]:
             self._record_known_order_id(order_id)
             self.cancelOrder(order_id, orderCancel)
             return self._wait_for_response(order_id, "order_status", timeout)
+
+        def cancelOrder(self, order_id: int, orderCancel: Any | None = None) -> None:  # noqa: N802
+            self._record_known_order_id(order_id)
+            self._append_broker_wire_audit_event(
+                self._serialize_outbound_cancel_request(order_id, orderCancel)
+            )
+            super().cancelOrder(order_id, orderCancel)
 
     return RepoSyncWrapper

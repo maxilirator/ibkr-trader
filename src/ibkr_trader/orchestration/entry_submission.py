@@ -167,6 +167,7 @@ def submit_persisted_instruction_entry(
             instruction,
             timeout=timeout,
         )
+        serialized_broker_submission = _serialize_for_json(broker_submission)
         broker_status = broker_submission["broker_order_status"]
         broker_kind = str(broker_submission.get("broker_kind") or BROKER_KIND_IBKR)
         fallback_account_key = (
@@ -221,7 +222,7 @@ def submit_persisted_instruction_entry(
             event_at=event_at,
             state_before=previous_state,
             state_after=instruction_record.state,
-            payload={"broker_submission": broker_submission},
+            payload={"broker_submission": serialized_broker_submission},
             note=(
                 "Persisted instruction entry order submitted to the virtual broker."
                 if broker_kind == BROKER_KIND_VIRTUAL
@@ -239,7 +240,7 @@ def submit_persisted_instruction_entry(
             broker_perm_id=instruction_record.broker_perm_id,
             broker_client_id=instruction_record.broker_client_id,
             broker_order_status=instruction_record.broker_order_status,
-            broker_submission=broker_submission,
+            broker_submission=serialized_broker_submission,
             submission_event=BrokerSubmissionEvent(
                 event_id=event.id,
                 event_type=event.event_type,
@@ -305,6 +306,7 @@ def cancel_persisted_instruction_entry(
             instruction_record.broker_order_id,
             timeout=timeout,
         )
+        serialized_broker_cancellation = _serialize_for_json(broker_cancellation)
         broker_status = broker_cancellation["broker_order_status"]
         broker_kind = str(broker_cancellation.get("broker_kind") or BROKER_KIND_IBKR)
         fallback_account_key = (
@@ -343,7 +345,7 @@ def cancel_persisted_instruction_entry(
             event_at=event_at,
             state_before=previous_state,
             state_after=instruction_record.state,
-            payload={"broker_cancellation": broker_cancellation},
+            payload={"broker_cancellation": serialized_broker_cancellation},
             note=(
                 "Persisted instruction entry order cancelled at the virtual broker."
                 if broker_kind == BROKER_KIND_VIRTUAL
@@ -361,7 +363,7 @@ def cancel_persisted_instruction_entry(
             broker_perm_id=instruction_record.broker_perm_id,
             broker_client_id=instruction_record.broker_client_id,
             broker_order_status=instruction_record.broker_order_status,
-            broker_cancellation=broker_cancellation,
+            broker_cancellation=serialized_broker_cancellation,
             cancellation_event=BrokerSubmissionEvent(
                 event_id=event.id,
                 event_type=event.event_type,

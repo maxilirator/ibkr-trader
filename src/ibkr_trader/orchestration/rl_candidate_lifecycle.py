@@ -226,6 +226,7 @@ def _is_terminal_without_entry_fill(record: InstructionRecord) -> bool:
         record.state
         in {
             ExecutionState.ENTRY_CANCELLED.value,
+            ExecutionState.NEEDS_REVIEW.value,
             ExecutionState.FAILED.value,
         }
         and _decimal_quantity(record.entry_filled_quantity) <= 0
