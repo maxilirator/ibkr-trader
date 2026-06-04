@@ -28,6 +28,7 @@
   export let marketTimeZone;
   export let liveHealth;
   export let brokerMonitor;
+  export let executionRuntime;
   export let killSwitch;
   export let accounts;
   export let positions;

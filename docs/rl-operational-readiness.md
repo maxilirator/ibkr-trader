@@ -115,13 +115,43 @@ checkout. Research paths are allowed only in lineage metadata; runtime model
 files come from `RL_MODEL_BUNDLE_ROOT`, and per-name static features come from
 Quant API instructions.
 
+Live data authority rule:
+
+- RL and scheduled policy trading both depend on the API-owned market stream for
+  live market data.
+- The API runtime owns the canonical stream target list. It is the union of
+  live broker orders, broker/persisted holdings, active virtual holdings, active
+  `MODEL_ROUTED_PENDING` source candidates, and active pending/submitted entry
+  instructions.
+- The stream key is the uppercased symbol, so RL and scheduled policy trading
+  share one subscription per name instead of opening separate feeds.
+- Active day names are prewarmed from model-routed or pending instructions
+  before a broker order exists; the system must not wait until entry submission
+  to subscribe the target name.
+- Each runtime sync replaces stale desired names with the current canonical
+  list. Yesterday's names should not remain subscribed unless they still have an
+  open order, holding, virtual position, or active instruction.
+- A symbol that can be traded must be in the stream desired/subscribed set before
+  the runtime sends an entry order.
+- Entry submission is blocked, not failed, when the stream has no fresh quote or
+  1-minute bar for the target. The instruction stays `ENTRY_PENDING` until a
+  later runtime cycle sees fresh stream evidence or the entry window expires.
+- Broker callbacks, executions, open orders, and positions remain the execution
+  truth after an order is submitted.
+- RL deployments consume candidates only when `model_key`, `account_key`,
+  `book_key`, and mode match. The seedpicker long virtual deployment uses
+  `long_trial_106_virtual_seedpicker_01` on
+  `VIRTUALSEEDRL01/seedpicker_rl_long_01`.
+
 ## Safe Morning Virtual Test
 
-1. Confirm exactly two deployments exist, one long and one short, both on
-   `VIRTUALRL01`.
+1. Confirm the intended deployments exist and are running, including
+   `long_trial_106_virtual_seedpicker_01` on
+   `VIRTUALSEEDRL01/seedpicker_rl_long_01`.
 2. Submit model-routed candidate names for both deployments.
-3. Publish the active names with `/v1/market-data/stream/desired` and confirm
-   the API stream owner subscribes them.
+3. Confirm the API-owned market-stream snapshot has the active candidate names
+   in `desired_symbols`; manual `/v1/market-data/stream/desired` calls are only
+   for diagnostics.
 4. For each name, build observations from the stream plus static features.
 5. Confirm `model_decision.ready=true` only at completed 5-minute boundaries.
 6. Force or observe one long `entry_prevclose_-50bp` decision and one short

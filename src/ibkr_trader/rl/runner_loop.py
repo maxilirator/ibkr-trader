@@ -405,7 +405,7 @@ def run_model_candidates(
     stage_started = time.perf_counter()
     try:
         observation_payload: dict[str, object] = {
-            "deployment_key": loaded.config.deployment_key,
+            "deployment_key": deployment_key,
             "symbols": active_symbols,
             "history_overrides": history_overrides,
             "static_features": static_features,
@@ -716,4 +716,3 @@ def run_model_candidates(
         },
     )
     print(json.dumps({"deployment_key": deployment_key, "actions": actions}, indent=2), flush=True)
-

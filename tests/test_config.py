@@ -82,6 +82,13 @@ class ConfigTests(TestCase):
         self.assertEqual(config.host, "127.0.0.1")
         self.assertEqual(config.port, 8000)
         self.assertTrue(config.require_loopback_only)
+        self.assertFalse(config.access_log_enabled)
+
+    def test_api_access_log_can_be_enabled_explicitly(self) -> None:
+        with patch.dict("os.environ", {"API_ACCESS_LOG_ENABLED": "true"}, clear=True):
+            config = ApiServerConfig.from_env()
+
+        self.assertTrue(config.access_log_enabled)
 
     def test_app_defaults_use_stockholm_timezone(self) -> None:
         with patch("ibkr_trader.config.load_dotenv_file"), patch.dict("os.environ", {}, clear=True):
@@ -93,6 +100,8 @@ class ConfigTests(TestCase):
         self.assertTrue(str(config.stockholm_identity_path).endswith("/q-data/xsto/meta/instrument_identity.parquet"))
         self.assertEqual(config.ibkr_api_max_requests_per_second, 45)
         self.assertEqual(config.broker_api_startup_failure_slow_probe_seconds, 900)
+        self.assertEqual(config.broker_execution_recovery_interval_seconds, 900)
+        self.assertEqual(config.broker_execution_recovery_failure_cooldown_seconds, 900)
         self.assertEqual(config.ibkr_market_data_line_limit, 80)
         self.assertEqual(config.ibkr_historical_requests_per_10_minutes, 50)
         self.assertEqual(config.effective_market_stream_max_subscriptions, 80)

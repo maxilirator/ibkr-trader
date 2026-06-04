@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import session_scope
+from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
@@ -28,6 +29,7 @@ from ibkr_trader.orchestration.runtime_cycle_support import _instruction_payload
 from ibkr_trader.orchestration.runtime_cycle_support import _persist_drained_broker_callbacks
 from ibkr_trader.orchestration.runtime_cycle_support import _record_runtime_note
 from ibkr_trader.orchestration.runtime_entries import _mark_pending_entry_failed, _submit_due_pending_entries
+from ibkr_trader.orchestration.market_data_readiness import MarketDataReadinessChecker
 from ibkr_trader.orchestration.runtime_exit_cleanup import _cancel_broker_order_and_persist
 from ibkr_trader.orchestration.runtime_exit_cleanup import _cancel_obsolete_exit_orders_for_current_intent
 from ibkr_trader.orchestration.runtime_exit_cleanup import _conflicting_exit_order_details_for_forced_exit
@@ -98,6 +100,7 @@ def run_runtime_cycle(
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
     virtual_market_sync: Callable[[datetime], Any] | None = None,
+    market_data_readiness_checker: MarketDataReadinessChecker | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
     submission_lead_time: timedelta = DEFAULT_SUBMISSION_LEAD_TIME,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -241,6 +244,7 @@ def run_runtime_cycle(
                 submitted_entries=submitted_entries,
                 cancelled_entries=cancelled_entries,
                 issues=issues,
+                market_data_readiness_checker=market_data_readiness_checker,
             )
         if broker_callback_fetcher is not None and real_broker_cycle_enabled:
             try:
@@ -276,24 +280,23 @@ def run_runtime_cycle(
         submission_lead_time=submission_lead_time,
     )
     open_orders_snapshot_required = bool(records)
-    executions_snapshot_required = any(not record.is_virtual for record in records)
+    # The active trading loop must not depend on reqExecutions completing. Fills
+    # are recovered first from the durable callback ledger and order-status
+    # records; execution-history snapshots are a slow background repair path.
+    executions_snapshot_required = False
     real_broker_work = has_real_broker_work(
         session_factory,
         instruction_ids=instruction_ids,
     )
     if real_broker_work and real_broker_cycle_enabled:
         try:
-            snapshot = _run_with_broker_retries(
-                lambda: runtime_snapshot_fetch(
-                    broker_config,
-                    timeout=timeout,
-                    include_open_orders=open_orders_snapshot_required,
-                    include_executions=executions_snapshot_required,
-                    include_account_updates=False,
-                    include_positions=forced_exit_snapshot_required,
-                ),
-                retry_delays=broker_retry_delays,
-                sleep_fn=sleep_fn,
+            snapshot = runtime_snapshot_fetch(
+                broker_config,
+                timeout=timeout,
+                include_open_orders=open_orders_snapshot_required,
+                include_executions=executions_snapshot_required,
+                include_account_updates=False,
+                include_positions=forced_exit_snapshot_required,
             )
         except Exception as exc:  # pragma: no cover - broad by design for runtime safety
             broker_snapshot_unavailable = True
@@ -396,17 +399,17 @@ def run_runtime_cycle(
             continue
         try:
             instruction = _instruction_payload(record)
-            entry_fill = _aggregate_executions(
-                snapshot.executions,
-                order_id=record.broker_order_id,
-                order_ref_exact=instruction.instruction_id,
+            entry_fill = _aggregate_persisted_execution_fill(
+                session_factory,
+                record=record,
+                order_role="ENTRY",
+                external_order_id=record.broker_order_id,
             )
             if not entry_fill.has_fill:
-                entry_fill = _aggregate_persisted_execution_fill(
-                    session_factory,
-                    record=record,
-                    order_role="ENTRY",
-                    external_order_id=record.broker_order_id,
+                entry_fill = _aggregate_executions(
+                    snapshot.executions,
+                    order_id=record.broker_order_id,
+                    order_ref_exact=instruction.instruction_id,
                 )
             if not entry_fill.has_fill:
                 entry_fill = _aggregate_broker_order_status_fill(
@@ -415,15 +418,15 @@ def run_runtime_cycle(
                     order_role="ENTRY",
                     external_order_id=record.broker_order_id,
                 )
-            exit_fill = _aggregate_executions(
-                snapshot.executions,
-                order_ref_prefix=f"{instruction.instruction_id}:exit:",
+            exit_fill = _aggregate_persisted_execution_fill(
+                session_factory,
+                record=record,
+                order_role="EXIT",
             )
             if not exit_fill.has_fill:
-                exit_fill = _aggregate_persisted_execution_fill(
-                    session_factory,
-                    record=record,
-                    order_role="EXIT",
+                exit_fill = _aggregate_executions(
+                    snapshot.executions,
+                    order_ref_prefix=f"{instruction.instruction_id}:exit:",
                 )
             if not exit_fill.has_fill:
                 exit_fill = _aggregate_broker_order_status_fill(
@@ -1058,6 +1061,7 @@ def run_runtime_cycle(
                 submitted_entries=submitted_entries,
                 cancelled_entries=cancelled_entries,
                 issues=issues,
+                market_data_readiness_checker=market_data_readiness_checker,
             )
     if broker_callback_fetcher is not None and real_broker_cycle_enabled:
         try:

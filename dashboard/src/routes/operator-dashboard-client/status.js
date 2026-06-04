@@ -8,6 +8,23 @@ import {
   timestampFormatter
 } from './view-state.js';
 
+const fallbackTimestampFormatter = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Europe/Stockholm',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  timeZoneName: 'short'
+});
+
+function activeTimestampFormatter() {
+  return timestampFormatter && typeof timestampFormatter.format === 'function'
+    ? timestampFormatter
+    : fallbackTimestampFormatter;
+}
+
 export function brokerConnected(role) {
   return liveHealth.broker_sessions[role].connected === true;
 }
@@ -134,7 +151,7 @@ export function formatTimestamp(value) {
   if (!parsed) {
     return value ?? 'n/a';
   }
-  return timestampFormatter.format(parsed);
+  return activeTimestampFormatter().format(parsed);
 }
 
 export function formatTimestampOrNull(value) {
@@ -142,7 +159,7 @@ export function formatTimestampOrNull(value) {
   if (!parsed) {
     return null;
   }
-  return timestampFormatter.format(parsed);
+  return activeTimestampFormatter().format(parsed);
 }
 
 export function ageSeconds(value) {
@@ -202,4 +219,3 @@ export function instrumentKeys(row) {
   ].filter(Boolean);
   return symbols.map((symbol) => `${account}|${symbol}`);
 }
-

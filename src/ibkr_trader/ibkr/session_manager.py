@@ -635,7 +635,7 @@ class ManagedSyncSession:
                     0,
                     int((completed_at - started_at).total_seconds() * 1000),
                 )
-                log_method = LOGGER.info if is_cooldown_error else LOGGER.warning
+                log_method = LOGGER.debug if is_cooldown_error else LOGGER.warning
                 log_method(
                     (
                         "IBKR broker operation skipped during cooldown: role=%s "

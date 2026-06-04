@@ -351,6 +351,87 @@ class MarketStreamTests(TestCase):
         self.assertEqual(snapshot["actual_subscription_count"], 0)
         self.assertEqual(repeated_snapshot["desired_noop_count"], 1)
 
+    def test_set_desired_many_empty_replace_clears_desired_without_socket(self) -> None:
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        service._desired_contracts_by_key["AXFO"] = MarketStreamContract(symbol="AXFO")
+
+        with patch.object(
+            service,
+            "connect_and_start",
+            side_effect=AssertionError("set_desired_many should not connect"),
+        ):
+            snapshot = service.set_desired_many([], replace=True)
+
+        self.assertEqual(snapshot["desired_subscription_count"], 0)
+        self.assertEqual(snapshot["desired_symbols"], [])
+
+    def test_subscribe_many_empty_replace_clears_desired_without_socket(self) -> None:
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        service._desired_contracts_by_key["AXFO"] = MarketStreamContract(symbol="AXFO")
+
+        with patch.object(
+            service,
+            "connect_and_start",
+            side_effect=AssertionError("empty clear should not connect"),
+        ):
+            snapshot = service.subscribe_many([], replace=True)
+
+        self.assertEqual(snapshot["desired_subscription_count"], 0)
+        self.assertEqual(snapshot["desired_symbols"], [])
+
+    def test_subscribe_many_empty_replace_cancels_active_subscriptions(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.cancel_requests: list[int] = []
+
+            def isConnected(self) -> bool:  # noqa: N802
+                return True
+
+            def cancelMktData(self, request_id: int) -> None:  # noqa: N802
+                self.cancel_requests.append(request_id)
+
+        service = LiveMarketDataStreamService(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=4002,
+                client_id=9,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            )
+        )
+        client = FakeClient()
+        contract = MarketStreamContract(symbol="AXFO")
+        service._client = client
+        service._desired_contracts_by_key["AXFO"] = contract
+        service._subscriptions_by_key["AXFO"] = MarketStreamSubscription(
+            request_id=100,
+            contract=contract,
+            subscribed_at=datetime(2026, 5, 8, 7, 0, tzinfo=UTC),
+        )
+        service._subscription_keys_by_req_id[100] = "AXFO"
+
+        snapshot = service.subscribe_many([], replace=True)
+
+        self.assertEqual(client.cancel_requests, [100])
+        self.assertEqual(snapshot["desired_subscription_count"], 0)
+        self.assertEqual(snapshot["subscribed_count"], 0)
+
     def test_restore_desired_subscriptions_cancels_stale_extras(self) -> None:
         class FakeClient:
             def __init__(self) -> None:

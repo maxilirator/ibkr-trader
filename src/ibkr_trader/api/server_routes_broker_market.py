@@ -234,6 +234,8 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
     app_config = context.app_config
     session_factory = context.session_factory
     broker_sessions = context.broker_sessions
+    broker_circuit = context.broker_circuit
+    broker_pacing_governor = context.broker_pacing_governor
     broker_monitor = context.broker_monitor
     market_stream_service = context.market_stream_service
     market_data_backfill_worker = context.market_data_backfill_worker
@@ -916,4 +918,3 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
             "quote_count": len(quotes),
             "quotes": list(quotes),
         }
-

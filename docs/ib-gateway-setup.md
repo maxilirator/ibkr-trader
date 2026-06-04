@@ -342,6 +342,64 @@ window, when the probe is still failing shortly after a restart, or when the
 restart command fails. For mobile push, the simplest path is `ntfy`: install the
 mobile app, choose a private topic, then set `OPERATOR_ALERT_NTFY_TOPIC`.
 
+### Disk pressure watchdog
+
+The Gateway host must keep enough free disk for journald, syslog, Gateway logs,
+Postgres, and the trader API. A full `/var/log` or root filesystem can make the
+Gateway appear alive while API callbacks stop completing. Install the root-owned
+disk watchdog alongside the Gateway watchdog:
+
+```bash
+install -m 0755 /home/mattias/ibkr-trader/ops/scripts/ibkr_disk_watchdog.sh \
+  /usr/local/sbin/ibkr_disk_watchdog.sh
+cp /home/mattias/ibkr-trader/ops/systemd/ibkr-disk-watchdog.service \
+  /etc/systemd/system/
+cp /home/mattias/ibkr-trader/ops/systemd/ibkr-disk-watchdog.timer \
+  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ibkr-disk-watchdog.timer
+```
+
+The watchdog is intentionally narrow:
+
+- it checks the root filesystem every five minutes
+- it starts cleanup when disk use is at least `80%` or free space is at most
+  `6144` MiB
+- it vacuums journald through supported `journalctl --vacuum-*` commands
+- it deletes only rotated or archived log files under `/var/log`, such as
+  `.gz`, `.xz`, `.zst`, `.old`, and `*.1`, that are older than the configured
+  retention
+- it does not delete active logs such as `/var/log/syslog`
+- it writes the latest before/after state to `/run/ibkr-disk-watchdog.last-run`
+- it sends a cooldown-protected operator alert if disk pressure remains
+  critical after cleanup
+
+Tune the service with systemd environment overrides:
+
+```ini
+Environment=WATCH_PATH=/
+Environment=CLEANUP_USE_PERCENT=80
+Environment=CLEANUP_MIN_FREE_MIB=6144
+Environment=CRITICAL_USE_PERCENT=90
+Environment=CRITICAL_MIN_FREE_MIB=2048
+Environment=JOURNAL_VACUUM_SIZE=1G
+Environment=JOURNAL_VACUUM_TIME=14d
+Environment=LOG_PRUNE_ROOTS=/var/log
+Environment=LOG_PRUNE_DAYS=14
+Environment=OPERATOR_ALERT_NTFY_TOPIC=your-secret-topic
+```
+
+Useful checks:
+
+```bash
+systemctl list-timers ibkr-disk-watchdog.timer
+systemctl status ibkr-disk-watchdog.service --no-pager
+journalctl -u ibkr-disk-watchdog.service -n 100 --no-pager
+cat /run/ibkr-disk-watchdog.last-run
+journalctl --disk-usage
+df -h /
+```
+
 ### Operational notes
 
 - If the XRDP display number changes later, rerun

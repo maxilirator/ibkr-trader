@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the quant disk pressure watchdog periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=ibkr-disk-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -99,3 +99,32 @@ def test_merge_bar_lists_prefers_newer_payload_for_same_timestamp() -> None:
         }
     ]
 
+
+def test_merge_bar_lists_deduplicates_same_instant_with_different_offsets() -> None:
+    merged = merge_bar_lists(
+        [
+            {
+                "timestamp": "2026-06-04T12:35:00+00:00",
+                "open": "57.6",
+                "high": "57.7",
+                "low": "57.6",
+                "close": "57.6",
+                "source": "ibkr_live_market_stream_1m",
+            }
+        ],
+        [
+            {
+                "timestamp": "2026-06-04T14:35:00+02:00",
+                "open": "57.7",
+                "high": "57.7",
+                "low": "57.7",
+                "close": "57.7",
+                "source": "ibkr_historical_backfill_1m",
+            }
+        ],
+        limit=10,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["timestamp"] == "2026-06-04T14:35:00+02:00"
+    assert merged[0]["close"] == "57.7"

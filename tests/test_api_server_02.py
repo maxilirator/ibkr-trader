@@ -523,6 +523,280 @@ class ApiServerTests02(ApiServerTestCase):
         finally:
             engine.dispose()
 
+    def test_market_stream_contracts_for_pending_entries_prewarms_entry_symbols(
+        self,
+    ) -> None:
+        from ibkr_trader.api.market_stream_payloads import (
+            market_stream_contracts_for_pending_entries,
+        )
+
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+        session = session_factory()
+        try:
+            session.add_all(
+                [
+                    InstructionRecord(
+                        instruction_id="model-routed-hem",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="batch-1",
+                        account_key="VIRTUALSEEDRL01",
+                        book_key="seedpicker_rl_long_01",
+                        symbol="HEM",
+                        exchange="SFB",
+                        currency="SEK",
+                        state="MODEL_ROUTED_PENDING",
+                        submit_at=datetime(2026, 4, 10, 7, 0, tzinfo=timezone.utc),
+                        expire_at=datetime(2030, 4, 10, 15, 30, tzinfo=timezone.utc),
+                        order_type="MODEL_ROUTED",
+                        side="BUY",
+                        payload={},
+                    ),
+                    InstructionRecord(
+                        instruction_id="pending-norion",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="batch-1",
+                        account_key="U25245596",
+                        book_key="long",
+                        symbol="NORION",
+                        exchange="SFB",
+                        currency="SEK",
+                        state="ENTRY_PENDING",
+                        submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+                        expire_at=datetime(2030, 4, 10, 15, 30, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        payload={},
+                    ),
+                    InstructionRecord(
+                        instruction_id="archived-axfo",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="batch-1",
+                        account_key="U25245596",
+                        book_key="long",
+                        symbol="AXFO",
+                        exchange="SFB",
+                        currency="SEK",
+                        state="ENTRY_PENDING",
+                        submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+                        expire_at=datetime(2030, 4, 10, 15, 30, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        archived_at=datetime(2026, 4, 10, 8, 0, tzinfo=timezone.utc),
+                        payload={},
+                    ),
+                ]
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        try:
+            contracts = market_stream_contracts_for_pending_entries(session_factory)
+            self.assertEqual(
+                [contract.symbol for contract in contracts],
+                ["HEM", "NORION"],
+            )
+            for contract in contracts:
+                self.assertEqual(contract.exchange, "SMART")
+                self.assertEqual(contract.primary_exchange, "SFB")
+        finally:
+            engine.dispose()
+
+    def test_subscribe_open_order_market_streams_replaces_with_active_intents(
+        self,
+    ) -> None:
+        from ibkr_trader.api.market_stream_payloads import (
+            subscribe_open_order_market_streams,
+        )
+
+        class FakeMarketStreamService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def subscribe_many(self, contracts, *, replace, market_data_type):
+                self.calls.append((contracts, replace, market_data_type))
+                return {"desired_symbols": [contract.symbol for contract in contracts]}
+
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+        session = session_factory()
+        try:
+            session.add(
+                InstructionRecord(
+                    instruction_id="model-routed-norion",
+                    schema_version="2026-04-10",
+                    source_system="q-training",
+                    batch_id="batch-1",
+                    account_key="VIRTUALSEEDRL01",
+                    book_key="seedpicker_rl_long_01",
+                    symbol="NORION",
+                    exchange="SFB",
+                    currency="SEK",
+                    state="MODEL_ROUTED_PENDING",
+                    submit_at=datetime(2026, 4, 10, 7, 0, tzinfo=timezone.utc),
+                    expire_at=datetime(2030, 4, 10, 15, 30, tzinfo=timezone.utc),
+                    order_type="MODEL_ROUTED",
+                    side="BUY",
+                    payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        try:
+            service = FakeMarketStreamService()
+            snapshot = type("Snapshot", (), {"open_orders": {}})()
+
+            symbols = subscribe_open_order_market_streams(
+                service,
+                snapshot,
+                session_factory,
+            )
+
+            self.assertEqual(symbols, ["NORION", "OMXS30"])
+            contracts, replace, market_data_type = service.calls[0]
+            self.assertEqual(
+                [contract.symbol for contract in contracts],
+                ["NORION", "OMXS30"],
+            )
+            benchmark_contract = contracts[1]
+            self.assertEqual(benchmark_contract.security_type, "IND")
+            self.assertEqual(benchmark_contract.exchange, "OMS")
+            self.assertEqual(benchmark_contract.currency, "SEK")
+            self.assertTrue(replace)
+            self.assertEqual(market_data_type, "LIVE")
+        finally:
+            engine.dispose()
+
+    def test_subscribe_open_order_market_streams_keeps_benchmark_without_targets(
+        self,
+    ) -> None:
+        from ibkr_trader.api.market_stream_payloads import (
+            subscribe_open_order_market_streams,
+        )
+
+        class FakeMarketStreamService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def subscribe_many(self, contracts, *, replace, market_data_type):
+                self.calls.append((contracts, replace, market_data_type))
+                return {"desired_symbols": [contract.symbol for contract in contracts]}
+
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+
+        try:
+            service = FakeMarketStreamService()
+            snapshot = type("Snapshot", (), {"open_orders": {}})()
+
+            symbols = subscribe_open_order_market_streams(
+                service,
+                snapshot,
+                session_factory,
+            )
+
+            self.assertEqual(symbols, ["OMXS30"])
+            contracts, replace, market_data_type = service.calls[0]
+            self.assertEqual([contract.symbol for contract in contracts], ["OMXS30"])
+            self.assertEqual(contracts[0].security_type, "IND")
+            self.assertEqual(contracts[0].exchange, "OMS")
+            self.assertEqual(contracts[0].currency, "SEK")
+            self.assertTrue(replace)
+            self.assertEqual(market_data_type, "LIVE")
+        finally:
+            engine.dispose()
+
+    def test_subscribe_open_order_market_streams_can_suppress_benchmark_after_hours(
+        self,
+    ) -> None:
+        from ibkr_trader.api.market_stream_payloads import (
+            subscribe_open_order_market_streams,
+        )
+
+        class FakeMarketStreamService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def subscribe_many(self, contracts, *, replace, market_data_type):
+                self.calls.append((contracts, replace, market_data_type))
+                return {"desired_symbols": [contract.symbol for contract in contracts]}
+
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        session_factory = create_session_factory(engine)
+
+        try:
+            service = FakeMarketStreamService()
+            snapshot = type("Snapshot", (), {"open_orders": {}})()
+
+            symbols = subscribe_open_order_market_streams(
+                service,
+                snapshot,
+                session_factory,
+                include_operator_benchmarks=False,
+            )
+
+            self.assertEqual(symbols, [])
+            contracts, replace, market_data_type = service.calls[0]
+            self.assertEqual(contracts, [])
+            self.assertTrue(replace)
+            self.assertIsNone(market_data_type)
+        finally:
+            engine.dispose()
+
+    def test_operator_benchmark_stream_window_uses_session_calendar(self) -> None:
+        from ibkr_trader.api.server import _should_include_operator_benchmark_streams
+
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "sessions.csv"
+            schedule_path.write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind",
+                        "2026-06-04,Europe/Stockholm,09:00,17:30,regular",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                _should_include_operator_benchmark_streams(
+                    reference_at=datetime.fromisoformat("2026-06-04T09:00:00+02:00"),
+                    runtime_timezone="Europe/Stockholm",
+                    session_calendar_path=schedule_path,
+                )
+            )
+            self.assertTrue(
+                _should_include_operator_benchmark_streams(
+                    reference_at=datetime.fromisoformat("2026-06-04T15:00:00+02:00"),
+                    runtime_timezone="Europe/Stockholm",
+                    session_calendar_path=schedule_path,
+                )
+            )
+            self.assertFalse(
+                _should_include_operator_benchmark_streams(
+                    reference_at=datetime.fromisoformat("2026-06-04T17:30:01+02:00"),
+                    runtime_timezone="Europe/Stockholm",
+                    session_calendar_path=schedule_path,
+                )
+            )
+            self.assertFalse(
+                _should_include_operator_benchmark_streams(
+                    reference_at=datetime.fromisoformat("2026-06-05T12:00:00+02:00"),
+                    runtime_timezone="Europe/Stockholm",
+                    session_calendar_path=schedule_path,
+                )
+            )
+
     def test_operator_snapshot_stream_overlay_marks_positions_orders_and_accounts(
         self,
     ) -> None:

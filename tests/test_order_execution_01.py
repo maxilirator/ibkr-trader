@@ -1,9 +1,144 @@
 from __future__ import annotations
 
 from tests._order_execution_shared import *  # noqa: F401,F403
+from ibkr_trader.ibkr.order_contract_queries import build_order_contract_query
 
 
 class OrderExecutionTests01(OrderExecutionTestsBase):
+    def test_order_contract_query_normalizes_stockholm_share_class_symbols(self) -> None:
+        payload = _base_payload()
+        instruction_payload = payload["instructions"][0]
+        instruction_payload["instrument"] = {
+            "symbol": "HEXA B",
+            "security_type": "STK",
+            "exchange": "SMART",
+            "currency": "SEK",
+            "primary_exchange": "SFB",
+        }
+        instruction = parse_execution_batch_payload(payload).instructions[0]
+
+        query = build_order_contract_query(instruction)
+
+        self.assertEqual(query.symbol, "HEXA.B")
+        self.assertEqual(query.local_symbol, "HEXA B")
+        self.assertEqual(query.primary_exchange, "SFB")
+
+    def test_order_contract_query_leaves_non_share_class_stockholm_symbols_alone(self) -> None:
+        payload = _base_payload()
+        instruction_payload = payload["instructions"][0]
+        instruction_payload["instrument"] = {
+            "symbol": "NOKIA SEK",
+            "security_type": "STK",
+            "exchange": "SMART",
+            "currency": "SEK",
+            "primary_exchange": "SFB",
+        }
+        instruction = parse_execution_batch_payload(payload).instructions[0]
+
+        query = build_order_contract_query(instruction)
+
+        self.assertEqual(query.symbol, "NOKIA SEK")
+        self.assertIsNone(query.local_symbol)
+
+    def test_submit_order_from_batch_resolves_stockholm_display_share_class_symbol(self) -> None:
+        class _StockholmShareClassWrapper(_FakeOrderExecutionSyncWrapper):
+            def get_account_updates(
+                self,
+                account_code: str = "",
+                timeout: int = 10,
+            ) -> dict[str, object]:
+                return {
+                    "portfolio": [],
+                    "account_values": {
+                        "DU1234567": {
+                            "NetLiquidation": {"value": "100000.00", "currency": "SEK"},
+                            "TotalCashValue": {"value": "100000.00", "currency": "SEK"},
+                            "BuyingPower": {"value": "200000.00", "currency": "SEK"},
+                            "AvailableFunds": {"value": "100000.00", "currency": "SEK"},
+                            "ExcessLiquidity": {"value": "100000.00", "currency": "SEK"},
+                            "AccountType": {"value": "INDIVIDUAL", "currency": ""},
+                        }
+                    },
+                }
+
+            def get_contract_details(
+                self,
+                contract: _FakeContract,
+                timeout: int | None = None,
+            ) -> list[object]:
+                if contract.symbol != "HEXA.B" or contract.localSymbol != "HEXA B":
+                    return []
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(
+                            conId=490414358,
+                            symbol=contract.symbol,
+                            localSymbol=contract.localSymbol,
+                            secType=contract.secType,
+                            exchange="SMART",
+                            primaryExchange=contract.primaryExchange,
+                            currency=contract.currency,
+                            tradingClass="HEXA.B",
+                        ),
+                        marketName="HEXA.B",
+                        minTick=0.0001,
+                        validExchanges="SMART,SFB,EUIBSI",
+                        marketRuleIds="26,1875,1876",
+                        orderTypes="LMT,MKT,WHATIF,GTC",
+                        timeZoneId="MET",
+                        tradingHours="20260603:0900-20260603:1730",
+                        liquidHours="20260603:0900-20260603:1730",
+                        stockType="COMMON",
+                        industry="Industrial",
+                        category="Machinery-Diversified",
+                        subcategory="Machinery-General Indust",
+                        longName="HEXAGON AB-B SHS",
+                        secIdList=[SimpleNamespace(tag="ISIN", value="SE0015961909")],
+                    )
+                ]
+
+            def get_market_rule(self, market_rule_id: int, timeout: int = 5) -> list[object]:
+                return [SimpleNamespace(lowEdge=0, increment=0.02)]
+
+        payload = _base_payload()
+        instruction_payload = payload["instructions"][0]
+        instruction_payload["instrument"] = {
+            "symbol": "HEXA B",
+            "security_type": "STK",
+            "exchange": "SMART",
+            "currency": "SEK",
+            "primary_exchange": "SFB",
+        }
+        instruction_payload["sizing"] = {
+            "mode": "target_quantity",
+            "target_quantity": "1",
+            "funding_basis": "cash",
+        }
+        instruction_payload["entry"]["limit_price"] = "50.00"
+        instruction_payload["entry"]["time_in_force"] = "GTC"
+        batch = parse_execution_batch_payload(payload)
+
+        result = submit_order_from_batch(
+            self.config,
+            batch,
+            sync_wrapper_cls=_StockholmShareClassWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+            order_cls=_FakeOrder,
+        )
+
+        self.assertEqual(result["resolved_contract"]["symbol"], "HEXA.B")
+        self.assertEqual(result["resolved_contract"]["local_symbol"], "HEXA B")
+        self.assertEqual(result["order"]["time_in_force"], "GTC")
+        self.assertEqual(result["order"]["limit_price"], "50.00")
+        wire_contracts = [
+            event["request"]["contract"]
+            for event in result["ibkr_wire_audit"]
+            if event["event_type"] == "outbound_order_request"
+        ]
+        self.assertEqual(wire_contracts[0]["symbol"], "HEXA.B")
+        self.assertEqual(wire_contracts[-1]["symbol"], "HEXA.B")
+
     def test_submit_order_from_batch_builds_limit_order(self) -> None:
         batch = parse_execution_batch_payload(_base_payload())
 

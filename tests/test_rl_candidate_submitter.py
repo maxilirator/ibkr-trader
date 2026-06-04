@@ -16,11 +16,13 @@ from scripts.submit_rl_candidate_lists import load_selected_rows
 from scripts.submit_rl_candidate_lists import resolve_capital_plan
 
 
-def test_default_virtual02_configs_use_live_short_book_keys() -> None:
+def test_default_configs_use_seedpicker_long_and_shared_short_book_keys() -> None:
     configs = {config.side: config for config in CONFIGS}
 
-    assert configs["LONG"].deployment_key == "long_trial_106_virtual_shared_01"
-    assert configs["LONG"].book_key == "bb_long_02"
+    assert configs["LONG"].account_key == "VIRTUALSEEDRL01"
+    assert configs["LONG"].deployment_key == "long_trial_106_virtual_seedpicker_01"
+    assert configs["LONG"].book_key == "seedpicker_rl_long_01"
+    assert configs["SHORT"].account_key == "VIRTUALRL02"
     assert configs["SHORT"].deployment_key == "short_trial_36_virtual_shared_01"
     assert configs["SHORT"].book_key == "bb_short_02"
 

@@ -6,7 +6,6 @@ from decimal import ROUND_DOWN
 from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
-from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import (
     ExecutionInstruction,
     ExecutionInstructionBatch,
@@ -24,6 +23,7 @@ from ibkr_trader.ibkr.contracts import (
     serialize_contract_details,
 )
 from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.order_contract_queries import build_order_contract_query
 from ibkr_trader.ibkr.price_rules import normalize_order_price
 from ibkr_trader.ibkr.price_rules import resolve_price_increment
 from ibkr_trader.ibkr.short_sale_validation import validate_short_sale_entry
@@ -717,14 +717,7 @@ def preview_execution_batch(
                 if hasattr(runtime_app, "contract_details"):
                     runtime_app.contract_details.clear()
                 raw_contract = build_ibkr_contract(
-                    ContractResolveQuery(
-                        symbol=instruction.instrument.symbol,
-                        security_type=instruction.instrument.security_type.value,
-                        exchange=instruction.instrument.exchange,
-                        currency=instruction.instrument.currency,
-                        primary_exchange=instruction.instrument.primary_exchange,
-                        isin=instruction.instrument.isin,
-                    ),
+                    build_order_contract_query(instruction),
                     contract_cls=runtime_contract_cls,
                 )
                 contract_matches = runtime_app.get_contract_details(

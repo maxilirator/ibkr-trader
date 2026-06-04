@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.models import InstructionEventRecord, InstructionRecord
+from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.orchestration.entry_submission import submit_persisted_instruction_entry
+from ibkr_trader.orchestration.market_data_readiness import MarketDataReadinessChecker
+from ibkr_trader.orchestration.market_data_readiness import normalize_market_data_readiness
 from ibkr_trader.orchestration.runtime_broker_errors import broker_exception_payload as _broker_exception_payload
 from ibkr_trader.orchestration.runtime_broker_errors import is_retryable_broker_error as _is_retryable_broker_error
 from ibkr_trader.orchestration.runtime_broker_errors import run_with_broker_retries as _run_with_broker_retries
@@ -63,6 +66,36 @@ def _record_runtime_note(
                 note=note,
             )
         )
+
+
+def _archive_resolved_market_data_readiness_issues(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    resolved_at: datetime,
+    readiness: dict[str, Any],
+) -> None:
+    with session_scope(session_factory) as session:
+        issues = list(
+            session.execute(
+                select(ReconciliationIssueRecord).where(
+                    ReconciliationIssueRecord.instruction_id == instruction_id,
+                    ReconciliationIssueRecord.stage == "market_data_readiness",
+                    ReconciliationIssueRecord.archived_at.is_(None),
+                )
+            ).scalars()
+        )
+        for issue in issues:
+            issue.archived_at = resolved_at
+            issue.archived_by = "runtime_cycle"
+            issue.archive_reason = (
+                "Market stream evidence became ready for this instruction; "
+                "the earlier readiness warning was resolved automatically."
+            )
+            payload = dict(issue.payload or {})
+            payload["auto_resolved_by"] = "entry_market_data_ready"
+            payload["resolved_readiness"] = _serialize_for_json(readiness)
+            issue.payload = payload
 
 
 def _mark_pending_entry_cancelled(
@@ -151,6 +184,89 @@ def _mark_pending_entry_failed(
         )
 
 
+def _entry_market_data_ready(
+    session_factory: sessionmaker[Session],
+    *,
+    instruction_id: str,
+    cycle_started_at: datetime,
+    market_data_readiness_checker: MarketDataReadinessChecker | None,
+    issues: list[RuntimeCycleIssue],
+) -> bool:
+    if market_data_readiness_checker is None:
+        return True
+
+    with session_scope(session_factory) as session:
+        payload = session.execute(
+            select(InstructionRecord.payload).where(
+                InstructionRecord.instruction_id == instruction_id
+            )
+        ).scalar_one_or_none()
+    if payload is None:
+        _append_issue(
+            issues,
+            instruction_id=instruction_id,
+            stage="market_data_readiness",
+            message=f"Instruction '{instruction_id}' was not found.",
+        )
+        return False
+
+    try:
+        readiness = normalize_market_data_readiness(
+            market_data_readiness_checker(
+                instruction_id,
+                payload,
+                cycle_started_at,
+            )
+        )
+    except Exception as exc:  # pragma: no cover - defensive runtime boundary.
+        readiness = {
+            "ready": False,
+            "reason": "market_data_readiness_checker_failed",
+            "evidence": {"error": str(exc)},
+        }
+
+    if readiness["ready"]:
+        _archive_resolved_market_data_readiness_issues(
+            session_factory,
+            instruction_id=instruction_id,
+            resolved_at=cycle_started_at,
+            readiness=readiness,
+        )
+        _record_runtime_note(
+            session_factory,
+            instruction_id=instruction_id,
+            event_type="entry_market_data_ready",
+            note=(
+                "Runtime verified live market-stream evidence before submitting "
+                "the entry order."
+            ),
+            payload=readiness,
+        )
+        return True
+
+    reason = str(readiness.get("reason") or "market stream data is not ready")
+    _append_issue(
+        issues,
+        instruction_id=instruction_id,
+        stage="market_data_readiness",
+        message=(
+            "Skipped due entry submission because live market-stream data is not "
+            f"ready: {reason}."
+        ),
+    )
+    _record_runtime_note(
+        session_factory,
+        instruction_id=instruction_id,
+        event_type="entry_submit_blocked_market_data_not_ready",
+        note=(
+            "Runtime kept the due entry pending because live market-stream "
+            "evidence was not ready."
+        ),
+        payload=readiness,
+    )
+    return False
+
+
 
 
 
@@ -169,6 +285,7 @@ def _submit_due_pending_entries(
     submitted_entries: list[RuntimeCycleAction],
     cancelled_entries: list[RuntimeCycleAction],
     issues: list[RuntimeCycleIssue],
+    market_data_readiness_checker: MarketDataReadinessChecker | None = None,
 ) -> None:
     if not due_instruction_ids:
         return
@@ -229,6 +346,15 @@ def _submit_due_pending_entries(
                     ),
                 )
             )
+            continue
+
+        if not _entry_market_data_ready(
+            session_factory,
+            instruction_id=instruction_id,
+            cycle_started_at=cycle_started_at,
+            market_data_readiness_checker=market_data_readiness_checker,
+            issues=issues,
+        ):
             continue
 
         try:

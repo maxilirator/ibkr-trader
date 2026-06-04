@@ -1,6 +1,7 @@
 import { executionInstructions, openOrders, referenceNow } from './view-state.js';
 import {
   formatTimestamp,
+  latestTimestamp,
   normalizedSymbol,
   parseTimestamp
 } from './status.js';

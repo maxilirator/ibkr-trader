@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests._api_server_shared import *  # noqa: F401,F403
+from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 
 
 class ApiServerTests03(ApiServerTestCase):
@@ -518,6 +519,127 @@ class ApiServerTests03(ApiServerTestCase):
                 session.close()
 
             self.assertTrue(should_include_background_execution_recovery(session_factory))
+
+    def test_background_execution_recovery_falls_back_to_light_snapshot_on_timeout(
+        self,
+    ) -> None:
+        class _FakeBrokerSession:
+            def execute(
+                self,
+                operation_name: str,
+                operation: object,
+                *,
+                ignore_cooldown: bool = False,
+            ) -> object:
+                del operation_name, ignore_cooldown
+                return operation(object())
+
+            def drain_broker_callback_events(
+                self,
+                *,
+                connect_if_needed: bool = False,
+            ) -> list[dict[str, object]]:
+                del connect_if_needed
+                return []
+
+        class _FakeBrokerSessions:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+                self.primary = _FakeBrokerSession()
+                self.diagnostic = _FakeBrokerSession()
+                self.historical = _FakeBrokerSession()
+
+            def warmup(self) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                return None
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "recovery_fallback.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            session = session_factory()
+            try:
+                session.add(
+                    InstructionRecord(
+                        instruction_id="runtime-sive-1",
+                        schema_version="2026-04-10",
+                        source_system="q-training",
+                        batch_id="batch-1",
+                        account_key="GTW05",
+                        book_key="long_risk_book",
+                        symbol="SIVE",
+                        exchange="SMART",
+                        currency="SEK",
+                        state="ENTRY_SUBMITTED",
+                        submit_at=datetime(2026, 4, 10, 7, 25, tzinfo=timezone.utc),
+                        expire_at=datetime(2026, 4, 10, 15, 30, tzinfo=timezone.utc),
+                        order_type="LIMIT",
+                        side="BUY",
+                        payload={"instruction": {"instruction_id": "runtime-sive-1"}},
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+                engine.dispose()
+
+            calls: list[bool] = []
+            light_snapshot = BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            )
+
+            def fake_snapshot_fetch(*args: object, **kwargs: object) -> BrokerRuntimeSnapshot:
+                del args
+                include_executions = bool(kwargs["include_executions"])
+                calls.append(include_executions)
+                if include_executions:
+                    raise TimeoutError(
+                        "Timed out while requesting executions for the IBKR runtime snapshot."
+                    )
+                return light_snapshot
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions", _FakeBrokerSessions),
+                patch("ibkr_trader.api.server.fetch_broker_runtime_snapshot", fake_snapshot_fetch),
+            ):
+                app = create_app(
+                    AppConfig(
+                        environment="test",
+                        timezone="Europe/Stockholm",
+                        database_url=database_url,
+                        session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                        stockholm_instruments_path=Path("/tmp/all.txt"),
+                        stockholm_identity_path=Path("/tmp/identity.parquet"),
+                        api=ApiServerConfig(
+                            host="127.0.0.1",
+                            port=8000,
+                            require_loopback_only=False,
+                        ),
+                        ibkr=IbkrConnectionConfig(
+                            host="127.0.0.1",
+                            port=4001,
+                            client_id=0,
+                            diagnostic_client_id=7,
+                            streaming_client_id=9,
+                            account_id="U25245596",
+                        ),
+                    )
+                )
+
+                snapshot = app.state.broker_monitor._snapshot_fetcher()
+                second_snapshot = app.state.broker_monitor._snapshot_fetcher()
+
+        self.assertIs(snapshot, light_snapshot)
+        self.assertIs(second_snapshot, light_snapshot)
+        self.assertEqual(calls, [True, False, False])
 
     def test_operator_snapshot_endpoint_returns_durable_ledger_state(self) -> None:
         try:

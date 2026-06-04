@@ -255,6 +255,7 @@ def register_operator_routes(app: Any, context: Any) -> None:
     fetch_reconciliation_runtime_snapshot_with_primary = context.fetch_reconciliation_runtime_snapshot_with_primary
     drain_broker_callbacks_with_primary = context.drain_broker_callbacks_with_primary
     sync_virtual_market_watch_from_stream = context.sync_virtual_market_watch_from_stream
+    market_data_readiness_checker = context.market_data_readiness_checker
     HTTPException = context.HTTPException
     Request = context.Request
 
@@ -832,6 +833,7 @@ def register_operator_routes(app: Any, context: Any) -> None:
                 broker_callback_fetcher=drain_broker_callbacks_with_primary,
                 broker_order_canceler=cancel_order_with_primary,
                 virtual_market_sync=sync_virtual_market_watch_from_stream,
+                market_data_readiness_checker=market_data_readiness_checker,
                 submission_lead_time=timedelta(
                     seconds=app_config.execution_runtime_submission_lead_seconds
                 ),
@@ -893,5 +895,4 @@ def register_operator_routes(app: Any, context: Any) -> None:
             "session_calendar_path": str(app_config.session_calendar_path),
             "startup_reconciliation": serialize_runtime_cycle_result(result),
         }
-
 

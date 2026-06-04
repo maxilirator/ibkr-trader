@@ -152,7 +152,7 @@ def merge_bar_lists(
             timestamp = str(bar.get("timestamp") or "").strip()
             if not timestamp:
                 continue
-            by_timestamp[timestamp] = dict(bar)
+            by_timestamp[_merge_timestamp_key(timestamp)] = dict(bar)
     return [
         by_timestamp[timestamp]
         for timestamp in sorted(by_timestamp)
@@ -203,6 +203,7 @@ def _parse_bar_payload(
 
 def _serialize_bar_record(row: MarketStreamBarRecord) -> dict[str, Any]:
     started_at = row.started_at
+    started_at = _storage_datetime(started_at)
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
     return {
@@ -216,6 +217,17 @@ def _serialize_bar_record(row: MarketStreamBarRecord) -> dict[str, Any]:
         "currency": row.currency,
         "source": row.source,
     }
+
+
+def _merge_timestamp_key(value: str) -> str:
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return value
+    normalized = _storage_datetime(parsed)
+    if normalized.tzinfo is None:
+        normalized = normalized.replace(tzinfo=timezone.utc)
+    normalized = normalized.replace(second=0, microsecond=0)
+    return normalized.isoformat()
 
 
 def _stream_payload(stream_snapshot: Mapping[str, Any]) -> Mapping[str, Any]:

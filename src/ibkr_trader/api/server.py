@@ -8,6 +8,7 @@ from dataclasses import asdict
 from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -166,6 +167,10 @@ from ibkr_trader.orchestration.operator_reviews import (
     serialize_reconciliation_issue_archive_result,
     serialize_operator_review_status,
 )
+from ibkr_trader.orchestration.market_data_readiness import (
+    build_market_stream_readiness_checker,
+)
+from ibkr_trader.orchestration.session_calendar import find_session_for_date
 from ibkr_trader.orchestration.rl_candidate_lifecycle import (
     retire_completed_rl_candidates,
 )
@@ -231,6 +236,37 @@ from ibkr_trader.virtual.execution import submit_virtual_exit_order
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _should_include_operator_benchmark_streams(
+    *,
+    reference_at: datetime,
+    runtime_timezone: str,
+    session_calendar_path: Any,
+) -> bool:
+    """Return true while the benchmark stream should be live-owned."""
+
+    if reference_at.tzinfo is None:
+        reference_at = reference_at.replace(tzinfo=timezone.utc)
+    try:
+        runtime_zone = ZoneInfo(runtime_timezone)
+        local_reference = reference_at.astimezone(runtime_zone)
+        session = find_session_for_date(
+            local_reference.date(),
+            session_calendar_path=session_calendar_path,
+        )
+    except (FileNotFoundError, ValueError):
+        return False
+
+    if session is None:
+        return False
+
+    reference_utc = reference_at.astimezone(timezone.utc)
+    return (
+        session.open_at.astimezone(timezone.utc)
+        <= reference_utc
+        <= session.close_at.astimezone(timezone.utc)
+    )
 
 
 class ApiDependencyError(RuntimeError):
@@ -552,7 +588,13 @@ def create_app(config: AppConfig | None = None) -> Any:
             ),
         )
 
+    background_execution_recovery_last_attempt_at: datetime | None = None
+    background_execution_recovery_suppressed_until: datetime | None = None
+
     def fetch_background_runtime_snapshot() -> Any:
+        nonlocal background_execution_recovery_last_attempt_at
+        nonlocal background_execution_recovery_suppressed_until
+
         account_id = app_config.ibkr.account_id.strip()
         diagnostic_config = app_config.ibkr.diagnostic_session()
         if account_id:
@@ -561,16 +603,60 @@ def create_app(config: AppConfig | None = None) -> Any:
                 account_id=account_id,
                 account_ids=(account_id,),
             )
-        include_execution_recovery = should_include_background_execution_recovery(
-            session_factory
-        )
-        return fetch_runtime_snapshot_with_diagnostic(
-            diagnostic_config,
-            timeout=app_config.broker_snapshot_refresh_timeout_seconds,
-            include_open_orders=True,
-            include_executions=include_execution_recovery,
-            include_positions=False,
-        )
+
+        def fetch_snapshot(*, include_executions: bool) -> Any:
+            return fetch_runtime_snapshot_with_diagnostic(
+                diagnostic_config,
+                timeout=app_config.broker_snapshot_refresh_timeout_seconds,
+                include_open_orders=True,
+                include_executions=include_executions,
+                include_positions=False,
+            )
+
+        now = utc_now()
+        include_execution_recovery = False
+        if (
+            background_execution_recovery_suppressed_until is None
+            or now >= background_execution_recovery_suppressed_until
+        ):
+            last_attempt = background_execution_recovery_last_attempt_at
+            recovery_interval = max(
+                1.0,
+                app_config.broker_execution_recovery_interval_seconds,
+            )
+            recovery_due = (
+                last_attempt is None
+                or (now - last_attempt).total_seconds() >= recovery_interval
+            )
+            if recovery_due:
+                include_execution_recovery = should_include_background_execution_recovery(
+                    session_factory
+                )
+
+        if not include_execution_recovery:
+            return fetch_snapshot(include_executions=False)
+
+        background_execution_recovery_last_attempt_at = now
+        try:
+            snapshot = fetch_snapshot(include_executions=True)
+        except Exception as exc:
+            cooldown_seconds = max(
+                1.0,
+                app_config.broker_execution_recovery_failure_cooldown_seconds,
+            )
+            background_execution_recovery_suppressed_until = utc_now() + timedelta(
+                seconds=cooldown_seconds
+            )
+            LOGGER.warning(
+                "IBKR execution-history recovery snapshot failed; retrying "
+                "background broker snapshot without executions until %s. error=%s",
+                background_execution_recovery_suppressed_until.isoformat(),
+                exc,
+            )
+            return fetch_snapshot(include_executions=False)
+
+        background_execution_recovery_suppressed_until = None
+        return snapshot
 
     def persist_background_runtime_snapshot(snapshot: Any, captured_at: datetime) -> None:
         persist_broker_runtime_snapshot(
@@ -586,6 +672,11 @@ def create_app(config: AppConfig | None = None) -> Any:
                 market_stream_service,
                 snapshot,
                 session_factory=session_factory,
+                include_operator_benchmarks=_should_include_operator_benchmark_streams(
+                    reference_at=captured_at,
+                    runtime_timezone=app_config.timezone,
+                    session_calendar_path=app_config.session_calendar_path,
+                ),
             )
         except Exception:
             LOGGER.warning(
@@ -618,11 +709,18 @@ def create_app(config: AppConfig | None = None) -> Any:
             observed_at=cycle_at,
         )
 
+    market_stream_entry_readiness_checker = build_market_stream_readiness_checker(
+        market_stream_service,
+        max_age_seconds=app_config.market_stream_stale_after_seconds,
+        market_data_type="LIVE",
+    )
+
     execution_runtime = BackgroundExecutionRuntimeService(
         session_factory,
         app_config,
         broker_sessions,
         virtual_market_sync=sync_virtual_market_watch_from_stream,
+        market_data_readiness_checker=market_stream_entry_readiness_checker,
     )
     market_data_backfill_worker = BackgroundMarketDataBackfillService(
         session_factory,
@@ -710,6 +808,8 @@ def create_app(config: AppConfig | None = None) -> Any:
         app_config=app_config,
         session_factory=session_factory,
         broker_sessions=broker_sessions,
+        broker_circuit=broker_circuit,
+        broker_pacing_governor=broker_pacing_governor,
         broker_monitor=broker_monitor,
         market_stream_service=market_stream_service,
         market_data_backfill_worker=market_data_backfill_worker,
@@ -727,6 +827,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         ),
         drain_broker_callbacks_with_primary=drain_broker_callbacks_with_primary,
         sync_virtual_market_watch_from_stream=sync_virtual_market_watch_from_stream,
+        market_data_readiness_checker=market_stream_entry_readiness_checker,
         collect_stockholm_intraday_backfill=(
             lambda *args, **kwargs: collect_stockholm_intraday_backfill(*args, **kwargs)
         ),
@@ -763,6 +864,7 @@ def run_server(config: AppConfig | None = None, *, reload: bool = False) -> None
         host=app_config.api.host,
         port=app_config.api.port,
         reload=reload,
+        access_log=app_config.api.access_log_enabled,
     )
 
 

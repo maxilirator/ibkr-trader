@@ -123,6 +123,116 @@ class _FakePreviewSyncWrapper:
 
 
 class OrderPreviewTests(TestCase):
+    def test_preview_resolves_stockholm_display_share_class_symbol(self) -> None:
+        class _StockholmShareClassPreviewWrapper(_FakePreviewSyncWrapper):
+            account_currency = "SEK"
+
+            def get_contract_details(
+                self,
+                contract: _FakeContract,
+                timeout: int | None = None,
+            ) -> list[object]:
+                if contract.symbol != "HEXA.B" or contract.localSymbol != "HEXA B":
+                    return []
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(
+                            conId=490414358,
+                            symbol=contract.symbol,
+                            localSymbol=contract.localSymbol,
+                            secType=contract.secType,
+                            exchange="SMART",
+                            primaryExchange=contract.primaryExchange,
+                            currency=contract.currency,
+                            tradingClass="HEXA.B",
+                        ),
+                        marketName="HEXA.B",
+                        minTick=0.0001,
+                        validExchanges="SMART,SFB,EUIBSI",
+                        marketRuleIds="26,1875,1876",
+                        orderTypes="LMT,MKT,WHATIF,GTC",
+                        timeZoneId="MET",
+                        tradingHours="20260603:0900-20260603:1730",
+                        liquidHours="20260603:0900-20260603:1730",
+                        stockType="COMMON",
+                        industry="Industrial",
+                        category="Machinery-Diversified",
+                        subcategory="Machinery-General Indust",
+                        longName="HEXAGON AB-B SHS",
+                        secIdList=[SimpleNamespace(tag="ISIN", value="SE0015961909")],
+                    )
+                ]
+
+            def get_market_rule(self, market_rule_id: int, timeout: int = 5) -> list[object]:
+                return [SimpleNamespace(lowEdge=0, increment=0.02)]
+
+        batch = parse_execution_batch_payload(
+            {
+                "schema_version": "2026-04-10",
+                "source": {
+                    "system": "q-training",
+                    "batch_id": "batch-1",
+                    "generated_at": "2026-04-10T02:15:44Z",
+                },
+                "instructions": [
+                    {
+                        "instruction_id": "hexa-preview-1",
+                        "account": {
+                            "account_key": "GTW05",
+                            "book_key": "long_risk_book",
+                        },
+                        "instrument": {
+                            "symbol": "HEXA B",
+                            "security_type": "STK",
+                            "exchange": "SMART",
+                            "currency": "SEK",
+                            "primary_exchange": "SFB",
+                        },
+                        "intent": {
+                            "side": "BUY",
+                            "position_side": "LONG",
+                        },
+                        "sizing": {
+                            "mode": "target_quantity",
+                            "target_quantity": "1",
+                        },
+                        "entry": {
+                            "order_type": "LIMIT",
+                            "submit_at": "2026-06-04T09:25:00+02:00",
+                            "expire_at": "2026-06-04T17:25:00+02:00",
+                            "limit_price": "50.00",
+                            "time_in_force": "GTC",
+                        },
+                        "exit": {
+                            "take_profit_pct": "0.02",
+                        },
+                        "trace": {
+                            "reason_code": "preview-test",
+                        },
+                    }
+                ],
+            }
+        )
+
+        payload = preview_execution_batch(
+            IbkrConnectionConfig(
+                host="127.0.0.1",
+                port=7497,
+                client_id=7,
+                diagnostic_client_id=7,
+                account_id="DU1234567",
+            ),
+            batch,
+            sync_wrapper_cls=_StockholmShareClassPreviewWrapper,
+            response_timeout_cls=TimeoutError,
+            contract_cls=_FakeContract,
+        )
+
+        preview = payload["previews"][0]
+        self.assertEqual(preview["status"], "ready")
+        self.assertEqual(preview["instrument"]["resolved"]["symbol"], "HEXA.B")
+        self.assertEqual(preview["instrument"]["resolved"]["local_symbol"], "HEXA B")
+
     def test_preview_ready_for_target_quantity(self) -> None:
         batch = parse_execution_batch_payload(
             {

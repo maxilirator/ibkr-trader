@@ -119,7 +119,7 @@ export function operatorSnapshotUrl(apiBaseUrl) {
 export function omxBenchmarkSnapshotUrl(apiBaseUrl) {
   const params = new URLSearchParams({
     symbols: 'OMXS30',
-    bar_limit: '390'
+    bar_limit: '600'
   });
   return `${apiBaseUrl}/v1/market-data/stream/snapshot?${params.toString()}`;
 }
@@ -200,10 +200,10 @@ export function benchmarkPointFromQuote(quote) {
   if (Number.isNaN(end.getTime())) {
     return null;
   }
-  const start = new Date(end.getTime() - 60_000);
+  const start = stockholmSessionOpenForTimestamp(end.toISOString()) ?? new Date(end.getTime() - 60_000).toISOString();
   return [
     {
-      timestamp: start.toISOString(),
+      timestamp: start,
       value: previousClose,
       return_pct: 0
     },
@@ -215,31 +215,95 @@ export function benchmarkPointFromQuote(quote) {
   ];
 }
 
-export function buildOmxBenchmarkFromBars(rawBars, { source = 'stream' } = {}) {
-  const validBars = (Array.isArray(rawBars) ? rawBars : [])
+export function stockholmDateKeyForTimestamp(timestamp) {
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  const parts = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Europe/Stockholm',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(parsed);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+export function stockholmSessionOpenForTimestamp(timestamp) {
+  const dateKey = stockholmDateKeyForTimestamp(timestamp);
+  if (!dateKey) {
+    return null;
+  }
+  const [year, month, day] = dateKey.split('-').map((part) => Number.parseInt(part, 10));
+  const offsetHours = stockholmOffsetHours(year, month, day, 9, 0, 0);
+  return new Date(Date.UTC(year, month - 1, day, 9 - offsetHours, 0, 0)).toISOString();
+}
+
+export function latestBenchmarkPointFromQuote(quote) {
+  const latest = parseFiniteNumber(quote?.last_price);
+  const latestTimestamp = quote?.last_trade_at ?? quote?.updated_at;
+  if (latest === null || !latestTimestamp) {
+    return null;
+  }
+  const timestamp = normalizeBarTimestamp(latestTimestamp);
+  return timestamp ? { timestamp, value: latest } : null;
+}
+
+export function buildOmxBenchmarkFromBars(rawBars, { source = 'stream', quote = null } = {}) {
+  const pointsByTimestamp = new Map();
+  for (const bar of Array.isArray(rawBars) ? rawBars : []) {
+    const timestamp = normalizeBarTimestamp(bar?.timestamp);
+    const value = parseFiniteNumber(bar?.close);
+    if (timestamp && value !== null) {
+      pointsByTimestamp.set(timestamp, { timestamp, value });
+    }
+  }
+
+  const quotePoint = latestBenchmarkPointFromQuote(quote);
+  if (quotePoint) {
+    pointsByTimestamp.set(quotePoint.timestamp, quotePoint);
+  }
+
+  const allBars = [...pointsByTimestamp.values()].sort(
+    (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()
+  );
+  const latestDateKey = stockholmDateKeyForTimestamp(allBars.at(-1)?.timestamp);
+  const validBars = allBars
+    .filter((bar) => !latestDateKey || stockholmDateKeyForTimestamp(bar.timestamp) === latestDateKey)
     .map((bar) => ({
-      timestamp: normalizeBarTimestamp(bar.timestamp),
-      value: parseFiniteNumber(bar.close)
+      timestamp: bar.timestamp,
+      value: bar.value
     }))
-    .filter((bar) => bar.timestamp && bar.value !== null);
-  const first = validBars.find((bar) => bar.value !== 0);
-  if (!first) {
+    .filter((bar) => bar.value !== 0);
+  const previousClose = parseFiniteNumber(quote?.close_price);
+  const baseline = previousClose ?? validBars[0]?.value ?? null;
+  if (baseline === null || baseline === 0) {
     return null;
   }
 
+  const anchorTimestamp =
+    previousClose !== null
+      ? stockholmSessionOpenForTimestamp(validBars.at(-1)?.timestamp ?? quotePoint?.timestamp)
+      : null;
+  const anchorPoint =
+    anchorTimestamp !== null
+      ? [{ timestamp: anchorTimestamp, value: baseline, return_pct: 0 }]
+      : [];
   const points = validBars.map((bar) => ({
     timestamp: bar.timestamp,
     value: bar.value,
-    return_pct: ((bar.value - first.value) / first.value) * 100
+    return_pct: ((bar.value - baseline) / baseline) * 100
   }));
-  const latest = points.at(-1);
+  const allPoints = [...anchorPoint, ...points];
+  const latest = allPoints.at(-1);
   return {
     label: 'OMX',
     symbol: 'OMXS30',
-    status: points.length > 1 ? 'ok' : 'insufficient_data',
+    status: allPoints.length > 1 ? 'ok' : 'insufficient_data',
     error: null,
     latest_return_pct: latest ? latest.return_pct : null,
-    points,
+    points: allPoints,
     source
   };
 }
@@ -262,19 +326,20 @@ export function buildOmxBenchmark(result) {
   }
 
   const barsBySymbol = result.body?.stream?.bars_by_symbol ?? {};
+  const quotes = result.body?.stream?.quotes ?? [];
+  const quote = Array.isArray(quotes)
+    ? quotes.find((item) => item?.symbol === 'OMXS30')
+    : null;
   for (const symbol of ['OMXS30']) {
     const benchmark = buildOmxBenchmarkFromBars(barsBySymbol[symbol], {
-      source: 'market_stream'
+      source: 'market_stream',
+      quote
     });
     if (benchmark) {
       return benchmark;
     }
   }
 
-  const quotes = result.body?.stream?.quotes ?? [];
-  const quote = Array.isArray(quotes)
-    ? quotes.find((item) => item?.symbol === 'OMXS30')
-    : null;
   const quotePoints = benchmarkPointFromQuote(quote);
   if (quotePoints) {
     const latest = quotePoints.at(-1);

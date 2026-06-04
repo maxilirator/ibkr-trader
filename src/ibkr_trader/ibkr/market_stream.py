@@ -428,7 +428,7 @@ class LiveMarketDataStreamService:
         replace: bool = False,
         market_data_type: str | None = None,
     ) -> dict[str, Any]:
-        if not contracts:
+        if not contracts and not replace:
             raise ValueError("symbols are required")
         for contract in contracts:
             contract.validate()
@@ -479,7 +479,7 @@ class LiveMarketDataStreamService:
         replace: bool = False,
         market_data_type: str | None = None,
     ) -> dict[str, Any]:
-        if not contracts:
+        if not contracts and not replace:
             raise ValueError("symbols are required")
         for contract in contracts:
             contract.validate()
@@ -508,8 +508,10 @@ class LiveMarketDataStreamService:
                     requested_line_count=len(desired_contracts_by_key),
                     operation_name="streaming.subscribe_many",
                 )
-            active_matches_desired = self._active_matches_desired_locked(
-                desired_contracts_by_key
+            active_matches_desired = (
+                not self._subscriptions_by_key
+                if not desired_contracts_by_key
+                else self._active_matches_desired_locked(desired_contracts_by_key)
             )
             no_op = (
                 desired_contracts_by_key == self._desired_contracts_by_key
@@ -528,6 +530,10 @@ class LiveMarketDataStreamService:
                 self._desired_market_data_type = desired_market_data_type
         if no_op:
             return self.snapshot()
+        if replace and not contracts:
+            with self._lock:
+                if not self._subscriptions_by_key:
+                    return self.snapshot()
         self.connect_and_start()
         with self._lock:
             client = self._client

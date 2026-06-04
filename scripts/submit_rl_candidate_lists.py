@@ -40,6 +40,7 @@ class CandidateBatchConfig:
     deployment_key: str
     book_key: str
     candidate_tape_path: Path
+    account_key: str = DEFAULT_SHARED_VIRTUAL_ACCOUNT
     static_feature_cols_path: Path | None = None
     strategy_key: str | None = None
 
@@ -51,10 +52,11 @@ CONFIGS: tuple[CandidateBatchConfig, ...] = (
         model_key="long_trial_106_v1",
         model_family="canonical_long_live_execution_policy",
         model_artifact_id="trial_106_seed240",
-        deployment_key="long_trial_106_virtual_shared_01",
-        book_key="bb_long_02",
+        deployment_key="long_trial_106_virtual_seedpicker_01",
+        book_key="seedpicker_rl_long_01",
         candidate_tape_path=CANDIDATE_SOURCE_ROOT
         / "artifacts/analysis/long_trial_104_ex_long_true_rl_input_materialize_ranker_v1/lockbox_candidate_tape.parquet",
+        account_key="VIRTUALSEEDRL01",
         static_feature_cols_path=CANDIDATE_SOURCE_ROOT
         / "artifacts/analysis/long_trial_106_ex_long_true_rl_dqn_w128_oracle_notrade_dualseed_extension_v1/continuation/true_rl_dqn_w128_seed240/static_feature_cols.csv",
         strategy_key="bucket_booster_long",
@@ -81,7 +83,11 @@ def main() -> int:
         description="Submit selected RL names as model-routed trader candidates."
     )
     parser.add_argument("--api-base", default="http://quant.geisler.se:8000")
-    parser.add_argument("--account-key", default=DEFAULT_SHARED_VIRTUAL_ACCOUNT)
+    parser.add_argument(
+        "--account-key",
+        default=None,
+        help="Optional override for every side; defaults to each side's configured account.",
+    )
     parser.add_argument("--trade-date", default=_today_stockholm().isoformat())
     parser.add_argument("--candidate-date", default="latest")
     parser.add_argument("--target-notional", default="1000")
@@ -156,6 +162,7 @@ def main() -> int:
     api_base = args.api_base.rstrip("/")
     results: list[dict[str, Any]] = []
     for config in CONFIGS:
+        account_key = str(args.account_key or config.account_key).strip().upper()
         limit = args.long_limit if config.side == "LONG" else args.short_limit
         rows, candidate_date = load_selected_rows(
             config.candidate_tape_path,
@@ -164,7 +171,7 @@ def main() -> int:
         )
         target_notional, capital_plan = resolve_capital_plan(
             side=config.side,
-            account_key=args.account_key,
+            account_key=account_key,
             candidate_count=len(rows),
             default_target_notional=str(args.target_notional),
             account_equity_reference=args.account_equity_reference,
@@ -184,7 +191,7 @@ def main() -> int:
             config,
             rows,
             identity=identity,
-            account_key=args.account_key,
+            account_key=account_key,
             trade_date=trade_date,
             candidate_date=candidate_date,
             target_notional=target_notional,

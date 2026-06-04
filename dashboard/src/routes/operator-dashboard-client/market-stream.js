@@ -82,6 +82,62 @@ export function streamTimestamp(value) {
   return parsed ? parsed.toISOString() : null;
 }
 
+export function streamQuoteForSymbol(snapshot, symbol) {
+  const stream = streamPayload(snapshot);
+  const quotes = Array.isArray(stream.quotes) ? stream.quotes : [];
+  const keys = new Set(streamSymbolKeys(symbol));
+  return quotes.find((quote) => keys.has(String(quote?.symbol ?? '').trim().toUpperCase())) ?? null;
+}
+
+export function stockholmDateKeyForTimestamp(timestamp) {
+  const parsed = parseTimestamp(timestamp);
+  if (!parsed) {
+    return null;
+  }
+  const parts = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Europe/Stockholm',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(parsed);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+export function stockholmOffsetHours(year, month, day, hour, minute, second = 0) {
+  const standardUtc = Date.UTC(year, month - 1, day, hour - 1, minute, second);
+  const dstStart = (() => {
+    const lastDay = new Date(Date.UTC(year, 2, 31));
+    const lastSunday = 31 - lastDay.getUTCDay();
+    return Date.UTC(year, 2, lastSunday, 1, 0, 0);
+  })();
+  const dstEnd = (() => {
+    const lastDay = new Date(Date.UTC(year, 9, 31));
+    const lastSunday = 31 - lastDay.getUTCDay();
+    return Date.UTC(year, 9, lastSunday, 1, 0, 0);
+  })();
+  return standardUtc >= dstStart && standardUtc < dstEnd ? 2 : 1;
+}
+
+export function stockholmSessionOpenForTimestamp(timestamp) {
+  const dateKey = stockholmDateKeyForTimestamp(timestamp);
+  if (!dateKey) {
+    return null;
+  }
+  const [year, month, day] = dateKey.split('-').map((part) => Number.parseInt(part, 10));
+  const offsetHours = stockholmOffsetHours(year, month, day, 9, 0);
+  return new Date(Date.UTC(year, month - 1, day, 9 - offsetHours, 0, 0)).toISOString();
+}
+
+export function latestBenchmarkPointFromQuote(quote) {
+  const latest = parseFiniteNumber(quote?.last_price);
+  const timestamp = streamTimestamp(quote?.last_trade_at ?? quote?.updated_at);
+  if (latest === null || !timestamp) {
+    return null;
+  }
+  return { timestamp, value: latest };
+}
+
 export function buildMarketStreamMarks(snapshot) {
   const stream = streamPayload(snapshot);
   const quoteBySymbol = new Map();
@@ -402,6 +458,7 @@ export function streamBarsForSymbol(snapshot, symbol) {
 
 export function buildLiveOmxBenchmark(fallbackBenchmark, snapshot) {
   const bars = streamBarsForSymbol(snapshot, 'OMXS30');
+  const quote = streamQuoteForSymbol(snapshot, 'OMXS30');
   const validBars = bars
     .map((bar) => ({
       timestamp: streamTimestamp(bar?.timestamp),
@@ -416,32 +473,49 @@ export function buildLiveOmxBenchmark(fallbackBenchmark, snapshot) {
         }))
         .filter((point) => point.timestamp && point.value !== null)
     : [];
+  const quotePoint = latestBenchmarkPointFromQuote(quote);
   const mergedByTimestamp = new Map();
-  for (const point of [...fallbackPoints, ...validBars]) {
+  for (const point of [...fallbackPoints, ...validBars, quotePoint].filter(Boolean)) {
     mergedByTimestamp.set(point.timestamp, point);
   }
-  const mergedPoints = [...mergedByTimestamp.values()].sort(
+  const allMergedPoints = [...mergedByTimestamp.values()].sort(
     (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()
   );
-  const first = mergedPoints.find((bar) => bar.value !== 0);
-  if (!first) {
+  const latestDateKey = stockholmDateKeyForTimestamp(allMergedPoints.at(-1)?.timestamp);
+  const mergedPoints = allMergedPoints
+    .filter(
+      (point) => !latestDateKey || stockholmDateKeyForTimestamp(point.timestamp) === latestDateKey
+    )
+    .filter((point) => point.value !== 0);
+  const previousClose = parseFiniteNumber(quote?.close_price);
+  const baseline = previousClose ?? mergedPoints[0]?.value ?? null;
+  if (baseline === null || baseline === 0) {
     return fallbackBenchmark;
   }
 
+  const anchorTimestamp =
+    previousClose !== null
+      ? stockholmSessionOpenForTimestamp(mergedPoints.at(-1)?.timestamp ?? quotePoint?.timestamp)
+      : null;
+  const anchorPoint =
+    anchorTimestamp !== null
+      ? [{ timestamp: anchorTimestamp, value: baseline, return_pct: 0 }]
+      : [];
   const points = mergedPoints.map((bar) => ({
     timestamp: bar.timestamp,
     value: bar.value,
-    return_pct: ((bar.value - first.value) / first.value) * 100
+    return_pct: ((bar.value - baseline) / baseline) * 100
   }));
-  const latest = points.at(-1);
+  const allPoints = [...anchorPoint, ...points];
+  const latest = allPoints.at(-1);
   return {
     ...(fallbackBenchmark ?? {}),
     label: 'OMX',
     symbol: 'OMXS30',
-    status: points.length > 1 ? 'ok' : 'insufficient_data',
+    status: allPoints.length > 1 ? 'ok' : 'insufficient_data',
     error: null,
     latest_return_pct: latest?.return_pct ?? null,
-    points,
+    points: allPoints,
     source: 'market_stream'
   };
 }

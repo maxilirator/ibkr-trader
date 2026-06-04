@@ -6,6 +6,7 @@ from unittest import TestCase
 from ibkr_trader.rl.observations import HISTORY_FEATURE_NAMES
 from ibkr_trader.rl.observations import build_history_override_from_source_bars
 from ibkr_trader.rl.observations import build_phase1_observation_payload
+from ibkr_trader.rl.observations import parse_source_bars_by_symbol
 
 
 def _bars_for_day(
@@ -62,6 +63,38 @@ def _history_override(prev_close: str = "100") -> dict[str, object]:
 
 
 class RLObservationTests(TestCase):
+    def test_parse_source_bars_deduplicates_same_instant_with_different_offsets(
+        self,
+    ) -> None:
+        parsed = parse_source_bars_by_symbol(
+            {
+                "NORION": [
+                    {
+                        "timestamp": "2026-06-04T12:35:00+00:00",
+                        "open": "57.6",
+                        "high": "57.6",
+                        "low": "57.6",
+                        "close": "57.6",
+                    },
+                    {
+                        "timestamp": "2026-06-04T14:35:00+02:00",
+                        "open": "57.7",
+                        "high": "57.7",
+                        "low": "57.7",
+                        "close": "57.7",
+                    },
+                ]
+            },
+            timezone_name="Europe/Stockholm",
+        )
+
+        self.assertEqual(len(parsed["NORION"]), 1)
+        self.assertEqual(
+            parsed["NORION"][0].timestamp.isoformat(),
+            "2026-06-04T14:35:00+02:00",
+        )
+        self.assertEqual(str(parsed["NORION"][0].close), "57.7")
+
     def test_builds_growing_five_minute_prefix_from_one_minute_bars(self) -> None:
         payload = build_phase1_observation_payload(
             deployment_key="long_trial_106_virtual_shared_01",

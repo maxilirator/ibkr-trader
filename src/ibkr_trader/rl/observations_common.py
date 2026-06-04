@@ -329,10 +329,19 @@ def parse_source_bars_by_symbol(
             raise ValueError("source_bars keys must be non-empty symbols")
         if not isinstance(raw_bars, Sequence) or isinstance(raw_bars, (str, bytes)):
             raise ValueError(f"source_bars.{symbol} must be an array")
-        parsed_bars = [
-            _source_bar_from_payload(symbol, dict(raw_bar), timezone_name=timezone_name)
-            for raw_bar in raw_bars
-        ]
+        parsed_bars_by_timestamp: dict[datetime, SourceBar] = {}
+        for raw_bar in raw_bars:
+            parsed_bar = _source_bar_from_payload(
+                symbol,
+                dict(raw_bar),
+                timezone_name=timezone_name,
+            )
+            normalized_timestamp = parsed_bar.timestamp.replace(
+                second=0,
+                microsecond=0,
+            )
+            parsed_bars_by_timestamp[normalized_timestamp] = parsed_bar
+        parsed_bars = list(parsed_bars_by_timestamp.values())
         if not parsed_bars:
             raise ValueError(f"source_bars.{symbol} must not be empty")
         out[symbol] = sorted(parsed_bars, key=lambda bar: bar.timestamp)

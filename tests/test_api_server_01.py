@@ -590,6 +590,53 @@ class ApiServerTests01(ApiServerTestCase):
 
         self.assertEqual(snapped.isoformat(), "2026-04-28T09:05:00+02:00")
 
+    def test_healthz_includes_broker_runtime_status(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "healthz.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            engine.dispose()
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                    broker_warmup_enabled=False,
+                )
+            )
+
+            with TestClient(app) as client:
+                response = client.get("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertIn("broker_sessions", body)
+        self.assertIn("broker_circuit", body)
+        self.assertIn("broker_pacing", body)
+
     def test_stockholm_intraday_backfill_endpoint_returns_paged_batch(self) -> None:
         try:
             from fastapi.testclient import TestClient

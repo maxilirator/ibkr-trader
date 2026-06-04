@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime
+from datetime import timezone
+from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -30,6 +33,7 @@ from ibkr_trader.ledger.persistence_shared import _require_text
 from ibkr_trader.ledger.persistence_shared import _resolve_account_key
 from ibkr_trader.ledger.persistence_shared import _retire_reused_external_order_id
 from ibkr_trader.ledger.persistence_shared import _serialize_for_json
+from ibkr_trader.ledger.persistence_shared import _to_decimal
 
 def _persist_account_snapshots(
     session: Session,
@@ -319,6 +323,62 @@ def _persist_position_snapshots(
         )
 
 
+def _execution_time_from_order_status_fill(
+    broker_order: BrokerOrderRecord | None,
+    execution_shares: Decimal | None,
+) -> datetime | None:
+    if broker_order is None or broker_order.last_status_at is None:
+        return None
+    status_payload = broker_order.metadata_json.get("last_order_status_callback")
+    if not isinstance(status_payload, dict):
+        return None
+    status = _normalize_text(
+        str(status_payload.get("status"))
+        if status_payload.get("status") not in (None, "")
+        else None
+    )
+    if status is None or status.upper() != "FILLED":
+        return None
+    filled_quantity = _to_decimal(status_payload.get("filled")) or Decimal("0")
+    if filled_quantity <= 0:
+        return None
+    if execution_shares is not None and execution_shares > 0:
+        remaining_quantity = _to_decimal(status_payload.get("remaining"))
+        if filled_quantity < execution_shares and remaining_quantity != Decimal("0"):
+            return None
+    if broker_order.last_status_at.tzinfo is None:
+        return broker_order.last_status_at.replace(tzinfo=timezone.utc)
+    return broker_order.last_status_at.astimezone(timezone.utc)
+
+
+def _resolve_execution_time(
+    execution: Any,
+    *,
+    broker_order: BrokerOrderRecord | None,
+    captured_at: datetime,
+) -> tuple[datetime, dict[str, Any]]:
+    if execution.executed_at is not None:
+        return execution.executed_at, {}
+    order_status_fill_at = _execution_time_from_order_status_fill(
+        broker_order,
+        execution.shares,
+    )
+    if order_status_fill_at is not None:
+        return order_status_fill_at, {
+            "executed_at_inferred_from_order_status_callback": True,
+            "order_status_callback_at": order_status_fill_at.isoformat(),
+            "snapshot_captured_at": captured_at.isoformat(),
+        }
+    # IBKR occasionally omits execution.time on fills that are otherwise
+    # complete. Use the snapshot capture time only as the final fallback, while
+    # retaining raw broker payload provenance so operators know it is not the
+    # exchange execution timestamp.
+    return captured_at, {
+        "executed_at_inferred_from_snapshot_capture": True,
+        "snapshot_captured_at": captured_at.isoformat(),
+    }
+
+
 def _persist_executions(
     session: Session,
     *,
@@ -407,6 +467,11 @@ def _persist_executions(
             )
             broker_order = None
 
+        executed_at, execution_time_metadata = _resolve_execution_time(
+            execution,
+            broker_order=broker_order,
+            captured_at=captured_at,
+        )
         symbol = _normalize_text(execution.symbol) or (
             broker_order.symbol if broker_order is not None else None
         )
@@ -487,8 +552,8 @@ def _persist_executions(
                 total_quantity=_decimal_to_string(execution.shares),
                 limit_price=None,
                 stop_price=None,
-                submitted_at=execution.executed_at or captured_at,
-                last_status_at=execution.executed_at or captured_at,
+                submitted_at=executed_at,
+                last_status_at=executed_at,
                 raw_payload=_serialize_for_json(asdict(execution)),
                 metadata_json={},
             )
@@ -498,7 +563,7 @@ def _persist_executions(
                 session,
                 broker_order=broker_order,
                 event_type="execution_observed_without_open_order",
-                event_at=execution.executed_at or captured_at,
+                event_at=executed_at,
                 status_before=None,
                 status_after="FILLED",
                 payload=_serialize_for_json(asdict(execution)),
@@ -519,32 +584,22 @@ def _persist_executions(
                 broker_order.order_role = resolved_order_role
             previous_status = broker_order.status
             broker_order.status = "FILLED"
-            broker_order.last_status_at = execution.executed_at or captured_at
+            broker_order.last_status_at = executed_at
             if previous_status != broker_order.status:
                 _record_broker_order_event(
                     session,
                     broker_order=broker_order,
                     event_type="execution_fill_observed",
-                    event_at=execution.executed_at or captured_at,
+                    event_at=executed_at,
                     status_before=previous_status,
                     status_after=broker_order.status,
                     payload=_serialize_for_json(asdict(execution)),
                     note="Observed broker execution and marked the durable order as filled.",
                 )
-
-        executed_at = execution.executed_at
-        fill_raw_payload = _serialize_for_json(asdict(execution))
-        if executed_at is None:
-            # IBKR occasionally omits execution.time on fills that are otherwise
-            # complete. Use the snapshot capture time so the runtime can keep
-            # reconciling, while retaining the raw broker payload that shows the
-            # missing execution timestamp.
-            executed_at = captured_at
-            fill_raw_payload = {
-                **fill_raw_payload,
-                "executed_at_inferred_from_snapshot_capture": True,
-                "snapshot_captured_at": captured_at.isoformat(),
-            }
+        fill_raw_payload = {
+            **_serialize_for_json(asdict(execution)),
+            **execution_time_metadata,
+        }
 
         session.add(
             ExecutionFillRecord(
@@ -583,5 +638,3 @@ def _persist_executions(
                 raw_payload=fill_raw_payload,
             )
         )
-
-

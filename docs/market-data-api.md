@@ -95,6 +95,31 @@ work.
 curl -sS "$API/healthz?refresh_broker_status=false"
 ```
 
+## Live Trading Stream Readiness
+
+Live trading decisions must use the API-owned market stream as their market-data
+truth. Historical bars are for diagnostics, backfills, and offline repair; they
+must not be the live decision source for RL or scheduled policy entries.
+
+Before the execution runtime submits a due entry order, it now verifies that the
+target instrument is committed to the market stream and that the stream snapshot
+has fresh symbol evidence. The readiness gate:
+
+- subscribes the target instrument additively with `replace=false`, so an entry
+  target cannot erase the RL desired universe;
+- requires an active stream subscription for the target symbol;
+- requires a fresh quote or 1-minute stream bar within
+  `MARKET_STREAM_STALE_AFTER_SECONDS`;
+- persists `entry_market_data_ready` with the trimmed quote/bar evidence before
+  broker submission;
+- persists `entry_submit_blocked_market_data_not_ready` and leaves the
+  instruction in `ENTRY_PENDING` when the stream is missing, stopped, errored, or
+  stale.
+
+Broker callbacks, open orders, executions, and positions remain the execution
+truth. The stream gate only answers whether the trading decision has current
+market data; it does not replace broker reconciliation.
+
 ## Historical Bars
 
 ### `POST /v1/market-data/historical-bars?timeout=20`

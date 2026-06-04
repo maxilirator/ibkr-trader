@@ -9,7 +9,6 @@ import time
 from typing import Any, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
-from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
 from ibkr_trader.domain.execution_contract import FundingBasis
@@ -20,6 +19,7 @@ from ibkr_trader.ibkr.account_summary import read_account_summary
 from ibkr_trader.ibkr.contracts import _extract_broker_error_message
 from ibkr_trader.ibkr.contracts import build_ibkr_contract
 from ibkr_trader.ibkr.contracts import serialize_contract_details
+from ibkr_trader.ibkr.order_contract_queries import build_order_contract_query
 from ibkr_trader.ibkr.order_preview import _load_contract_class
 from ibkr_trader.ibkr.order_preview import _load_response_timeout_class
 from ibkr_trader.ibkr.order_preview import _load_sync_wrapper_class
@@ -697,14 +697,7 @@ def _resolve_instruction_contract_and_account(
         raise LookupError("; ".join(account_warnings) or "No broker account could be selected.")
 
     raw_contract = build_ibkr_contract(
-        ContractResolveQuery(
-            symbol=instruction.instrument.symbol,
-            security_type=instruction.instrument.security_type.value,
-            exchange=instruction.instrument.exchange,
-            currency=instruction.instrument.currency,
-            primary_exchange=instruction.instrument.primary_exchange,
-            isin=instruction.instrument.isin,
-        ),
+        build_order_contract_query(instruction),
         contract_cls=runtime_contract_cls,
     )
     try:

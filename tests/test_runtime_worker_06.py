@@ -104,7 +104,7 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
 
         self.assertEqual(len(result.submitted_exits), 1)
         self.assertTrue(snapshot_kwargs["include_open_orders"])
-        self.assertTrue(snapshot_kwargs["include_executions"])
+        self.assertFalse(snapshot_kwargs["include_executions"])
         self.assertTrue(snapshot_kwargs["include_positions"])
         record = self._read_record("runtime-sive-1")
         self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)

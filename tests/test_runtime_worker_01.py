@@ -4,6 +4,18 @@ from tests._runtime_worker_shared import *  # noqa: F401,F403
 
 
 class RuntimeWorkerTests01(RuntimeWorkerTestCase):
+    def test_run_runtime_cycle_uses_default_utc_clock_when_now_is_omitted(self) -> None:
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            submit_due_entries=False,
+        )
+
+        self.assertEqual(result.cycle_started_at.tzinfo, timezone.utc)
+        self.assertEqual(result.issues, ())
+
     def test_runtime_broker_operations_keep_normal_cycle_snapshot_light(self) -> None:
         recorded_operations: list[str] = []
 
@@ -146,7 +158,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
         self.assertEqual(record.broker_order_id, 11)
         self.assertEqual(record.entry_submitted_quantity, "1")
 
-    def test_run_runtime_cycle_requests_executions_for_active_real_work(self) -> None:
+    def test_run_runtime_cycle_keeps_active_real_work_snapshot_light(self) -> None:
         self._insert_instruction(
             instruction_id="runtime-aapl-1",
             symbol="AAPL",
@@ -182,7 +194,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
         )
 
         self.assertTrue(snapshot_kwargs["include_open_orders"])
-        self.assertTrue(snapshot_kwargs["include_executions"])
+        self.assertFalse(snapshot_kwargs["include_executions"])
         self.assertFalse(snapshot_kwargs["include_positions"])
 
     def test_submit_due_pending_entries_skips_stale_already_submitted_entry(self) -> None:
@@ -298,6 +310,282 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             )
             self.assertTrue(
                 event.payload["ibkr_wire_audit"][0]["request"]["order"]["transmit"]
+            )
+        finally:
+            session.close()
+
+    def test_submit_due_pending_entries_blocks_when_market_stream_is_not_ready(self) -> None:
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 20, 30, tzinfo=timezone.utc),
+            payload=_aapl_payload(),
+        )
+        submitted_entries = []
+        cancelled_entries = []
+        issues = []
+
+        _submit_due_pending_entries(
+            self.session_factory,
+            self.config,
+            due_instruction_ids=["runtime-aapl-1"],
+            cycle_started_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            timeout=10,
+            kill_switch_enabled=False,
+            entry_submitter=lambda *args, **kwargs: self.fail(
+                "entry submission must wait for fresh market-stream data"
+            ),
+            broker_retry_delays=(),
+            sleep_fn=lambda seconds: None,
+            submitted_entries=submitted_entries,
+            cancelled_entries=cancelled_entries,
+            issues=issues,
+            market_data_readiness_checker=lambda *args: {
+                "ready": False,
+                "symbol": "AAPL",
+                "reason": "market_stream_data_stale",
+                "evidence": {"latest_market_data_age_seconds": 600},
+            },
+        )
+
+        self.assertEqual(submitted_entries, [])
+        self.assertEqual(cancelled_entries, [])
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].stage, "market_data_readiness")
+        record = self._read_record("runtime-aapl-1")
+        self.assertEqual(record.state, ExecutionState.ENTRY_PENDING.value)
+
+        session = self.session_factory()
+        try:
+            event = session.execute(
+                select(InstructionEventRecord).where(
+                    InstructionEventRecord.event_type
+                    == "entry_submit_blocked_market_data_not_ready"
+                )
+            ).scalar_one()
+            self.assertFalse(event.payload["ready"])
+            self.assertEqual(event.payload["reason"], "market_stream_data_stale")
+        finally:
+            session.close()
+
+    def test_run_runtime_cycle_records_ready_market_stream_evidence_before_submit(self) -> None:
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 20, 30, tzinfo=timezone.utc),
+            payload=_aapl_payload(),
+        )
+        checks: list[tuple[str, str]] = []
+
+        def readiness_checker(
+            instruction_id: str,
+            payload: dict[str, object],
+            cycle_started_at: datetime,
+        ) -> dict[str, object]:
+            checks.append((instruction_id, payload["instruction"]["instrument"]["symbol"]))
+            self.assertEqual(cycle_started_at, datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc))
+            return {
+                "ready": True,
+                "symbol": "AAPL",
+                "reason": "market_stream_ready",
+                "evidence": {
+                    "latest_market_data_at": "2026-04-10T19:59:59+00:00",
+                    "latest_market_data_age_seconds": 1,
+                },
+            }
+
+        def fake_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            del broker_config, timeout
+            return {
+                "instruction_id": instruction.instruction_id,
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 265598, "symbol": "AAPL"},
+                "order": {
+                    "order_ref": instruction.instruction_id,
+                    "action": "BUY",
+                    "order_type": "LMT",
+                    "time_in_force": "DAY",
+                    "limit_price": "200.00",
+                    "total_quantity": "1",
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 11,
+                    "status": "PreSubmitted",
+                    "filled": "0",
+                    "remaining": "1",
+                    "avgFillPrice": 0.0,
+                    "permId": 8001,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+            entry_submitter=fake_submitter,
+            market_data_readiness_checker=readiness_checker,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(checks, [("runtime-aapl-1", "AAPL")])
+        self.assertEqual(len(result.submitted_entries), 1)
+        session = self.session_factory()
+        try:
+            event_types = [
+                event.event_type
+                for event in session.execute(
+                    select(InstructionEventRecord).order_by(InstructionEventRecord.id)
+                ).scalars()
+            ]
+            self.assertLess(
+                event_types.index("entry_market_data_ready"),
+                event_types.index("entry_order_submitted"),
+            )
+        finally:
+            session.close()
+
+    def test_run_runtime_cycle_archives_resolved_market_data_readiness_issue(self) -> None:
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_PENDING.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 20, 30, tzinfo=timezone.utc),
+            payload=_aapl_payload(),
+        )
+        session = self.session_factory()
+        try:
+            reconciliation_run = ReconciliationRunRecord(
+                run_kind="runtime_cycle",
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                runtime_timezone="Europe/Stockholm",
+                started_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+                completed_at=datetime(2026, 4, 10, 19, 55, 5, tzinfo=timezone.utc),
+                status="WARNINGS",
+                issue_count=1,
+                action_count=0,
+                metadata_json={},
+            )
+            reconciliation_run.issues.append(
+                ReconciliationIssueRecord(
+                    instruction_id="runtime-aapl-1",
+                    stage="market_data_readiness",
+                    severity="ERROR",
+                    message=(
+                        "Skipped due entry submission because live market-stream "
+                        "data is not ready: market_stream_has_no_quote_or_bar."
+                    ),
+                    observed_at=datetime(2026, 4, 10, 19, 55, 5, tzinfo=timezone.utc),
+                    payload={},
+                )
+            )
+            session.add(reconciliation_run)
+            session.commit()
+        finally:
+            session.close()
+
+        def fake_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            timeout: int = 10,
+        ) -> dict[str, object]:
+            del broker_config, timeout
+            return {
+                "instruction_id": instruction.instruction_id,
+                "account": "DU1234567",
+                "warnings": [],
+                "resolved_contract": {"con_id": 265598, "symbol": "AAPL"},
+                "order": {
+                    "order_ref": instruction.instruction_id,
+                    "action": "BUY",
+                    "order_type": "LMT",
+                    "time_in_force": "DAY",
+                    "limit_price": "200.00",
+                    "total_quantity": "1",
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 11,
+                    "status": "PreSubmitted",
+                    "filled": "0",
+                    "remaining": "1",
+                    "avgFillPrice": 0.0,
+                    "permId": 8001,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
+            entry_submitter=fake_submitter,
+            market_data_readiness_checker=lambda *args: {
+                "ready": True,
+                "symbol": "AAPL",
+                "reason": "market_stream_ready",
+                "evidence": {"latest_market_data_age_seconds": 1},
+            },
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(len(result.submitted_entries), 1)
+        session = self.session_factory()
+        try:
+            issue = session.execute(select(ReconciliationIssueRecord)).scalar_one()
+            self.assertIsNotNone(issue.archived_at)
+            self.assertEqual(issue.archived_by, "runtime_cycle")
+            self.assertIn("Market stream evidence became ready", issue.archive_reason)
+            self.assertEqual(
+                issue.payload["auto_resolved_by"],
+                "entry_market_data_ready",
             )
         finally:
             session.close()

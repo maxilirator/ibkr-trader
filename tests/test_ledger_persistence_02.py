@@ -274,6 +274,114 @@ class BrokerLedgerPersistenceTests02(BrokerLedgerPersistenceTestCase):
                 captured_at=datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc),
             )
 
+    def test_missing_execution_time_uses_matching_order_status_fill_time(self) -> None:
+        self._insert_instruction()
+        self._insert_broker_order()
+        status_fill_at = datetime(2026, 4, 19, 8, 26, 44, tzinfo=timezone.utc)
+        captured_at = datetime(2026, 4, 19, 13, 28, 56, tzinfo=timezone.utc)
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(
+                select(BrokerOrderRecord).where(
+                    BrokerOrderRecord.external_order_id == "11"
+                )
+            ).scalar_one()
+            broker_order.status = "Filled"
+            broker_order.last_status_at = status_fill_at
+            broker_order.metadata_json = {
+                "last_order_status_callback": {
+                    "orderId": 11,
+                    "status": "Filled",
+                    "filled": "1",
+                    "remaining": "0",
+                    "avgFillPrice": "200.00",
+                    "permId": 9001,
+                    "parentId": 0,
+                    "lastFillPrice": "200.00",
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": "0.0",
+                }
+            }
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(
+                    BrokerExecution(
+                        exec_id="missing-time-exec",
+                        order_id=11,
+                        perm_id=9001,
+                        client_id=0,
+                        order_ref="persisted-aapl-1",
+                        side="BOT",
+                        shares=Decimal("1"),
+                        price=Decimal("200.00"),
+                        exchange="NASDAQ",
+                        executed_at=None,
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                    ),
+                ),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=captured_at,
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            broker_order = session.execute(
+                select(BrokerOrderRecord).where(
+                    BrokerOrderRecord.external_order_id == "11"
+                )
+            ).scalar_one()
+            execution_fill = session.execute(select(ExecutionFillRecord)).scalar_one()
+            broker_order_event = session.execute(
+                select(BrokerOrderEventRecord).where(
+                    BrokerOrderEventRecord.event_type == "execution_fill_observed"
+                )
+            ).scalar_one()
+            self.assertEqual(
+                execution_fill.executed_at.replace(tzinfo=timezone.utc),
+                status_fill_at,
+            )
+            self.assertEqual(
+                broker_order.last_status_at.replace(tzinfo=timezone.utc),
+                status_fill_at,
+            )
+            self.assertEqual(
+                broker_order_event.event_at.replace(tzinfo=timezone.utc),
+                status_fill_at,
+            )
+            self.assertEqual(
+                execution_fill.raw_payload[
+                    "executed_at_inferred_from_order_status_callback"
+                ],
+                True,
+            )
+            self.assertEqual(
+                execution_fill.raw_payload["order_status_callback_at"],
+                status_fill_at.isoformat(),
+            )
+            self.assertNotIn(
+                "executed_at_inferred_from_snapshot_capture",
+                execution_fill.raw_payload,
+            )
+        finally:
+            session.close()
+
     def test_persist_broker_runtime_snapshot_uses_capture_time_when_execution_time_is_missing(self) -> None:
         self._insert_instruction()
         captured_at = datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc)

@@ -21,6 +21,7 @@
     buildMarketStreamMarks
   } from './operator-dashboard-client/market-stream.js';
   import {
+    ageSeconds,
     compactCount,
     formatAge,
     formatTimestamp,
@@ -282,7 +283,7 @@
     if (!browser || !window.EventSource) {
       return null;
     }
-    const source = new EventSource('/api/market-stream/events?bar_limit=1');
+    const source = new EventSource('/api/market-stream/events?bar_limit=600');
     source.onopen = () => {
       marketStreamStatus = {
         ...marketStreamStatus,
@@ -620,6 +621,7 @@ $: stateSync = buildStateSyncSummary();
     {marketTimeZone}
     {liveHealth}
     {brokerMonitor}
+    {executionRuntime}
     {killSwitch}
     {accounts}
     {positions}
@@ -686,4 +688,3 @@ $: stateSync = buildStateSyncSummary();
     {enhanceDashboardAction}
   />
 </div>
-

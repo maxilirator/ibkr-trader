@@ -121,6 +121,7 @@ class ApiServerConfig:
     host: str
     port: int
     require_loopback_only: bool
+    access_log_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "ApiServerConfig":
@@ -130,6 +131,10 @@ class ApiServerConfig:
             require_loopback_only=getenv(
                 "API_REQUIRE_LOOPBACK_ONLY",
                 "true",
+            ).lower() not in {"0", "false", "no"},
+            access_log_enabled=getenv(
+                "API_ACCESS_LOG_ENABLED",
+                "false",
             ).lower() not in {"0", "false", "no"},
         )
 
@@ -152,6 +157,8 @@ class AppConfig:
     broker_heartbeat_timeout_seconds: int = 5
     broker_snapshot_refresh_interval_seconds: float = 60.0
     broker_snapshot_refresh_timeout_seconds: int = 10
+    broker_execution_recovery_interval_seconds: float = 900.0
+    broker_execution_recovery_failure_cooldown_seconds: float = 900.0
     broker_status_refresh_min_interval_seconds: float = 30.0
     broker_api_startup_failure_slow_probe_seconds: float = 900.0
     ibkr_api_max_requests_per_second: float = 45.0
@@ -242,6 +249,12 @@ class AppConfig:
             ),
             broker_snapshot_refresh_timeout_seconds=int(
                 getenv("BROKER_SNAPSHOT_REFRESH_TIMEOUT_SECONDS", "10")
+            ),
+            broker_execution_recovery_interval_seconds=float(
+                getenv("BROKER_EXECUTION_RECOVERY_INTERVAL_SECONDS", "900")
+            ),
+            broker_execution_recovery_failure_cooldown_seconds=float(
+                getenv("BROKER_EXECUTION_RECOVERY_FAILURE_COOLDOWN_SECONDS", "900")
             ),
             broker_status_refresh_min_interval_seconds=float(
                 getenv("BROKER_STATUS_REFRESH_MIN_INTERVAL_SECONDS", "30")

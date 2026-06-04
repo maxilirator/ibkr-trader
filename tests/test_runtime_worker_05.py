@@ -420,6 +420,187 @@ class RuntimeWorkerTests05(RuntimeWorkerTestCase):
         self.assertEqual(record.entry_filled_quantity, "1")
         self.assertEqual(record.entry_avg_fill_price, "200.00")
 
+    def test_run_runtime_cycle_uses_order_status_time_for_execution_missing_time(self) -> None:
+        payload = _aapl_payload()
+        self._insert_instruction(
+            instruction_id="runtime-aapl-1",
+            symbol="AAPL",
+            exchange="SMART",
+            currency="USD",
+            state=ExecutionState.ENTRY_SUBMITTED.value,
+            submit_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+            expire_at=datetime(2026, 4, 10, 20, 10, tzinfo=timezone.utc),
+            payload=payload,
+            broker_order_id=11,
+        )
+        status_fill_at = datetime(2026, 4, 10, 20, 0, 44, tzinfo=timezone.utc)
+
+        session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            instruction_record = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "runtime-aapl-1"
+                )
+            ).scalar_one()
+            session.add(
+                BrokerOrderRecord(
+                    instruction_id=instruction_record.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="DU1234567",
+                    order_role="ENTRY",
+                    external_order_id="11",
+                    external_perm_id="8001",
+                    external_client_id="0",
+                    order_ref="runtime-aapl-1",
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    primary_exchange="NASDAQ",
+                    local_symbol="AAPL",
+                    side="BUY",
+                    order_type="LMT",
+                    time_in_force="DAY",
+                    status="Filled",
+                    total_quantity="1",
+                    limit_price="200.00",
+                    stop_price=None,
+                    submitted_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
+                    last_status_at=status_fill_at,
+                    raw_payload={},
+                    metadata_json={
+                        "last_order_status_callback": {
+                            "orderId": 11,
+                            "status": "Filled",
+                            "filled": "1",
+                            "remaining": "0",
+                            "avgFillPrice": "200.00",
+                            "permId": 8001,
+                            "parentId": 0,
+                            "lastFillPrice": "200.00",
+                            "clientId": 0,
+                            "whyHeld": "",
+                            "mktCapPrice": "0.0",
+                        }
+                    },
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        def fake_exit_submitter(
+            broker_config: IbkrConnectionConfig,
+            instruction: object,
+            *,
+            quantity: Decimal,
+            order_type: object,
+            order_ref: str,
+            timeout: int = 10,
+            limit_price: Decimal | None = None,
+            stop_price: Decimal | None = None,
+            oca_group: str | None = None,
+            oca_type: int | None = None,
+        ) -> dict[str, object]:
+            del broker_config, instruction, order_type, timeout
+            del limit_price, stop_price, oca_group, oca_type
+            return {
+                "contract": {"symbol": "AAPL", "exchange": "SMART", "currency": "USD"},
+                "order": {
+                    "order_id": 21,
+                    "order_ref": order_ref,
+                    "order_type": "LMT",
+                    "action": "SELL",
+                    "time_in_force": "DAY",
+                    "limit_price": "204.00",
+                    "total_quantity": str(quantity),
+                    "outside_rth": False,
+                    "transmit": True,
+                },
+                "broker_order_status": {
+                    "orderId": 21,
+                    "status": "Submitted",
+                    "filled": "0",
+                    "remaining": str(quantity),
+                    "avgFillPrice": 0.0,
+                    "permId": 9001,
+                    "parentId": 0,
+                    "lastFillPrice": 0.0,
+                    "clientId": 0,
+                    "whyHeld": "",
+                    "mktCapPrice": 0.0,
+                },
+            }
+
+        result = run_runtime_cycle(
+            self.session_factory,
+            self.config,
+            runtime_timezone="Europe/Stockholm",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            now=datetime(2026, 4, 10, 20, 5, tzinfo=timezone.utc),
+            exit_submitter=fake_exit_submitter,
+            broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(
+                    BrokerExecution(
+                        exec_id="missing-time-exec",
+                        order_id=11,
+                        perm_id=8001,
+                        client_id=0,
+                        order_ref="runtime-aapl-1",
+                        side="BOT",
+                        shares=Decimal("1"),
+                        price=Decimal("200.00"),
+                        exchange="NASDAQ",
+                        executed_at=None,
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                    ),
+                ),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+        )
+
+        self.assertEqual(len(result.filled_entries), 1)
+        self.assertEqual(len(result.submitted_exits), 1)
+        record = self._read_record("runtime-aapl-1")
+        self.assertEqual(record.state, ExecutionState.EXIT_PENDING.value)
+        self.assertEqual(record.entry_filled_quantity, "1")
+        self.assertEqual(record.entry_avg_fill_price, "200.00")
+        self.assertEqual(
+            record.entry_filled_at.replace(tzinfo=timezone.utc),
+            status_fill_at,
+        )
+        session = self.session_factory()
+        try:
+            execution_fill = session.execute(select(ExecutionFillRecord)).scalar_one()
+            self.assertEqual(
+                execution_fill.executed_at.replace(tzinfo=timezone.utc),
+                status_fill_at,
+            )
+            self.assertEqual(
+                execution_fill.raw_payload[
+                    "executed_at_inferred_from_order_status_callback"
+                ],
+                True,
+            )
+        finally:
+            session.close()
+
     def test_run_runtime_cycle_submits_delayed_market_anchored_limit_exit(self) -> None:
         payload = _sive_payload()
         payload["instruction"]["exit"] = {

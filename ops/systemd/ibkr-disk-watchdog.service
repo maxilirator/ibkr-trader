@@ -1,0 +1,18 @@
+[Unit]
+Description=Keep quant disk pressure below live-trading danger levels
+Documentation=file:/home/mattias/ibkr-trader/docs/ib-gateway-setup.md
+
+[Service]
+Type=oneshot
+Environment=WATCH_PATH=/
+Environment=CLEANUP_USE_PERCENT=80
+Environment=CLEANUP_MIN_FREE_MIB=6144
+Environment=CRITICAL_USE_PERCENT=90
+Environment=CRITICAL_MIN_FREE_MIB=2048
+Environment=JOURNAL_VACUUM_SIZE=1G
+Environment=JOURNAL_VACUUM_TIME=14d
+Environment=LOG_PRUNE_ROOTS=/var/log
+Environment=LOG_PRUNE_DAYS=14
+Environment=LOG_PRUNE_FIND_MAX_DEPTH=3
+Environment=OPERATOR_ALERT_COOLDOWN_SECONDS=1800
+ExecStart=/usr/local/sbin/ibkr_disk_watchdog.sh

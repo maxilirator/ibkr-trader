@@ -44,6 +44,118 @@ def test_runner_publishes_omxs30_as_desired_index_contract(monkeypatch) -> None:
         },
     ]
 
+
+def test_runner_observation_uses_deployment_row_key(monkeypatch) -> None:
+    observation_payloads: list[dict[str, object]] = []
+    heartbeats: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runner,
+        "load_runtime_states_from_instructions",
+        lambda **_: {"NORION": RunnerSymbolState()},
+    )
+    monkeypatch.setattr(
+        runner,
+        "static_feature_payload",
+        lambda *_, **__: {"feature_names": ["x"], "values": [0.0], "normalized": True},
+    )
+    monkeypatch.setattr(
+        runner,
+        "history_override_payload",
+        lambda **_: {"previous_session": {"prev_close": 100}, "history_features": {}},
+    )
+    monkeypatch.setattr(
+        runner,
+        "expected_decision_bar_ended_at",
+        lambda **_: "2026-06-04T14:30:00+02:00",
+    )
+    monkeypatch.setattr(
+        runner,
+        "classify_decision_bar_freshness",
+        lambda *_args, **_kwargs: {
+            "status": "stale_bar",
+            "latest_usable_bar_ended_at": "2026-06-04T14:25:00+02:00",
+        },
+    )
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        if "/v1/rl/observations/build" in url:
+            observation_payloads.append(payload)
+            deployment_key = str(payload["deployment_key"])
+            return {
+                "rl_observation": {
+                    "feature_schema": {"path_pad_length": 102},
+                    "observations": {
+                        "NORION": {
+                            "latest_bar_ended_at": "2026-06-04T14:25:00+02:00",
+                            "model_decision": {
+                                "ready": True,
+                                "decision_id": (
+                                    f"{deployment_key}:NORION:"
+                                    "2026-06-04T14:25:00+02:00"
+                                ),
+                                "latest_usable_bar_ended_at": (
+                                    "2026-06-04T14:25:00+02:00"
+                                ),
+                            },
+                        },
+                    },
+                },
+                "fetched_symbols": [],
+            }
+        assert "/heartbeat" in url
+        heartbeats.append(payload)
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+
+    runner.run_model_candidates(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(
+            config=SimpleNamespace(
+                model_key="long_trial_106_v1",
+                deployment_key="long_trial_106_virtual_shared_01",
+                side="LONG",
+            ),
+            action_names=["skip", "wait", "entry_prevclose_-50bp"],
+            obs_dim=10,
+        ),
+        deployment_key="long_trial_106_virtual_seedpicker_01",
+        deployment_mode="virtual",
+        candidates=[
+            {
+                "instruction_id": "seedpicker-norion",
+                "symbol": "NORION",
+                "account_key": "VIRTUALSEEDRL01",
+                "trace": {
+                    "trade_date": "2026-06-04",
+                    "data_cutoff_date": "2026-06-03",
+                },
+            }
+        ],
+        processed_decisions=set(),
+        execute_actions=True,
+        history_cache={},
+        history_duration="5 D",
+        history_bar_size="1 min",
+        history_timeout=20,
+        stream_bar_ready_symbols={"NORION"},
+        stream_plan={"stream_symbol_count": 1},
+        trade_date="2026-06-04",
+    )
+
+    assert observation_payloads[0]["deployment_key"] == (
+        "long_trial_106_virtual_seedpicker_01"
+    )
+    action = heartbeats[-1]["metrics"]["actions"][0]
+    assert action["decision_id"].startswith("long_trial_106_virtual_seedpicker_01:")
+
 def test_runner_skips_duplicate_desired_stream_posts(monkeypatch) -> None:
     posted: list[tuple[str, dict[str, object]]] = []
 

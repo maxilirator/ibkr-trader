@@ -95,6 +95,7 @@ from ibkr_trader.orchestration.runtime_broker_matching import (
 from ibkr_trader.orchestration.runtime_broker_matching import (
     _normalize_broker_order_status,
 )
+from ibkr_trader.orchestration.market_data_readiness import MarketDataReadinessChecker
 from ibkr_trader.orchestration.runtime_cycle import run_runtime_cycle
 from ibkr_trader.orchestration.runtime_exit_pricing import (
     _is_delayed_limit_exit_due,
@@ -288,6 +289,7 @@ def run_startup_reconciliation(
     broker_callback_fetcher: Callable[[], list[dict[str, Any]]] | None = None,
     broker_order_canceler: Callable[..., dict[str, Any]] | None = None,
     virtual_market_sync: Callable[[datetime], Any] | None = None,
+    market_data_readiness_checker: MarketDataReadinessChecker | None = None,
     broker_retry_delays: tuple[float, ...] = DEFAULT_BROKER_RETRY_DELAYS,
     submission_lead_time: timedelta = DEFAULT_SUBMISSION_LEAD_TIME,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -310,6 +312,7 @@ def run_startup_reconciliation(
         broker_callback_fetcher=broker_callback_fetcher,
         broker_order_canceler=broker_order_canceler,
         virtual_market_sync=virtual_market_sync,
+        market_data_readiness_checker=market_data_readiness_checker,
         broker_retry_delays=broker_retry_delays,
         submission_lead_time=submission_lead_time,
         sleep_fn=sleep_fn,
@@ -557,6 +560,7 @@ def run_persistent_execution_runtime(
     emit_results: bool = True,
     shutdown_sessions_on_exit: bool = True,
     virtual_market_sync: Callable[[datetime], Any] | None = None,
+    market_data_readiness_checker: MarketDataReadinessChecker | None = None,
 ) -> int:
     runtime_stop_event = stop_event or Event()
     owner_token = uuid.uuid4().hex
@@ -609,6 +613,7 @@ def run_persistent_execution_runtime(
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
                 virtual_market_sync=virtual_market_sync,
+                market_data_readiness_checker=market_data_readiness_checker,
                 submission_lead_time=submission_lead_time,
             )
             record_runtime_cycle_completed(
@@ -676,6 +681,7 @@ def run_persistent_execution_runtime(
                 broker_callback_fetcher=broker_ops.drain_callbacks,
                 broker_order_canceler=broker_ops.cancel_order,
                 virtual_market_sync=virtual_market_sync,
+                market_data_readiness_checker=market_data_readiness_checker,
                 submission_lead_time=submission_lead_time,
             )
             record_runtime_cycle_completed(
@@ -732,11 +738,13 @@ class BackgroundExecutionRuntimeService:
         app_config: AppConfig,
         broker_sessions: CanonicalSyncSessions,
         virtual_market_sync: Callable[[datetime], Any] | None = None,
+        market_data_readiness_checker: MarketDataReadinessChecker | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._app_config = app_config
         self._broker_sessions = broker_sessions
         self._virtual_market_sync = virtual_market_sync
+        self._market_data_readiness_checker = market_data_readiness_checker
         self._stop_event = Event()
         self._thread: Thread | None = None
 
@@ -789,6 +797,7 @@ class BackgroundExecutionRuntimeService:
                     emit_results=False,
                     shutdown_sessions_on_exit=False,
                     virtual_market_sync=self._virtual_market_sync,
+                    market_data_readiness_checker=self._market_data_readiness_checker,
                 )
             except RuntimeServiceLeaseError:
                 if self._stop_event.wait(restart_delay):

@@ -7,7 +7,9 @@ from typing import Mapping
 from sqlalchemy import select
 
 from ibkr_trader.db.base import session_scope
+from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import BrokerAccountRecord
+from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import PositionSnapshotRecord
 from ibkr_trader.ibkr.market_stream import MarketStreamContract
 from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
@@ -22,6 +24,18 @@ BACKGROUND_RECOVERY_CLOSED_ORDER_STATUSES = {
     "NOT_FOUND_AT_BROKER",
     "REJECTED",
 }
+ENTRY_STREAM_STATES = {"ENTRY_PENDING", "ENTRY_SUBMITTED"}
+MODEL_ROUTED_STREAM_STATES = {"MODEL_ROUTED_PENDING"}
+INTENT_STREAM_STATES = ENTRY_STREAM_STATES | MODEL_ROUTED_STREAM_STATES
+OPERATOR_BENCHMARK_STREAM_CONTRACTS = (
+    MarketStreamContract(
+        symbol="OMXS30",
+        security_type="IND",
+        exchange="OMS",
+        primary_exchange="",
+        currency="SEK",
+    ),
+)
 
 
 def parse_market_stream_subscribe_payload(
@@ -290,17 +304,61 @@ def market_stream_contracts_for_open_virtual_positions(
     )
 
 
+def market_stream_contracts_for_pending_entries(
+    session_factory: Any,
+) -> list[MarketStreamContract]:
+    """Build stream subscriptions for active instructions before broker orders exist."""
+
+    contracts_by_key: dict[str, MarketStreamContract] = {}
+    now = utc_now()
+    with session_scope(session_factory) as session:
+        records = list(
+            session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.state.in_(INTENT_STREAM_STATES),
+                    InstructionRecord.archived_at.is_(None),
+                    InstructionRecord.expire_at >= now,
+                )
+            ).scalars()
+        )
+
+    for record in records:
+        contract = _market_stream_contract_from_instrument_fields(
+            symbol=record.symbol,
+            security_type="STK",
+            exchange=record.exchange,
+            currency=record.currency,
+            primary_exchange=None,
+            local_symbol=None,
+        )
+        if contract is not None:
+            contracts_by_key[contract.key] = contract
+
+    return sorted(contracts_by_key.values(), key=lambda contract: contract.symbol)
+
+
+def market_stream_contracts_for_operator_benchmarks() -> list[MarketStreamContract]:
+    """Build subscriptions for dashboard/operator benchmark context."""
+
+    return list(OPERATOR_BENCHMARK_STREAM_CONTRACTS)
+
+
 def subscribe_open_order_market_streams(
     market_stream_service: Any,
     snapshot: Any,
     session_factory: Any | None = None,
+    *,
+    include_operator_benchmarks: bool = True,
 ) -> list[str]:
-    """Subscribe live streams needed by open orders and current holdings."""
+    """Synchronize live streams needed by current runtime targets."""
 
     contracts = market_stream_contracts_for_open_orders(
         getattr(snapshot, "open_orders", {}) or {}
     )
     contracts_by_key = {contract.key: contract for contract in contracts}
+    if include_operator_benchmarks:
+        for contract in market_stream_contracts_for_operator_benchmarks():
+            contracts_by_key[contract.key] = contract
     for contract in market_stream_contracts_for_runtime_holdings(snapshot):
         contracts_by_key[contract.key] = contract
     if session_factory is not None:
@@ -308,16 +366,19 @@ def subscribe_open_order_market_streams(
             session_factory,
         ):
             contracts_by_key[contract.key] = contract
+        for contract in market_stream_contracts_for_pending_entries(
+            session_factory,
+        ):
+            contracts_by_key[contract.key] = contract
     contracts = sorted(
         contracts_by_key.values(),
         key=lambda contract: contract.symbol,
     )
-    if not contracts:
-        return []
+    market_data_type = "LIVE" if contracts else None
     market_stream_service.subscribe_many(
         contracts,
-        replace=False,
-        market_data_type=None,
+        replace=True,
+        market_data_type=market_data_type,
     )
     return [contract.symbol for contract in contracts]
 
