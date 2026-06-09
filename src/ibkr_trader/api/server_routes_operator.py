@@ -141,6 +141,7 @@ from ibkr_trader.orchestration.intent_replacement import (
     IntentCleanupSelectorError,
     IntentReplacementConflictError,
     cleanup_intent_groups,
+    deferred_reentry_instruction_ids_for_cleanup,
     serialize_intent_cleanup_result,
     supersede_batch_intent_entries,
 )
@@ -578,12 +579,16 @@ def register_operator_routes(app: Any, context: Any) -> None:
                 reason="Incoming instruction batch superseded older active entries.",
                 timeout=10,
                 canceler=cancel_order_with_primary,
+                defer_blocked_positions=True,
             )
             result = submit_execution_batch(
                 session_factory,
                 batch,
                 runtime_timezone=app_config.timezone,
                 session_calendar_path=app_config.session_calendar_path,
+                deferred_reentry_instruction_ids=(
+                    deferred_reentry_instruction_ids_for_cleanup(batch, intent_cleanup)
+                ),
             )
         except IntentReplacementConflictError as exc:
             detail: dict[str, Any] = {"message": str(exc)}
@@ -895,4 +900,3 @@ def register_operator_routes(app: Any, context: Any) -> None:
             "session_calendar_path": str(app_config.session_calendar_path),
             "startup_reconciliation": serialize_runtime_cycle_result(result),
         }
-

@@ -5,6 +5,12 @@ export function isOpenReview(review) {
   return review.status === 'OPEN';
 }
 
+export function brokerAttentionEventLabel(eventType) {
+  if (eventType === 'broker_warning') return 'Broker warning';
+  if (eventType === 'order_error_callback') return 'Order error';
+  return String(eventType ?? '').replaceAll('_', ' ');
+}
+
 export function groupBrokerAttentionRows(rows) {
   const groupedRows = new Map();
 
@@ -24,7 +30,7 @@ export function groupBrokerAttentionRows(rows) {
       accountKey: row.account_key,
       accountLabel: row.account_label,
       symbol: row.symbol,
-      eventType: row.event_type,
+      eventType: brokerAttentionEventLabel(row.event_type),
       message: row.message,
       latestAt: row.event_at,
       latestStatusAfter: row.status_after,

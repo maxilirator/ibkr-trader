@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime
 from datetime import timedelta
+from decimal import Decimal
+from decimal import InvalidOperation
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,6 +14,8 @@ from sqlalchemy.orm import sessionmaker
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
+from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import ReconciliationIssueRecord
 from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.ibkr.gateway_diagnostics import format_gateway_diagnostic_hint
@@ -46,6 +51,21 @@ BROKER_OUTAGE_MESSAGE_MARKERS = (
     "timed out",
     "timeout",
 )
+FORCED_EXIT_CLEANUP_UNCONFIRMED_PREFIX = (
+    "Forced exit cleanup could not confirm cancellation of broker order "
+)
+FORCED_EXIT_CLEANUP_ORDER_ID_PATTERN = re.compile(
+    r"Forced exit cleanup could not confirm cancellation of broker order (\d+)"
+)
+RESOLVED_BROKER_ORDER_STATUSES = {
+    "API_CANCELLED",
+    "CANCELLED",
+    "ERROR",
+    "FILLED",
+    "INACTIVE",
+    "NOT_FOUND_AT_BROKER",
+    "REJECTED",
+}
 
 
 def broker_snapshot_unavailable_message(error: Exception) -> str:
@@ -209,6 +229,10 @@ def _persist_runtime_cycle_audit(
     action_count = sum(len(entries) for entries in action_payload.values())
 
     with session_scope(session_factory) as session:
+        _archive_resolved_forced_exit_cleanup_issues(
+            session,
+            resolved_at=cycle_completed_at,
+        )
         if _should_suppress_broker_outage_audit(
             action_count=action_count,
             issues=issues,
@@ -260,6 +284,113 @@ def _persist_runtime_cycle_audit(
                     payload={},
                 )
             )
+
+
+def _archive_resolved_forced_exit_cleanup_issues(
+    session: Session,
+    *,
+    resolved_at: datetime,
+) -> None:
+    """Hide stale cleanup warnings once durable ledger state proves them resolved."""
+
+    issues = list(
+        session.execute(
+            select(ReconciliationIssueRecord).where(
+                ReconciliationIssueRecord.stage == "reconcile_instruction",
+                ReconciliationIssueRecord.message.like(
+                    f"{FORCED_EXIT_CLEANUP_UNCONFIRMED_PREFIX}%"
+                ),
+                ReconciliationIssueRecord.archived_at.is_(None),
+            )
+        ).scalars()
+    )
+    for issue in issues:
+        resolution = _resolved_forced_exit_cleanup_issue(session, issue)
+        if resolution is None:
+            continue
+        issue.archived_at = resolved_at
+        issue.archived_by = "runtime_cycle"
+        issue.archive_reason = (
+            "Forced-exit cleanup warning was auto-resolved because the "
+            "durable ledger later showed the instruction/order was closed."
+        )
+        payload = dict(issue.payload or {})
+        payload["auto_resolved_by"] = "forced_exit_cleanup_resolved"
+        payload["resolution"] = serialize_for_json(resolution)
+        issue.payload = payload
+
+
+def _resolved_forced_exit_cleanup_issue(
+    session: Session,
+    issue: ReconciliationIssueRecord,
+) -> dict[str, object] | None:
+    instruction = _issue_instruction(session, issue)
+    if (
+        instruction is not None
+        and instruction.state == "COMPLETED"
+        and _has_nonzero_quantity(instruction.exit_filled_quantity)
+    ):
+        return {
+            "reason": "instruction_completed",
+            "instruction_id": instruction.instruction_id,
+            "instruction_state": instruction.state,
+            "exit_filled_quantity": instruction.exit_filled_quantity,
+            "exit_filled_at": instruction.exit_filled_at,
+        }
+
+    broker_order_id = _forced_exit_cleanup_broker_order_id(issue.message)
+    if broker_order_id is None:
+        return None
+    statement = select(BrokerOrderRecord).where(
+        BrokerOrderRecord.external_order_id == str(broker_order_id)
+    )
+    if instruction is not None:
+        statement = statement.where(BrokerOrderRecord.instruction_id == instruction.id)
+    broker_order = session.execute(statement).scalars().first()
+    if broker_order is None:
+        return None
+    status = _normalize_order_status(broker_order.status)
+    if status not in RESOLVED_BROKER_ORDER_STATUSES:
+        return None
+    return {
+        "reason": "broker_order_closed",
+        "broker_order_id": broker_order.external_order_id,
+        "broker_order_status": broker_order.status,
+        "instruction_id": instruction.instruction_id if instruction is not None else None,
+    }
+
+
+def _issue_instruction(
+    session: Session,
+    issue: ReconciliationIssueRecord,
+) -> InstructionRecord | None:
+    if issue.instruction_id in (None, ""):
+        return None
+    return session.execute(
+        select(InstructionRecord).where(
+            InstructionRecord.instruction_id == issue.instruction_id
+        )
+    ).scalar_one_or_none()
+
+
+def _forced_exit_cleanup_broker_order_id(message: str) -> int | None:
+    match = FORCED_EXIT_CLEANUP_ORDER_ID_PATTERN.search(message)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _has_nonzero_quantity(value: str | None) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        return Decimal(str(value)) != 0
+    except (InvalidOperation, ValueError):
+        return True
+
+
+def _normalize_order_status(value: str | None) -> str:
+    return str(value or "").strip().upper()
 
 
 def _normalise_broker_outage_message(message: str) -> str:

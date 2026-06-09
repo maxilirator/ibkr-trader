@@ -34,6 +34,7 @@ from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
 from ibkr_trader.virtual.accounts import is_virtual_account_key
 
 BROKER_KIND_IBKR = "IBKR"
+ORDER_STATUS_FILL_EXECUTION_ID_PREFIX = "order-status-fill:"
 
 _OPEN_ORDER_CLOSED_STATUSES = {
     "API_CANCELLED",
@@ -103,6 +104,37 @@ def _resolve_account_key(
 
 def _is_virtual_ledger_identity(*, broker_kind: str, account_key: str | None) -> bool:
     return broker_kind == BROKER_KIND_VIRTUAL or is_virtual_account_key(account_key)
+
+
+def _order_status_fill_execution_id(broker_order: BrokerOrderRecord) -> str:
+    order_id = _normalize_text(broker_order.external_order_id) or "no-order-id"
+    perm_id = _normalize_text(broker_order.external_perm_id) or "no-perm-id"
+    return (
+        f"{ORDER_STATUS_FILL_EXECUTION_ID_PREFIX}"
+        f"{broker_order.broker_kind}:{broker_order.account_key}:"
+        f"{broker_order.id}:{order_id}:{perm_id}"
+    )
+
+
+def _is_order_status_synthetic_fill(fill: ExecutionFillRecord) -> bool:
+    if fill.external_execution_id.startswith(ORDER_STATUS_FILL_EXECUTION_ID_PREFIX):
+        return True
+    raw_payload = fill.raw_payload if isinstance(fill.raw_payload, dict) else {}
+    return bool(raw_payload.get("synthetic_from_order_status_callback"))
+
+
+def _delete_order_status_synthetic_fills_for_broker_order(
+    session: Session,
+    broker_order: BrokerOrderRecord,
+) -> None:
+    rows = session.execute(
+        select(ExecutionFillRecord).where(
+            ExecutionFillRecord.broker_order_id == broker_order.id,
+        )
+    ).scalars()
+    for fill in rows:
+        if _is_order_status_synthetic_fill(fill):
+            session.delete(fill)
 
 
 def _derive_account_base_currency(
@@ -782,5 +814,4 @@ def _mark_missing_open_orders_closed(
                 "broker order, so the instruction was marked cancelled."
             ),
         )
-
 

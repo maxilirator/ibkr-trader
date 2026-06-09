@@ -19,6 +19,9 @@ from ibkr_trader.ibkr.runtime_snapshot import BrokerPosition
 from ibkr_trader.ibkr.runtime_snapshot import BrokerRuntimeSnapshot
 from ibkr_trader.ledger.persistence_shared import _broker_order_lineage_changed
 from ibkr_trader.ledger.persistence_shared import _decimal_to_string
+from ibkr_trader.ledger.persistence_shared import (
+    _delete_order_status_synthetic_fills_for_broker_order,
+)
 from ibkr_trader.ledger.persistence_shared import _derive_account_base_currency
 from ibkr_trader.ledger.persistence_shared import _execution_side_is_exit_for_instruction
 from ibkr_trader.ledger.persistence_shared import _find_active_exit_instruction_for_execution
@@ -570,6 +573,10 @@ def _persist_executions(
                 note="Created broker order record from execution because no open-order ledger row existed.",
             )
         else:
+            _delete_order_status_synthetic_fills_for_broker_order(
+                session,
+                broker_order,
+            )
             if instruction_record is not None:
                 broker_order.instruction_id = instruction_record.id
             if broker_order.order_role != resolved_order_role:

@@ -11,9 +11,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
 
 from ibkr_trader.db.base import session_scope
+from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_payloads import parse_execution_instruction_payload
+from ibkr_trader.orchestration.intent_replacement import intent_group_key_for_record
 from ibkr_trader.orchestration.scheduling import (
     resolve_effective_entry_expire_at_for_schedule,
 )
@@ -224,6 +226,102 @@ def fetch_due_entry_instruction_ids(
     ]
 
 
+def promote_due_reentry_waiting_for_flat(
+    session_factory: sessionmaker[Session],
+    *,
+    cycle_at: datetime,
+    session_calendar_path: Path,
+    submission_lead_time: timedelta,
+    instruction_ids: tuple[str, ...] | None = None,
+) -> list[str]:
+    """Promote deferred same-symbol entries once their previous position is flat."""
+
+    cycle_at = ensure_utc(cycle_at) or cycle_at
+    candidate_cutoff = cycle_at + submission_lead_time
+    promoted_instruction_ids: list[str] = []
+    with session_scope(session_factory) as session:
+        query = (
+            select(InstructionRecord)
+            .where(
+                InstructionRecord.state
+                == ExecutionState.REENTRY_WAITING_FOR_FLAT.value,
+                InstructionRecord.submit_at <= candidate_cutoff,
+                InstructionRecord.archived_at.is_(None),
+            )
+            .order_by(InstructionRecord.submit_at, InstructionRecord.id)
+            .with_for_update()
+        )
+        if instruction_ids:
+            query = query.where(InstructionRecord.instruction_id.in_(instruction_ids))
+        records = list(session.execute(query).scalars())
+
+        for record in records:
+            expired = _is_entry_record_expired(
+                record,
+                cycle_at=cycle_at,
+                session_calendar_path=session_calendar_path,
+            )
+            due = _is_entry_submission_due(
+                record,
+                cycle_at=cycle_at,
+                session_calendar_path=session_calendar_path,
+                submission_lead_time=submission_lead_time,
+            )
+            if not expired and not due:
+                continue
+
+            blocking_instruction_ids = _same_group_active_position_instruction_ids(
+                session,
+                record,
+            )
+            if blocking_instruction_ids:
+                if expired:
+                    _transition_reentry_waiting_for_flat(
+                        session,
+                        record,
+                        cycle_at=cycle_at,
+                        state_after=ExecutionState.ENTRY_CANCELLED.value,
+                        event_type="reentry_waiting_for_flat_expired",
+                        note=(
+                            "Deferred re-entry expired before the previous same-group "
+                            "position reached flat."
+                        ),
+                        payload={"blocked_by_instruction_ids": blocking_instruction_ids},
+                    )
+                continue
+
+            if expired:
+                _transition_reentry_waiting_for_flat(
+                    session,
+                    record,
+                    cycle_at=cycle_at,
+                    state_after=ExecutionState.ENTRY_CANCELLED.value,
+                    event_type="reentry_waiting_for_flat_expired",
+                    note=(
+                        "Deferred re-entry was flat-ready only after its entry window "
+                        "had expired."
+                    ),
+                    payload={"blocked_by_instruction_ids": []},
+                )
+                continue
+
+            _transition_reentry_waiting_for_flat(
+                session,
+                record,
+                cycle_at=cycle_at,
+                state_after=ExecutionState.ENTRY_PENDING.value,
+                event_type="reentry_waiting_for_flat_promoted",
+                note=(
+                    "Deferred re-entry promoted after no active same-group position "
+                    "remained in the durable lifecycle."
+                ),
+                payload={"blocked_by_instruction_ids": []},
+            )
+            promoted_instruction_ids.append(record.instruction_id)
+
+    return promoted_instruction_ids
+
+
 def fetch_expired_submitted_entry_instruction_ids(
     session_factory: sessionmaker[Session],
     *,
@@ -257,6 +355,62 @@ def fetch_expired_submitted_entry_instruction_ids(
             session_calendar_path=session_calendar_path,
         )
     ]
+
+
+def _same_group_active_position_instruction_ids(
+    session: Session,
+    record: InstructionRecord,
+) -> list[str]:
+    group_key = intent_group_key_for_record(record)
+    candidates = session.execute(
+        select(InstructionRecord).where(
+            InstructionRecord.id != record.id,
+            InstructionRecord.account_key == record.account_key,
+            InstructionRecord.book_key == record.book_key,
+            InstructionRecord.symbol == record.symbol,
+            InstructionRecord.exchange == record.exchange,
+            InstructionRecord.currency == record.currency,
+            InstructionRecord.state.in_(
+                (
+                    ExecutionState.POSITION_OPEN.value,
+                    ExecutionState.EXIT_PENDING.value,
+                )
+            ),
+            InstructionRecord.archived_at.is_(None),
+        )
+    ).scalars()
+    return [
+        candidate.instruction_id
+        for candidate in candidates
+        if intent_group_key_for_record(candidate) == group_key
+    ]
+
+
+def _transition_reentry_waiting_for_flat(
+    session: Session,
+    record: InstructionRecord,
+    *,
+    cycle_at: datetime,
+    state_after: str,
+    event_type: str,
+    note: str,
+    payload: dict[str, object],
+) -> None:
+    state_before = record.state
+    record.state = state_after
+    record.updated_at = cycle_at
+    session.add(
+        InstructionEventRecord(
+            instruction_id=record.id,
+            event_type=event_type,
+            source="runtime",
+            event_at=cycle_at,
+            state_before=state_before,
+            state_after=state_after,
+            payload=payload,
+            note=note,
+        )
+    )
 
 
 def is_pending_entry_expired(

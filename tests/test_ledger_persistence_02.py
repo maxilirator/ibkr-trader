@@ -910,6 +910,231 @@ class BrokerLedgerPersistenceTests02(BrokerLedgerPersistenceTestCase):
                 instruction_events[0].payload["evidence_source"],
                 "broker_order_status",
             )
-            self.assertEqual(fills, [])
+            self.assertEqual(len(fills), 1)
+            self.assertTrue(
+                fills[0].external_execution_id.startswith("order-status-fill:")
+            )
+            self.assertEqual(fills[0].external_order_id, "11")
+            self.assertEqual(fills[0].external_perm_id, "9001")
+            self.assertEqual(fills[0].order_ref, "persisted-aapl-1")
+            self.assertEqual(fills[0].side, "BUY")
+            self.assertEqual(fills[0].quantity, "1")
+            self.assertEqual(fills[0].price, "200.00")
+            self.assertTrue(fills[0].raw_payload["synthetic_from_order_status_callback"])
+        finally:
+            session.close()
+
+    def test_order_status_callback_materializes_exit_fill_for_recent_fills(
+        self,
+    ) -> None:
+        self._insert_instruction()
+        session = self.session_factory()
+        try:
+            instruction = session.execute(
+                select(InstructionRecord).where(
+                    InstructionRecord.instruction_id == "persisted-aapl-1"
+                )
+            ).scalar_one()
+            instruction.state = ExecutionState.EXIT_PENDING.value
+            instruction.entry_filled_quantity = "1"
+            instruction.entry_avg_fill_price = "199.00"
+            instruction.entry_filled_at = datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc)
+            broker_account = BrokerAccountRecord(
+                broker_kind=BROKER_KIND_IBKR,
+                account_key="DU1234567",
+                base_currency="USD",
+            )
+            session.add(broker_account)
+            session.flush()
+            session.add_all(
+                [
+                    BrokerOrderRecord(
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind=BROKER_KIND_IBKR,
+                        account_key="DU1234567",
+                        order_role="ENTRY",
+                        external_order_id="10",
+                        external_perm_id="8999",
+                        external_client_id="0",
+                        order_ref="persisted-aapl-1",
+                        symbol="AAPL",
+                        exchange="SMART",
+                        currency="USD",
+                        security_type="STK",
+                        primary_exchange="NASDAQ",
+                        local_symbol="AAPL",
+                        side="BUY",
+                        order_type="LMT",
+                        time_in_force="DAY",
+                        status="Filled",
+                        total_quantity="1",
+                        limit_price="199.00",
+                        submitted_at=datetime(2026, 4, 19, 8, 30, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                    BrokerOrderRecord(
+                        instruction_id=instruction.id,
+                        broker_account_id=broker_account.id,
+                        broker_kind=BROKER_KIND_IBKR,
+                        account_key="DU1234567",
+                        order_role="EXIT",
+                        external_order_id="12",
+                        external_perm_id="9002",
+                        external_client_id="0",
+                        order_ref="persisted-aapl-1:exit:take_profit",
+                        symbol="AAPL",
+                        exchange="SMART",
+                        currency="USD",
+                        security_type="STK",
+                        primary_exchange="NASDAQ",
+                        local_symbol="AAPL",
+                        side="SELL",
+                        order_type="LMT",
+                        time_in_force="DAY",
+                        status="Submitted",
+                        total_quantity="1",
+                        limit_price="203.00",
+                        submitted_at=datetime(2026, 4, 19, 8, 35, tzinfo=timezone.utc),
+                        last_status_at=datetime(2026, 4, 19, 8, 35, tzinfo=timezone.utc),
+                        raw_payload={},
+                        metadata_json={},
+                    ),
+                ]
+            )
+            session.add(
+                ExecutionFillRecord(
+                    broker_order_id=None,
+                    instruction_id=instruction.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind=BROKER_KIND_IBKR,
+                    account_key="DU1234567",
+                    external_execution_id="entry-exec-1",
+                    external_order_id="10",
+                    external_perm_id="8999",
+                    order_ref="persisted-aapl-1",
+                    symbol="AAPL",
+                    exchange="SMART",
+                    currency="USD",
+                    security_type="STK",
+                    side="BOT",
+                    quantity="1",
+                    price="199.00",
+                    commission="1.00",
+                    commission_currency="USD",
+                    executed_at=datetime(2026, 4, 19, 8, 31, tzinfo=timezone.utc),
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        persist_broker_callback_events(
+            self.session_factory,
+            [
+                {
+                    "event_type": "order_status",
+                    "event_at": datetime(2026, 4, 19, 8, 40, tzinfo=timezone.utc),
+                    "order_status": {
+                        "orderId": 12,
+                        "status": "Filled",
+                        "filled": "1",
+                        "remaining": "0",
+                        "avgFillPrice": "203.00",
+                        "permId": 9002,
+                        "parentId": 0,
+                        "lastFillPrice": "203.00",
+                        "clientId": 0,
+                        "whyHeld": "",
+                        "mktCapPrice": "0.0",
+                    },
+                }
+            ],
+            broker_kind=BROKER_KIND_IBKR,
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            exit_fills = session.execute(
+                select(ExecutionFillRecord).where(
+                    ExecutionFillRecord.order_ref == "persisted-aapl-1:exit:take_profit"
+                )
+            ).scalars().all()
+            exit_order = session.execute(
+                select(BrokerOrderRecord).where(BrokerOrderRecord.external_order_id == "12")
+            ).scalar_one()
+
+            self.assertEqual(exit_order.status, "Filled")
+            self.assertEqual(len(exit_fills), 1)
+            self.assertEqual(exit_fills[0].broker_order_id, exit_order.id)
+            self.assertEqual(exit_fills[0].instruction_id, exit_order.instruction_id)
+            self.assertEqual(exit_fills[0].side, "SELL")
+            self.assertEqual(exit_fills[0].quantity, "1")
+            self.assertEqual(exit_fills[0].price, "203.00")
+            self.assertIsNone(exit_fills[0].commission)
+            self.assertTrue(
+                exit_fills[0].raw_payload["synthetic_from_order_status_callback"]
+            )
+        finally:
+            session.close()
+
+    def test_runtime_execution_recovery_replaces_order_status_synthetic_fill(
+        self,
+    ) -> None:
+        self.test_order_status_callback_materializes_exit_fill_for_recent_fills()
+
+        persist_broker_runtime_snapshot(
+            self.session_factory,
+            BrokerRuntimeSnapshot(
+                open_orders={},
+                executions=(
+                    BrokerExecution(
+                        exec_id="real-exit-exec-1",
+                        order_id=12,
+                        perm_id=9002,
+                        client_id=0,
+                        order_ref="persisted-aapl-1:exit:take_profit",
+                        side="SLD",
+                        shares=Decimal("1"),
+                        price=Decimal("203.00"),
+                        exchange="NYSE",
+                        executed_at=datetime(2026, 4, 19, 8, 40, 2, tzinfo=timezone.utc),
+                        symbol="AAPL",
+                        account="DU1234567",
+                        security_type="STK",
+                        primary_exchange="NASDAQ",
+                        currency="USD",
+                        local_symbol="AAPL",
+                        commission=Decimal("1.25"),
+                        commission_currency="USD",
+                    ),
+                ),
+                portfolio=(),
+                positions=(),
+                account_values={},
+            ),
+            broker_kind=BROKER_KIND_IBKR,
+            captured_at=datetime(2026, 4, 19, 8, 41, tzinfo=timezone.utc),
+            default_account_key="DU1234567",
+        )
+
+        session = self.session_factory()
+        try:
+            exit_fills = session.execute(
+                select(ExecutionFillRecord)
+                .where(ExecutionFillRecord.order_ref == "persisted-aapl-1:exit:take_profit")
+                .order_by(ExecutionFillRecord.id)
+            ).scalars().all()
+
+            self.assertEqual(len(exit_fills), 1)
+            self.assertEqual(exit_fills[0].external_execution_id, "real-exit-exec-1")
+            self.assertEqual(exit_fills[0].commission, "1.25")
+            self.assertFalse(
+                exit_fills[0].raw_payload.get("synthetic_from_order_status_callback", False)
+            )
         finally:
             session.close()

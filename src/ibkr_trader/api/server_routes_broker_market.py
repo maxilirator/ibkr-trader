@@ -7,7 +7,9 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from dataclasses import replace
 from datetime import datetime
+from datetime import time
 from datetime import timedelta
+from datetime import timezone
 from decimal import Decimal
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -84,6 +86,7 @@ from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import BrokerOrderRecord
 from ibkr_trader.db.models import InstructionRecord
+from ibkr_trader.db.models import MarketStreamBarRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.domain.execution_payloads import parse_datetime
@@ -228,6 +231,118 @@ from ibkr_trader.virtual.execution import submit_virtual_exit_order
 
 LOGGER = logging.getLogger(__name__)
 
+
+def _parse_stream_bar_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    raw_value = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _stream_quote_for_symbol(stream_snapshot: dict[str, Any], symbol: str) -> dict[str, Any] | None:
+    quotes = stream_snapshot.get("quotes")
+    if not isinstance(quotes, list):
+        return None
+    normalized_symbol = symbol.strip().upper()
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            continue
+        if str(quote.get("symbol") or "").strip().upper() == normalized_symbol:
+            return quote
+    return None
+
+
+def _latest_stream_bar_for_symbol(
+    stream_snapshot: dict[str, Any],
+    symbol: str,
+) -> dict[str, Any] | None:
+    bars_by_symbol = stream_snapshot.get("bars_by_symbol")
+    if not isinstance(bars_by_symbol, dict):
+        return None
+    bars = bars_by_symbol.get(symbol)
+    if not isinstance(bars, list) or not bars:
+        return None
+    for bar in reversed(bars):
+        if isinstance(bar, dict):
+            return bar
+    return None
+
+
+def _enrich_omxs30_snapshot_previous_close(
+    session_factory: Any,
+    *,
+    stream_snapshot: dict[str, Any],
+    symbols: list[str] | None,
+    timezone_name: str,
+) -> None:
+    requested_symbols = {str(symbol).strip().upper() for symbol in symbols or []}
+    if requested_symbols and "OMXS30" not in requested_symbols:
+        return
+
+    quote = _stream_quote_for_symbol(stream_snapshot, "OMXS30")
+    if quote is not None and quote.get("close_price") not in (None, ""):
+        return
+
+    latest_bar = _latest_stream_bar_for_symbol(stream_snapshot, "OMXS30")
+    if latest_bar is None:
+        return
+    latest_timestamp = _parse_stream_bar_timestamp(latest_bar.get("timestamp"))
+    if latest_timestamp is None:
+        return
+
+    local_zone = ZoneInfo(timezone_name)
+    local_latest = latest_timestamp.astimezone(local_zone)
+    session_open = datetime.combine(
+        local_latest.date(),
+        time(9, 0),
+        tzinfo=local_zone,
+    )
+
+    with session_scope(session_factory) as session:
+        previous_bar = session.execute(
+            select(MarketStreamBarRecord)
+            .where(
+                MarketStreamBarRecord.symbol == "OMXS30",
+                MarketStreamBarRecord.started_at < session_open,
+            )
+            .order_by(MarketStreamBarRecord.started_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+    if previous_bar is None:
+        return
+    previous_bar_started_at = previous_bar.started_at
+    if previous_bar_started_at.tzinfo is None:
+        previous_bar_started_at = previous_bar_started_at.replace(tzinfo=timezone.utc)
+    previous_local = previous_bar_started_at.astimezone(local_zone)
+    previous_age_days = (local_latest.date() - previous_local.date()).days
+    if previous_age_days <= 0 or previous_age_days > 7:
+        return
+
+    quotes = stream_snapshot.get("quotes")
+    if not isinstance(quotes, list):
+        quotes = []
+        stream_snapshot["quotes"] = quotes
+    if quote is None:
+        quote = {
+            "symbol": "OMXS30",
+            "exchange": latest_bar.get("exchange") or "OMS",
+            "currency": latest_bar.get("currency") or "SEK",
+            "security_type": "IND",
+            "primary_exchange": "",
+        }
+        quotes.append(quote)
+
+    quote.setdefault("last_price", latest_bar.get("close"))
+    quote["close_price"] = previous_bar.close_price
+    quote.setdefault("updated_at", latest_bar.get("timestamp"))
+    quote.setdefault("last_trade_at", latest_bar.get("timestamp"))
 
 
 def register_broker_market_routes(app: Any, context: Any) -> None:
@@ -592,6 +707,12 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
             symbols=parse_market_stream_symbols(symbols),
             bar_limit=bar_limit,
             as_of=utc_now(),
+            timezone_name=app_config.timezone,
+        )
+        _enrich_omxs30_snapshot_previous_close(
+            session_factory,
+            stream_snapshot=snapshot,
+            symbols=parse_market_stream_symbols(symbols),
             timezone_name=app_config.timezone,
         )
         return {

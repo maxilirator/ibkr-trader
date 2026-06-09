@@ -56,6 +56,7 @@ from ibkr_trader.orchestration.runtime_planning import fetch_expired_submitted_e
 from ibkr_trader.orchestration.runtime_planning import fetch_instruction_account_keys as _fetch_instruction_account_keys
 from ibkr_trader.orchestration.runtime_planning import fetch_instruction_ids as _fetch_instruction_ids
 from ibkr_trader.orchestration.runtime_planning import has_virtual_runtime_work as _has_virtual_runtime_work
+from ibkr_trader.orchestration.runtime_planning import promote_due_reentry_waiting_for_flat as _promote_due_reentry_waiting_for_flat
 from ibkr_trader.orchestration.runtime_planning import should_reconcile_active_runtime_instructions as _should_reconcile_active_runtime_instructions
 from ibkr_trader.orchestration.runtime_planning import should_touch_real_broker_for_runtime_cycle as _should_touch_real_broker_for_runtime_cycle
 from ibkr_trader.orchestration.runtime_planning import split_instruction_ids_by_virtual as _split_instruction_ids_by_virtual
@@ -81,6 +82,12 @@ from ibkr_trader.virtual.execution import has_real_broker_work
 from ibkr_trader.virtual.execution import read_virtual_market_price
 DEFAULT_BROKER_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 DEFAULT_SUBMISSION_LEAD_TIME = timedelta(seconds=60)
+
+
+def _merge_instruction_ids(base: list[str], extra: list[str]) -> list[str]:
+    return list(dict.fromkeys([*base, *extra]))
+
+
 def run_runtime_cycle(
     session_factory: sessionmaker[Session],
     broker_config: IbkrConnectionConfig,
@@ -166,6 +173,17 @@ def run_runtime_cycle(
         submission_lead_time=submission_lead_time,
         instruction_ids=instruction_ids,
     )
+    if submit_due_entries:
+        due_instruction_ids = _merge_instruction_ids(
+            due_instruction_ids,
+            _promote_due_reentry_waiting_for_flat(
+                session_factory,
+                cycle_at=cycle_started_at,
+                session_calendar_path=session_calendar_path,
+                submission_lead_time=submission_lead_time,
+                instruction_ids=instruction_ids,
+            ),
+        )
     expired_submitted_entry_instruction_ids = (
         _fetch_expired_submitted_entry_instruction_ids(
             session_factory,
@@ -1021,6 +1039,17 @@ def run_runtime_cycle(
                 payload={"error": str(exc)},
             )
     if submit_due_entries:
+        due_instruction_ids = _merge_instruction_ids(
+            due_instruction_ids,
+            _promote_due_reentry_waiting_for_flat(
+                session_factory,
+                cycle_at=cycle_started_at,
+                session_calendar_path=session_calendar_path,
+                submission_lead_time=submission_lead_time,
+                instruction_ids=instruction_ids,
+            ),
+        )
+        due_instruction_count = len(due_instruction_ids)
         # Active exit workflows take priority over fresh entries so we do not
         # size or submit new risk before urgent carry-over positions are handled.
         # The gate is account-scoped: a virtual account cleanup issue must not

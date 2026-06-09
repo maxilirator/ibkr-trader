@@ -362,6 +362,15 @@ def _is_order_cancelled_error(payload: dict[str, Any]) -> bool:
     return "order canceled" in message or "order cancelled" in message
 
 
+def _is_price_collar_warning_callback(
+    broker_order_event: BrokerOrderEventRecord,
+) -> bool:
+    if broker_order_event.event_type != "order_error_callback":
+        return False
+    payload = broker_order_event.payload if isinstance(broker_order_event.payload, dict) else {}
+    return str(payload.get("errorCode") or "").strip() == "2161"
+
+
 def _is_expected_oca_sibling_cancel(
     session: Session,
     *,
@@ -398,6 +407,43 @@ def _is_expected_oca_sibling_cancel(
         if _normalize_order_status(sibling_order.status) == "FILLED":
             return True
     return False
+
+
+def _is_expected_forced_exit_cleanup_cancel(
+    session: Session,
+    *,
+    broker_order_event: BrokerOrderEventRecord,
+    broker_order: BrokerOrderRecord,
+) -> bool:
+    if broker_order_event.event_type != "order_error_callback":
+        return False
+    if broker_order.order_role != "EXIT":
+        return False
+    if broker_order.instruction_id is None:
+        return False
+
+    payload = broker_order_event.payload if isinstance(broker_order_event.payload, dict) else {}
+    if not _is_order_cancelled_error(payload):
+        return False
+    if _normalize_order_status(broker_order_event.status_after) != "CANCELLED":
+        return False
+
+    order_ref = (broker_order.order_ref or "").strip()
+    if not (
+        order_ref.endswith(":exit:take_profit")
+        or order_ref.endswith(":exit:catastrophic_stop")
+        or order_ref.endswith(":exit:stop_loss")
+    ):
+        return False
+
+    forced_exit = session.execute(
+        select(BrokerOrderRecord.id).where(
+            BrokerOrderRecord.instruction_id == broker_order.instruction_id,
+            BrokerOrderRecord.order_role == "EXIT",
+            BrokerOrderRecord.order_ref == f"{order_ref.rsplit(':exit:', 1)[0]}:exit:forced",
+        )
+    ).first()
+    return forced_exit is not None
 
 
 def _has_entry_fill(

@@ -141,6 +141,7 @@ from ibkr_trader.orchestration.intent_replacement import (
     IntentCleanupSelectorError,
     IntentReplacementConflictError,
     cleanup_intent_groups,
+    deferred_reentry_instruction_ids_for_cleanup,
     serialize_intent_cleanup_result,
     supersede_batch_intent_entries,
 )
@@ -582,12 +583,19 @@ def register_rl_routes(app: Any, context: Any) -> None:
                     ),
                     timeout=10,
                     canceler=cancel_order_with_primary,
+                    defer_blocked_positions=True,
                 )
                 submitted_batch = submit_execution_batch(
                     session_factory,
                     deterministic_batch,
                     runtime_timezone=app_config.timezone,
                     session_calendar_path=app_config.session_calendar_path,
+                    deferred_reentry_instruction_ids=(
+                        deferred_reentry_instruction_ids_for_cleanup(
+                            deterministic_batch,
+                            intent_cleanup,
+                        )
+                    ),
                 )
 
             if (
@@ -1199,5 +1207,4 @@ def register_rl_routes(app: Any, context: Any) -> None:
             "accepted": True,
             "runtime_state": runtime_state,
         }
-
 

@@ -50,6 +50,10 @@ This file is the repository-level execution contract for future work in `ibkr-tr
 - The live API/dashboard stack runs on `quant`, currently exposed through
   `http://quant.geisler.se:4173/` for the dashboard and the trader API service
   on that host.
+- Read-only IB Gateway inspection can be done as the `ibgateway` Unix user:
+  `ssh -i ~/.ssh/codex_quant_ibgateway ibgateway@quant.geisler.se`. This
+  account is for Gateway/IBC process, config, and log inspection. Do not use it
+  to restart Gateway or change settings unless the operator explicitly asks.
 - Do not leave a local trader API, RL runner, broker probe, or stream process
   running from a development machine if it can talk to IB Gateway. Two API
   processes talking to the same Gateway is an operational fault.
@@ -59,3 +63,24 @@ This file is the repository-level execution contract for future work in `ibkr-tr
   service restarts, and Gateway restarts belong on `quant` and require explicit
   operator intent.
 
+## IB Gateway Restart Diagnostics
+
+- Canonical IBKR client IDs are role-based: `0` primary runtime/order control,
+  `7` diagnostic heartbeat/snapshot, `8` historical/backfill, and `9` market
+  stream. Do not treat "pick a fresh client ID" as normal recovery; visibility
+  and order control semantics depend on these IDs.
+- IB Gateway may autorestart without manual 2FA. In IBC/systemd logs this looks
+  like `Restart in progress`, then `autorestart file found ... authentication
+  will not be required`, then `Login has completed`, followed by the Trader
+  Workstation Configuration dialog and API port confirmation.
+- After Gateway autorestart, `addLogConsole Client 7` or `Client 9` churn soon
+  after login usually means diagnostic/stream reconnect pressure. If the API
+  then reports `client id is already in use` or `no nextValidId callback`, treat
+  it as Gateway/API session lifecycle instability, not as an order-code bug.
+- `api_startup_no_next_valid_id` means the socket opened but IBKR did not finish
+  the API startup handshake. Before changing trading code, check Gateway/IBC
+  logs, whether the config dialog has closed, whether duplicate clients exist,
+  and whether primary client `0` is healthy.
+- A diagnostic-client failure should be interpreted carefully. If primary client
+  `0` is connected and runtime cycles are succeeding, avoid escalating a
+  diagnostic `7` startup failure into an assumed trading outage.

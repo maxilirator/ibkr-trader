@@ -219,6 +219,202 @@ class OperatorDashboardReadModelTests02(OperatorDashboardReadModelTestCase):
 
         self.assertEqual(tuple(snapshot.recent_broker_attention), ())
 
+    def test_build_operator_dashboard_snapshot_hides_forced_exit_protective_cleanup_cancel(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            instruction = InstructionRecord(
+                instruction_id="2026-06-05-U25245596-live_top1_31_seedpicker-SINCH-long-01",
+                schema_version="2026-04-10",
+                source_system="test",
+                batch_id="batch-1",
+                account_key="U25245596",
+                book_key="live_top1_31_seedpicker",
+                symbol="SINCH",
+                exchange="SMART",
+                currency="SEK",
+                state="EXIT_PENDING",
+                submit_at=datetime(2026, 6, 5, 7, 25, tzinfo=timezone.utc),
+                expire_at=datetime(2026, 6, 5, 15, 30, tzinfo=timezone.utc),
+                order_type="LMT",
+                side="BUY",
+                payload={},
+            )
+            session.add(instruction)
+            session.flush()
+
+            take_profit_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4950",
+                external_perm_id="1468603000",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:take_profit",
+                symbol="SINCH",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SINCH",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Cancelled",
+                total_quantity="455",
+                limit_price="43.20",
+                submitted_at=datetime(2026, 6, 5, 7, 25, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 6, 8, 6, 59, 33, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            forced_order = BrokerOrderRecord(
+                instruction_id=instruction.id,
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4960",
+                external_perm_id="1468603001",
+                external_client_id="0",
+                order_ref=f"{instruction.instruction_id}:exit:forced",
+                symbol="SINCH",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SINCH",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Submitted",
+                total_quantity="455",
+                limit_price="39.50",
+                submitted_at=datetime(2026, 6, 8, 7, 0, 8, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 6, 8, 7, 0, 8, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add_all([take_profit_order, forced_order])
+            session.flush()
+
+            session.add(
+                BrokerOrderEventRecord(
+                    broker_order_id=take_profit_order.id,
+                    event_type="order_error_callback",
+                    event_at=datetime(2026, 6, 8, 6, 59, 33, tzinfo=timezone.utc),
+                    status_before="PendingCancel",
+                    status_after="Cancelled",
+                    payload={
+                        "orderId": 4950,
+                        "errorCode": 202,
+                        "errorString": "Order Canceled - reason:",
+                    },
+                    note="Persisted broker order error callback directly from the live session.",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(tuple(snapshot.recent_broker_attention), ())
+
+    def test_build_operator_dashboard_snapshot_labels_price_collar_callback_as_warning(self) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            broker_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4960",
+                external_perm_id="1468603001",
+                external_client_id="0",
+                order_ref="2026-06-05-U25245596-live_top1_31_seedpicker-SINCH-long-01:exit:forced",
+                symbol="SINCH",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="SINCH",
+                side="SELL",
+                order_type="LMT",
+                time_in_force="DAY",
+                status="Submitted",
+                total_quantity="455",
+                limit_price="39.50",
+                submitted_at=datetime(2026, 6, 8, 7, 0, 8, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 6, 8, 7, 0, 8, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(broker_order)
+            session.flush()
+
+            session.add(
+                BrokerOrderEventRecord(
+                    broker_order_id=broker_order.id,
+                    event_type="order_error_callback",
+                    event_at=datetime(2026, 6, 8, 7, 0, 8, tzinfo=timezone.utc),
+                    status_before="Submitted",
+                    status_after="Submitted",
+                    payload={
+                        "orderId": 4960,
+                        "errorCode": 2161,
+                        "errorString": (
+                            "SELL 455 SINCH SFB for U25245596 In accordance with "
+                            "our regulatory obligations as a broker, we will initially "
+                            "cap (or limit) the price of your Limit Order to 39.50."
+                        ),
+                    },
+                    note="Persisted broker order error callback directly from the live session.",
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            order_limit=10,
+            fill_limit=10,
+            attention_limit=10,
+            reconciliation_run_limit=10,
+        )
+
+        self.assertEqual(len(snapshot.recent_broker_attention), 1)
+        self.assertEqual(snapshot.recent_broker_attention[0].event_type, "broker_warning")
+        self.assertTrue(
+            snapshot.recent_broker_attention[0].message.startswith("[2161] SELL 455 SINCH")
+        )
+
     def test_build_operator_dashboard_snapshot_keeps_unmatched_exit_cancel_attention(self) -> None:
         session: Session = self.session_factory()
         try:

@@ -1,24 +1,31 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
 
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder
 from ibkr_trader.ledger.persistence_order_records import _upsert_open_order
 from ibkr_trader.ledger.persistence_order_reconstruction import _matches_instruction_exit_identity
 from ibkr_trader.ledger.persistence_order_reconstruction import _reconstruct_entry_broker_order_from_instruction
 from ibkr_trader.ledger.persistence_order_reconstruction import _reconstruct_exit_broker_order_from_instruction
+from ibkr_trader.ledger.persistence_shared import _decimal_to_string
 from ibkr_trader.ledger.persistence_shared import _find_broker_order
 from ibkr_trader.ledger.persistence_shared import _find_broker_order_any_account
 from ibkr_trader.ledger.persistence_shared import _find_instruction_record_for_order
 from ibkr_trader.ledger.persistence_shared import _get_or_create_broker_account
+from ibkr_trader.ledger.persistence_shared import _is_order_status_synthetic_fill
+from ibkr_trader.ledger.persistence_shared import _is_virtual_ledger_identity
 from ibkr_trader.ledger.persistence_shared import _mark_instruction_needs_review_from_order_error
 from ibkr_trader.ledger.persistence_shared import _normalize_text
+from ibkr_trader.ledger.persistence_shared import _order_status_fill_execution_id
 from ibkr_trader.ledger.persistence_shared import _record_broker_order_event
 from ibkr_trader.ledger.persistence_shared import _require_text
 from ibkr_trader.ledger.persistence_shared import _resolve_account_key
@@ -319,6 +326,12 @@ def _persist_order_status_callback_event(
         payload=_serialize_for_json(status_payload),
         note="Persisted broker order-status callback directly from the live session.",
     )
+    _persist_order_status_fill_if_terminal(
+        session,
+        broker_order=broker_order,
+        status_payload=status_payload,
+        event_at=event_at,
+    )
     _sync_instruction_from_broker_order_terminal_status(
         session,
         broker_order=broker_order,
@@ -329,6 +342,121 @@ def _persist_order_status_callback_event(
             "Broker callback marked the unfilled entry order as cancelled before "
             "expiry."
         ),
+    )
+
+
+def _persist_order_status_fill_if_terminal(
+    session: Session,
+    *,
+    broker_order: BrokerOrderRecord,
+    status_payload: dict[str, Any],
+    event_at: datetime,
+) -> None:
+    status = _normalize_text(
+        str(status_payload["status"])
+        if status_payload.get("status") not in (None, "")
+        else None
+    )
+    if status is None or status.upper() != "FILLED":
+        return
+
+    filled_quantity = _to_decimal(status_payload.get("filled")) or Decimal("0")
+    if filled_quantity <= 0:
+        return
+    remaining_quantity = _to_decimal(status_payload.get("remaining"))
+    if remaining_quantity not in (None, Decimal("0")):
+        return
+
+    fill_price = _to_decimal(status_payload.get("avgFillPrice"))
+    if fill_price is None or fill_price <= 0:
+        fill_price = _to_decimal(status_payload.get("lastFillPrice"))
+    if fill_price is None or fill_price <= 0:
+        return
+
+    existing_fills = list(
+        session.execute(
+            select(ExecutionFillRecord).where(
+                ExecutionFillRecord.broker_order_id == broker_order.id,
+            )
+        ).scalars()
+    )
+    if any(not _is_order_status_synthetic_fill(fill) for fill in existing_fills):
+        return
+
+    external_execution_id = _order_status_fill_execution_id(broker_order)
+    existing_fill = next(
+        (
+            fill
+            for fill in existing_fills
+            if fill.external_execution_id == external_execution_id
+        ),
+        None,
+    )
+    raw_payload = {
+        "synthetic_from_order_status_callback": True,
+        "evidence_source": "broker_order_status",
+        "order_status_callback": _serialize_for_json(status_payload),
+        "order_status_callback_at": event_at.isoformat(),
+    }
+    if existing_fill is not None:
+        existing_fill.instruction_id = broker_order.instruction_id
+        existing_fill.external_perm_id = broker_order.external_perm_id
+        existing_fill.order_ref = broker_order.order_ref
+        existing_fill.side = broker_order.side
+        existing_fill.quantity = _require_text(
+            _decimal_to_string(filled_quantity),
+            context="Order-status fill quantity",
+        )
+        existing_fill.price = _require_text(
+            _decimal_to_string(fill_price),
+            context="Order-status fill price",
+        )
+        existing_fill.executed_at = event_at
+        existing_fill.raw_payload = raw_payload
+        return
+
+    session.add(
+        ExecutionFillRecord(
+            broker_order_id=broker_order.id,
+            instruction_id=broker_order.instruction_id,
+            broker_account_id=broker_order.broker_account_id,
+            broker_kind=broker_order.broker_kind,
+            account_key=broker_order.account_key,
+            is_virtual=_is_virtual_ledger_identity(
+                broker_kind=broker_order.broker_kind,
+                account_key=broker_order.account_key,
+            ),
+            external_execution_id=external_execution_id,
+            external_order_id=broker_order.external_order_id,
+            external_perm_id=broker_order.external_perm_id,
+            order_ref=broker_order.order_ref,
+            symbol=_require_text(
+                broker_order.symbol,
+                context="Order-status fill symbol",
+            ),
+            exchange=broker_order.exchange,
+            currency=_require_text(
+                broker_order.currency,
+                context="Order-status fill currency",
+            ),
+            security_type=_require_text(
+                broker_order.security_type,
+                context="Order-status fill security type",
+            ),
+            side=broker_order.side,
+            quantity=_require_text(
+                _decimal_to_string(filled_quantity),
+                context="Order-status fill quantity",
+            ),
+            price=_require_text(
+                _decimal_to_string(fill_price),
+                context="Order-status fill price",
+            ),
+            commission=None,
+            commission_currency=None,
+            executed_at=event_at,
+            raw_payload=raw_payload,
+        )
     )
 
 
@@ -538,5 +666,3 @@ def persist_broker_callback_events(
                 )
                 continue
             raise ValueError(f"Unsupported broker callback event type: {event_type!r}")
-
-

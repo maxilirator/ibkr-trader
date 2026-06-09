@@ -432,6 +432,12 @@ def _build_recent_broker_attention(
             broker_order=broker_order,
         ):
             continue
+        if _is_expected_forced_exit_cleanup_cancel(
+            session,
+            broker_order_event=broker_order_event,
+            broker_order=broker_order,
+        ):
+            continue
         if _is_expected_unfilled_entry_expiry_cancel(
             session,
             broker_order_event=broker_order_event,
@@ -446,7 +452,11 @@ def _build_recent_broker_attention(
                 account_label=broker_account.account_label,
                 symbol=broker_order.symbol,
                 order_ref=broker_order.order_ref,
-                event_type=broker_order_event.event_type,
+                event_type=(
+                    "broker_warning"
+                    if _is_price_collar_warning_callback(broker_order_event)
+                    else broker_order_event.event_type
+                ),
                 status_after=broker_order_event.status_after,
                 event_at=broker_order_event.event_at,
                 message=message,

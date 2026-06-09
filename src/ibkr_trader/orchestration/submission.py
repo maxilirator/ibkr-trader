@@ -293,9 +293,11 @@ def submit_execution_batch(
     *,
     runtime_timezone: str,
     session_calendar_path: Path,
+    deferred_reentry_instruction_ids: tuple[str, ...] = (),
 ) -> SubmittedBatch:
     batch.validate()
     _ensure_unique_instruction_ids(batch)
+    deferred_reentry_ids = set(deferred_reentry_instruction_ids)
 
     schedule = build_batch_runtime_schedule(
         batch,
@@ -335,11 +337,12 @@ def submit_execution_batch(
         ):
             _upsert_instrument(session, instruction)
             is_model_routed = instruction.is_model_routed
-            initial_state = (
-                ExecutionState.MODEL_ROUTED_PENDING.value
-                if is_model_routed
-                else ExecutionState.ENTRY_PENDING.value
-            )
+            if is_model_routed:
+                initial_state = ExecutionState.MODEL_ROUTED_PENDING.value
+            elif instruction.instruction_id in deferred_reentry_ids:
+                initial_state = ExecutionState.REENTRY_WAITING_FOR_FLAT.value
+            else:
+                initial_state = ExecutionState.ENTRY_PENDING.value
             if is_model_routed:
                 if instruction.execution is None:
                     raise ValueError("execution is required for model-routed instructions")
@@ -384,7 +387,12 @@ def submit_execution_batch(
                 note=(
                     "Model-routed instruction validated and persisted for RL agent pickup."
                     if is_model_routed
-                    else "Instruction validated and persisted for scheduled execution."
+                    else (
+                        "Instruction validated and deferred until the existing same-group "
+                        "position is flat."
+                        if instruction.instruction_id in deferred_reentry_ids
+                        else "Instruction validated and persisted for scheduled execution."
+                    )
                 ),
             )
             session.add(initial_event)

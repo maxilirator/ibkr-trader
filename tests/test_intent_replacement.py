@@ -17,6 +17,7 @@ from ibkr_trader.domain.execution_payloads import parse_execution_batch_payload
 from ibkr_trader.orchestration.intent_replacement import (
     IntentReplacementConflictError,
     cleanup_intent_groups,
+    deferred_reentry_instruction_ids_for_cleanup,
     supersede_batch_intent_entries,
 )
 from ibkr_trader.orchestration.state_machine import ExecutionState
@@ -378,6 +379,49 @@ class IntentReplacementTests(TestCase):
         states = self._states_by_instruction_id()
         self.assertEqual(states["open-position"], ExecutionState.POSITION_OPEN.value)
         self.assertEqual(states["stale-pending"], ExecutionState.ENTRY_CANCELLED.value)
+
+    def test_superseding_batch_can_defer_reentry_when_position_owns_group(self) -> None:
+        self._insert_instruction(
+            instruction_id="open-position",
+            state=ExecutionState.POSITION_OPEN.value,
+            entry_filled_quantity="1",
+        )
+        self._insert_instruction(
+            instruction_id="stale-pending",
+            state=ExecutionState.ENTRY_PENDING.value,
+        )
+        batch = parse_execution_batch_payload(self._batch_payload("new-entry"))
+
+        result = supersede_batch_intent_entries(
+            self.session_factory,
+            self.config,
+            batch,
+            requested_by="test",
+            defer_blocked_positions=True,
+        )
+        deferred_instruction_ids = deferred_reentry_instruction_ids_for_cleanup(
+            batch,
+            result,
+        )
+        submit_execution_batch(
+            self.session_factory,
+            batch,
+            runtime_timezone="America/New_York",
+            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            deferred_reentry_instruction_ids=deferred_instruction_ids,
+        )
+
+        states = self._states_by_instruction_id()
+        self.assertEqual(result.status, "DEFERRED")
+        self.assertEqual(result.blocked_count, 1)
+        self.assertEqual(result.cancelled_pending_count, 1)
+        self.assertEqual(deferred_instruction_ids, ("new-entry",))
+        self.assertEqual(states["open-position"], ExecutionState.POSITION_OPEN.value)
+        self.assertEqual(states["stale-pending"], ExecutionState.ENTRY_CANCELLED.value)
+        self.assertEqual(
+            states["new-entry"],
+            ExecutionState.REENTRY_WAITING_FOR_FLAT.value,
+        )
 
     def test_superseding_batch_rejects_duplicate_incoming_intent_group(self) -> None:
         batch = parse_execution_batch_payload(self._two_instruction_batch_payload())

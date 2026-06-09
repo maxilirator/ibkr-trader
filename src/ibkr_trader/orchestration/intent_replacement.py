@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
@@ -204,12 +205,15 @@ def supersede_batch_intent_entries(
     reason: str | None = None,
     timeout: int = 10,
     canceler: Callable[..., dict[str, Any]] | None = None,
+    defer_blocked_positions: bool = False,
 ) -> IntentCleanupResult:
     """Cancel older active entries that compete with a submitted batch.
 
     Open positions are never mutated here. If a position is already open for the
-    same group as an incoming entry, the replacement is blocked after any stale
-    entries in that group have been cancelled.
+    same group as an incoming entry, the default replacement path is blocked
+    after any stale entries in that group have been cancelled. Callers may opt
+    into deferred same-symbol re-entry, which keeps the new row inert until the
+    existing position lifecycle reaches flat.
     """
 
     deterministic_instructions = tuple(
@@ -300,12 +304,36 @@ def supersede_batch_intent_entries(
             result=result,
         )
     if result.blocked_count:
+        if defer_blocked_positions and _blockers_are_deferable_reentries(
+            result,
+            incoming_group_keys=incoming_group_keys,
+        ):
+            return replace(result, status="DEFERRED")
         raise IntentReplacementConflictError(
             "A current open position already owns this intent group; refusing to "
             "submit a fresh entry that could add or cross risk.",
             result=result,
         )
     return result
+
+
+def deferred_reentry_instruction_ids_for_cleanup(
+    batch: ExecutionInstructionBatch,
+    cleanup_result: IntentCleanupResult | None,
+) -> tuple[str, ...]:
+    """Return deterministic instruction ids that must wait for a same-group flat state."""
+
+    if cleanup_result is None or cleanup_result.status != "DEFERRED":
+        return ()
+    blocked_group_keys = {blocker.group_key for blocker in cleanup_result.blockers}
+    if not blocked_group_keys:
+        return ()
+    return tuple(
+        instruction.instruction_id
+        for instruction in batch.instructions
+        if not instruction.is_model_routed
+        and intent_group_key_for_instruction(instruction) in blocked_group_keys
+    )
 
 
 def intent_group_key_for_instruction(
@@ -337,6 +365,20 @@ def intent_group_key_for_record(record: InstructionRecord) -> IntentGroupKey:
         symbol=_normalize_upper(record.symbol),
         exchange=_normalize_upper(record.exchange),
         currency=_normalize_upper(record.currency),
+    )
+
+
+def _blockers_are_deferable_reentries(
+    result: IntentCleanupResult,
+    *,
+    incoming_group_keys: set[IntentGroupKey],
+) -> bool:
+    if not result.blockers:
+        return False
+    return all(
+        blocker.group_key in incoming_group_keys
+        and blocker.state in _POSITION_ACTIVE_STATES
+        for blocker in result.blockers
     )
 
 
