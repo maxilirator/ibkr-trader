@@ -29,6 +29,7 @@ from ibkr_trader.rl.runner_http import ApiError
 from ibkr_trader.rl.runner_http import _is_executable_action
 from ibkr_trader.rl.runner_http import get_json
 from ibkr_trader.rl.runner_http import post_json
+from ibkr_trader.rl.model_contracts import runtime_contract_for_model
 from ibkr_trader.rl.runner_model import static_feature_payload
 from ibkr_trader.rl.runner_runtime_state import _api_error_is_conflict
 from ibkr_trader.rl.runner_runtime_state import load_runtime_state_context
@@ -399,6 +400,66 @@ def run_model_candidates(
 
     active_symbols = sorted({str(candidate["symbol"]).upper() for candidate in active_candidates})
 
+    runtime_contract = _loaded_runtime_contract(loaded)
+    if runtime_contract is not None and runtime_contract.include_market_context:
+        runtime_error = (
+            f"{runtime_contract.model_key} requires research-compatible "
+            "market-context universe features; live top-1 candidate inference "
+            "is not contract-compatible"
+        )
+        _finalize_timing_metrics(
+            timing_metrics,
+            started_at=run_started,
+            active_candidate_count=len(active_candidates),
+        )
+        heartbeat(
+            api_base,
+            deployment_key,
+            "degraded",
+            runtime_error=runtime_error,
+            metrics={
+                "candidate_count": len(candidates),
+                "active_candidate_count": len(active_candidates),
+                "symbols": symbols,
+                "active_symbols": active_symbols,
+                "skipped_candidates": [
+                    {
+                        "symbol": str(candidate["symbol"]).upper(),
+                        "status": "runtime_contract_blocked",
+                        "reason": runtime_error,
+                    }
+                    for candidate in active_candidates
+                ],
+                "runtime_contract": {
+                    "model_key": runtime_contract.model_key,
+                    "artifact_id": runtime_contract.artifact_id,
+                    "include_market_context": runtime_contract.include_market_context,
+                    "market_context_requirement": "research_candidate_universe",
+                },
+                "stream_plan": dict(stream_plan or {}),
+                "timing": timing_metrics,
+            },
+        )
+        print(
+            json.dumps(
+                {
+                    "deployment_key": deployment_key,
+                    "error": runtime_error,
+                    "actions": [
+                        {
+                            "symbol": str(candidate["symbol"]).upper(),
+                            "status": "runtime_contract_blocked",
+                            "reason": runtime_error,
+                        }
+                        for candidate in active_candidates
+                    ],
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        return
+
     target_decision_bar_ended_at = expected_decision_bar_ended_at(
         trade_date=trade_date_from_candidates(active_candidates, fallback=trade_date)
     )
@@ -716,3 +777,14 @@ def run_model_candidates(
         },
     )
     print(json.dumps({"deployment_key": deployment_key, "actions": actions}, indent=2), flush=True)
+
+
+def _loaded_runtime_contract(loaded: LoadedModel) -> Any | None:
+    contract = runtime_contract_for_model(str(loaded.config.model_key))
+    if contract is None:
+        return None
+    if getattr(loaded, "static_feature_mean_sha256", None) != contract.static_mean_sha256:
+        return None
+    if getattr(loaded, "static_feature_std_sha256", None) != contract.static_std_sha256:
+        return None
+    return contract

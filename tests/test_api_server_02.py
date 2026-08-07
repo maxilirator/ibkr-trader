@@ -42,8 +42,14 @@ class ApiServerTests02(ApiServerTestCase):
             )
 
             with (
-                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
-                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                patch(
+                    "ibkr_trader.api.server.CanonicalSyncSessions.warmup",
+                    return_value=None,
+                ),
+                patch(
+                    "ibkr_trader.api.server.CanonicalSyncSessions.shutdown",
+                    return_value=None,
+                ),
                 TestClient(app) as client,
             ):
                 register_response = client.post(
@@ -233,8 +239,14 @@ class ApiServerTests02(ApiServerTestCase):
             )
 
             with (
-                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
-                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                patch(
+                    "ibkr_trader.api.server.CanonicalSyncSessions.warmup",
+                    return_value=None,
+                ),
+                patch(
+                    "ibkr_trader.api.server.CanonicalSyncSessions.shutdown",
+                    return_value=None,
+                ),
                 TestClient(app) as client,
             ):
                 register_response = client.post(
@@ -347,7 +359,9 @@ class ApiServerTests02(ApiServerTestCase):
             }
         )
 
-        self.assertEqual([item.symbol for item in payload["contracts"]], ["AXFO", "AZN"])
+        self.assertEqual(
+            [item.symbol for item in payload["contracts"]], ["AXFO", "AZN"]
+        )
         self.assertEqual(payload["contracts"][0].exchange, "SMART")
         self.assertEqual(payload["contracts"][0].primary_exchange, "SFB")
         self.assertEqual(payload["market_data_type"], "DELAYED")
@@ -866,7 +880,9 @@ class ApiServerTests02(ApiServerTestCase):
         self.assertEqual(enriched["positions"][0]["market_value"], "206")
         self.assertEqual(enriched["positions"][0]["unrealized_pnl"], "6")
         self.assertEqual(enriched["open_orders"][0]["reference_market_price"], "103")
-        self.assertEqual(enriched["open_orders"][0]["last_market_price_direction"], "UP")
+        self.assertEqual(
+            enriched["open_orders"][0]["last_market_price_direction"], "UP"
+        )
         self.assertEqual(enriched["open_orders"][0]["price_spread"], "+1.00")
         self.assertEqual(enriched["accounts"][0]["net_liquidation"], "100004")
         self.assertEqual(
@@ -920,7 +936,153 @@ class ApiServerTests02(ApiServerTestCase):
         self.assertEqual(enriched["accounts"][0]["net_liquidation"], "18716.12")
         self.assertEqual(enriched["market_stream_overlay"]["marked_account_count"], 0)
 
-    def test_parse_market_stream_subscribe_payload_enriches_stockholm_identity(self) -> None:
+    def test_operator_snapshot_stream_overlay_skips_corporate_action_split_positions(
+        self,
+    ) -> None:
+        snapshot = {
+            "accounts": [
+                {
+                    "account_key": "U25245596",
+                    "is_virtual": False,
+                    "net_liquidation": "50000",
+                    "day_performance": {"points": []},
+                }
+            ],
+            "positions": [
+                {
+                    "account_key": "U25245596",
+                    "symbol": "INTRUM",
+                    "local_symbol": "INTRUM",
+                    "exchange": "SFB",
+                    "currency": "SEK",
+                    "security_type": "STK",
+                    "quantity": "1100",
+                    "average_cost": "16.2465703",
+                    "market_price": "3.1474",
+                    "market_value": "3462.14",
+                    "unrealized_pnl": "-14409.09",
+                    "snapshot_at": "2026-06-10T05:47:12+00:00",
+                },
+                {
+                    "account_key": "U25245596",
+                    "symbol": "INTRUMTR",
+                    "local_symbol": "INTRUMTR",
+                    "exchange": "CORPACT",
+                    "currency": "SEK",
+                    "security_type": "STK",
+                    "quantity": "1100",
+                    "average_cost": "0",
+                    "market_price": "12.5526",
+                    "market_value": "13807.86",
+                    "unrealized_pnl": "13807.86",
+                    "snapshot_at": "2026-06-10T05:47:12+00:00",
+                },
+            ],
+            "open_orders": [],
+        }
+
+        enriched = enrich_operator_snapshot_with_market_stream(
+            snapshot,
+            {
+                "running": True,
+                "bars_by_symbol": {
+                    "INTRUM": [
+                        {
+                            "timestamp": "2026-06-10T05:47:12+00:00",
+                            "close": "15.70",
+                        }
+                    ],
+                    "INTRUMTR": [
+                        {
+                            "timestamp": "2026-06-10T05:47:12+00:00",
+                            "close": "12.5526",
+                        }
+                    ],
+                },
+            },
+        )
+
+        intrum, intrum_right = enriched["positions"]
+        self.assertEqual(intrum["market_price"], "3.1474")
+        self.assertEqual(intrum["market_value"], "3462.14")
+        self.assertEqual(
+            intrum["market_stream_overlay_skip_reason"],
+            "corporate_action_sibling",
+        )
+        self.assertEqual(intrum_right["market_price"], "12.5526")
+        self.assertEqual(intrum_right["market_value"], "13807.86")
+        self.assertEqual(
+            intrum_right["market_stream_overlay_skip_reason"],
+            "corporate_action_entitlement",
+        )
+        self.assertEqual(
+            enriched["market_stream_overlay"]["skipped_position_reasons"],
+            {
+                "corporate_action_sibling": 1,
+                "corporate_action_entitlement": 1,
+            },
+        )
+        self.assertEqual(enriched["market_stream_overlay"]["marked_position_count"], 0)
+
+    def test_operator_snapshot_stream_overlay_skips_stale_live_position_mark(
+        self,
+    ) -> None:
+        snapshot = {
+            "accounts": [
+                {
+                    "account_key": "U25245596",
+                    "is_virtual": False,
+                    "net_liquidation": "50000",
+                    "day_performance": {"points": []},
+                }
+            ],
+            "positions": [
+                {
+                    "account_key": "U25245596",
+                    "symbol": "INTRUM",
+                    "local_symbol": "INTRUM",
+                    "exchange": "SFB",
+                    "currency": "SEK",
+                    "security_type": "STK",
+                    "quantity": "1100",
+                    "average_cost": "16.2465703",
+                    "market_price": "3.1474",
+                    "market_value": "3462.14",
+                    "unrealized_pnl": "-14409.09",
+                    "snapshot_at": "2026-06-10T05:47:12+00:00",
+                }
+            ],
+            "open_orders": [],
+        }
+
+        enriched = enrich_operator_snapshot_with_market_stream(
+            snapshot,
+            {
+                "running": True,
+                "quotes": [
+                    {
+                        "symbol": "INTRUM",
+                        "last_price": "15.70",
+                        "close_price": "3.1474",
+                        "updated_at": "2026-06-10T04:51:56+00:00",
+                        "last_trade_at": "2026-06-09T19:20:27+00:00",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(enriched["positions"][0]["market_price"], "3.1474")
+        self.assertEqual(enriched["positions"][0]["market_value"], "3462.14")
+        self.assertEqual(
+            enriched["positions"][0]["market_stream_overlay_skip_reason"],
+            "stale_market_stream_mark",
+        )
+        self.assertEqual(enriched["market_stream_overlay"]["marked_position_count"], 0)
+        self.assertEqual(enriched["market_stream_overlay"]["marked_account_count"], 0)
+
+    def test_parse_market_stream_subscribe_payload_enriches_stockholm_identity(
+        self,
+    ) -> None:
         payload = parse_market_stream_subscribe_payload(
             {
                 "symbols": ["eric-b"],
@@ -1009,8 +1171,13 @@ class ApiServerTests02(ApiServerTestCase):
         }
 
         with (
-            patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
-            patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+            patch(
+                "ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None
+            ),
+            patch(
+                "ibkr_trader.api.server.CanonicalSyncSessions.shutdown",
+                return_value=None,
+            ),
             patch(
                 "ibkr_trader.api.server.collect_tick_stream_sample",
                 return_value=expected_payload,

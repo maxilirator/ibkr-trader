@@ -30,6 +30,7 @@ from ibkr_trader.domain.execution_contract import (
     TimeInForce,
     TraceSpec,
 )
+from ibkr_trader.domain.model_routing_policy import retired_model_route_reason
 
 
 def parse_decimal(value: Any, field_name: str) -> Decimal:
@@ -493,6 +494,14 @@ def parse_execution_instruction_payload(payload: Mapping[str, Any]) -> Execution
         lifecycle=_parse_lifecycle_policy(payload),
     )
     instruction.validate()
+    if instruction.execution is not None:
+        retired_reason = retired_model_route_reason(
+            model_id=instruction.execution.model_id,
+            account_key=instruction.account.account_key,
+            book_key=instruction.account.book_key,
+        )
+        if retired_reason is not None:
+            raise ValueError(retired_reason)
     return instruction
 
 

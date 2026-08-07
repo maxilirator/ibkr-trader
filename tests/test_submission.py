@@ -222,6 +222,18 @@ class SubmissionTests(TestCase):
             "long_trial_106_v1",
         )
 
+    def test_parse_rejects_retired_seedpicker_long_trial_106_route(self) -> None:
+        payload = _model_routed_payload()
+        instruction_payload = payload["instructions"][0]
+        assert isinstance(instruction_payload, dict)
+        account_payload = instruction_payload["account"]
+        assert isinstance(account_payload, dict)
+        account_payload["account_key"] = "VIRTUALSEEDRL01"
+        account_payload["book_key"] = "seedpicker_rl_long_01"
+
+        with self.assertRaisesRegex(ValueError, "not fit for the single-name"):
+            parse_execution_batch_payload(payload)
+
     def test_parse_rejects_virtual_book_role_on_live_account(self) -> None:
         payload = _model_routed_payload()
         instruction_payload = payload["instructions"][0]

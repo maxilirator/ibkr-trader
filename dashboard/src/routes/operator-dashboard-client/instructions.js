@@ -714,7 +714,25 @@ export function activeInstructionsForPosition(position, instructionRows = execut
     });
 }
 
+export function positionIsCorporateActionEntitlement(position) {
+  const exchanges = [
+    position?.exchange,
+    position?.primary_exchange
+  ].map((value) => String(value ?? '').trim().toUpperCase());
+  return exchanges.includes('CORPACT');
+}
+
 export function positionExitPlan(position, instructionRows = executionInstructions) {
+  if (positionIsCorporateActionEntitlement(position)) {
+    return {
+      label: 'Corporate action',
+      className: 'neutral',
+      detail:
+        'Broker reports this as a corporate-action entitlement. It is not owned by an execution instruction and should not block the ordinary-share exit.',
+      instructionId: null
+    };
+  }
+
   const owningInstructions = activeInstructionsForPosition(position, instructionRows);
   const primaryInstruction = owningInstructions[0];
   if (!primaryInstruction) {

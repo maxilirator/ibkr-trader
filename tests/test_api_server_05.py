@@ -214,6 +214,112 @@ class ApiServerTests05(ApiServerTestCase):
             self.assertEqual(response.status_code, 409)
             self.assertIn("kill switch", response.text)
 
+    def test_submit_endpoint_rejects_retired_seedpicker_long_trial_106_route(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except (ModuleNotFoundError, RuntimeError):
+            self.skipTest("fastapi test dependencies are not installed")
+
+        payload = {
+            "schema_version": "2026-04-25",
+            "source": {
+                "system": "seed-selector",
+                "batch_id": "seedpicker-2026-06-12",
+                "generated_at": "2026-06-12T05:30:00Z",
+                "strategy_id": "seedpicker_rl",
+                "policy_id": "long_trial_106_v1",
+            },
+            "instructions": [
+                {
+                    "instruction_id": (
+                        "2026-06-12-VIRTUALSEEDRL01-seedpicker-NORION-model-routed"
+                    ),
+                    "account": {
+                        "account_key": "VIRTUALSEEDRL01",
+                        "book_key": "seedpicker_rl_long_01",
+                        "book_role": "virtual",
+                        "book_side": "LONG",
+                    },
+                    "instrument": {
+                        "symbol": "NORION",
+                        "security_type": "STK",
+                        "exchange": "SMART",
+                        "primary_exchange": "SFB",
+                        "currency": "SEK",
+                    },
+                    "intent": {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                    },
+                    "sizing": {
+                        "mode": "target_notional",
+                        "target_notional": "20000",
+                    },
+                    "execution": {
+                        "mode": "model_routed",
+                        "model_id": "long_trial_106_v1",
+                        "model_artifact_id": "trial_106_seed240",
+                        "window": {
+                            "start_at": "2026-06-12T09:00:00+02:00",
+                            "end_at": "2026-06-12T17:30:00+02:00",
+                        },
+                    },
+                    "trace": {
+                        "reason_code": "rl_model_routed_selected_candidate",
+                        "trade_date": "2026-06-12",
+                        "data_cutoff_date": "2026-06-11",
+                    },
+                }
+            ],
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "retired_seedpicker_model.db"
+            database_url = f"sqlite+pysqlite:///{database_path}"
+            engine = build_engine(database_url)
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+            engine.dispose()
+
+            app = create_app(
+                AppConfig(
+                    environment="test",
+                    timezone="Europe/Stockholm",
+                    database_url=database_url,
+                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    stockholm_instruments_path=Path("/tmp/all.txt"),
+                    stockholm_identity_path=Path("/tmp/identity.parquet"),
+                    api=ApiServerConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        require_loopback_only=False,
+                    ),
+                    ibkr=IbkrConnectionConfig(
+                        host="127.0.0.1",
+                        port=4001,
+                        client_id=0,
+                        diagnostic_client_id=7,
+                        streaming_client_id=9,
+                        account_id="DU1234567",
+                    ),
+                )
+            )
+
+            with (
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.warmup", return_value=None),
+                patch("ibkr_trader.api.server.CanonicalSyncSessions.shutdown", return_value=None),
+                TestClient(app) as client,
+            ):
+                response = client.post("/v1/instructions/submit", json=payload)
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("retired", response.text)
+            self.assertIn("not fit for the single-name seedpicker", response.text)
+
+            with session_factory() as session:
+                records = session.query(InstructionRecord).all()
+            self.assertEqual(records, [])
+
     def test_submit_endpoint_accepts_exact_replay_and_rejects_changed_duplicate(self) -> None:
         try:
             from fastapi.testclient import TestClient

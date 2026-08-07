@@ -428,4 +428,3 @@ def decision_observed_at(symbol_observation: Mapping[str, Any]) -> str:
         or datetime.now(timezone.utc).isoformat()
     )
 
-

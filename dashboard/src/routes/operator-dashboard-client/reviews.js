@@ -79,7 +79,7 @@ export function orderFillSpreadLabel(order) {
 
 export function fillExitPnlLabel(fill) {
   if (!fill.realized_pnl) {
-    return fill.order_role === 'EXIT' ? 'pending' : 'n/a';
+    return fill.order_role === 'EXIT' ? 'basis n/a' : 'n/a';
   }
   return `${formatSignedMoney(fill.realized_pnl)} ${fill.realized_pnl_currency ?? fill.currency}`;
 }
@@ -103,4 +103,3 @@ export function fillExitPnlSearchText(fill) {
     fill.realized_pnl_basis_price ? `basis ${fill.realized_pnl_basis_price}` : null
   ].filter(Boolean).join(' ');
 }
-

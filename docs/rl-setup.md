@@ -560,6 +560,12 @@ symbols to the market-data stream, rolls every candidate through bars during the
 execution window, and only creates a real trader instruction after the model
 emits an action.
 
+Retired route: do not send `long_trial_106_v1` to
+`VIRTUALSEEDRL01/seedpicker_rl_long_01`. That checkpoint is research-valid only
+when the runtime supplies the full multi-name market-context universe. The
+single-name seedpicker virtual path is blocked at `/v1/instructions/submit` with
+HTTP 400 so the payload maker sees the failure immediately.
+
 Use:
 
 ```json

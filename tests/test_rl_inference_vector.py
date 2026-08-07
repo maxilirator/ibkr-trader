@@ -6,6 +6,7 @@ import numpy as np
 
 from ibkr_trader.rl.inference_vector import RunnerSymbolState
 from ibkr_trader.rl.inference_vector import assemble_dqn_observation_vector
+from ibkr_trader.rl.inference_vector import build_runtime_dynamic_features
 from ibkr_trader.rl.inference_vector import valid_action_mask
 
 
@@ -53,6 +54,61 @@ class RLInferenceVectorTests(unittest.TestCase):
             vector[-8:],
             np.array([0.1, 0.3, 0.0, 0.0, 0.2, 0.4, 0.0, 0.0]),
         )
+
+    def test_runtime_dynamic_first_eleven_features_track_runner_state(self) -> None:
+        pending_entry = build_runtime_dynamic_features(
+            state=RunnerSymbolState(
+                pending_entry_anchor="prev_close",
+                pending_entry_rel_bp=-50,
+                bars_since_entry_order=1,
+            ),
+            bar_idx=1,
+            n_bars=102,
+            previous_close=100.0,
+            session_open=101.0,
+            open_now=99.0,
+            trade_sign=1.0,
+        )
+
+        np.testing.assert_allclose(
+            pending_entry[:11],
+            np.array([0.0, 1.0, 0.0, 1.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+
+        open_position = build_runtime_dynamic_features(
+            state=RunnerSymbolState(
+                in_position=True,
+                pending_exit_tp_bp=200,
+                entry_price=100.0,
+                entry_bar_idx=0,
+            ),
+            bar_idx=1,
+            n_bars=102,
+            previous_close=98.0,
+            session_open=99.0,
+            open_now=101.0,
+            trade_sign=1.0,
+        )
+
+        np.testing.assert_allclose(
+            open_position[:11],
+            np.array(
+                [
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    2.0,
+                    (100.0 / 98.0) - 1.0,
+                    (100.0 / 99.0) - 1.0,
+                    (101.0 / 100.0) - 1.0,
+                ]
+            ),
+        )
+        self.assertGreater(open_position[11], 0.0)
 
     def test_valid_flat_mask_matches_bucket_action_space(self) -> None:
         action_names = [

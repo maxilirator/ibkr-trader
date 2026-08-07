@@ -331,7 +331,8 @@ def _build_recent_fills(
             OperatorExecutionFill(
                 fill_id=fill.id,
                 broker_order_id=fill.broker_order_id,
-                instruction_record_id=fill.instruction_id,
+                instruction_record_id=fill.instruction_id
+                or (broker_order.instruction_id if broker_order else None),
                 order_role=order_role,
                 broker_kind=fill.broker_kind,
                 account_key=fill.account_key,

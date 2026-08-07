@@ -239,6 +239,61 @@ def _entry_fill_basis_for_instruction(
     return weighted_notional / total_quantity, total_quantity, commission_total, entry_side
 
 
+def _position_snapshot_basis_for_exit_fill(
+    session: Session,
+    *,
+    fill: ExecutionFillRecord,
+    broker_order: BrokerOrderRecord | None,
+) -> tuple[Decimal | None, str | None]:
+    normalized_side = (
+        fill.side or (broker_order.side if broker_order else "") or ""
+    ).strip().upper()
+    if normalized_side in {"SLD", "SELL"}:
+        position_side = "LONG"
+    elif normalized_side in {"BOT", "BUY"}:
+        position_side = "SHORT"
+    else:
+        return None, None
+
+    rows = session.execute(
+        select(PositionSnapshotRecord)
+        .where(
+            PositionSnapshotRecord.broker_account_id == fill.broker_account_id,
+            PositionSnapshotRecord.symbol == fill.symbol,
+            PositionSnapshotRecord.currency == fill.currency,
+            PositionSnapshotRecord.security_type == fill.security_type,
+            PositionSnapshotRecord.snapshot_at <= fill.executed_at,
+        )
+        .order_by(
+            PositionSnapshotRecord.snapshot_at.desc(),
+            PositionSnapshotRecord.id.desc(),
+        )
+        .limit(16)
+    ).scalars()
+
+    for position_snapshot in rows:
+        if broker_order is not None and not _position_snapshot_matches_order(
+            position_snapshot,
+            broker_order=broker_order,
+        ):
+            continue
+
+        position_quantity = _to_decimal(position_snapshot.quantity)
+        if position_quantity is None:
+            continue
+        if position_side == "LONG" and position_quantity <= 0:
+            continue
+        if position_side == "SHORT" and position_quantity >= 0:
+            continue
+
+        average_cost = _meaningful_decimal(position_snapshot.average_cost)
+        if average_cost is None:
+            continue
+        return abs(average_cost), position_side
+
+    return None, position_side
+
+
 def _fill_realized_pnl(
     session: Session,
     *,
@@ -253,23 +308,39 @@ def _fill_realized_pnl(
         fill.instruction_id
         or (broker_order.instruction_id if broker_order is not None else None)
     )
-    if instruction_id is None:
-        return None, None, fill.currency, None
-
     pnl_currency = fill.currency
-    basis_price, entry_quantity, entry_commission, entry_side = (
-        _entry_fill_basis_for_instruction(
+    basis_price: Decimal | None = None
+    entry_quantity = Decimal("0")
+    entry_commission = Decimal("0")
+    entry_side: str | None = None
+    if instruction_id is not None:
+        basis_price, entry_quantity, entry_commission, entry_side = _entry_fill_basis_for_instruction(
             session,
             instruction_id=instruction_id,
             pnl_currency=pnl_currency,
         )
-    )
+
     exit_quantity = _meaningful_decimal(fill.quantity)
     exit_price = _meaningful_decimal(fill.price)
-    if basis_price is None or exit_quantity is None or exit_price is None:
+    if exit_quantity is None or exit_price is None:
         return None, None, pnl_currency, None
 
     position_side = _instruction_position_side(instruction) or entry_side
+    if basis_price is None or position_side is None:
+        snapshot_basis_price, snapshot_position_side = _position_snapshot_basis_for_exit_fill(
+            session,
+            fill=fill,
+            broker_order=broker_order,
+        )
+        if basis_price is None:
+            basis_price = snapshot_basis_price
+            entry_quantity = abs(exit_quantity)
+            entry_commission = Decimal("0")
+        position_side = position_side or snapshot_position_side
+
+    if basis_price is None:
+        return None, None, pnl_currency, None
+
     if position_side == "LONG":
         gross_pnl = (exit_price - basis_price) * abs(exit_quantity)
     elif position_side == "SHORT":

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
+from datetime import timedelta
 from decimal import Decimal
+import re
 from typing import Any, Mapping
 
 from ibkr_trader.domain.execution_payloads import parse_datetime
+
+
+_CORPORATE_ACTION_EXCHANGES = {"CORPACT"}
+_CORPORATE_ACTION_SUFFIXES = ("TR", "RT", "RIGHT", "R")
+_POSITION_STREAM_MARK_MAX_STALENESS = timedelta(minutes=15)
 
 
 def _stream_payload(stream_snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -45,7 +52,9 @@ def _operator_plain_decimal(value: Decimal | None) -> str | None:
     return text
 
 
-def _operator_signed_decimal(value: Decimal | None, *, places: str = "0.01") -> str | None:
+def _operator_signed_decimal(
+    value: Decimal | None, *, places: str = "0.01"
+) -> str | None:
     if value is None:
         return None
     quantized = value.quantize(Decimal(places))
@@ -59,7 +68,7 @@ def _parse_operator_stream_time(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value
     try:
-        return parse_datetime(str(value))
+        return parse_datetime(str(value), "stream timestamp")
     except Exception:
         return None
 
@@ -76,6 +85,95 @@ def _operator_stream_symbol_keys(symbol: Any) -> set[str]:
     return keys
 
 
+def _operator_compact_symbol(value: Any) -> str | None:
+    compact = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    return compact or None
+
+
+def _operator_position_is_corporate_action(position: Mapping[str, Any]) -> bool:
+    exchanges = {
+        str(value).strip().upper()
+        for value in (position.get("exchange"), position.get("primary_exchange"))
+        if value not in (None, "")
+    }
+    return not exchanges.isdisjoint(_CORPORATE_ACTION_EXCHANGES)
+
+
+def _operator_corporate_action_base_symbols(position: Mapping[str, Any]) -> set[str]:
+    bases: set[str] = set()
+    for raw_symbol in (position.get("local_symbol"), position.get("symbol")):
+        compact = _operator_compact_symbol(raw_symbol)
+        if compact is None:
+            continue
+        bases.add(compact)
+        for suffix in _CORPORATE_ACTION_SUFFIXES:
+            if len(compact) > len(suffix) and compact.endswith(suffix):
+                bases.add(compact[: -len(suffix)])
+    return bases
+
+
+def _operator_corporate_action_bases_by_account(
+    positions: list[Any],
+) -> dict[tuple[str | None, str | None, str | None], set[str]]:
+    bases_by_account: dict[tuple[str | None, str | None, str | None], set[str]] = {}
+    for position in positions:
+        if not isinstance(position, Mapping):
+            continue
+        if not _operator_position_is_corporate_action(position):
+            continue
+        quantity = _operator_any_decimal(position.get("quantity"))
+        if quantity is None or quantity == 0:
+            continue
+        key = (
+            str(position.get("account_key"))
+            if position.get("account_key") not in (None, "")
+            else None,
+            str(position.get("currency")).upper()
+            if position.get("currency") not in (None, "")
+            else None,
+            str(position.get("security_type")).upper()
+            if position.get("security_type") not in (None, "")
+            else None,
+        )
+        bases_by_account.setdefault(key, set()).update(
+            _operator_corporate_action_base_symbols(position)
+        )
+    return bases_by_account
+
+
+def _operator_position_has_corporate_action_sibling(
+    position: Mapping[str, Any],
+    corporate_action_bases_by_account: Mapping[
+        tuple[str | None, str | None, str | None], set[str]
+    ],
+) -> bool:
+    if _operator_position_is_corporate_action(position):
+        return False
+    key = (
+        str(position.get("account_key"))
+        if position.get("account_key") not in (None, "")
+        else None,
+        str(position.get("currency")).upper()
+        if position.get("currency") not in (None, "")
+        else None,
+        str(position.get("security_type")).upper()
+        if position.get("security_type") not in (None, "")
+        else None,
+    )
+    corporate_action_bases = corporate_action_bases_by_account.get(key)
+    if not corporate_action_bases:
+        return False
+    row_symbols = {
+        compact
+        for compact in (
+            _operator_compact_symbol(position.get("local_symbol")),
+            _operator_compact_symbol(position.get("symbol")),
+        )
+        if compact is not None
+    }
+    return not row_symbols.isdisjoint(corporate_action_bases)
+
+
 def _operator_stream_quote_price(quote: Mapping[str, Any]) -> Decimal | None:
     bid = _operator_stream_decimal(quote.get("bid_price"))
     ask = _operator_stream_decimal(quote.get("ask_price"))
@@ -90,7 +188,9 @@ def _operator_stream_quote_price(quote: Mapping[str, Any]) -> Decimal | None:
         bid,
         ask,
     ):
-        parsed = value if isinstance(value, Decimal) else _operator_stream_decimal(value)
+        parsed = (
+            value if isinstance(value, Decimal) else _operator_stream_decimal(value)
+        )
         if parsed is not None:
             return parsed
     return None
@@ -129,7 +229,9 @@ def _operator_stream_marks_by_symbol(
                     break
         bars = bars if isinstance(bars, list) else []
         latest_bar = bars[-1] if bars and isinstance(bars[-1], Mapping) else None
-        previous_bar = bars[-2] if len(bars) >= 2 and isinstance(bars[-2], Mapping) else None
+        previous_bar = (
+            bars[-2] if len(bars) >= 2 and isinstance(bars[-2], Mapping) else None
+        )
 
         price = _operator_stream_quote_price(quote) if quote is not None else None
         source = "quote"
@@ -200,6 +302,36 @@ def _operator_stream_mark_for_row(
     return None
 
 
+def _operator_position_stream_overlay_skip_reason(
+    position: Mapping[str, Any],
+    mark: Mapping[str, Any],
+    *,
+    virtual_accounts: set[Any],
+    corporate_action_bases_by_account: Mapping[
+        tuple[str | None, str | None, str | None], set[str]
+    ],
+) -> str | None:
+    if position.get("is_virtual") or position.get("account_key") in virtual_accounts:
+        return None
+    if _operator_position_is_corporate_action(position):
+        return "corporate_action_entitlement"
+    if _operator_position_has_corporate_action_sibling(
+        position,
+        corporate_action_bases_by_account,
+    ):
+        return "corporate_action_sibling"
+
+    observed_at = mark.get("observed_at")
+    snapshot_at = _parse_operator_stream_time(position.get("snapshot_at"))
+    if (
+        isinstance(observed_at, datetime)
+        and snapshot_at is not None
+        and observed_at < snapshot_at - _POSITION_STREAM_MARK_MAX_STALENESS
+    ):
+        return "stale_market_stream_mark"
+    return None
+
+
 def _operator_enrich_day_performance(
     account: dict[str, Any],
     *,
@@ -229,9 +361,7 @@ def _operator_enrich_day_performance(
         "return_pct": _operator_signed_decimal(latest_return) or "0.00",
     }
     latest_point_at = (
-        _parse_operator_stream_time(points[-1].get("snapshot_at"))
-        if points
-        else None
+        _parse_operator_stream_time(points[-1].get("snapshot_at")) if points else None
     )
     if latest_point_at is None or observed_at > latest_point_at:
         points.append(point)
@@ -272,7 +402,12 @@ def enrich_operator_snapshot_with_market_stream(
             )
     account_marked_position_counts: dict[str, int] = {}
     account_stream_market_values: dict[str, Decimal] = {}
+    corporate_action_bases_by_account = _operator_corporate_action_bases_by_account(
+        snapshot_payload.get("positions", [])
+    )
     marked_positions = 0
+    skipped_positions = 0
+    skipped_position_reasons: dict[str, int] = {}
     for position in snapshot_payload.get("positions", []):
         if not isinstance(position, dict):
             continue
@@ -282,18 +417,33 @@ def enrich_operator_snapshot_with_market_stream(
         mark = _operator_stream_mark_for_row(marks_by_symbol, position)
         if mark is None:
             continue
+        skip_reason = _operator_position_stream_overlay_skip_reason(
+            position,
+            mark,
+            virtual_accounts=virtual_accounts,
+            corporate_action_bases_by_account=corporate_action_bases_by_account,
+        )
+        if skip_reason is not None:
+            position["market_stream_overlay_skip_reason"] = skip_reason
+            skipped_positions += 1
+            skipped_position_reasons[skip_reason] = (
+                skipped_position_reasons.get(skip_reason, 0) + 1
+            )
+            continue
         price = mark["price"]
         old_market_value = _operator_any_decimal(position.get("market_value"))
         old_market_value_was_available = old_market_value is not None
         if old_market_value is None:
             old_market_price = _operator_stream_decimal(position.get("market_price"))
-            old_market_value = quantity * old_market_price if old_market_price is not None else Decimal("0")
+            old_market_value = (
+                quantity * old_market_price
+                if old_market_price is not None
+                else Decimal("0")
+            )
         market_value = quantity * price
         average_cost = _operator_stream_decimal(position.get("average_cost"))
         unrealized_pnl = (
-            quantity * (price - average_cost)
-            if average_cost is not None
-            else None
+            quantity * (price - average_cost) if average_cost is not None else None
         )
         position["market_price"] = _operator_plain_decimal(price)
         position["market_value"] = _operator_plain_decimal(market_value)
@@ -310,12 +460,10 @@ def enrich_operator_snapshot_with_market_stream(
             account_marked_position_counts.get(account_key, 0) + 1
         )
         account_stream_market_values[account_key] = (
-            account_stream_market_values.get(account_key, Decimal("0"))
-            + market_value
+            account_stream_market_values.get(account_key, Decimal("0")) + market_value
         )
-        can_apply_account_delta = (
-            account_key in virtual_accounts
-            or (old_market_value_was_available and old_market_value != 0)
+        can_apply_account_delta = account_key in virtual_accounts or (
+            old_market_value_was_available and old_market_value != 0
         )
         if can_apply_account_delta:
             account_deltas[account_key] = (
@@ -335,7 +483,9 @@ def enrich_operator_snapshot_with_market_stream(
         price = mark["price"]
         order["reference_market_price"] = _operator_plain_decimal(price)
         order["reference_market_price_at"] = (
-            mark["observed_at"].isoformat() if mark.get("observed_at") is not None else None
+            mark["observed_at"].isoformat()
+            if mark.get("observed_at") is not None
+            else None
         )
         order["last_market_price_direction"] = mark.get("direction")
         working_price = (
@@ -414,6 +564,8 @@ def enrich_operator_snapshot_with_market_stream(
     snapshot_payload["market_stream_overlay"] = {
         "applied": marked_positions > 0 or marked_orders > 0 or marked_accounts > 0,
         "marked_position_count": marked_positions,
+        "skipped_position_count": skipped_positions,
+        "skipped_position_reasons": skipped_position_reasons,
         "marked_open_order_count": marked_orders,
         "marked_account_count": marked_accounts,
         "running": stream.get("running"),

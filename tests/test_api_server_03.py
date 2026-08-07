@@ -479,6 +479,7 @@ class ApiServerTests03(ApiServerTestCase):
             engine = build_engine(f"sqlite+pysqlite:///{database_path}")
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            broker_order_id: int
 
             session = session_factory()
             try:
@@ -519,6 +520,99 @@ class ApiServerTests03(ApiServerTestCase):
                 session.close()
 
             self.assertTrue(should_include_background_execution_recovery(session_factory))
+
+    def test_background_execution_recovery_runs_for_filled_order_without_fill(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "recovery_filled_missing_fill.db"
+            engine = build_engine(f"sqlite+pysqlite:///{database_path}")
+            create_schema(engine)
+            session_factory = create_session_factory(engine)
+
+            session = session_factory()
+            try:
+                broker_account = BrokerAccountRecord(
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    base_currency="SEK",
+                )
+                session.add(broker_account)
+                session.flush()
+                broker_order = BrokerOrderRecord(
+                    instruction_id=None,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    order_role="EXIT",
+                    external_order_id="4956",
+                    external_perm_id="1456474004",
+                    external_client_id="0",
+                    order_ref="operator-flatten-20260615-U25245596-INTRUMTR-rights-01:exit:operator_flatten_market",
+                    symbol="INTRUMTR",
+                    exchange="SMART",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="INTRUMTR",
+                    side="SELL",
+                    order_type="MKT",
+                    status="Filled",
+                    total_quantity="1100",
+                    submitted_at=datetime(2026, 6, 15, 13, 9, tzinfo=timezone.utc),
+                    last_status_at=datetime(2026, 6, 15, 13, 9, tzinfo=timezone.utc),
+                    raw_payload={},
+                    metadata_json={},
+                )
+                session.add(broker_order)
+                session.flush()
+                broker_order_id = broker_order.id
+                session.commit()
+            finally:
+                session.close()
+
+            self.assertTrue(should_include_background_execution_recovery(session_factory))
+
+            session = session_factory()
+            try:
+                broker_order = session.get(BrokerOrderRecord, broker_order_id)
+                assert broker_order is not None
+                session.add(
+                    ExecutionFillRecord(
+                        broker_order_id=broker_order.id,
+                        broker_account_id=broker_order.broker_account_id,
+                        broker_kind="IBKR",
+                        account_key="U25245596",
+                        external_execution_id="00014800.6a2f9cf7.01.01",
+                        external_order_id="4956",
+                        external_perm_id="1456474004",
+                        order_ref=broker_order.order_ref,
+                        symbol="INTRUMTR",
+                        exchange="SFB",
+                        currency="SEK",
+                        security_type="STK",
+                        side="SLD",
+                        quantity="287",
+                        price="12.60",
+                        commission="0.084981",
+                        commission_currency="SEK",
+                        executed_at=datetime(
+                            2026,
+                            6,
+                            15,
+                            13,
+                            9,
+                            57,
+                            tzinfo=timezone.utc,
+                        ),
+                        raw_payload={},
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+
+            self.assertFalse(should_include_background_execution_recovery(session_factory))
 
     def test_background_execution_recovery_falls_back_to_light_snapshot_on_timeout(
         self,

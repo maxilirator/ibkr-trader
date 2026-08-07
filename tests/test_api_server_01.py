@@ -76,12 +76,13 @@ class ApiServerTests01(ApiServerTestCase):
                     exchange="XSTO",
                     currency="SEK",
                     state="POSITION_OPEN",
-                    submit_at=datetime(2026, 5, 7, 13, 35, tzinfo=timezone.utc),
+                    submit_at=datetime(2026, 5, 7, 7, 5, tzinfo=timezone.utc),
                     expire_at=datetime(2026, 5, 7, 15, 30, tzinfo=timezone.utc),
                     order_type="MARKET",
                     side="BUY",
                     entry_filled_quantity="88",
                     entry_avg_fill_price="130.45",
+                    entry_filled_at=datetime(2026, 5, 7, 7, 5, tzinfo=timezone.utc),
                     payload={
                         "instruction": {
                             "trace": {
@@ -100,7 +101,7 @@ class ApiServerTests01(ApiServerTestCase):
                 PositionSnapshotRecord(
                     broker_account_id=account.id,
                     is_virtual=True,
-                    snapshot_at=datetime(2026, 5, 7, 13, 40, tzinfo=timezone.utc),
+                    snapshot_at=datetime(2026, 5, 7, 7, 10, tzinfo=timezone.utc),
                     source="virtual_execution",
                     symbol="SHB A",
                     exchange="XSTO",
@@ -134,6 +135,7 @@ class ApiServerTests01(ApiServerTestCase):
         self.assertEqual(row["state_before"], "LONG_OPEN")
         self.assertTrue(row["runner_state"]["in_position"])
         self.assertEqual(row["runner_state"]["entry_price"], "130.50")
+        self.assertEqual(row["runner_state"]["entry_bar_idx"], 0)
         self.assertEqual(row["position_snapshot"]["quantity"], "88")
         self.assertEqual(
             row["position_snapshot"]["owner_deployment_key"],

@@ -36,6 +36,8 @@ class LoadedModel:
     static_feature_mean: np.ndarray | None = None
     static_feature_std: np.ndarray | None = None
     static_feature_normalization_id: str | None = None
+    static_feature_mean_sha256: str | None = None
+    static_feature_std_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

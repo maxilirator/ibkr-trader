@@ -143,11 +143,25 @@ Live data authority rule:
   `long_trial_106_virtual_seedpicker_01` on
   `VIRTUALSEEDRL01/seedpicker_rl_long_01`.
 
+Retired seedpicker route:
+
+- `long_trial_106_v1` must not be used on
+  `VIRTUALSEEDRL01/seedpicker_rl_long_01`.
+- The q-training runtime contract probe showed that this checkpoint was trained
+  with full same-date market-context features from the multi-name research
+  universe. A top-1 seedpicker candidate turns that context into a mean-of-one
+  input and is not contract-compatible.
+- `POST /v1/instructions/submit` rejects this exact route before persisting a
+  `MODEL_ROUTED_PENDING` row. The seedpicker path needs either a retrained
+  single-name model or a new deployment that supplies the full research-style
+  market-context panel.
+- `scripts/submit_rl_candidate_lists.py` also marks this long seedpicker config
+  retired and skips it locally before submitting candidate payloads.
+
 ## Safe Morning Virtual Test
 
-1. Confirm the intended deployments exist and are running, including
-   `long_trial_106_virtual_seedpicker_01` on
-   `VIRTUALSEEDRL01/seedpicker_rl_long_01`.
+1. Confirm the intended deployments exist and are running. Do not use
+   `long_trial_106_v1` on the retired seedpicker route above.
 2. Submit model-routed candidate names for both deployments.
 3. Confirm the API-owned market-stream snapshot has the active candidate names
    in `desired_symbols`; manual `/v1/market-data/stream/desired` calls are only

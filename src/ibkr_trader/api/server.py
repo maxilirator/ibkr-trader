@@ -88,6 +88,7 @@ from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.base import utc_now
 from ibkr_trader.db.models import BrokerOrderRecord
+from ibkr_trader.db.models import ExecutionFillRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
@@ -325,7 +326,23 @@ def should_include_background_execution_recovery(
             )
             .limit(1)
         ).first()
-        return unsettled_order is not None
+        if unsettled_order is not None:
+            return True
+
+        filled_order_without_fill = session.execute(
+            select(BrokerOrderRecord.id)
+            .where(
+                BrokerOrderRecord.is_virtual.is_(False),
+                func.upper(BrokerOrderRecord.status) == "FILLED",
+                ~(
+                    select(ExecutionFillRecord.id)
+                    .where(ExecutionFillRecord.broker_order_id == BrokerOrderRecord.id)
+                    .exists()
+                ),
+            )
+            .limit(1)
+        ).first()
+        return filled_order_without_fill is not None
 
 
 

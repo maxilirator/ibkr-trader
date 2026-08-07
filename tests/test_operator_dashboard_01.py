@@ -230,6 +230,111 @@ class OperatorDashboardReadModelTests01(OperatorDashboardReadModelTestCase):
         self.assertEqual(exit_fill.realized_pnl_currency, "SEK")
         self.assertEqual(exit_fill.realized_pnl_basis_price, "100")
 
+    def test_manual_exit_fill_uses_latest_position_average_cost_for_realized_pnl(
+        self,
+    ) -> None:
+        session: Session = self.session_factory()
+        try:
+            broker_account = BrokerAccountRecord(
+                broker_kind="IBKR",
+                account_key="U25245596",
+                account_label="Live Sweden",
+                base_currency="SEK",
+            )
+            session.add(broker_account)
+            session.flush()
+
+            session.add(
+                PositionSnapshotRecord(
+                    broker_account_id=broker_account.id,
+                    snapshot_at=datetime(2026, 6, 15, 13, 0, tzinfo=timezone.utc),
+                    source="runtime_snapshot",
+                    symbol="INTRUMTR",
+                    exchange="SFB",
+                    currency="SEK",
+                    security_type="STK",
+                    primary_exchange="SFB",
+                    local_symbol="INTRUMTR",
+                    quantity="1100",
+                    average_cost="2.016",
+                    market_price="12.56",
+                    market_value="13816.00",
+                    unrealized_pnl="11642.40",
+                    realized_pnl="0.00",
+                )
+            )
+            exit_order = BrokerOrderRecord(
+                broker_account_id=broker_account.id,
+                broker_kind="IBKR",
+                account_key="U25245596",
+                order_role="EXIT",
+                external_order_id="4956",
+                external_perm_id="1456474004",
+                external_client_id="0",
+                order_ref="operator-flatten-20260615-U25245596-INTRUMTR-rights-01:exit:operator_flatten_market",
+                symbol="INTRUMTR",
+                exchange="SMART",
+                currency="SEK",
+                security_type="STK",
+                primary_exchange="SFB",
+                local_symbol="INTRUMTR",
+                side="SELL",
+                order_type="MKT",
+                time_in_force="DAY",
+                status="Filled",
+                total_quantity="1100",
+                limit_price=None,
+                stop_price=None,
+                submitted_at=datetime(2026, 6, 15, 13, 9, tzinfo=timezone.utc),
+                last_status_at=datetime(2026, 6, 15, 13, 9, tzinfo=timezone.utc),
+                raw_payload={},
+                metadata_json={},
+            )
+            session.add(exit_order)
+            session.flush()
+
+            session.add(
+                ExecutionFillRecord(
+                    broker_order_id=exit_order.id,
+                    broker_account_id=broker_account.id,
+                    broker_kind="IBKR",
+                    account_key="U25245596",
+                    external_execution_id="00014800.6a2f9cf7.01.01",
+                    external_order_id="4956",
+                    external_perm_id="1456474004",
+                    order_ref=exit_order.order_ref,
+                    symbol="INTRUMTR",
+                    exchange="SFB",
+                    currency="SEK",
+                    security_type="STK",
+                    side="SLD",
+                    quantity="287",
+                    price="12.60",
+                    commission="0.084981",
+                    commission_currency="SEK",
+                    executed_at=datetime(2026, 6, 15, 13, 9, 57, tzinfo=timezone.utc),
+                    raw_payload={},
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        snapshot = build_operator_dashboard_snapshot(
+            self.session_factory,
+            fill_limit=10,
+        )
+
+        exit_fill = snapshot.recent_fills[0]
+        self.assertEqual(exit_fill.external_execution_id, "00014800.6a2f9cf7.01.01")
+        self.assertEqual(exit_fill.instruction_record_id, None)
+        self.assertEqual(exit_fill.order_role, "EXIT")
+        self.assertEqual(exit_fill.position_side, "LONG")
+        self.assertEqual(exit_fill.realized_pnl, "+3037.52")
+        self.assertEqual(exit_fill.realized_pnl_gross, "+3037.61")
+        self.assertEqual(exit_fill.realized_pnl_currency, "SEK")
+        self.assertEqual(exit_fill.realized_pnl_basis_price, "2.016")
+
     def test_build_operator_dashboard_snapshot_includes_account_day_performance(self) -> None:
         self._seed_operator_data()
 

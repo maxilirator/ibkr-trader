@@ -21,6 +21,9 @@ import pandas as pd
 
 from ibkr_trader.rl.model_artifacts import DEFAULT_SHARED_VIRTUAL_ACCOUNT
 from ibkr_trader.rl.model_artifacts import read_static_feature_names
+from ibkr_trader.domain.model_routing_policy import (
+    LONG_TRIAL_106_SEEDPICKER_RETIREMENT_REASON,
+)
 
 
 IDENTITY_PATH = Path("/home/mattias/dev/q-data/xsto/meta/instrument_identity.parquet")
@@ -43,6 +46,7 @@ class CandidateBatchConfig:
     account_key: str = DEFAULT_SHARED_VIRTUAL_ACCOUNT
     static_feature_cols_path: Path | None = None
     strategy_key: str | None = None
+    retired_reason: str | None = None
 
 
 CONFIGS: tuple[CandidateBatchConfig, ...] = (
@@ -60,6 +64,7 @@ CONFIGS: tuple[CandidateBatchConfig, ...] = (
         static_feature_cols_path=CANDIDATE_SOURCE_ROOT
         / "artifacts/analysis/long_trial_106_ex_long_true_rl_dqn_w128_oracle_notrade_dualseed_extension_v1/continuation/true_rl_dqn_w128_seed240/static_feature_cols.csv",
         strategy_key="bucket_booster_long",
+        retired_reason=LONG_TRIAL_106_SEEDPICKER_RETIREMENT_REASON,
     ),
     CandidateBatchConfig(
         side="SHORT",
@@ -162,6 +167,21 @@ def main() -> int:
     api_base = args.api_base.rstrip("/")
     results: list[dict[str, Any]] = []
     for config in CONFIGS:
+        if config.retired_reason is not None:
+            results.append(
+                {
+                    "side": config.side,
+                    "model_key": config.model_key,
+                    "deployment_key": config.deployment_key,
+                    "account_key": config.account_key,
+                    "book_key": config.book_key,
+                    "status": "retired",
+                    "skipped": True,
+                    "reason": config.retired_reason,
+                }
+            )
+            continue
+
         account_key = str(args.account_key or config.account_key).strip().upper()
         limit = args.long_limit if config.side == "LONG" else args.short_limit
         rows, candidate_date = load_selected_rows(

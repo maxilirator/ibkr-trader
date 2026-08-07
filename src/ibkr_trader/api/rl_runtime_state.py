@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+from datetime import timezone
 from decimal import Decimal
 from decimal import InvalidOperation
 from typing import Any, Mapping
@@ -17,6 +19,8 @@ from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.trader_registry import TraderDeploymentNotFoundError
+from ibkr_trader.rl.observations_common import ObservationConfig
+from ibkr_trader.rl.observations_common import observation_config_from_contract
 
 
 _RL_RUNTIME_ACTIVE_STATES = {
@@ -57,6 +61,9 @@ def build_rl_runtime_state_snapshot(
             raise ValueError(
                 f"Trader deployment '{normalized_deployment_key}' has unsupported side '{side}'."
             )
+        observation_config = observation_config_from_contract(
+            deployment.trader_model.observation_contract_json,
+        )
 
         active_statement = select(InstructionRecord).where(
             InstructionRecord.account_key == deployment.account_key,
@@ -96,6 +103,8 @@ def build_rl_runtime_state_snapshot(
                 symbol=symbol,
                 deployment_key=normalized_deployment_key,
                 side=side,
+                generated_at=generated_at,
+                observation_config=observation_config,
                 active_records=tuple(records_by_symbol.get(symbol, ())),
                 position_snapshot=latest_positions_by_symbol.get(symbol),
             )
@@ -182,6 +191,8 @@ def _build_rl_runtime_symbol_state(
     symbol: str,
     deployment_key: str,
     side: str,
+    generated_at: datetime,
+    observation_config: ObservationConfig,
     active_records: tuple[InstructionRecord, ...],
     position_snapshot: tuple[PositionSnapshotRecord, BrokerAccountRecord] | None,
 ) -> dict[str, Any]:
@@ -325,6 +336,11 @@ def _build_rl_runtime_symbol_state(
     if entry_records:
         entry = entry_records[0]
         action_name = _rl_runtime_instruction_action_name(entry)
+        entry_order_age = _completed_model_bars_between(
+            entry.submit_at,
+            generated_at,
+            config=observation_config,
+        )
         return {
             "symbol": symbol,
             "status": "ready",
@@ -336,7 +352,7 @@ def _build_rl_runtime_symbol_state(
                 "pending_exit_tp_bp": None,
                 "entry_price": None,
                 "entry_bar_idx": None,
-                "bars_since_entry_order": 1,
+                "bars_since_entry_order": entry_order_age,
                 "bars_since_exit_order": 0,
             },
             "blockers": [],
@@ -353,6 +369,19 @@ def _build_rl_runtime_symbol_state(
             or _decimal_or_none(position_record.entry_avg_fill_price)
         )
         exit_pending = position_record.state == ExecutionState.EXIT_PENDING.value
+        entry_bar_idx = _completed_model_bar_index_at(
+            position_record.entry_filled_at or position_record.submit_at,
+            config=observation_config,
+        )
+        exit_order_age = (
+            _completed_model_bars_between(
+                _rl_runtime_exit_order_started_at(position_record),
+                generated_at,
+                config=observation_config,
+            )
+            if exit_pending
+            else 0
+        )
         return {
             "symbol": symbol,
             "status": "ready",
@@ -367,9 +396,9 @@ def _build_rl_runtime_symbol_state(
                 if exit_pending
                 else None,
                 "entry_price": entry_price,
-                "entry_bar_idx": None,
+                "entry_bar_idx": entry_bar_idx,
                 "bars_since_entry_order": 0,
-                "bars_since_exit_order": 1 if exit_pending else 0,
+                "bars_since_exit_order": exit_order_age,
             },
             "blockers": [],
             "position_snapshot": position_payload,
@@ -413,6 +442,7 @@ def _serialize_rl_runtime_instruction(record: InstructionRecord) -> dict[str, An
         "exit_order_status": record.exit_order_status,
         "entry_filled_quantity": record.entry_filled_quantity,
         "entry_avg_fill_price": record.entry_avg_fill_price,
+        "entry_filled_at": record.entry_filled_at,
         "activity_at": record.updated_at,
         "metadata": _rl_runtime_instruction_runtime_metadata(record),
     }
@@ -482,6 +512,52 @@ def _rl_runtime_instruction_deployment_key(record: InstructionRecord) -> str:
 
 def _rl_runtime_instruction_action_name(record: InstructionRecord) -> str:
     return str(_rl_runtime_instruction_metadata(record).get("rl_action_name") or "")
+
+
+def _completed_model_bar_index_at(
+    timestamp: datetime | None,
+    *,
+    config: ObservationConfig,
+) -> int | None:
+    if timestamp is None:
+        return None
+    observed = _ensure_aware_datetime(timestamp).astimezone(config.zoneinfo)
+    session_open = datetime.combine(
+        observed.date(),
+        config.session_open,
+        tzinfo=config.zoneinfo,
+    )
+    if observed < session_open:
+        return None
+    elapsed_minutes = int((observed - session_open).total_seconds() // 60)
+    completed_count = elapsed_minutes // config.target_bar_minutes
+    completed_count = min(max(completed_count, 0), config.expected_session_bars)
+    if completed_count <= 0:
+        return None
+    return completed_count - 1
+
+
+def _completed_model_bars_between(
+    started_at: datetime | None,
+    ended_at: datetime | None,
+    *,
+    config: ObservationConfig,
+) -> int:
+    start_idx = _completed_model_bar_index_at(started_at, config=config)
+    end_idx = _completed_model_bar_index_at(ended_at, config=config)
+    if start_idx is None or end_idx is None:
+        return 0
+    return max(0, end_idx - start_idx)
+
+
+def _rl_runtime_exit_order_started_at(record: InstructionRecord) -> datetime | None:
+    return record.updated_at or record.entry_filled_at or record.submit_at
+
+
+def _ensure_aware_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def _rl_runtime_pending_entry_anchor(action_name: str) -> str:

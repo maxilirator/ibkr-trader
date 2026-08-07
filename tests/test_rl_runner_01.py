@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
+from ibkr_trader.rl.model_contracts import LONG_TRIAL_106_V1_CONTRACT
+
 from tests._rl_runner_shared import *  # noqa: F401,F403
 
 
@@ -236,6 +241,99 @@ def test_runner_waits_for_stream_bars_before_feature_or_history_preparation(
     assert (
         heartbeats[-1]["metrics"]["skipped_candidates"][0]["status"]
         == "waiting_for_stream_bars"
+    )
+
+def test_runner_blocks_contract_model_without_market_context_universe(
+    monkeypatch,
+) -> None:
+    heartbeats: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runner,
+        "load_runtime_state_context",
+        lambda **_: runner.RuntimeStateContext(
+            states={},
+            blocked_symbols={},
+            source="runtime-state",
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "static_feature_payload",
+        lambda *_, **__: {
+            "feature_names": ["rank_score"],
+            "values": [0.0],
+            "normalized": True,
+            "source": "test",
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "history_override_payload",
+        lambda *_, **__: {
+            "prev_close": "100",
+            "history_features": {name: 0.0 for name in runner.HISTORY_FEATURE_NAMES},
+            "source": "test",
+        },
+    )
+
+    def fake_post_json(
+        url: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        del timeout
+        if "/v1/rl/observations/build" in url:
+            pytest.fail("contract-bound long_trial_106 must not infer on top-1 context")
+        assert "/heartbeat" in url
+        heartbeats.append(payload)
+        return {"accepted": True}
+
+    monkeypatch.setattr(runner, "post_json", fake_post_json)
+
+    runner.run_model_candidates(
+        api_base="http://127.0.0.1:8000",
+        loaded=SimpleNamespace(
+            config=SimpleNamespace(
+                model_key="long_trial_106_v1",
+                deployment_key="long_trial_106_virtual_shared_01",
+                side="LONG",
+            ),
+            static_feature_mean_sha256=LONG_TRIAL_106_V1_CONTRACT.static_mean_sha256,
+            static_feature_std_sha256=LONG_TRIAL_106_V1_CONTRACT.static_std_sha256,
+        ),
+        deployment_key="long_trial_106_virtual_shared_01",
+        deployment_mode="virtual",
+        candidates=[
+            {
+                "instruction_id": "long-saga",
+                "symbol": "SAGA B",
+                "account_key": "VIRTUALRL02",
+                "trace": {
+                    "trade_date": "2026-05-08",
+                    "data_cutoff_date": "2026-05-07",
+                },
+            }
+        ],
+        processed_decisions=set(),
+        execute_actions=True,
+        history_cache={},
+        history_duration="5 D",
+        history_bar_size="1 min",
+        history_timeout=20,
+        stream_bar_ready_symbols={"SAGA B"},
+        stream_plan={"stream_symbol_count": 1},
+        trade_date="2026-05-08",
+    )
+
+    assert heartbeats[-1]["status"] == "degraded"
+    assert "market-context universe" in str(heartbeats[-1]["runtime_error"])
+    metrics = heartbeats[-1]["metrics"]
+    assert metrics["runtime_contract"]["model_key"] == "long_trial_106_v1"
+    assert (
+        metrics["skipped_candidates"][0]["status"]
+        == "runtime_contract_blocked"
     )
 
 def test_runner_observed_at_uses_latest_completed_model_bar() -> None:
@@ -671,6 +769,134 @@ def test_runner_normalizes_candidate_values_even_when_legacy_payload_claims_norm
 
     assert payload["values"] == [2.0]
 
+def test_runner_rejects_normalized_static_features_without_contract_hashes() -> None:
+    mean = runner.np.asarray([10.0, 100.0], dtype=runner.np.float32)
+    std = runner.np.asarray([2.0, 10.0], dtype=runner.np.float32)
+    loaded = SimpleNamespace(
+        config=SimpleNamespace(model_key="long_trial_106_v1"),
+        static_feature_names=["rank_score", "turnover"],
+        static_feature_mean=mean,
+        static_feature_std=std,
+        static_feature_normalization_id="trial_106_seed240",
+        static_feature_mean_sha256=_array_sha256(mean),
+        static_feature_std_sha256=_array_sha256(std),
+    )
+
+    with pytest.raises(ValueError, match="normalized=true"):
+        static_feature_payload(
+            loaded,
+            candidate={
+                "trace": {
+                    "metadata": {
+                        "static_features": {
+                            "schema_version": "rl_static_features_v1",
+                            "model_key": "long_trial_106_v1",
+                            "feature_names": ["rank_score", "turnover"],
+                            "values": [1.0, -2.0],
+                            "normalized": True,
+                            "source": "upstream_candidate_payload",
+                        }
+                    }
+                }
+            },
+            symbol="AXFO",
+            trade_date="2026-03-23",
+        )
+
+def test_runner_accepts_static_features_with_exact_contract_normalization_marker() -> None:
+    mean = runner.np.asarray([10.0, 100.0], dtype=runner.np.float32)
+    std = runner.np.asarray([2.0, 10.0], dtype=runner.np.float32)
+    mean_sha256 = _array_sha256(mean)
+    std_sha256 = _array_sha256(std)
+    loaded = SimpleNamespace(
+        config=SimpleNamespace(model_key="long_trial_106_v1"),
+        static_feature_names=["rank_score", "turnover"],
+        static_feature_mean=mean,
+        static_feature_std=std,
+        static_feature_normalization_id="trial_106_seed240",
+        static_feature_mean_sha256=mean_sha256,
+        static_feature_std_sha256=std_sha256,
+    )
+
+    payload = static_feature_payload(
+        loaded,
+        candidate={
+            "trace": {
+                "metadata": {
+                    "static_features": {
+                        "schema_version": "rl_static_features_v1",
+                        "model_key": "long_trial_106_v1",
+                        "feature_names": ["rank_score", "turnover"],
+                        "values": [1.0, -2.0],
+                        "normalized": True,
+                        "source": "research_runtime_probe",
+                        "normalization": {
+                            "method": "training_static_zscore",
+                            "model_artifact_id": "trial_106_seed240",
+                            "mean_sha256": mean_sha256,
+                            "std_sha256": std_sha256,
+                        },
+                    }
+                }
+            }
+        },
+        symbol="AXFO",
+        trade_date="2026-03-23",
+    )
+
+    assert payload == {
+        "feature_names": ["rank_score", "turnover"],
+        "values": [1.0, -2.0],
+        "normalized": True,
+        "source": "research_runtime_probe",
+    }
+
+def test_runner_loads_contract_static_scaler_format(tmp_path) -> None:
+    mean = runner.np.asarray([10.0, 100.0], dtype=runner.np.float32)
+    std = runner.np.asarray([2.0, 10.0], dtype=runner.np.float32)
+    scaler_path = tmp_path / "static_scaler.json"
+    scaler_path.write_text(
+        json.dumps(
+            {
+                "model_key": "long_trial_106_v1",
+                "artifact_id": "trial_106_seed240",
+                "feature_count": 2,
+                "mean_sha256": _array_sha256(mean),
+                "std_sha256": _array_sha256(std),
+                "features": [
+                    {
+                        "index": 0,
+                        "feature_name": "rank_score",
+                        "mean": 10.0,
+                        "std": 2.0,
+                    },
+                    {
+                        "index": 1,
+                        "feature_name": "turnover",
+                        "mean": 100.0,
+                        "std": 10.0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded_mean, loaded_std, normalization_id, mean_sha256, std_sha256 = (
+        runner.load_static_feature_normalization(
+            scaler_path,
+            expected_feature_names=["rank_score", "turnover"],
+            expected_mean_sha256=_array_sha256(mean),
+            expected_std_sha256=_array_sha256(std),
+        )
+    )
+
+    assert loaded_mean.tolist() == [10.0, 100.0]
+    assert loaded_std.tolist() == [2.0, 10.0]
+    assert normalization_id == "trial_106_seed240"
+    assert mean_sha256 == _array_sha256(mean)
+    assert std_sha256 == _array_sha256(std)
+
 def test_runner_requires_static_features_on_candidate_payload() -> None:
     loaded = SimpleNamespace(
         config=SimpleNamespace(model_key="long_trial_106_v1"),
@@ -684,6 +910,11 @@ def test_runner_requires_static_features_on_candidate_payload() -> None:
             symbol="AXFO",
             trade_date="2026-03-23",
         )
+
+def _array_sha256(values: object) -> str:
+    return hashlib.sha256(
+        runner.np.asarray(values, dtype=runner.np.float32).tobytes()
+    ).hexdigest()
 
 def test_runner_reason_code_filter_accepts_current_upstream_candidate_tape_reason() -> None:
     assert "rl_model_routed_candidate_tape_selected" in parse_reason_code_filter(None)
