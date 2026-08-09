@@ -68,11 +68,12 @@ rg -n '^(def (create_app|main|run_persistent_execution_runtime)|class Background
   scripts/run_rl_agents.py
 
 # Focused tests whose fixtures use local/in-memory state and mocked broker boundaries.
-uv run --extra dev --extra db pytest \
+uv run --extra dev --extra db --extra rl pytest \
   tests/test_config.py \
   tests/test_client_ids.py \
   tests/test_db_schema.py \
-  tests/test_rl_runner.py
+  tests/test_rl_runner_01.py \
+  tests/test_rl_runner_02.py
 
 # Compile the dashboard without starting its development or preview servers.
 npm --prefix dashboard ci
