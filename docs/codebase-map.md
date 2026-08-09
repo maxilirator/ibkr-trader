@@ -13,6 +13,22 @@ Use this document for static, local orientation only.
 
 ## Runtime topology and entry points
 
+The checked-in deployed topology has three application processes, not one process per
+conceptual runtime area:
+
+| Process | Concrete command evidence | Runtime areas hosted |
+| --- | --- | --- |
+| Trader API | [`ops/systemd/ibkr-trader-api.service`](../ops/systemd/ibkr-trader-api.service) runs `python -m ibkr_trader.db.init_schema` and then `python -m ibkr_trader.api.server` | HTTP control/read API, broker session manager and monitor, execution loop, live market stream, and historical backfill worker |
+| Dashboard | [`ops/systemd/ibkr-trader-dashboard.service`](../ops/systemd/ibkr-trader-dashboard.service) runs the adapter-node output `dashboard/build/index.js` | SvelteKit operator, ledger, and RL views; server-side actions call the Trader API |
+| RL runner | [`ops/systemd/ibkr-trader-rl-runner.service`](../ops/systemd/ibkr-trader-rl-runner.service) runs `scripts/run_rl_agents.py --execute-virtual ...` | Polling/model-decision loop that reads and writes through the Trader API |
+
+This is the implemented topology. In particular, the market-data and execution
+responsibilities described separately in [`plan.md`](../plan.md) are currently
+background services inside the API process; they are not independently deployed
+services. Host configuration, deployment state, broker availability, and operational
+readiness cannot be established by this repository map and require separate
+operational verification.
+
 ### API and control plane
 
 The executable API entry point is [`src/ibkr_trader/api/server.py`](../src/ibkr_trader/api/server.py): `create_app()` constructs the database/session layer, canonical broker sessions, background broker monitor, market stream, backfill worker, and execution runtime; its FastAPI lifespan conditionally starts and stops those background components; `main()` runs Uvicorn. The checked-in service declaration invokes the same module in [`ops/systemd/ibkr-trader-api.service`](../ops/systemd/ibkr-trader-api.service). By contrast, [`src/ibkr_trader/main.py`](../src/ibkr_trader/main.py) only prints selected configuration and is not the API server.
@@ -31,6 +47,10 @@ The operator dashboard is a SvelteKit application under [`dashboard/`](../dashbo
 
 Server-side requests to the trader API are centralized in [`dashboard/src/lib/server/trader-api.js`](../dashboard/src/lib/server/trader-api.js). Build and start scripts are declared in [`dashboard/package.json`](../dashboard/package.json), while the checked-in deployed-process shape is documented by [`ops/systemd/ibkr-trader-dashboard.service`](../ops/systemd/ibkr-trader-dashboard.service).
 
+The request path is therefore browser -> SvelteKit route loader/action -> Trader API
+-> database-backed read model or control handler. The SvelteKit server does not import
+the Python database or broker layers.
+
 ### Orchestration and execution runtime
 
 The persistent execution loop is `run_persistent_execution_runtime()` in [`src/ibkr_trader/orchestration/runtime_worker.py`](../src/ibkr_trader/orchestration/runtime_worker.py). It acquires a durable runtime lease, performs startup reconciliation, runs cycles, and records lifecycle status; the same module supplies an embedded `BackgroundExecutionRuntimeService` and a standalone CLI `main()`. The API embeds that service from [`src/ibkr_trader/api/server.py`](../src/ibkr_trader/api/server.py).
@@ -43,11 +63,49 @@ Broker-facing code is under [`src/ibkr_trader/ibkr/`](../src/ibkr_trader/ibkr/).
 
 The order boundary is [`order_execution.py`](../src/ibkr_trader/ibkr/order_execution.py), with submission and cancellation details in [`order_execution_submission.py`](../src/ibkr_trader/ibkr/order_execution_submission.py) and [`order_execution_cancel.py`](../src/ibkr_trader/ibkr/order_execution_cancel.py). Broker runtime snapshots are assembled in [`runtime_snapshot.py`](../src/ibkr_trader/ibkr/runtime_snapshot.py). Streaming and historical paths are distinct in [`market_stream.py`](../src/ibkr_trader/ibkr/market_stream.py), [`market_stream_store.py`](../src/ibkr_trader/ibkr/market_stream_store.py), and [`market_data_backfill.py`](../src/ibkr_trader/ibkr/market_data_backfill.py).
 
+There is no standalone market-data executable in the checked-in deployment. The API
+constructs `LiveMarketDataStreamService` and `BackgroundMarketDataBackfillService` in
+[`src/ibkr_trader/api/server.py`](../src/ibkr_trader/api/server.py), starts them from
+the FastAPI lifespan when enabled, and exposes their controls through
+[`server_routes_broker_market.py`](../src/ibkr_trader/api/server_routes_broker_market.py).
+Tick collection and contract resolution below those services are implemented in
+[`tick_stream.py`](../src/ibkr_trader/ibkr/tick_stream.py) and
+[`contracts.py`](../src/ibkr_trader/ibkr/contracts.py).
+
 ### Ledger and read models
 
 SQLAlchemy engine, session, and schema helpers live in [`src/ibkr_trader/db/base.py`](../src/ibkr_trader/db/base.py); first-class persisted records are declared in [`src/ibkr_trader/db/models.py`](../src/ibkr_trader/db/models.py). The schema initializer entry point is [`src/ibkr_trader/db/init_schema.py`](../src/ibkr_trader/db/init_schema.py), also referenced by the API service declaration in [`ops/systemd/ibkr-trader-api.service`](../ops/systemd/ibkr-trader-api.service).
 
-Ledger writes are grouped under [`src/ibkr_trader/ledger/`](../src/ibkr_trader/ledger/): [`persistence.py`](../src/ibkr_trader/ledger/persistence.py) exposes the public persistence operations, while callbacks, order records, runtime snapshots, and snapshot records are split into [`persistence_callbacks.py`](../src/ibkr_trader/ledger/persistence_callbacks.py), [`persistence_order_records.py`](../src/ibkr_trader/ledger/persistence_order_records.py), [`persistence_runtime.py`](../src/ibkr_trader/ledger/persistence_runtime.py), and [`persistence_snapshots.py`](../src/ibkr_trader/ledger/persistence_snapshots.py). [`instruction_projection.py`](../src/ibkr_trader/ledger/instruction_projection.py) projects terminal broker order evidence back onto instruction state. API payload modules and the dashboard server loaders cited above form the local read/view path; they should be preferred for operator views over adding ad hoc live-broker reads.
+Ledger writes are grouped under [`src/ibkr_trader/ledger/`](../src/ibkr_trader/ledger/): [`persistence.py`](../src/ibkr_trader/ledger/persistence.py) exposes the public persistence operations, while callbacks, order records, runtime snapshots, and snapshot records are split into [`persistence_callbacks.py`](../src/ibkr_trader/ledger/persistence_callbacks.py), [`persistence_order_records.py`](../src/ibkr_trader/ledger/persistence_order_records.py), [`persistence_runtime.py`](../src/ibkr_trader/ledger/persistence_runtime.py), and [`persistence_snapshots.py`](../src/ibkr_trader/ledger/persistence_snapshots.py). [`instruction_projection.py`](../src/ibkr_trader/ledger/instruction_projection.py) projects terminal broker order evidence back onto instruction state.
+
+The concrete database-backed read-model entry points exported by
+[`src/ibkr_trader/read_models/__init__.py`](../src/ibkr_trader/read_models/__init__.py)
+are `build_operator_dashboard_snapshot()`, `build_ledger_dashboard_snapshot()`, and
+`build_rl_trader_dashboard_snapshot()`. Their implementations are rooted in
+[`operator_dashboard.py`](../src/ibkr_trader/read_models/operator_dashboard.py),
+[`ledger_dashboard.py`](../src/ibkr_trader/read_models/ledger_dashboard.py), and
+[`rl_dashboard.py`](../src/ibkr_trader/read_models/rl_dashboard.py). The API route
+modules serialize these projections for the dashboard. Some broker-control and
+market-data endpoints intentionally perform broker work, so “UI prefers local
+projections” does not mean every API route is database-only.
+
+### Domain contracts and virtual execution
+
+Broker-neutral instruction and execution contracts are defined in
+[`src/ibkr_trader/domain/instructions.py`](../src/ibkr_trader/domain/instructions.py),
+[`execution_contract.py`](../src/ibkr_trader/domain/execution_contract.py), and
+[`contract_resolution.py`](../src/ibkr_trader/domain/contract_resolution.py). These
+types cross from API submission into orchestration; IBKR translation remains under
+`src/ibkr_trader/ibkr/`.
+
+Virtual trading is not a separate process. The public virtual execution surface is
+[`src/ibkr_trader/virtual/execution.py`](../src/ibkr_trader/virtual/execution.py),
+which composes order submission, cancellation, quote ingestion, fills, accounts, and
+positions from the other modules in that package. The API dispatches virtual-account
+orders to that implementation in [`src/ibkr_trader/api/server.py`](../src/ibkr_trader/api/server.py),
+and the ordinary execution runtime processes the resulting persisted records. Thus
+virtual and real execution share orchestration and ledger schemas, while virtual
+orders do not contact IBKR.
 
 ### RL runner
 
