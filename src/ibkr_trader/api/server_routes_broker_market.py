@@ -767,8 +767,11 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
         if persist_requested:
             persisted_artifacts = persist_shortability_snapshot(
                 snapshot,
-                instruments_dir=app_config.stockholm_instruments_path.parent,
-                meta_dir=app_config.stockholm_identity_path.parent / "shortability",
+                # This service's own outputs go under its own root. Deriving
+                # them from a resolved q-data path would write into an
+                # immutable, versioned dataset directory q-data owns.
+                instruments_dir=app_config.output_root,
+                meta_dir=app_config.output_root / "shortability",
             )
 
         return {

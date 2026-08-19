@@ -76,6 +76,26 @@ class StockholmIntradayBackfillQuery:
 
 
 def _load_current_stockholm_universe(path: Path) -> list[str]:
+    """Read the tradable universe from the published dataset.
+
+    q-data publishes the universe as parquet; the legacy layout used a tab
+    separated text file. Both are read here so the switch is a configuration
+    change rather than a code fork during the cutover.
+    """
+    if path.suffix == ".parquet":
+        try:
+            import duckdb
+        except ModuleNotFoundError as exc:  # pragma: no cover - runtime dependency
+            raise RuntimeError(f"duckdb is required to read the universe parquet at {path}") from exc
+        connection = duckdb.connect()
+        try:
+            rows = connection.execute(
+                "SELECT DISTINCT lower(instrument) AS slug FROM read_parquet(?) ORDER BY 1",
+                [str(path)],
+            ).fetchall()
+        finally:
+            connection.close()
+        return [str(row[0]) for row in rows if row[0]]
     slugs: list[str] = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         if not raw_line.strip():

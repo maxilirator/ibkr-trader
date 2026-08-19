@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from os import environ, getenv
 from pathlib import Path
 
-from ibkr_trader.q_data import resolve_dataset
+from ibkr_trader.q_data import resolve
 from ibkr_trader.ibkr.client_ids import DIAGNOSTIC_CLIENT_ID
 from ibkr_trader.ibkr.client_ids import HISTORICAL_CLIENT_ID
 from ibkr_trader.ibkr.client_ids import PRIMARY_RUNTIME_CLIENT_ID
@@ -62,11 +62,25 @@ def _resolve_project_path(raw_path: str) -> Path:
 
 
 
-def _q_data_path(dataset_id: str, fallback: str) -> Path:
-    catalog = getenv("Q_DATA_CATALOG_PATH", "").strip()
-    if catalog:
-        return resolve_dataset(Path(catalog), dataset_id)
-    return _resolve_project_path(fallback)
+def _q_data_path(dataset_id: str) -> Path:
+    """Resolve a shared dataset through the q-data catalog, and only that way.
+
+    There used to be a path fallback here. It is gone on purpose: a fallback
+    turns "the catalog is unreachable" into "read whatever is at this path",
+    which is exactly how a six-month-stale file was once mistaken for current
+    data. Failing here is loud and recoverable; reading the wrong file is not.
+    """
+    return resolve(dataset_id)
+
+
+def _output_root() -> Path:
+    """Where this service writes its own artefacts.
+
+    Never derived from a resolved q-data path. Shared datasets are immutable,
+    versioned and owned by q-data; a consumer writing into a sibling of one of
+    them writes into someone else's contract.
+    """
+    return _resolve_project_path(getenv("IBKR_TRADER_OUTPUT_ROOT", "var/shortability"))
 
 def _parse_env_list(raw_value: str) -> tuple[str, ...]:
     return tuple(
@@ -158,6 +172,9 @@ class AppConfig:
     stockholm_identity_path: Path
     api: ApiServerConfig
     ibkr: IbkrConnectionConfig
+    #: Where this service writes its own artefacts. Defaulted so existing
+    #: callers keep working; never derived from a resolved q-data path.
+    output_root: Path = PROJECT_ROOT / "var"
     broker_warmup_enabled: bool = True
     broker_monitor_enabled: bool = True
     broker_connect_backoff_initial_seconds: float = 5.0
@@ -211,26 +228,10 @@ class AppConfig:
                 "DATABASE_URL",
                 "postgresql://postgres:postgres@localhost:5432/ibkr_trader",
             ),
-            session_calendar_path=_q_data_path(
-                "xsto.world.calendar",
-                getenv(
-                    "SESSION_CALENDAR_PATH",
-                    "../q-data/xsto/calendars/day_sessions.parquet",
-                ),
-            ),
-            stockholm_instruments_path=_resolve_project_path(
-                getenv(
-                    "XSTO_INSTRUMENTS_PATH",
-                    "../q-data/xsto/instruments/all.txt",
-                )
-            ),
-            stockholm_identity_path=_q_data_path(
-                "xsto.world.instrument_identity",
-                getenv(
-                    "XSTO_IDENTITY_PATH",
-                    "../q-data/xsto/meta/instrument_identity.parquet",
-                ),
-            ),
+            session_calendar_path=_q_data_path("xsto.world.calendar"),
+            stockholm_instruments_path=_q_data_path("xsto.world.universe"),
+            stockholm_identity_path=_q_data_path("xsto.world.instrument_identity"),
+            output_root=_output_root(),
             api=ApiServerConfig.from_env(),
             ibkr=IbkrConnectionConfig.from_env(),
             broker_warmup_enabled=getenv(
