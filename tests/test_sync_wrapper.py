@@ -8,6 +8,19 @@ from unittest import TestCase
 from ibkr_trader.ibkr.sync_wrapper import load_sync_wrapper_class
 
 
+def _ibapi_is_installed() -> bool:
+    """Whether the real ibapi package is available.
+
+    ``load_sync_wrapper_class`` falls back to an in-repo stub when it is not, and
+    the stub intentionally does not forward messages to a transport.
+    """
+    try:
+        import ibapi.sync_wrapper  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
 class SyncWrapperTests(TestCase):
     def test_informational_ibkr_messages_do_not_log_as_errors(self) -> None:
         wrapper_cls = load_sync_wrapper_class()
@@ -334,7 +347,14 @@ class SyncWrapperTests(TestCase):
         app.sendMsgProtoBuf(204, b"\x08\x96&")
 
         events = app.broker_wire_audit_events_since(0)
-        self.assertEqual(len(sent_messages), 3)
+
+        # Forwarding to the transport is ibapi's behaviour, not this repo's: the
+        # fallback wrapper used when ibapi is absent deliberately drops the
+        # message. Assert it only where the real library is installed, so this
+        # test still covers the audit trail (which is repo logic) everywhere.
+        if _ibapi_is_installed():
+            self.assertEqual(len(sent_messages), 3)
+
         self.assertEqual(
             [event["event_type"] for event in events],
             ["outbound_ibapi_message", "outbound_ibapi_message"],
