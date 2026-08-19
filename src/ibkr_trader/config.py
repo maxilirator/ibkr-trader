@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from os import environ, getenv
 from pathlib import Path
 
+from ibkr_trader.bootstrap import is_production_environment
+from ibkr_trader.bootstrap import load_runtime_environment
+from ibkr_trader.bootstrap import require_production_value
 from ibkr_trader.q_data import resolve
 from ibkr_trader.ibkr.client_ids import DIAGNOSTIC_CLIENT_ID
 from ibkr_trader.ibkr.client_ids import HISTORICAL_CLIENT_ID
@@ -121,9 +124,21 @@ class IbkrConnectionConfig:
             configured_account_ids = (configured_account_id,)
         if not configured_account_id and configured_account_ids:
             configured_account_id = configured_account_ids[0]
+
+        # In production these must come from the protected bootstrap file. The
+        # defaults below are development conveniences and are actively unsafe
+        # live: 7497 is the paper-trading port, so silently defaulting to it
+        # would point the live runtime at the wrong Gateway.
+        if is_production_environment(getenv("APP_ENV")):
+            host = require_production_value("IBKR_HOST", getenv("IBKR_HOST"))
+            port = int(require_production_value("IBKR_PORT", getenv("IBKR_PORT")))
+        else:
+            host = getenv("IBKR_HOST", "127.0.0.1")
+            port = int(getenv("IBKR_PORT", "7497"))
+
         return cls(
-            host=getenv("IBKR_HOST", "127.0.0.1"),
-            port=int(getenv("IBKR_PORT", "7497")),
+            host=host,
+            port=port,
             client_id=int(getenv("IBKR_CLIENT_ID", str(PRIMARY_RUNTIME_CLIENT_ID))),
             diagnostic_client_id=int(
                 getenv("IBKR_DIAGNOSTIC_CLIENT_ID", str(DIAGNOSTIC_CLIENT_ID))
@@ -220,14 +235,29 @@ class AppConfig:
 
     @classmethod
     def from_env(cls) -> "AppConfig":
-        load_dotenv_file()
-        return cls(
-            environment=getenv("APP_ENV", "dev"),
-            timezone=getenv("APP_TIMEZONE", "Europe/Stockholm"),
-            database_url=getenv(
+        # Resolves the protected bootstrap file in production and the
+        # checkout-local .env otherwise. Raises rather than starting on
+        # incomplete production configuration.
+        load_runtime_environment()
+
+        environment = getenv("APP_ENV", "dev")
+        if is_production_environment(environment):
+            # No default: the development default points at a local throwaway
+            # database, and silently using it in production would write the
+            # ledger somewhere nobody is reading.
+            database_url = require_production_value(
+                "DATABASE_URL", getenv("DATABASE_URL")
+            )
+        else:
+            database_url = getenv(
                 "DATABASE_URL",
                 "postgresql://postgres:postgres@localhost:5432/ibkr_trader",
-            ),
+            )
+
+        return cls(
+            environment=environment,
+            timezone=getenv("APP_TIMEZONE", "Europe/Stockholm"),
+            database_url=database_url,
             session_calendar_path=_q_data_path("xsto.world.calendar"),
             stockholm_instruments_path=_q_data_path("xsto.world.universe"),
             stockholm_identity_path=_q_data_path("xsto.world.instrument_identity"),
