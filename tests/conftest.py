@@ -74,6 +74,12 @@ def isolated_bootstrap_env(
         return None
     path = tmp_path / "absent-bootstrap.env"
     monkeypatch.setattr(bootstrap, "DEFAULT_BOOTSTRAP_ENV_PATH", path)
+    # The runtime environment is loaded once per process; without clearing it,
+    # one test's resolved environment would leak into every later test.
+    bootstrap.reset_runtime_environment_cache()
+    # The path override is honoured ahead of the patched constant, so an
+    # exported value would bypass this isolation entirely.
+    monkeypatch.delenv(bootstrap.BOOTSTRAP_ENV_PATH_VAR, raising=False)
     return path
 
 

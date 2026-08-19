@@ -133,16 +133,59 @@ cutover — not assumed.
 
 Checklist:
 
-1. Confirm the live `APP_ENV` value and where it is currently set.
+**Production stops reading the checkout `.env` entirely.** Every key the `.env`
+was supplying that the bootstrap file does not will silently revert to a code
+default. On this repository's `.env.example` that is over 40 keys, including
+`API_HOST` and `API_REQUIRE_LOOPBACK_ONLY`, which change how the API is exposed.
+
+The dangerous outcome is not an outage. `DATABASE_URL` is only checked for being
+non-empty, and the global kill switch reads *disabled* when its
+`operator_control` row is absent — so a mistyped database name yields a service
+that starts cleanly, creates an empty schema, reports healthy, and has no kill
+switch, on a live account.
+
+Run the preflight, which checks all of this without starting the application:
+
+```bash
+python scripts/preflight_bootstrap_cutover.py \
+    --bootstrap /etc/ibkr-trader/bootstrap.env \
+    --dotenv /home/mattias/ibkr-trader/.env
+```
+
+It exits non-zero on any blocking finding. It is read-only: no broker
+connection, no writes, one `SELECT` against the target database.
+
+Checklist:
+
+1. Confirm the live `APP_ENV` value and where it is currently set
+   (`systemctl --user show ibkr-trader-api -p Environment`, and `grep APP_ENV .env`).
 2. Create `/etc/ibkr-trader/bootstrap.env` with correct ownership, mode, and
    every required key; verify the service user can read it.
-3. Confirm `IBKR_PORT` is the live Gateway port. `7497`/`7496` are refused
-   unless `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1` records the decision.
-4. Confirm `DATABASE_URL` points at the production database.
-5. Remove any `APP_ENV` from the checkout `.env` — it would now be refused.
-6. Only then add `Environment=APP_ENV=production` to the systemd unit and
+3. Confirm `IBKR_PORT` is the **live** port. IB Gateway: live `4001`, paper
+   `4002`. TWS: live `7496`, paper `7497`. The paper ports are refused unless
+   `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1` records the decision. Note
+   `.env.example` ships `4002`, so do not copy that value across unchecked.
+4. Confirm `DATABASE_URL` points at the production database, and that the kill
+   switch still reads enabled there. The preflight checks this.
+5. Copy across every `.env` key that should survive; the preflight lists what
+   would be lost.
+6. Remove any `APP_ENV` from the checkout `.env` — it would now be refused.
+7. Run the preflight until it reports GO.
+8. Only then add `Environment=APP_ENV=production` to the systemd unit and
    restart the application services.
+9. Immediately after restart, confirm the kill switch still reports enabled
+   with its original reason and timestamp.
 
-Steps 1-6 change application startup behaviour and require explicit operator
+Steps 1-9 change application startup behaviour and require explicit operator
 approval before being applied to the live host. Restart only the application
 services; do not restart IB Gateway.
+
+### Rollback
+
+Reverting the commits is sufficient — the bootstrap code writes nothing to disk
+or database. Two caveats: run
+`systemctl --user reset-failed ibkr-trader-api ibkr-trader-rl-runner` afterwards,
+because a crash-looping unit that hits systemd's start limit will not come back
+on a plain restart; and if the cutover ran `init_schema` against a wrong
+`DATABASE_URL`, an empty schema now exists in that database and the revert does
+not remove it. Do not restart IB Gateway as part of any rollback.

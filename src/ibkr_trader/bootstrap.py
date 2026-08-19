@@ -63,10 +63,18 @@ PRODUCTION_ENVIRONMENTS = frozenset({"production", "prod"})
 #: production, which is exactly the failure mode this list exists to prevent:
 #: ``DATABASE_URL`` would point at a local throwaway database, and ``IBKR_PORT``
 #: would point at the paper-trading port rather than the live Gateway.
+#: ``Q_DATA_CATALOG_PATH`` is here for a different reason from the others: it has
+#: no default at all. ``AppConfig.from_env()`` resolves shared datasets through
+#: ``q_data.resolve()``, which fails closed when it is unset. In production the
+#: checkout ``.env`` is no longer read, so unless the protected file supplies it
+#: the application dies with a ``QDataContractError`` that reads like a data
+#: problem rather than a configuration one. Requiring it turns a confusing
+#: mid-startup failure into one clear message listed alongside the others.
 REQUIRED_PRODUCTION_KEYS = (
     "DATABASE_URL",
     "IBKR_HOST",
     "IBKR_PORT",
+    "Q_DATA_CATALOG_PATH",
 )
 
 #: At least one of these must be present and non-empty in production, so the
@@ -76,7 +84,18 @@ REQUIRED_PRODUCTION_ACCOUNT_KEYS = ("IBKR_ACCOUNT_ID", "IBKR_ACCOUNT_IDS")
 #: IBKR paper-trading ports. Pointing the live runtime at one of these is the
 #: specific accident this module exists to prevent, so it is refused rather
 #: than merely defaulted away from.
-PAPER_TRADING_PORTS = frozenset({7497, 7496})
+#:
+#: The IBKR convention is easy to get backwards, and getting it backwards here
+#: is worse than having no check at all:
+#:
+#:     TWS          live 7496   paper 7497
+#:     IB Gateway   live 4001   paper 4002
+#:
+#: This deployment runs IB Gateway (``.env.example`` and ``docs/ib-gateway-setup.md``
+#: both use ``4002``), so ``4002`` is the paper port that actually matters here.
+#: An earlier version listed ``{7497, 7496}``, which refused a live TWS port
+#: while letting the Gateway paper port through unchallenged.
+PAPER_TRADING_PORTS = frozenset({7497, 4002})
 
 #: Records a deliberate decision to run production against a paper port.
 PAPER_PORT_ACKNOWLEDGEMENT_KEY = "IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION"
@@ -390,6 +409,16 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
         )
 
 
+#: Result of the process-wide load, cached after the first default-argument call.
+_CACHED_RESULT: BootstrapLoadResult | None = None
+
+
+def reset_runtime_environment_cache() -> None:
+    """Forget the cached load. For tests; not used by runtime code."""
+    global _CACHED_RESULT
+    _CACHED_RESULT = None
+
+
 def load_runtime_environment(
     *,
     environment: str | None = None,
@@ -407,6 +436,17 @@ def load_runtime_environment(
     and then the checkout-local ``.env`` are applied with ``setdefault``, so an
     explicitly exported variable still wins for local work.
 
+    **Loaded once per process.** ``AppConfig.from_env()`` is called from the live
+    order-submission path (Stockholm short-sale validation resolves a q-data path
+    per instruction), so without caching every order would re-read and
+    re-validate the protected file. An operator running ``chmod g+w`` on it, or a
+    half-finished edit, would then turn a healthy running service into one whose
+    orders fail validation - a startup-time contract enforced at trade time.
+    Startup is the right place to fail; caching keeps it there.
+
+    Only default-argument calls are cached, so tests passing explicit paths are
+    unaffected and never populate the cache.
+
     Args:
         environment: ``APP_ENV`` value. Read from the environment when omitted.
         bootstrap_path: Override the protected file location.
@@ -417,6 +457,13 @@ def load_runtime_environment(
             missing, unreadable, world-accessible, or incomplete.
     """
     from ibkr_trader.config import DEFAULT_ENV_FILE
+
+    global _CACHED_RESULT
+    uses_defaults = (
+        environment is None and bootstrap_path is None and dotenv_path is None
+    )
+    if uses_defaults and _CACHED_RESULT is not None:
+        return _CACHED_RESULT
 
     resolved_environment = (
         environment if environment is not None else getenv("APP_ENV", "dev")
@@ -462,7 +509,7 @@ def load_runtime_environment(
                 ", ".join(overridden),
             )
 
-        return BootstrapLoadResult(
+        result = BootstrapLoadResult(
             environment=resolved_environment,
             is_production=True,
             source="bootstrap",
@@ -471,6 +518,9 @@ def load_runtime_environment(
             overridden_keys=overridden,
             warnings=(),
         )
+        if uses_defaults:
+            _CACHED_RESULT = result
+        return result
 
     warnings: list[str] = []
     applied: list[str] = []
@@ -542,10 +592,27 @@ def load_runtime_environment(
 
     effective_environment = getenv("APP_ENV", resolved_environment)
 
+    # The branch taken must match the environment ended up in. This re-read of
+    # ambient APP_ENV is the last place where the value *checked* could differ
+    # from the value *used*: a caller that passes environment="dev" explicitly
+    # while ambient APP_ENV says production decided the gate on one value and
+    # would return the other, leaving is_production=False alongside a production
+    # APP_ENV and the protected file never read.
+    if is_production_environment(effective_environment) or _looks_like_production(
+        effective_environment
+    ):
+        raise BootstrapConfigurationError(
+            f"APP_ENV resolved to {effective_environment!r} after the "
+            f"non-production branch was selected on {resolved_environment!r}. "
+            "Refusing rather than running with production configuration that "
+            "was never validated against the protected bootstrap file."
+        )
+
     # Invariant: after this call os.environ["APP_ENV"] always agrees with the
-    # returned environment. Every other read of APP_ENV in the codebase depends
-    # on it, and the split-brain state it prevents (result says dev, environment
-    # says production) is how the paper port was reached.
+    # returned environment, and neither is production. Every other read of
+    # APP_ENV in the codebase depends on it, and the split-brain state it
+    # prevents (result says dev, environment says production) is how the paper
+    # port was reached.
     environ["APP_ENV"] = effective_environment
 
     if _bootstrap_path_exists(path) is not True:
@@ -558,7 +625,7 @@ def load_runtime_environment(
         path,
     )
 
-    return BootstrapLoadResult(
+    result = BootstrapLoadResult(
         environment=effective_environment,
         is_production=False,
         source=source,
@@ -567,6 +634,9 @@ def load_runtime_environment(
         overridden_keys=(),
         warnings=tuple(warnings),
     )
+    if uses_defaults:
+        _CACHED_RESULT = result
+    return result
 
 
 def require_production_value(key: str, value: str | None) -> str:

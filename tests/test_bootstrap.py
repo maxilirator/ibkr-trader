@@ -21,8 +21,10 @@ from ibkr_trader.bootstrap import (
     BootstrapConfigurationError,
     bootstrap_env_path,
     is_production_environment,
+    PAPER_TRADING_PORTS,
     load_runtime_environment,
     require_production_value,
+    reset_runtime_environment_cache,
 )
 from ibkr_trader.config import AppConfig, IbkrConnectionConfig
 
@@ -33,6 +35,7 @@ COMPLETE_BOOTSTRAP = "\n".join(
         "IBKR_HOST=127.0.0.1",
         "IBKR_PORT=4001",
         "IBKR_ACCOUNT_IDS=U1234567",
+        "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json",
         "",
     )
 )
@@ -128,7 +131,8 @@ class ProductionFailClosedTests(TestCase):
         with TemporaryDirectory() as temp_dir:
             path = _write_bootstrap(
                 Path(temp_dir),
-                "DATABASE_URL=postgresql://a@b/c\nIBKR_HOST=h\nIBKR_PORT=4001\n",
+                "DATABASE_URL=postgresql://a@b/c\nIBKR_HOST=h\nIBKR_PORT=4001\n"
+                "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n",
             )
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(BootstrapConfigurationError) as ctx:
@@ -141,7 +145,8 @@ class ProductionFailClosedTests(TestCase):
         with TemporaryDirectory() as temp_dir:
             path = _write_bootstrap(
                 Path(temp_dir),
-                "DATABASE_URL=\nIBKR_HOST=h\nIBKR_PORT=4001\nIBKR_ACCOUNT_ID=U1\n",
+                "DATABASE_URL=\nIBKR_HOST=h\nIBKR_PORT=4001\nIBKR_ACCOUNT_ID=U1\n"
+                "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n",
             )
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(BootstrapConfigurationError) as ctx:
@@ -456,11 +461,12 @@ class PaperPortRefusalTests(TestCase):
         return _write_bootstrap(
             root,
             "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
+            "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n"
             f"IBKR_PORT={port}\nIBKR_ACCOUNT_ID=U1\n{extra}",
         )
 
     def test_paper_port_is_refused_in_production(self) -> None:
-        for port in ("7497", "7496"):
+        for port in ("7497", "4002"):
             with self.subTest(port=port):
                 with TemporaryDirectory() as temp_dir:
                     path = self._bootstrap_with_port(Path(temp_dir), port)
@@ -578,6 +584,7 @@ class EscalationClassRegressionTests(TestCase):
             path = _write_bootstrap(
                 root,
                 "APP_ENV=production\nIBKR_HOST=127.0.0.1\n"
+                "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n"
                 "IBKR_PORT=7497\nIBKR_ACCOUNT_ID=U1\n",
             )
             with patch.dict(os.environ, {}, clear=True):
@@ -725,3 +732,162 @@ class ProductionDetectionPrecisionTests(TestCase):
                                 bootstrap_path=root / "absent.env",
                             )
                 self.assertIn("does not exist", str(ctx.exception))
+
+
+class BranchAndEnvironmentMustAgreeTests(TestCase):
+    """The branch taken must match the environment ended up in.
+
+    The gate decides production from one value; if the value finally returned
+    and written back could differ, a caller sees is_production=False while the
+    process runs with a production APP_ENV that was never validated against the
+    protected file. That is the same "value checked differs from value used"
+    class as the earlier .env and duplicate-key defects.
+    """
+
+    def test_explicit_dev_with_ambient_production_is_refused(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.dict(
+                os.environ,
+                {
+                    "APP_ENV": "production",
+                    BOOTSTRAP_ENV_PATH_VAR: str(root / "absent.env"),
+                },
+                clear=True,
+            ):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="dev", dotenv_path=root / "absent.dotenv"
+                    )
+        message = str(ctx.exception)
+        self.assertIn("non-production branch", message)
+
+    def test_result_and_environment_never_disagree_about_production(self) -> None:
+        """Whatever comes back, is_production and os.environ must agree."""
+        cases = ("dev", "staging", "test", "nonprod")
+        for value in cases:
+            with self.subTest(environment=value):
+                with TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    with patch.dict(os.environ, {}, clear=True):
+                        result = load_runtime_environment(
+                            environment=value,
+                            bootstrap_path=root / "absent.env",
+                            dotenv_path=root / "absent.dotenv",
+                        )
+                        self.assertEqual(
+                            result.is_production,
+                            is_production_environment(os.environ["APP_ENV"]),
+                        )
+                        self.assertFalse(result.is_production)
+
+    def test_explicit_production_still_engages_the_gate(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.dict(os.environ, {"APP_ENV": "dev"}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=root / "absent.env"
+                    )
+        self.assertIn("does not exist", str(ctx.exception))
+
+
+class PaperPortConventionTests(TestCase):
+    """The IBKR port convention is easy to invert, and inverting it here is
+    worse than having no check: it refuses a live port while waving the paper
+    port through.
+
+        TWS         live 7496   paper 7497
+        IB Gateway  live 4001   paper 4002
+
+    This deployment runs IB Gateway, so 4002 is the one that matters.
+    """
+
+    def test_paper_ports_are_the_paper_ones(self) -> None:
+        self.assertIn(7497, PAPER_TRADING_PORTS)   # TWS paper
+        self.assertIn(4002, PAPER_TRADING_PORTS)   # IB Gateway paper
+
+    def test_live_ports_are_not_treated_as_paper(self) -> None:
+        self.assertNotIn(4001, PAPER_TRADING_PORTS)  # IB Gateway live
+        self.assertNotIn(7496, PAPER_TRADING_PORTS)  # TWS live
+
+    def test_gateway_paper_port_is_refused_in_production(self) -> None:
+        """4002 is what .env.example ships; it must not reach production."""
+        with TemporaryDirectory() as temp_dir:
+            path = _write_bootstrap(
+                Path(temp_dir),
+                "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
+                "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n"
+                "IBKR_PORT=4002\nIBKR_ACCOUNT_ID=U1\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("paper-trading port", str(ctx.exception))
+
+
+class QDataCatalogRequirementTests(TestCase):
+    """Q_DATA_CATALOG_PATH has no default and the checkout .env is not read in
+    production, so omitting it kills startup with an error that reads like a
+    data problem rather than a configuration one."""
+
+    def test_missing_catalog_path_is_reported_with_the_other_keys(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = _write_bootstrap(
+                Path(temp_dir),
+                "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
+                "IBKR_PORT=4001\nIBKR_ACCOUNT_ID=U1\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("Q_DATA_CATALOG_PATH", str(ctx.exception))
+
+
+class BootstrapCachingTests(TestCase):
+    """Loaded once per process.
+
+    AppConfig.from_env() is reached from the live order-submission path, so an
+    uncached load would re-validate the protected file on every order: a chmod
+    or a half-finished edit would break order validation on a running service.
+    """
+
+    def setUp(self) -> None:
+        reset_runtime_environment_cache()
+
+    def tearDown(self) -> None:
+        reset_runtime_environment_cache()
+
+    def test_default_argument_calls_are_cached(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            dotenv = Path(temp_dir) / ".env"
+            dotenv.write_text("APP_TIMEZONE=UTC\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("ibkr_trader.config.DEFAULT_ENV_FILE", dotenv):
+                    first = load_runtime_environment()
+                    # Removing the file must not change a cached result.
+                    dotenv.unlink()
+                    second = load_runtime_environment()
+        self.assertIs(first, second)
+
+    def test_explicit_arguments_bypass_and_do_not_populate_the_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.dict(os.environ, {}, clear=True):
+                explicit = load_runtime_environment(
+                    environment="staging",
+                    bootstrap_path=root / "absent.env",
+                    dotenv_path=root / "absent.dotenv",
+                )
+                self.assertEqual(explicit.environment, "staging")
+                with patch("ibkr_trader.config.DEFAULT_ENV_FILE", root / "none.env"):
+                    default_call = load_runtime_environment()
+                    cached_call = load_runtime_environment()
+        # The explicit call did not populate the cache...
+        self.assertIsNot(explicit, default_call)
+        # ...but the first default call did.
+        self.assertIs(default_call, cached_call)
