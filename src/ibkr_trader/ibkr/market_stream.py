@@ -595,122 +595,175 @@ class LiveMarketDataStreamService:
                         -bar_limit:
                     ]
                 ]
-            connected = self._client is not None and self._client.isConnected()
-            now = _utc_now()
-            latest_quote_at = self._latest_quote_update_locked()
-            latest_trade_at = self._latest_trade_update_locked()
-            latest_market_data_at = max(
-                [item for item in (latest_quote_at, latest_trade_at) if item is not None],
-                default=None,
-            )
-            latest_market_data_age_seconds = (
-                int((now - latest_market_data_at).total_seconds())
-                if latest_market_data_at is not None
-                else None
-            )
-            stale_after_seconds = (
-                int(self._stale_data_after_seconds)
-                if self._stale_data_after_seconds > 0
-                else None
-            )
-            is_stale = self._is_stream_stale_locked(now)
             return {
-                "running": connected,
-                "started_at": (
-                    self._started_at.isoformat() if self._started_at is not None else None
-                ),
-                "last_error": self._last_error,
-                "consecutive_failures": self._consecutive_failures,
-                "cooldown_until": (
-                    self._cooldown_until.isoformat()
-                    if self._cooldown_until is not None
-                    else None
-                ),
-                "cooldown_seconds_remaining": self._cooldown_seconds_remaining_locked(),
-                "connect_attempt_count": self._connect_attempt_count,
-                "connect_success_count": self._connect_success_count,
-                "last_connect_attempt_at": (
-                    self._last_connect_attempt_at.isoformat()
-                    if self._last_connect_attempt_at is not None
-                    else None
-                ),
-                "last_connect_success_at": (
-                    self._last_connect_success_at.isoformat()
-                    if self._last_connect_success_at is not None
-                    else None
-                ),
-                "last_disconnect_observed_at": (
-                    self._last_disconnect_observed_at.isoformat()
-                    if self._last_disconnect_observed_at is not None
-                    else None
-                ),
-                "latest_market_data_at": (
-                    latest_market_data_at.isoformat()
-                    if latest_market_data_at is not None
-                    else None
-                ),
-                "latest_market_data_age_seconds": latest_market_data_age_seconds,
-                "latest_quote_at": (
-                    latest_quote_at.isoformat() if latest_quote_at is not None else None
-                ),
-                "latest_trade_at": (
-                    latest_trade_at.isoformat() if latest_trade_at is not None else None
-                ),
-                "stale_after_seconds": stale_after_seconds,
-                "is_stale": is_stale,
-                "stale_reconnect_enabled": self._stale_reconnect_enabled,
-                "stale_reconnect_allowed": self._stale_reconnect_allowed_locked(now),
-                "stale_reconnect_count": self._stale_reconnect_count,
-                "last_connectivity_event_at": (
-                    self._last_connectivity_event_at.isoformat()
-                    if self._last_connectivity_event_at is not None
-                    else None
-                ),
-                "last_connectivity_event_code": self._last_connectivity_event_code,
-                "last_connectivity_event_message": self._last_connectivity_event_message,
-                "connectivity_resubscribe_count": self._connectivity_resubscribe_count,
-                "connectivity_maintained_count": self._connectivity_maintained_count,
-                "market_data_line_limit": (
-                    self._pacing_governor.config.max_market_data_lines
-                    if self._pacing_governor is not None
-                    else None
-                ),
-                "last_stale_detected_at": (
-                    self._last_stale_detected_at.isoformat()
-                    if self._last_stale_detected_at is not None
-                    else None
-                ),
-                "desired_subscription_count": len(self._desired_contracts_by_key),
-                "desired_symbols": sorted(self._desired_contracts_by_key),
-                "last_desired_update_at": (
-                    self._last_desired_update_at.isoformat()
-                    if self._last_desired_update_at is not None
-                    else None
-                ),
-                "desired_update_count": self._desired_update_count,
-                "desired_noop_count": self._desired_noop_count,
-                "subscribed_count": len(self._subscriptions_by_key),
-                "last_subscribe_request_at": (
-                    self._last_subscribe_request_at.isoformat()
-                    if self._last_subscribe_request_at is not None
-                    else None
-                ),
-                "last_subscription_change_at": (
-                    self._last_subscription_change_at.isoformat()
-                    if self._last_subscription_change_at is not None
-                    else None
-                ),
-                "subscribe_request_count": self._subscribe_request_count,
-                "subscribe_noop_count": self._subscribe_noop_count,
-                "actual_subscription_count": self._actual_subscription_count,
-                "actual_unsubscription_count": self._actual_unsubscription_count,
-                "market_data_type_request_count": self._market_data_type_request_count,
+                **self._health_fields_locked(),
                 "subscriptions": subscriptions,
                 "quote_count": len(quotes),
                 "quotes": quotes,
                 "bars_by_symbol": bars_by_symbol,
-                "errors": list(self._errors[-50:]),
             }
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return only the connection/staleness fields of :meth:`snapshot`.
+
+        ``snapshot`` serialises every quote and up to ``bar_limit`` bars for
+        every subscribed symbol, which is far too expensive for an endpoint that
+        gets polled. Health classification needs none of that, so this returns
+        the same health fields without touching quotes or bars.
+
+        Acquires the lock non-blockingly. ``_restore_desired_subscriptions``
+        holds it across pacing-governed IBKR calls for up to one subscription
+        batch, and a health endpoint that can block for that long would stall
+        the operator watchdog exactly during stream-reconnect churn - the moment
+        Gateway trouble is most likely. Losing the race reports
+        ``status_available: False`` (classified as unknown) rather than waiting
+        or inventing a state.
+        """
+        if not self._lock.acquire(blocking=False):
+            return {
+                "status_available": False,
+                "unavailable_reason": (
+                    "Market stream status is unavailable because the stream lock "
+                    "is busy."
+                ),
+            }
+        try:
+            return self._health_fields_locked()
+        finally:
+            self._lock.release()
+
+    def _health_fields_locked(self) -> dict[str, Any]:
+        """Build the health portion of the stream snapshot.
+
+        Shared by :meth:`snapshot` and :meth:`health_snapshot` so the two can
+        never disagree about what "running" or "is_stale" mean.
+        """
+        connected = self._client is not None and self._client.isConnected()
+        now = _utc_now()
+        latest_quote_at = self._latest_quote_update_locked()
+        latest_trade_at = self._latest_trade_update_locked()
+        latest_market_data_at = max(
+            [item for item in (latest_quote_at, latest_trade_at) if item is not None],
+            default=None,
+        )
+        latest_market_data_age_seconds = (
+            int((now - latest_market_data_at).total_seconds())
+            if latest_market_data_at is not None
+            else None
+        )
+        stale_after_seconds = (
+            int(self._stale_data_after_seconds)
+            if self._stale_data_after_seconds > 0
+            else None
+        )
+        is_stale = self._is_stream_stale_locked(now)
+        # Whether the supervisor thread is actually alive, not whether it was
+        # once configured. This is the only honest answer to "will a dropped
+        # stream come back on its own?", and the caller that decides to start
+        # the supervisor lives outside this class.
+        auto_reconnect_active = (
+            self._supervisor_thread is not None and self._supervisor_thread.is_alive()
+        )
+        # Staleness can only be judged when a positive threshold is configured.
+        # `_is_stream_stale_locked` returns False both for "fresh" and for
+        # "detection disabled", so that boolean alone cannot be trusted.
+        staleness_detectable = self._stale_data_after_seconds > 0
+        return {
+            "status_available": True,
+            "auto_reconnect_active": auto_reconnect_active,
+            "staleness_detectable": staleness_detectable,
+            "running": connected,
+            "started_at": (
+                self._started_at.isoformat() if self._started_at is not None else None
+            ),
+            "last_error": self._last_error,
+            "consecutive_failures": self._consecutive_failures,
+            "cooldown_until": (
+                self._cooldown_until.isoformat()
+                if self._cooldown_until is not None
+                else None
+            ),
+            "cooldown_seconds_remaining": self._cooldown_seconds_remaining_locked(),
+            "connect_attempt_count": self._connect_attempt_count,
+            "connect_success_count": self._connect_success_count,
+            "last_connect_attempt_at": (
+                self._last_connect_attempt_at.isoformat()
+                if self._last_connect_attempt_at is not None
+                else None
+            ),
+            "last_connect_success_at": (
+                self._last_connect_success_at.isoformat()
+                if self._last_connect_success_at is not None
+                else None
+            ),
+            "last_disconnect_observed_at": (
+                self._last_disconnect_observed_at.isoformat()
+                if self._last_disconnect_observed_at is not None
+                else None
+            ),
+            "latest_market_data_at": (
+                latest_market_data_at.isoformat()
+                if latest_market_data_at is not None
+                else None
+            ),
+            "latest_market_data_age_seconds": latest_market_data_age_seconds,
+            "latest_quote_at": (
+                latest_quote_at.isoformat() if latest_quote_at is not None else None
+            ),
+            "latest_trade_at": (
+                latest_trade_at.isoformat() if latest_trade_at is not None else None
+            ),
+            "stale_after_seconds": stale_after_seconds,
+            "is_stale": is_stale,
+            "stale_reconnect_enabled": self._stale_reconnect_enabled,
+            "stale_reconnect_allowed": self._stale_reconnect_allowed_locked(now),
+            "stale_reconnect_count": self._stale_reconnect_count,
+            "last_connectivity_event_at": (
+                self._last_connectivity_event_at.isoformat()
+                if self._last_connectivity_event_at is not None
+                else None
+            ),
+            "last_connectivity_event_code": self._last_connectivity_event_code,
+            "last_connectivity_event_message": self._last_connectivity_event_message,
+            "connectivity_resubscribe_count": self._connectivity_resubscribe_count,
+            "connectivity_maintained_count": self._connectivity_maintained_count,
+            "market_data_line_limit": (
+                self._pacing_governor.config.max_market_data_lines
+                if self._pacing_governor is not None
+                else None
+            ),
+            "last_stale_detected_at": (
+                self._last_stale_detected_at.isoformat()
+                if self._last_stale_detected_at is not None
+                else None
+            ),
+            "desired_subscription_count": len(self._desired_contracts_by_key),
+            "desired_symbols": sorted(self._desired_contracts_by_key),
+            "last_desired_update_at": (
+                self._last_desired_update_at.isoformat()
+                if self._last_desired_update_at is not None
+                else None
+            ),
+            "desired_update_count": self._desired_update_count,
+            "desired_noop_count": self._desired_noop_count,
+            "subscribed_count": len(self._subscriptions_by_key),
+            "last_subscribe_request_at": (
+                self._last_subscribe_request_at.isoformat()
+                if self._last_subscribe_request_at is not None
+                else None
+            ),
+            "last_subscription_change_at": (
+                self._last_subscription_change_at.isoformat()
+                if self._last_subscription_change_at is not None
+                else None
+            ),
+            "subscribe_request_count": self._subscribe_request_count,
+            "subscribe_noop_count": self._subscribe_noop_count,
+            "actual_subscription_count": self._actual_subscription_count,
+            "actual_unsubscription_count": self._actual_unsubscription_count,
+            "market_data_type_request_count": self._market_data_type_request_count,
+            "errors": list(self._errors[-50:]),
+        }
 
     def _latest_quote_update_locked(self) -> datetime | None:
         return max(

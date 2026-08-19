@@ -100,6 +100,11 @@ class ManagedSessionStatus:
     circuit_breaker_reason: str | None
     circuit_breaker_until: datetime | None
     metrics: ManagedSessionMetrics
+    #: False when the snapshot was taken without the session lock (a
+    #: non-blocking ``status()`` call that lost the race). The connection fields
+    #: are then last-known values, not observed state, and must not be read as
+    #: "disconnected" - the session is very likely busy serving a broker call.
+    status_available: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -528,6 +533,7 @@ class ManagedSyncSession:
                     last_disconnect_at=self._last_disconnect_at,
                     last_checkout_at=self._last_checkout_at,
                 ),
+                status_available=False,
             )
 
         try:

@@ -639,6 +639,20 @@ class ApiServerTests01(ApiServerTestCase):
         self.assertIn("broker_circuit", body)
         self.assertIn("broker_pacing", body)
 
+        # Named recovery/stream states are reported alongside the raw counters.
+        recovery = body["recovery_policy"]
+        self.assertIsNone(recovery["maintenance_mode_error"])
+        self.assertFalse(recovery["maintenance_mode"])
+        self.assertIn("primary", recovery["broker_sessions"])
+        for role, assessment in recovery["broker_sessions"].items():
+            with self.subTest(role=role):
+                self.assertIn("state", assessment)
+                self.assertIn("allows_new_entries", assessment)
+                # Nothing is connected in this test app, so no entry authority.
+                self.assertFalse(assessment["allows_new_entries"])
+        self.assertIn("state", recovery["market_stream"])
+        self.assertFalse(recovery["market_stream"]["is_usable"])
+
     def test_stockholm_intraday_backfill_endpoint_returns_paged_batch(self) -> None:
         try:
             from fastapi.testclient import TestClient

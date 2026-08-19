@@ -105,6 +105,10 @@ from ibkr_trader.ibkr.market_data_backfill import (
     enqueue_market_data_backfill_request,
 )
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
+from ibkr_trader.ibkr.recovery_policy import (
+    assess_broker_session_payload,
+    assess_market_stream_payload,
+)
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
 from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
@@ -151,6 +155,7 @@ from ibkr_trader.orchestration.operator_controls import (
     InstructionSetCancellationNotFoundError,
     InstructionSetCancellationSelectorError,
     KillSwitchActiveError,
+    broker_maintenance_mode_is_enabled,
     cancel_instruction_set,
     read_kill_switch_state,
     serialize_instruction_set_cancellation_result,
@@ -345,6 +350,67 @@ def _enrich_omxs30_snapshot_previous_close(
     quote.setdefault("last_trade_at", latest_bar.get("timestamp"))
 
 
+def _build_recovery_policy_payload(
+    *,
+    session_statuses: dict[str, Any],
+    circuit_snapshot: dict[str, Any],
+    market_stream_service: Any,
+    session_factory: Any,
+    maintenance_reader: Any = broker_maintenance_mode_is_enabled,
+) -> dict[str, Any]:
+    """Derive the named recovery and stream states for ``/healthz``.
+
+    Read-only reporting: this classifies state that already exists, and never
+    changes broker, stream or runtime behaviour.
+
+    If broker maintenance mode cannot be read, the broker states are reported as
+    ``unknown`` (which withholds all authority) and the read error is surfaced
+    rather than swallowed. Health reporting must not take the whole endpoint down,
+    but it also must not report a state it could not actually establish.
+    """
+    # Left as None when it could not be read. Emitting False would be a default
+    # that looks valid: a caller reading only this field would conclude "not in
+    # maintenance" for a state that was never established.
+    maintenance_mode: bool | None = None
+    maintenance_error: str | None = None
+    try:
+        maintenance_mode = maintenance_reader(session_factory)
+    except Exception as exc:  # noqa: BLE001 - reported, not silently defaulted
+        maintenance_error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning("Broker maintenance mode could not be read: %s", exc)
+
+    sessions: dict[str, Any] = {}
+    for role, status_payload in (session_statuses or {}).items():
+        if maintenance_error is not None:
+            sessions[role] = assess_broker_session_payload(None).to_payload()
+            sessions[role]["reason"] = (
+                "Broker maintenance mode could not be read, so recovery state "
+                f"could not be established: {maintenance_error}"
+            )
+            continue
+        sessions[role] = assess_broker_session_payload(
+            status_payload,
+            circuit_payload=circuit_snapshot,
+            maintenance_mode=bool(maintenance_mode),
+        ).to_payload()
+
+    stream_error: str | None = None
+    try:
+        stream_health = market_stream_service.health_snapshot()
+    except Exception as exc:  # noqa: BLE001 - reported, not silently defaulted
+        stream_health = None
+        stream_error = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning("Market stream health snapshot failed: %s", exc)
+
+    return {
+        "broker_sessions": sessions,
+        "market_stream": assess_market_stream_payload(stream_health).to_payload(),
+        "market_stream_error": stream_error,
+        "maintenance_mode": maintenance_mode,
+        "maintenance_mode_error": maintenance_error,
+    }
+
+
 def register_broker_market_routes(app: Any, context: Any) -> None:
     app_config = context.app_config
     session_factory = context.session_factory
@@ -381,6 +447,8 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
             broker_monitor.request_cycle_if_due(
                 min_interval_seconds=app_config.broker_status_refresh_min_interval_seconds
             )
+        session_statuses = broker_sessions.status_snapshot(blocking=False)
+        circuit_snapshot = broker_circuit.snapshot()
         return {
             "status": "ok",
             "local_only": app_config.api.require_loopback_only,
@@ -388,8 +456,14 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
             "api_port": app_config.api.port,
             "runtime_timezone": app_config.timezone,
             "session_calendar_path": str(app_config.session_calendar_path),
-            "broker_sessions": broker_sessions.status_snapshot(blocking=False),
-            "broker_circuit": broker_circuit.snapshot(),
+            "recovery_policy": _build_recovery_policy_payload(
+                session_statuses=session_statuses,
+                circuit_snapshot=circuit_snapshot,
+                market_stream_service=market_stream_service,
+                session_factory=session_factory,
+            ),
+            "broker_sessions": session_statuses,
+            "broker_circuit": circuit_snapshot,
             "broker_pacing": broker_pacing_governor.snapshot(),
             "ibgateway": read_ibgateway_diagnostics(),
             "broker_operations": broker_sessions.activity_tracker.snapshot(recent_limit=10),
