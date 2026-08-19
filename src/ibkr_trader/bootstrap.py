@@ -199,6 +199,19 @@ def _parse_env_text(text: str) -> dict[str, str]:
             continue
         values[key] = value
 
+    # A NUL byte cannot go into os.environ. Caught here, before anything is
+    # applied, so it raises a BootstrapConfigurationError naming the key rather
+    # than a bare ValueError from halfway through the apply loop with some keys
+    # already set.
+    embedded_nul = sorted(
+        key for key, value in values.items() if "\0" in key or "\0" in value
+    )
+    if embedded_nul:
+        raise BootstrapConfigurationError(
+            "Environment file contains a NUL byte in: "
+            f"{', '.join(embedded_nul)}. Environment values cannot contain NUL."
+        )
+
     if duplicates:
         # Refused rather than resolved. This parser is first-wins, but POSIX
         # `. file` and systemd EnvironmentFile= are both last-wins, so a
@@ -304,31 +317,18 @@ def _describe_access_failure(path: Path, exc: OSError) -> str:
     )
 
 
-def _assert_protected_location(path: Path) -> Path:
-    """Verify the file's *neighbourhood*, not just its own mode.
+def _assert_location_is_protected(resolved: Path) -> None:
+    """Refuse a file whose *neighbourhood* cannot be trusted.
 
-    Checking the file alone is not enough. A ``0600`` file inside a
-    world-writable directory can be unlinked and replaced by any local user, and
-    a symlink can point a correctly-permissioned path at content the service
-    user controls. Both leave the file's own mode looking impeccable.
+    Checking the file alone is not enough: a ``0600`` file inside a
+    world-writable directory can be unlinked and replaced by any local user.
 
     Also refuses a path inside the source tree. The override variable is read
     from the same ambient environment this module treats as untrustworthy, and
-    without this it can aim production straight at the checkout ``.env`` - the
-    exact thing rule 1 exists to prevent, defeated through the escape hatch.
-
-    Returns the fully resolved path, so what gets recorded and read is the real
-    target rather than the link.
+    without this it can aim production straight at the checkout ``.env`` - rule
+    1 defeated through its own escape hatch.
     """
     from ibkr_trader.config import PROJECT_ROOT
-
-    if _bootstrap_path_exists(path) is False:
-        # Let the read produce the "does not exist" message, which is the more
-        # actionable one. Location checks on a path that is not there would only
-        # obscure it.
-        return path
-
-    resolved = path.resolve()
 
     try:
         resolved.relative_to(PROJECT_ROOT.resolve())
@@ -342,105 +342,122 @@ def _assert_protected_location(path: Path) -> Path:
             "started from."
         )
 
-    parent = resolved.parent
-    try:
-        parent_mode = parent.stat().st_mode
-    except OSError as exc:
-        raise BootstrapConfigurationError(
-            _describe_access_failure(parent, exc)
-        ) from exc
-
-    if parent_mode & (stat.S_IWOTH | stat.S_IWGRP):
-        raise BootstrapConfigurationError(
-            f"Directory {parent} is group- or world-writable "
-            f"(mode {stat.filemode(parent_mode)}). Anyone able to write there "
-            "can replace the bootstrap file regardless of its own permissions. "
-            f"Fix with: chmod go-w {parent}"
-        )
-
-    try:
-        owner = resolved.stat().st_uid
-    except OSError as exc:
-        raise BootstrapConfigurationError(
-            _describe_access_failure(resolved, exc)
-        ) from exc
-
-    if owner not in {0, os.geteuid()}:
-        raise BootstrapConfigurationError(
-            f"Bootstrap environment file {resolved} is owned by uid {owner}, "
-            f"which is neither root nor the service user (uid {os.geteuid()}). "
-            "A file owned by another account can be rewritten without notice."
-        )
-
-    return resolved
+    # Every ancestor, not just the immediate parent: anyone able to write a
+    # grandparent can rename the parent away and substitute their own tree.
+    # Sticky directories (/tmp) are exempt - the sticky bit is precisely the
+    # guarantee that others cannot remove entries they do not own.
+    for ancestor in [resolved.parent, *resolved.parent.parents]:
+        try:
+            mode = ancestor.stat().st_mode
+        except OSError as exc:
+            raise BootstrapConfigurationError(
+                _describe_access_failure(ancestor, exc)
+            ) from exc
+        if mode & (stat.S_IWOTH | stat.S_IWGRP) and not mode & stat.S_ISVTX:
+            raise BootstrapConfigurationError(
+                f"Directory {ancestor} is group- or world-writable "
+                f"(mode {stat.filemode(mode)}). Anyone able to write there can "
+                "replace the bootstrap file regardless of its own permissions. "
+                f"Fix with: chmod go-w {ancestor}"
+            )
 
 
-def _assert_not_world_accessible(path: Path) -> None:
-    """Refuse to use a secrets file that any local user can read.
+def _assert_opened_file_is_protected(resolved: Path, info: os.stat_result) -> None:
+    """Validate the *opened inode*, not a path that may since have changed.
 
-    Group access is permitted so a service group can share the file; world
-    access is not, because that defeats the point of a protected environment.
+    Every check here reads from a ``fstat`` of the descriptor the contents are
+    read from, so the file that is validated and the file that is used are the
+    same inode by construction. Validating a path and then re-opening it is a
+    race, and a real one: a rename between the two lets an unvalidated file be
+    read as though it had passed.
     """
-    try:
-        mode = path.stat().st_mode
-    except OSError as exc:
+    if not stat.S_ISREG(info.st_mode):
         raise BootstrapConfigurationError(
-            f"Bootstrap environment file {path} could not be inspected: {exc}. "
-            "Production startup requires a readable protected environment file."
-        ) from exc
+            f"Bootstrap environment path {resolved} is not a regular file."
+        )
 
-    if mode & (stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH):
+    if info.st_mode & (stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH):
         raise BootstrapConfigurationError(
-            f"Bootstrap environment file {path} is world-accessible "
-            f"(mode {stat.filemode(mode)}). It holds secrets and must not be "
-            "readable by all local users. Fix with: "
-            f"chmod o= {path}"
+            f"Bootstrap environment file {resolved} is world-accessible "
+            f"(mode {stat.filemode(info.st_mode)}). It holds secrets and must "
+            f"not be readable by all local users. Fix with: chmod o= {resolved}"
         )
 
     # Group *read* is allowed so a service group can share the file. Group
     # *write* is not: anyone in that group could redirect DATABASE_URL to
     # another database, or change IBKR_PORT, without touching this code.
-    if mode & stat.S_IWGRP:
+    if info.st_mode & stat.S_IWGRP:
         raise BootstrapConfigurationError(
-            f"Bootstrap environment file {path} is group-writable "
-            f"(mode {stat.filemode(mode)}). Anyone in that group could "
-            "redirect the ledger database or the Gateway port. Fix with: "
-            f"chmod g-w {path}"
+            f"Bootstrap environment file {resolved} is group-writable "
+            f"(mode {stat.filemode(info.st_mode)}). Anyone in that group could "
+            f"redirect the ledger database or the Gateway port. Fix with: "
+            f"chmod g-w {resolved}"
+        )
+
+    if info.st_uid not in {0, os.geteuid()}:
+        raise BootstrapConfigurationError(
+            f"Bootstrap environment file {resolved} is owned by uid "
+            f"{info.st_uid}, which is neither root nor the service user (uid "
+            f"{os.geteuid()}). A file owned by another account can be "
+            "rewritten without notice."
         )
 
 
-def _read_bootstrap_file(path: Path) -> dict[str, str]:
-    try:
-        exists = path.exists()
-    except OSError as exc:
-        raise BootstrapConfigurationError(
-            _describe_access_failure(path, exc)
-        ) from exc
+def _read_protected_file(path: Path) -> tuple[dict[str, str], Path]:
+    """Open the protected file once and validate the descriptor it returned.
 
-    if not exists:
+    Returns the parsed values and the resolved path, so the audit record names
+    what was actually read rather than a symlink pointing at it.
+    """
+    resolved = path.resolve()
+    _assert_location_is_protected(resolved)
+
+    try:
+        # O_NOFOLLOW on the already-resolved path: symlinks are followed once,
+        # deliberately, by resolve(); a symlink appearing at the resolved path
+        # afterwards is a swap and is refused rather than followed.
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
         raise BootstrapConfigurationError(
             f"Bootstrap environment file {path} does not exist. Production "
             "startup is fail-closed and will not fall back to checkout-local "
             "configuration or to built-in defaults. Create the file (see "
             "docs/bootstrap-configuration.md) or set "
             f"{BOOTSTRAP_ENV_PATH_VAR} to its location."
-        )
-    if not path.is_file():
+        ) from exc
+    except IsADirectoryError as exc:
         raise BootstrapConfigurationError(
-            f"Bootstrap environment path {path} is not a regular file."
-        )
-
-    _assert_not_world_accessible(path)
-
-    try:
-        text = path.read_text(encoding="utf-8")
+            f"Bootstrap environment path {resolved} is not a regular file."
+        ) from exc
     except OSError as exc:
         raise BootstrapConfigurationError(
-            f"Bootstrap environment file {path} could not be read: {exc}. "
-            "Check that the service user has read access."
+            _describe_access_failure(resolved, exc)
         ) from exc
 
-    return _parse_env_text(text)
+    try:
+        _assert_opened_file_is_protected(resolved, os.fstat(descriptor))
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1  # ownership transferred to the file object
+            text = handle.read()
+    except UnicodeDecodeError as exc:
+        raise BootstrapConfigurationError(
+            f"Bootstrap environment file {resolved} is not valid UTF-8: {exc}."
+        ) from exc
+    except OSError as exc:
+        raise BootstrapConfigurationError(
+            f"Bootstrap environment file {resolved} could not be read: {exc}. "
+            "Check that the service user has read access."
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    return _parse_env_text(text), resolved
+
+
+def _read_bootstrap_file(path: Path) -> dict[str, str]:
+    """Read the protected file outside production, where it is optional."""
+    return _read_protected_file(path)[0]
 
 
 def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
@@ -604,12 +621,11 @@ def load_runtime_environment(
                 "the protected environment must be identified by absolute path."
             )
 
-        # Validate the location before the contents: a file in an untrustworthy
-        # place should be refused whatever it happens to contain. The resolved
-        # path is used from here on so a symlink cannot make the audit record
-        # name something other than what was read.
-        path = _assert_protected_location(path)
-        values = _read_bootstrap_file(path)
+        # One open, validated by fstat on that same descriptor, read from that
+        # same descriptor. Validating a path and then re-opening it is a race,
+        # and a demonstrated one: a rename between the two let an unvalidated
+        # file be read as though it had passed every location check.
+        values, path = _read_protected_file(path)
         _assert_required_keys_present(values, path)
 
         overridden = tuple(

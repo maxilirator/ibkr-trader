@@ -1153,3 +1153,106 @@ class UnreadableDotenvTests(TestCase):
                 )
         self.assertFalse(result.is_production)
         self.assertTrue(result.warnings)
+
+
+class AtomicValidationTests(TestCase):
+    """Validation and the read must observe the same inode.
+
+    Checks used to run against a path that was then re-opened, so a rename
+    between the two let an unvalidated file be read as though it had passed.
+    That was demonstrated with a real race, won on attempt 4 of 100.
+    """
+
+    def _bootstrap(self, root: Path, port: str = "4001", mode: int = 0o600) -> Path:
+        catalog = root / "catalog.json"
+        catalog.write_text("{}", encoding="utf-8")
+        path = root / "bootstrap.env"
+        path.write_text(
+            "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=h\n"
+            f"IBKR_PORT={port}\nIBKR_ACCOUNT_ID=U1\n"
+            f"Q_DATA_CATALOG_PATH={catalog}\n",
+            encoding="utf-8",
+        )
+        path.chmod(mode)
+        return path
+
+    def test_location_checks_are_not_skipped_for_a_file_that_appears_late(self) -> None:
+        """The early return for a missing file skipped every location check; a
+        file appearing before the read was then never location-validated."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "wide"
+            root.mkdir()
+            path = self._bootstrap(root)
+            root.chmod(0o777)  # world-writable, not sticky
+            try:
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(BootstrapConfigurationError) as ctx:
+                        load_runtime_environment(
+                            environment="production", bootstrap_path=path
+                        )
+            finally:
+                root.chmod(0o755)
+        self.assertIn("writable", str(ctx.exception))
+
+    def test_a_writable_grandparent_is_refused(self) -> None:
+        """Anyone able to write a grandparent can rename the parent away."""
+        with TemporaryDirectory() as temp_dir:
+            wide = Path(temp_dir) / "wide"
+            inner = wide / "cfg"
+            inner.mkdir(parents=True)
+            path = self._bootstrap(inner)
+            wide.chmod(0o777)
+            try:
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(BootstrapConfigurationError) as ctx:
+                        load_runtime_environment(
+                            environment="production", bootstrap_path=path
+                        )
+            finally:
+                wide.chmod(0o755)
+        self.assertIn("writable", str(ctx.exception))
+
+    def test_sticky_world_writable_ancestors_are_permitted(self) -> None:
+        """/tmp is world-writable and sticky; the sticky bit is precisely the
+        guarantee that others cannot remove entries they do not own. Without
+        this exemption every temp-dir deployment would be refused."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = self._bootstrap(root)
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    environment="production", bootstrap_path=path
+                )
+        self.assertTrue(result.is_production)
+
+    def test_a_nul_byte_raises_a_configuration_error_before_applying(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = root / "catalog.json"
+            catalog.write_text("{}", encoding="utf-8")
+            path = root / "bootstrap.env"
+            path.write_text(
+                "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=h\x00bad\n"
+                f"IBKR_PORT=4001\nIBKR_ACCOUNT_ID=U1\nQ_DATA_CATALOG_PATH={catalog}\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+                self.assertIsNone(os.environ.get("DATABASE_URL"))
+        self.assertIn("NUL", str(ctx.exception))
+
+    def test_non_utf8_protected_file_is_a_configuration_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bootstrap.env"
+            path.write_bytes(b"DATABASE_URL=\xff\xfe\x00")
+            path.chmod(0o600)
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("UTF-8", str(ctx.exception))
