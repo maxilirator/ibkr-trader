@@ -457,3 +457,65 @@ unaffected.
   require explicit Mattias approval and live-host access
 - Nothing deployed. No live host contacted. Gateway, watchdog restart authority,
   kill switch, and RL runner mode all untouched.
+
+## Phase 2 — atomic validation (commit `1084857`)
+
+Final adversarial verification found a genuine TOCTOU and **won the race**, on
+attempt 4 of 100. The gate's checks and its read observed different filesystem
+states, so location validation could be skipped entirely.
+
+Two causes. `_assert_protected_location` returned early when the file did not
+exist, so a file appearing before the subsequent read was never
+location-validated. And the read performed four independent path lookups
+(`exists`, `is_file`, `stat`, `read_text`), so the mode checked and the inode
+read need not be the same file. Between them they re-opened three routes that had
+just been closed, and voided the new ownership check.
+
+Resolved by: resolve once, run location checks unconditionally, then a single
+`os.open(O_RDONLY|O_NOFOLLOW)` whose `os.fstat` drives every remaining check and
+whose descriptor is what the contents are read from.
+
+**Both races re-run against the fixed code:**
+
+| Race | Before | After |
+| --- | --- | --- |
+| Location checks (world-writable parent, foreign uid) | won on attempt 4 of 100 | **0 successful starts in 400 attempts** |
+| File mode (`0666` file swapped in) | won within 100 attempts | **0 bad reads in 400 attempts**, with 79 legitimate starts in the same run |
+
+The 79 legitimate starts matter: the check admits the good file and refuses the
+swapped one, rather than failing everything.
+
+Also closed: only the immediate parent's writability was checked (a writable
+grandparent allows renaming the parent away); a NUL byte escaped as a bare
+`ValueError` after partial application; a non-UTF-8 protected file raised
+`UnicodeDecodeError`.
+
+Sticky directories are exempt from the ancestor-writability check. The sticky bit
+is precisely the guarantee that others cannot remove entries they do not own;
+without the exemption no `/tmp`-based deployment or test would start.
+
+### Verification also confirmed
+
+- All **ten** previously-closed escalation routes remain closed
+- Non-production is not over-blocked across fourteen environment names
+  (`dev`, `staging`, `nonprod`, `preprod`, `prod-eu`, `non-production`,
+  `production-mirror`, `reproduction`, `prod_1`, `prod/eu`, `live`, `qa`,
+  `uat`, `test`), nor by absent/unreadable/non-UTF-8/directory `.env`
+- The documented `0750`/`0640` `root:<service group>` shape starts and the
+  protected file overrides ambient values, recorded in `overridden_keys`
+- No secret **value** reaches any exception, log record, or audit payload on any
+  path. `Q_DATA_CATALOG_PATH` and `IBKR_PORT` do appear in diagnostics; neither
+  is a secret.
+
+### Residual, accepted
+
+- A **hard link** from outside the tree to the checkout `.env` defeats the
+  source-tree check. Requires deliberate operator action, and every content
+  check still applies.
+- A residual TOCTOU exists between validating `Q_DATA_CATALOG_PATH` and q-data
+  first using it. Unavoidable without holding the file open across startup.
+- `-prod-`, `_prod_`, `prod|eu`, `prod|`, `prod#eu` are refused as malformed
+  production attempts. None is a plausible environment name; every realistic one
+  is accepted.
+
+Suite: **699 passed, 1 skipped, 0 failed.**
