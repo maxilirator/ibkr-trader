@@ -42,37 +42,44 @@ def write_catalog(root: Path) -> Path:
         }
     catalog = root / "catalog.json"
     catalog.write_text(json.dumps({"contract_version": 1, "datasets": entries}), encoding="utf-8")
-    _write_shortability_snapshot(root, entries)
     return catalog
 
 
-def _write_shortability_snapshot(root: Path, entries: dict[str, dict[str, str]]) -> None:
-    """Write an empty Stockholm shortable-list snapshot beside the identity dataset.
+def write_shortability_snapshot(output_root: Path) -> Path:
+    """Write an empty Stockholm shortable-list snapshot under this service's output root.
 
-    Short-sale validation reads this file and rejects any symbol not on it. Without
-    the file at all it raises "snapshot is missing" instead, which short-circuits
-    the validation tests before they reach the rejection path they are asserting.
+    Short-sale validation reads this file and rejects any symbol not on it.
+    Without the file at all it raises "snapshot is missing", which
+    short-circuits the validation tests before they reach the rejection path
+    they are asserting.
 
-    The list is deliberately empty rather than populated: "nothing is shortable"
-    is the safe fixture, and it is the state those tests actually need. It is not
-    a stand-in for real shortability data - runtime code still fails loudly when
+    It goes under ``output_root``, not beside the identity dataset. Seeding it
+    into a q-data dataset directory would have the test fixture perform the
+    exact write the production code was just changed to stop doing, and would
+    make a test asserting that directory stays clean fail against correct code.
+
+    The list is deliberately empty rather than populated: "nothing is
+    shortable" is the safe fixture and the state those tests need. It is not a
+    stand-in for real shortability data -- runtime code still fails loudly when
     the real snapshot is absent.
     """
-    identity = entries["xsto.world.instrument_identity"]["relative_path"]
-    snapshot = root / identity
-    snapshot = snapshot.parent / "shortability" / "shortability_latest.json"
+    snapshot = output_root / "shortability" / "shortability_latest.json"
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     as_of = datetime.now(UTC).astimezone().date().isoformat()
     snapshot.write_text(
         json.dumps({"as_of_date": as_of, "snapshot_at": as_of, "entries": []}),
         encoding="utf-8",
     )
+    return snapshot
 
 
 @pytest.fixture(autouse=True, scope="session")
 def q_data_catalog(tmp_path_factory: pytest.TempPathFactory) -> Path:
     catalog = write_catalog(tmp_path_factory.mktemp("q-data"))
     os.environ.setdefault("Q_DATA_CATALOG_PATH", str(catalog))
+    output_root = tmp_path_factory.mktemp("ibkr-output")
+    os.environ.setdefault("IBKR_TRADER_OUTPUT_ROOT", str(output_root))
+    write_shortability_snapshot(output_root)
     return catalog
 
 
