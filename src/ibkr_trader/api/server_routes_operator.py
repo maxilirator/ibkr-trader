@@ -215,6 +215,8 @@ from ibkr_trader.orchestration.trader_registry import (
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
 from ibkr_trader.ledger.persistence import persist_broker_runtime_snapshot
 from ibkr_trader.ledger.persistence import persist_broker_order_cancellation_result
+from ibkr_trader.settings_registry import read_settings_registry
+from ibkr_trader.settings_registry import serialize_settings_registry
 from ibkr_trader.read_models import build_operator_dashboard_snapshot
 from ibkr_trader.read_models import build_ledger_dashboard_snapshot
 from ibkr_trader.read_models import build_rl_trader_dashboard_snapshot
@@ -484,6 +486,20 @@ def register_operator_routes(app: Any, context: Any) -> None:
         return {
             "accepted": True,
             "ledger_snapshot": serialize_ledger_dashboard_snapshot(ledger_snapshot),
+        }
+
+    @app.get("/v1/settings")
+    def get_settings_registry() -> dict[str, Any]:
+        """Read-only view of declared non-secret runtime settings.
+
+        There is deliberately no POST counterpart: the registry reports what the
+        runtime resolved, and must not become a second way to change trading
+        behaviour. Secrets are structurally excluded from the registry, so this
+        response cannot carry one.
+        """
+        return {
+            "accepted": True,
+            **serialize_settings_registry(read_settings_registry(session_factory)),
         }
 
     @app.get("/v1/controls/kill-switch")

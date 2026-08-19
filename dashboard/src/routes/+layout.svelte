@@ -4,7 +4,8 @@
   const navigationItems = [
     { href: '/', label: 'Operator Dashboard' },
     { href: '/ledger', label: 'Ledger Dashboard' },
-    { href: '/rl', label: 'RL Trader' }
+    { href: '/rl', label: 'RL Trader' },
+    { href: '/settings', label: 'Settings' }
   ];
 
   function isActive(href, pathname) {

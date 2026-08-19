@@ -74,6 +74,8 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "reconciliation_run",
                 "runtime_service",
                 "runtime_service_event",
+                "runtime_setting",
+                "runtime_setting_event",
                 "trader_action",
                 "trader_deployment",
                 "trader_heartbeat",

@@ -13,3 +13,8 @@ node_modules/
 .DS_Store
 .idea/
 .vscode/
+
+# dashboard build output
+dashboard/build/
+dashboard/.svelte-kit/
+dashboard/node_modules/

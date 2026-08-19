@@ -897,3 +897,66 @@ class RuntimeServiceEventRecord(Base):
     runtime_service: Mapped[RuntimeServiceRecord] = relationship(
         back_populates="events"
     )
+
+
+class RuntimeSettingRecord(TimestampMixin, Base):
+    """Stored value for a declared, non-secret runtime setting.
+
+    Holds only settings declared in ``ibkr_trader.settings_registry``. Secrets
+    stay in the protected bootstrap file; this table is non-secret and audited,
+    so its rows can safely be read by the operator dashboard.
+
+    Values are stored as text and parsed against the declared type on read. A
+    row is an override: a setting with no row resolves to its declared default.
+    """
+
+    __tablename__ = "runtime_setting"
+    __table_args__ = (
+        UniqueConstraint("setting_key", name="uq_runtime_setting_setting_key"),
+        Index("ix_runtime_setting_category", "category"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    setting_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    category: Mapped[str | None] = mapped_column(String(64))
+    updated_by: Mapped[str | None] = mapped_column(String(64))
+    note: Mapped[str | None] = mapped_column(Text)
+
+    events: Mapped[list["RuntimeSettingEventRecord"]] = relationship(
+        back_populates="runtime_setting",
+        cascade="all, delete-orphan",
+    )
+
+
+class RuntimeSettingEventRecord(Base):
+    """Append-only audit trail for runtime setting changes."""
+
+    __tablename__ = "runtime_setting_event"
+    __table_args__ = (
+        Index("ix_runtime_setting_event_setting_id", "runtime_setting_id"),
+        Index("ix_runtime_setting_event_event_at", "event_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_setting_id: Mapped[int] = mapped_column(
+        ForeignKey("runtime_setting.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+    value_before: Mapped[str | None] = mapped_column(Text)
+    value_after: Mapped[str | None] = mapped_column(Text)
+    updated_by: Mapped[str | None] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+
+    runtime_setting: Mapped[RuntimeSettingRecord] = relationship(
+        back_populates="events"
+    )
