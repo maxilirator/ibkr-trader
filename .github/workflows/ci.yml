@@ -1,0 +1,83 @@
+name: CI
+
+# There was no CI in this repository. Every check below is one that was
+# previously only ever run by hand, which means "the tests pass" was an
+# assertion rather than a fact attached to a commit.
+#
+# Nothing here contacts IB Gateway, the live host, or a real database. Tests use
+# in-memory/sqlite fixtures, and the release-evidence step runs with --no-tests
+# so the suite is not executed twice.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Release evidence records the commit and compares the working tree,
+          # so it needs real history rather than a shallow clone.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install project
+        run: uv sync --all-extras
+
+      - name: Lint changed-in-this-work modules
+        # The repository has a large pre-existing ruff backlog, so a repo-wide
+        # gate would fail on day one and be switched off. These are the modules
+        # this programme introduced; they are expected to stay clean.
+        run: |
+          uv run ruff check \
+            src/ibkr_trader/bootstrap.py \
+            src/ibkr_trader/settings_registry.py \
+            src/ibkr_trader/ibkr/recovery_policy.py \
+            scripts/build_release_evidence.py \
+            scripts/preflight_bootstrap_cutover.py \
+            tests/test_bootstrap.py \
+            tests/test_settings_registry.py \
+            tests/test_recovery_policy.py \
+            tests/test_release_evidence.py
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Release evidence
+        run: |
+          uv run python scripts/build_release_evidence.py \
+            --no-tests --output release-evidence.json
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence
+          path: release-evidence.json
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm install --no-audit --no-fund
+
+      - name: Build dashboard
+        # The dashboard is the canonical operator UI; a page that does not
+        # compile is not a deployable release.
+        working-directory: dashboard
+        run: npm run build

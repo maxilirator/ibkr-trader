@@ -253,3 +253,127 @@ confirmed against the live database rather than assumed.
   no provenance/version stamping exists. Blocked on the 3 red baseline tests.
 - **Phase 5** — cutover. Requires explicit Mattias approval. Not started.
 - **Phase 6** — stability observation. Depends on Phase 5.
+
+## Phase 2 — final state
+
+Commits `73bc591`, `a4f9011`, `402ad33`, `1ef68b6`, `aafd1b8`, `0a337e5`.
+
+Rejected on first review, found incomplete on re-verification, and then subjected
+to a red-team exploit hunt and a deployment-safety review in parallel. **Seven**
+distinct ways to reach production without a validated protected file were found
+and closed. Six of the seven were the same defect class: *the value checked
+differed from the value used*, or *state already decided was read a second time*.
+
+| # | Route | Found by |
+| --- | --- | --- |
+| 1 | `.env` declared production after the gate declined to engage | review |
+| 2 | Duplicate `APP_ENV` key: inspected last-wins, applied first-wins | re-verification |
+| 3 | Bootstrap file self-promoted to production when the unit had not — the documented cutover's own intermediate state | re-verification |
+| 4 | `expanduser()` ran before the absolute-path check, so `~/x.env` passed | re-verification |
+| 5 | Non-production branch returned an environment re-read from ambient, disagreeing with the branch it took | red team |
+| 6 | Unkeyed per-process cache served a stale `dev` result after `APP_ENV` became production | self-found while auditing the cache |
+| 7 | `_looks_like_production` substring match refused legitimate names (`nonprod`, `preprod`, `prod-eu`) — the inverse failure: a self-inflicted startup outage | self-found, confirmed by deployment review |
+
+Two further correctness defects were found by the deployment review:
+
+- **`PAPER_TRADING_PORTS` was inverted for this deployment.** It listed
+  `{7497, 7496}`; `7496` is TWS **live**, and `4002` is IB Gateway **paper**.
+  This host runs IB Gateway (`.env.example` and `docs/ib-gateway-setup.md` both
+  use `4002`), so the guard refused a live port while waving the paper port
+  through. Now `{7497, 4002}`.
+- **`Q_DATA_CATALOG_PATH` was not required.** It has no default and fails closed,
+  and production no longer reads `.env`, so the documented cutover produced a
+  guaranteed outage with an error that reads like a data problem.
+
+The runtime environment is now loaded once per process. `AppConfig.from_env()` is
+reached from the live order-submission path, so every order was re-reading and
+re-validating the protected file — a `chmod` would have broken order validation
+on a running service.
+
+### Cutover risk that cannot be fixed in code
+
+Production stops reading `.env` entirely, so every key it supplied that the
+bootstrap file does not silently reverts to a code default — **over 40 keys** for
+this repository's `.env.example`. Combined with the kill switch reading
+*disabled* when its row is absent, a mistyped `DATABASE_URL` yields a service
+that starts cleanly, creates an empty schema, reports healthy, and has no kill
+switch on a live account. That is worse than an outage because nothing looks wrong.
+
+`scripts/preflight_bootstrap_cutover.py` blocks on exactly that, plus paper
+ports, missing keys, bad permissions, and `APP_ENV` in `.env`. It is read-only.
+Verified against a database with no kill-switch row.
+
+### Verification
+
+- `tests/test_bootstrap.py`: 60 passed, with a regression test per route
+- All seven routes re-run against the fixed code: **all refused**, `os.environ` unpolluted
+- Instrumented probe: **0** resolutions of the real protected path across the suite
+- Full suite: **675 passed, 1 skipped, 0 failed**
+
+## Test baseline — now green
+
+The three pre-existing failures are fixed (commit `e7a8ca5`). None was a product
+defect.
+
+- The two Stockholm short-sale tests: the shared q-data fixture never wrote the
+  shortability snapshot, so the validator raised "snapshot is missing" and
+  short-circuited before the rejection path under test. The fixture now writes an
+  empty snapshot. Runtime code still fails loudly when the real one is absent.
+- `test_sync_wrapper`: asserted `sendMsg` forwarding, which is `ibapi`'s
+  behaviour; `ibapi` is not installed, so the in-repo fallback drops the message.
+  The assertion is now scoped to environments with the real library, keeping the
+  wire-audit coverage — this repository's own logic — running everywhere.
+
+**The suite is green, which is what Phase 4's matched-tests gate requires.**
+
+## Phase 3 — settings registry and dashboard `/settings`
+
+Commit `3423d44`. Status: **implemented, independent review pending**.
+
+Typed non-secret settings resolved from a new `runtime_setting` table and shown
+read-only at `/settings` in the existing dashboard. No parallel dashboard.
+
+The secret/non-secret split is enforced in code, not documented:
+`assert_not_secret_key` rejects keys matching `PASSWORD`, `SECRET`, `TOKEN`,
+`CREDENTIAL`, `PRIVATE_KEY`, `API_KEY`, `DATABASE_URL`, `DSN` at import time.
+
+Read-only by design: no `POST /v1/settings` and no application write path, so the
+registry cannot become a second way to change trading behaviour. A test asserts
+no write method is registered.
+
+Resolution never presents a value the runtime is not using: an unparseable stored
+value is reported as an error with the default named as what is in effect, and a
+stored row with no definition is surfaced as undeclared rather than dropped.
+
+Verified: dashboard builds; page rendered against a stub API carrying a payload
+generated from the real registry, exercising the parse-error and undeclared-key
+paths. No local service left running; nothing contacted IB Gateway.
+
+## Phase 4 — verifiable release pipeline
+
+Commit pending. `scripts/build_release_evidence.py` answers one question: **is the
+code running on the host the code someone reviewed?** Deployment is a file copy,
+so nothing otherwise ties a running process to a commit.
+
+Four independent checks, each catching what the others cannot:
+
+| Check | Catches |
+| --- | --- |
+| Provenance | what the build claims to be (commit, branch, dirty state) |
+| Active-tree comparison | an edit made in place on the host — the commit hash is unchanged and `git log` shows nothing |
+| Import provenance | a shadowing install, where reviewed source is present but a stale copy earlier on `sys.path` is what actually runs |
+| Test result | the suite outcome for this exact tree |
+
+Both non-obvious checks were demonstrated, not just written:
+
+- An appended comment to `settings_registry.py` was detected as
+  `content differs`, by name, while `git rev-parse HEAD` was unchanged.
+- A stale `ibkr_trader.bootstrap` placed earlier on `PYTHONPATH` was reported as
+  `resolved outside the repo`.
+
+`--compare` re-computes and diffs against recorded evidence; this is the check to
+run **on the host after deploying**. Exit code 1 on mismatch.
+
+`.github/workflows/ci.yml` adds CI, which did not exist. Lint is scoped to the
+modules this programme introduced rather than repo-wide, because the existing
+ruff backlog is large and a gate that fails on day one gets switched off.
