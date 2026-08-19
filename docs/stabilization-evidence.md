@@ -1,0 +1,163 @@
+# Stabilization program evidence
+
+Acceptance evidence for the phases in `docs/approved-stabilization-goal.md`.
+Append-only: each phase records what was built, how it was verified, and what
+review found. Claims here must be reproducible from the recorded commits.
+
+Branch: `stabilization/phases-1-4`
+Baseline commit: `b7a2973` ("Resolve shared q-data through the catalog only")
+
+## Standing constraints (unchanged by this work)
+
+| Constraint | State | Evidence |
+| --- | --- | --- |
+| Global kill switch enabled | Untouched by this work — **but see Open finding 1** | No change to `orchestration/operator_controls.py` in `ddb394f`/`73bc591` |
+| One dedicated Gateway; legacy `ibgateway.service` disabled | Untouched | No change to `ops/systemd/*`; no Gateway restart or config change performed |
+| Watchdog restart authority disabled | Untouched | `ops/systemd/ibgateway-api-watchdog.service` still sets `WATCHDOG_RESTART_ENABLED=no` |
+| RL runner virtual | Untouched | `ops/systemd/ibkr-trader-rl-runner.service` still passes `--execute-virtual` only |
+| Canonical dashboard extended, not replaced | No parallel dashboard created | No new dashboard app; Phase 3 will extend `dashboard/src/routes/` |
+| No live RL trading enabled | Untouched | No change to `rl/runner_loop.py` mode gating |
+
+Nothing in Phases 1-2 was deployed. No live host was contacted. No Gateway,
+service restart, or configuration change was performed.
+
+## Test baseline
+
+The suite is **not** green on the baseline commit. Recorded here because Phase 4
+gates a release on matched tests and cannot honestly claim "all tests pass".
+
+Baseline `b7a2973`: **3 failed, 538 passed, 1 skipped**.
+
+| Failing test | Cause | Product defect? |
+| --- | --- | --- |
+| `test_sync_wrapper.py::test_send_msg_records_raw_order_protocol_payloads` | Locally installed `ibapi`'s `sendMsg` never reaches the stubbed `conn`; version skew in `.venv` | No — environment |
+| `test_order_preview.py::test_preview_flags_invalid_stockholm_short_before_submit` | `tests/conftest.py::write_catalog` never creates `shortability/shortability_latest.json`; `FileNotFoundError` | No — test fixture gap |
+| `test_order_execution_01.py::test_submit_order_from_batch_rejects_explicit_short_on_non_shortable_stockholm_account` | Same fixture gap | No — test fixture gap |
+
+These three remain failing and unmodified. They are a **Phase 4 prerequisite**:
+a release gate cannot pass while they are red, so they must be fixed or
+explicitly quarantined with justification before Phase 4 completes.
+
+## Phase 1 — Recovery and stream policy
+
+Commit `ddb394f`. Status: **implemented, reviewed, changes applied**.
+
+Added `src/ibkr_trader/ibkr/recovery_policy.py`: named `BrokerRecoveryState`
+(`healthy`/`degraded`/`recovering`/`blocked`/`down`/`maintenance`/`unknown`) and
+`StreamState` (`streaming`/`idle`/`stale`/`reconnecting`/`blocked`/`stopped`/
+`unknown`). Each broker state carries a `RecoveryAuthority`. Classifiers are
+pure functions of a snapshot, so transitions are directly testable.
+
+Surfaced read-only at `/healthz` under `recovery_policy`. No trading, broker or
+reconnect behaviour changed.
+
+### Independent review
+
+Verdict: **APPROVE-WITH-CHANGES**, 3 blocking findings. All 3 were independently
+re-verified against the source before fixing, and all 3 were confirmed real.
+
+| # | Finding | Verified | Resolution |
+| --- | --- | --- | --- |
+| 1 | Stream state read `stale_reconnect_enabled`, a different setting from the one gating the reconnect supervisor (`market_stream_auto_reconnect_enabled`, `server.py:763`). A stream that would never recover reported `reconnecting`. | Confirmed: the auto-reconnect flag was not in the snapshot at all | Snapshot now exposes `auto_reconnect_active` (supervisor thread liveness — the honest observable). Absent ⇒ `unknown`, never optimistic. |
+| 2 | `status(blocking=False)` returns a synthetic `connected=False` when the session lock is busy (`session_manager.py:503-531`). A connected, actively-trading session classified as `recovering`/`down`. | Confirmed | `ManagedSessionStatus.status_available` added; classifies `unknown`. |
+| 3 | `_is_stream_stale_locked` returns `False` both for "fresh" and for "staleness detection disabled" (`market_stream.py:752`). A six-hour-stale feed could classify `streaming`, `is_usable: true`. | Confirmed | Service verdict is now corroborating, not authoritative; undetectable staleness ⇒ `unknown`. |
+
+Non-blocking findings also applied: per-session circuit breaker now blocks even
+when the shared circuit is closed (a successful market-stream connect clears the
+shared circuit out from under a circuit-broken primary session); negative failure
+counts classify `unknown` instead of clamping to healthy; `maintenance_mode`
+reports `null` rather than `false` when unreadable; stream errors surface in the
+payload rather than only in a log line; `health_snapshot()` acquires the stream
+lock non-blockingly so `/healthz` cannot stall the operator watchdog during
+reconnect churn.
+
+Review **refuted** one suspected defect: the `snapshot()` extraction refactor was
+verified key-for-key equivalent at AST level (45 keys, no drift). An exact-key-set
+test (`test_snapshot_returns_exactly_the_contracted_keys`) now pins the contract,
+since a subset check could not have caught key loss.
+
+### Verification
+
+- `tests/test_recovery_policy.py`: 45 passed
+- Full suite: **3 failed (the pre-existing three), 609 passed, 1 skipped**
+- `ruff check` clean on new modules; `market_stream.py`'s 56 pre-existing findings unchanged
+
+## Phase 2 — Fail-closed source-independent bootstrap
+
+Commit `73bc591`. Status: **implemented, independent review pending**.
+
+Added `src/ibkr_trader/bootstrap.py`. With `APP_ENV=production`/`prod`:
+
+- `/etc/ibkr-trader/bootstrap.env` is required; the checkout-local `.env` is
+  never read (source-independence).
+- Missing / non-regular / unreadable / world-accessible / incomplete file raises
+  `BootstrapConfigurationError` and the process does not start. All missing keys
+  are reported at once.
+- Required: `DATABASE_URL`, `IBKR_HOST`, `IBKR_PORT`, and one of
+  `IBKR_ACCOUNT_ID` / `IBKR_ACCOUNT_IDS`. These previously fell back to a local
+  throwaway database and to port `7497` — the **paper** port.
+- The file is authoritative over ambient environment; overridden key names are
+  recorded for audit. It cannot downgrade `APP_ENV` and so cannot disable the
+  enforcement that validated it.
+- Secret values never reach logs, error messages or the audit payload.
+
+Outside production: file optional, `.env` still applies, explicit exports still win.
+
+`APP_ENV=live` is deliberately **not** a production alias — `live` already names
+an RL deployment mode, and the trigger for refusing to start must be unambiguous.
+
+### Verification
+
+- `tests/test_bootstrap.py`: 25 passed, including one test per unsafe default
+  proving it is unreachable in production, and one proving no secret value
+  appears in the error message
+- Full suite: **3 failed (pre-existing), 609 passed, 1 skipped**
+- The pre-existing `test_config.py::test_real_environment_overrides_dotenv`
+  passes **unmodified**, evidence that non-production semantics are unchanged
+
+### Blocking pre-cutover action
+
+Nothing in this repository sets `APP_ENV`. Fail-closed startup engages **only**
+for `production`/`prod`. The value the live host actually uses must be confirmed
+on that host; if it is anything else, these protections are inactive. The
+checklist is in `docs/bootstrap-configuration.md`. Changing it is an application
+startup change and requires explicit operator approval.
+
+## Open findings requiring a decision
+
+### 1. The global kill switch is fail-open on a fresh database (HIGH)
+
+`orchestration/operator_controls.py:117-129` — `_build_kill_switch_status`
+returns `enabled=False` when no `operator_control` row exists. `read_kill_switch_state`
+→ `assert_kill_switch_inactive` therefore **permits new entries** when the
+control row is absent.
+
+Verified directly in source. This contradicts the non-negotiable rule "the
+global kill switch remains enabled throughout this goal": the rule holds only
+because a row happens to exist in the live database. A fresh database, a failed
+schema migration, or a deleted row silently authorises trading.
+
+Not changed unilaterally: it alters kill-switch semantics, and while making it
+fail *closed* is strictly safer than the present behaviour, it is a material
+change to a control the approval gates name explicitly.
+
+Proposed fix, pending approval:
+1. Treat an absent control row as **enabled** (blocked) in
+   `_build_kill_switch_status`, and
+2. seed the row as enabled in `db/init_schema.py`, with an audit event
+   recording that it was seeded rather than operator-set.
+
+Impact to confirm before applying: any environment without the row would begin
+blocking new entries. The RL runner is virtual and `execution_runtime_enabled`
+defaults to `false`, so the expected live impact is nil — but this must be
+confirmed against the live database rather than assumed.
+
+## Phases not started
+
+- **Phase 3** — non-secret typed settings registry + existing dashboard `/settings`.
+  No `/settings` route exists today; `operator_control` is the closest existing
+  pattern to reuse. No migration tool in the repo (schema is `create_all`).
+- **Phase 4** — verifiable release pipeline. No CI exists (`.github/` absent) and
+  no provenance/version stamping exists. Blocked on the 3 red baseline tests.
+- **Phase 5** — cutover. Requires explicit Mattias approval. Not started.
+- **Phase 6** — stability observation. Depends on Phase 5.
