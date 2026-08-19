@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+
+import pytest
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -60,6 +62,7 @@ class ProductionEnvironmentDetectionTests(TestCase):
         self.assertFalse(is_production_environment("live"))
 
 
+@pytest.mark.real_bootstrap_default
 class BootstrapPathTests(TestCase):
     def test_default_path_is_the_protected_etc_location(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -518,3 +521,134 @@ class BootstrapPermissionTests(TestCase):
             with self.assertRaises(BootstrapConfigurationError) as ctx:
                 load_runtime_environment(environment="production")
         self.assertIn("absolute", str(ctx.exception))
+
+
+class EscalationClassRegressionTests(TestCase):
+    """Every known route by which a non-production start could become production.
+
+    These are grouped deliberately: three separate bugs all had the same root
+    cause - APP_ENV being read from os.environ in more than one place, and the
+    candidate file being resolved differently when inspected than when applied.
+    """
+
+    def test_duplicate_app_env_key_cannot_smuggle_production(self) -> None:
+        """The pre-check and the apply step must resolve duplicates identically.
+
+        Last-wins on inspection and first-wins on apply meant a file could be
+        vetted as APP_ENV=dev and applied as APP_ENV=production.
+        """
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dotenv = root / ".env"
+            dotenv.write_text(
+                "APP_ENV=production\nAPP_ENV=dev\n"
+                "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ibkr_trader\n"
+                "IBKR_PORT=7497\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError):
+                    load_runtime_environment(
+                        bootstrap_path=root / "absent.env", dotenv_path=dotenv
+                    )
+                self.assertIsNone(os.environ.get("APP_ENV"))
+                self.assertIsNone(os.environ.get("IBKR_PORT"))
+
+    def test_reversed_duplicate_order_resolves_to_the_inspected_value(self) -> None:
+        """The mirror case. `dev` first wins, so this is genuinely not an
+        escalation - and, critically, the value applied is the value inspected."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dotenv = root / ".env"
+            dotenv.write_text("APP_ENV=dev\nAPP_ENV=production\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    bootstrap_path=root / "absent.env", dotenv_path=dotenv
+                )
+                self.assertEqual(os.environ["APP_ENV"], "dev")
+        self.assertEqual(result.environment, "dev")
+        self.assertFalse(result.is_production)
+
+    def test_bootstrap_file_cannot_escalate_when_the_unit_has_not(self) -> None:
+        """The documented cutover's own intermediate state: the file exists but
+        the unit does not yet set APP_ENV. It must not self-promote, because the
+        production branch - and all its validation - would never run."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = _write_bootstrap(
+                root,
+                "APP_ENV=production\nIBKR_HOST=127.0.0.1\n"
+                "IBKR_PORT=7497\nIBKR_ACCOUNT_ID=U1\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        bootstrap_path=path, dotenv_path=root / "absent.env"
+                    )
+                self.assertIsNone(os.environ.get("APP_ENV"))
+                self.assertIsNone(os.environ.get("IBKR_PORT"))
+        self.assertIn("must not declare production", str(ctx.exception))
+
+    def test_home_relative_override_is_refused_in_production(self) -> None:
+        """expanduser() ran before the absolute check, so ~/x.env slipped past
+        the guard whose own purpose was to reject it."""
+        with patch.dict(
+            os.environ,
+            {"IBKR_TRADER_BOOTSTRAP_ENV": "~/evil-bootstrap.env"},
+            clear=True,
+        ):
+            with self.assertRaises(BootstrapConfigurationError) as ctx:
+                load_runtime_environment(environment="production")
+        self.assertIn("absolute", str(ctx.exception))
+
+    def test_malformed_production_value_is_refused_not_degraded(self) -> None:
+        """`production # live` matches no alias, so it silently became dev: the
+        operator believes production is on while the gate disengages."""
+        # Note " prod " is NOT here: it strips to a valid alias and is accepted.
+        for value in ("production # live", "Production;", "prod-eu"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(BootstrapConfigurationError) as ctx:
+                        load_runtime_environment(environment=value)
+                self.assertIn("not a recognised environment", str(ctx.exception))
+
+    def test_app_env_in_environ_always_agrees_with_the_result(self) -> None:
+        """The invariant the whole defect class violated.
+
+        A split brain - result says dev while os.environ says production -
+        is how IbkrConnectionConfig reached the paper port while AppConfig
+        skipped the DATABASE_URL requirement.
+        """
+        cases = (
+            ("dev", "APP_ENV=dev\n"),
+            ("staging", "APP_ENV=staging\n"),
+            ("dev", ""),
+        )
+        for expected, dotenv_text in cases:
+            with self.subTest(dotenv=dotenv_text):
+                with TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    dotenv = root / ".env"
+                    dotenv.write_text(dotenv_text, encoding="utf-8")
+                    with patch.dict(os.environ, {}, clear=True):
+                        result = load_runtime_environment(
+                            bootstrap_path=root / "absent.env", dotenv_path=dotenv
+                        )
+                        self.assertEqual(os.environ["APP_ENV"], result.environment)
+                        self.assertEqual(result.environment, expected)
+                        self.assertFalse(
+                            is_production_environment(os.environ["APP_ENV"])
+                        )
+
+    def test_non_production_start_is_not_over_blocked(self) -> None:
+        """The fix must not make ordinary development startup fail."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dotenv = root / ".env"
+            dotenv.write_text("APP_TIMEZONE=UTC\nDATABASE_URL=x\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    bootstrap_path=root / "absent.env", dotenv_path=dotenv
+                )
+                self.assertEqual(os.environ["APP_TIMEZONE"], "UTC")
+        self.assertFalse(result.is_production)

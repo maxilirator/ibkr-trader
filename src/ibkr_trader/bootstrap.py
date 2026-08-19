@@ -133,16 +133,38 @@ def is_production_environment(environment: str | None) -> bool:
     return (environment or "").strip().lower() in PRODUCTION_ENVIRONMENTS
 
 
-def bootstrap_env_path() -> Path:
-    """Resolve the bootstrap file path, honouring the override variable."""
+def bootstrap_env_path(*, production: bool = False) -> Path:
+    """Resolve the bootstrap file path, honouring the override variable.
+
+    In production the override must already be absolute. ``expanduser()`` would
+    otherwise turn ``~/bootstrap.env`` into an absolute path *before* the
+    absolute-path check, so the home-relative form that check exists to reject
+    would sail through and point production configuration at a user-writable
+    file.
+    """
     configured = getenv(BOOTSTRAP_ENV_PATH_VAR, "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return DEFAULT_BOOTSTRAP_ENV_PATH
+    if not configured:
+        return DEFAULT_BOOTSTRAP_ENV_PATH
+    if production and not Path(configured).is_absolute():
+        raise BootstrapConfigurationError(
+            f"{BOOTSTRAP_ENV_PATH_VAR}={configured!r} is not an absolute path. "
+            "In production the protected environment must be identified by "
+            "absolute path so it cannot be relocated by the process's working "
+            "directory or home directory."
+        )
+    return Path(configured).expanduser()
 
 
 def _parse_env_text(text: str) -> dict[str, str]:
-    """Parse ``KEY=value`` lines, ignoring blanks, comments and ``export``."""
+    """Parse ``KEY=value`` lines, ignoring blanks, comments and ``export``.
+
+    On a duplicated key the **first** occurrence wins, matching
+    ``load_dotenv_file``'s ``environ.setdefault``. This is not cosmetic: when
+    this parse resolved duplicates last-wins while the apply step resolved them
+    first-wins, a file could be inspected as ``APP_ENV=dev`` and applied as
+    ``APP_ENV=production``, so the pre-check passed on a value that was never
+    the one used.
+    """
     # Imported lazily to keep config.py as the single owner of the line format.
     from ibkr_trader.config import _parse_env_line
 
@@ -152,8 +174,49 @@ def _parse_env_text(text: str) -> dict[str, str]:
         if parsed is None:
             continue
         key, value = parsed
-        values[key] = value
+        values.setdefault(key, value)
     return values
+
+
+def _assert_cannot_declare_production(
+    values: dict[str, str], path: Path, kind: str
+) -> None:
+    """Refuse a file that escalates ``APP_ENV`` into production.
+
+    Applies to both the checkout ``.env`` and the bootstrap file when the gate
+    has *not* engaged. Selecting production is what decides whether the
+    protected file is read and validated at all, so a file that is applied
+    before that decision must not be able to make it. Otherwise the file's own
+    keys land in the environment unvalidated - no required-key check, no
+    paper-port check - and later readers of ``APP_ENV`` see production.
+    """
+    declared = values.get("APP_ENV")
+    if declared is None:
+        return
+    if not _looks_like_production(declared):
+        return
+    raise BootstrapConfigurationError(
+        f"{path} sets APP_ENV={declared!r}, but a {kind} must not declare "
+        "production. Production is selected by the service environment "
+        "(systemd Environment=), so that it cannot be redefined by a file that "
+        "is loaded before the decision to enforce production has been made. "
+        "Remove APP_ENV from that file."
+    )
+
+
+def _looks_like_production(value: str) -> bool:
+    """Whether a value is production, or is trying to be.
+
+    ``APP_ENV=production # live`` is not equal to any production alias, so a
+    plain equality test silently degrades it to development: the operator
+    believes production is on while the gate quietly disengages. Anything
+    containing a production token is treated as an attempt to select production
+    and is handled as such rather than ignored.
+    """
+    normalized = (value or "").strip().lower()
+    if normalized in PRODUCTION_ENVIRONMENTS:
+        return True
+    return any(token in normalized for token in PRODUCTION_ENVIRONMENTS)
 
 
 def _bootstrap_path_exists(path: Path) -> bool | None:
@@ -332,25 +395,21 @@ def load_runtime_environment(
         BootstrapConfigurationError: In production, when the protected file is
             missing, unreadable, world-accessible, or incomplete.
     """
-    from ibkr_trader.config import DEFAULT_ENV_FILE, load_dotenv_file
+    from ibkr_trader.config import DEFAULT_ENV_FILE
 
     resolved_environment = (
         environment if environment is not None else getenv("APP_ENV", "dev")
     )
     production = is_production_environment(resolved_environment)
-    path = bootstrap_path or bootstrap_env_path()
+    # The override is read from the same ambient environment this design treats
+    # as untrustworthy, so in production it is constrained to absolute paths.
+    path = bootstrap_path or bootstrap_env_path(production=production)
 
     if production:
-        # The override is read from the same ambient environment this design
-        # treats as untrustworthy. A relative or home-relative path would let a
-        # stray export redirect production configuration to a user-writable
-        # file, reintroducing source-dependence through the back door.
         if not path.is_absolute():
             raise BootstrapConfigurationError(
-                f"{BOOTSTRAP_ENV_PATH_VAR}={str(path)!r} is not an absolute "
-                "path. In production the protected environment must be "
-                "identified by absolute path so it cannot be relocated by the "
-                "process's working directory."
+                f"Bootstrap path {str(path)!r} is not absolute. In production "
+                "the protected environment must be identified by absolute path."
             )
 
         values = _read_bootstrap_file(path)
@@ -396,6 +455,18 @@ def load_runtime_environment(
     applied: list[str] = []
     source = "none"
 
+    # Both candidate files are parsed and vetted BEFORE anything is applied.
+    # The gate has already declined to engage, so neither file may now declare
+    # production: doing so would put its keys into the environment without the
+    # required-key, paper-port or permission checks ever running, while later
+    # readers of APP_ENV saw production. Vetting first also means a rejected
+    # file leaves os.environ untouched.
+    #
+    # Each file is parsed exactly once and that same dict is what gets applied,
+    # so the value inspected is always the value used.
+    resolved_dotenv = dotenv_path or DEFAULT_ENV_FILE
+
+    bootstrap_values: dict[str, str] = {}
     exists = _bootstrap_path_exists(path)
     if exists is None:
         # Unreadable /etc is not fatal here: the file is documented as optional
@@ -406,45 +477,55 @@ def load_runtime_environment(
         )
     elif exists:
         try:
-            values = _read_bootstrap_file(path)
+            bootstrap_values = _read_bootstrap_file(path)
         except BootstrapConfigurationError as exc:
-            # Outside production this is informational, not fatal.
+            # Outside production a malformed/ill-permissioned file is
+            # informational, not fatal.
             warnings.append(str(exc))
         else:
-            for key, value in values.items():
-                environ.setdefault(key, value)
-            applied.extend(values)
-            source = "bootstrap"
+            _assert_cannot_declare_production(
+                bootstrap_values, path, "bootstrap file loaded outside production"
+            )
 
-    resolved_dotenv = dotenv_path or DEFAULT_ENV_FILE
-    effective_environment = resolved_environment
-
-    if resolved_dotenv.exists():
-        # Inspected before it is applied. Production was decided *before* this
-        # load, so a checkout-local file that declares itself production would
-        # otherwise escalate after the gate had already declined to engage: the
-        # protected file would never be opened, and every value - including the
-        # throwaway DATABASE_URL and the paper IBKR_PORT - would come from the
-        # source tree while the process reported environment=production.
-        # Declaring production is exactly the decision a checkout may not make.
-        # Checking first also means a rejected file leaves os.environ untouched.
+    dotenv_values: dict[str, str] = {}
+    if _bootstrap_path_exists(resolved_dotenv):
         dotenv_values = _parse_env_text(
             resolved_dotenv.read_text(encoding="utf-8")
         )
-        # setdefault semantics: an ambient APP_ENV wins over the file's.
-        declared = getenv("APP_ENV") or dotenv_values.get("APP_ENV", "")
-        if is_production_environment(declared):
-            raise BootstrapConfigurationError(
-                f"{resolved_dotenv} sets APP_ENV={declared!r}, but a "
-                "checkout-local .env must not declare production. Production is "
-                "selected by the service environment (systemd Environment=), so "
-                "that it cannot be redefined by whichever source tree the "
-                "process started from. Remove APP_ENV from that file."
-            )
+        _assert_cannot_declare_production(
+            dotenv_values, resolved_dotenv, "checkout-local .env"
+        )
 
-        load_dotenv_file(resolved_dotenv)
-        effective_environment = getenv("APP_ENV", resolved_environment)
+    # An ambient APP_ENV that looks production must not reach here at all: the
+    # caller resolved a non-production environment, so a production-looking
+    # ambient value means it was malformed (e.g. "production # live") and
+    # silently degraded. Refusing is the only safe reading.
+    if _looks_like_production(resolved_environment):
+        raise BootstrapConfigurationError(
+            f"APP_ENV={resolved_environment!r} is not a recognised environment "
+            "but looks like an attempt to select production. Production "
+            f"requires APP_ENV to be exactly one of {sorted(PRODUCTION_ENVIRONMENTS)}; "
+            "a trailing comment or stray character is part of the value."
+        )
+
+    if bootstrap_values:
+        for key, value in bootstrap_values.items():
+            environ.setdefault(key, value)
+        applied.extend(bootstrap_values)
+        source = "bootstrap"
+
+    if dotenv_values:
+        for key, value in dotenv_values.items():
+            environ.setdefault(key, value)
         source = "bootstrap+dotenv" if source == "bootstrap" else "dotenv"
+
+    effective_environment = getenv("APP_ENV", resolved_environment)
+
+    # Invariant: after this call os.environ["APP_ENV"] always agrees with the
+    # returned environment. Every other read of APP_ENV in the codebase depends
+    # on it, and the split-brain state it prevents (result says dev, environment
+    # says production) is how the paper port was reached.
+    environ["APP_ENV"] = effective_environment
 
     if _bootstrap_path_exists(path) is not True:
         path = None
