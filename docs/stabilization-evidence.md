@@ -84,8 +84,14 @@ since a subset check could not have caught key loss.
 
 ## Phase 2 — Fail-closed source-independent bootstrap
 
-Commits `73bc591` (initial), `a4f9011` (review fixes). Status: **implemented,
-reviewed, rejected, fixed; re-verification in progress**.
+Commits `73bc591` (initial), `a4f9011` (review fixes), `402ad33` (re-verification
+fixes). Status: **implemented; reviewed twice; rejected twice; fixed. A third
+independent verification is required before this phase may be called done.**
+
+This phase was rejected on first review and found incomplete on re-verification.
+Both times the finding was the same class of defect: a production process could
+start without the protected file being read and validated. That history is the
+reason the phase is not treated as settled after two rounds.
 
 Added `src/ibkr_trader/bootstrap.py`. With `APP_ENV=production`/`prod`:
 
@@ -154,13 +160,41 @@ The review also identified that the test suite would read the real
 `/etc/ibkr-trader/bootstrap.env` — on the live host, pulling production secrets
 into the test process. A `conftest.py` fixture now redirects it.
 
+### Re-verification of the fix (commit `402ad33`)
+
+The fix to blocker 1 was independently re-verified and found **INCOMPLETE**. The
+specific exploit was closed, but three further routes reached production without
+the protected file being read and validated. All were reproduced before fixing.
+
+| Route | Effect | Resolution |
+| --- | --- | --- |
+| Duplicate `APP_ENV` key in `.env` | `_parse_env_text` resolved duplicates last-wins, `load_dotenv_file` first-wins. A file inspected as `dev` was applied as `production` — the full original bug restored. | Parse is first-wins; each file parsed once and that dict applied, so the value inspected is the value used. Also removes a TOCTOU double read. |
+| Bootstrap file containing `APP_ENV=production` while the unit had not set it | Non-production branch applied every key including `APP_ENV`, with no validation. Split brain: `AppConfig.environment=dev` (skipping the `DATABASE_URL` requirement, using the throwaway default) while `IbkrConnectionConfig` took the production branch and got port 7497. **This is the documented cutover's own intermediate state.** | Neither file may declare production when the gate has not engaged; both are vetted before anything is applied. |
+| `IBKR_TRADER_BOOTSTRAP_ENV=~/x.env` | `expanduser()` ran before the absolute-path check, so the home-relative form that check exists to reject was made absolute first. | Check runs on the raw value. |
+| `APP_ENV=production # live` | Matched no alias, silently degraded to dev: operator believes production is on while the gate disengages. | Refused. |
+
+The invariant behind the whole class is now explicit and tested: after
+`load_runtime_environment()`, `os.environ["APP_ENV"]` always agrees with the
+returned environment.
+
+Re-verification also found the `conftest` isolation fixture ineffective — it used
+`os.environ.setdefault`, which `patch.dict(clear=True)` strips, so six tests
+still resolved the real `/etc/ibkr-trader/bootstrap.env`. On the live host that
+would have read production secrets into the test process and produced spurious
+failures in the release-evidence run. It now patches the module constant.
+
 ### Verification
 
-- `tests/test_bootstrap.py`: 37 passed, including a regression test per blocker,
-  one test per unsafe default proving it is unreachable in production, and one
-  proving no secret value appears in the error message
-- Full suite: **3 failed (pre-existing), 621 passed, 1 skipped**
-- `ruff check` clean
+- `tests/test_bootstrap.py`: 45 passed, including a regression test per route,
+  one test per unsafe default proving it is unreachable in production, one
+  proving no secret value appears in the error message, and one pinning the
+  `APP_ENV` agreement invariant
+- All four exploits re-run against the fixed code: **all refused**, with
+  `os.environ` left unpolluted
+- Instrumented probe across the full suite: **0 resolutions** of the real
+  protected path
+- Full suite: **3 failed (pre-existing), 628 passed, 1 skipped**
+- `ruff check` clean on changed files
 - The pre-existing `test_config.py::test_real_environment_overrides_dotenv`
   passes **unmodified**, evidence that non-production semantics are unchanged
 
