@@ -101,8 +101,8 @@ class SchedulingTests(TestCase):
 
     def test_build_batch_runtime_schedule_resolves_next_stockholm_open_from_local_calendar(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            parquet_path = Path(temp_dir) / "day_sessions.parquet"
-            parquet_path.with_suffix(".csv").write_text(
+            calendar_path = Path(temp_dir) / "day_sessions.csv"
+            calendar_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -117,7 +117,7 @@ class SchedulingTests(TestCase):
             schedule = build_batch_runtime_schedule(
                 batch,
                 runtime_timezone="Europe/Stockholm",
-                session_calendar_path=parquet_path,
+                session_calendar_path=calendar_path,
             )
 
         next_session_exit = schedule.instructions[0].next_session_exit
@@ -139,8 +139,8 @@ class SchedulingTests(TestCase):
 
     def test_resolve_scheduled_submission_due_at_uses_one_minute_lead_for_stockholm_open(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            parquet_path = Path(temp_dir) / "day_sessions.parquet"
-            parquet_path.with_suffix(".csv").write_text(
+            calendar_path = Path(temp_dir) / "day_sessions.csv"
+            calendar_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -158,7 +158,7 @@ class SchedulingTests(TestCase):
             due_at = resolve_scheduled_submission_due_at(
                 instruction,
                 scheduled_at=instruction.entry.submit_at,
-                session_calendar_path=parquet_path,
+                session_calendar_path=calendar_path,
                 submission_lead_time=timedelta(minutes=1),
             )
 
@@ -166,8 +166,8 @@ class SchedulingTests(TestCase):
 
     def test_resolve_scheduled_submission_due_at_uses_one_minute_lead_for_stockholm_close(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            parquet_path = Path(temp_dir) / "day_sessions.parquet"
-            parquet_path.with_suffix(".csv").write_text(
+            calendar_path = Path(temp_dir) / "day_sessions.csv"
+            calendar_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -186,7 +186,7 @@ class SchedulingTests(TestCase):
             due_at = resolve_scheduled_submission_due_at(
                 instruction,
                 scheduled_at=instruction.entry.submit_at,
-                session_calendar_path=parquet_path,
+                session_calendar_path=calendar_path,
                 submission_lead_time=timedelta(minutes=1),
             )
 
@@ -194,8 +194,8 @@ class SchedulingTests(TestCase):
 
     def test_resolve_effective_entry_expire_at_caps_to_stockholm_session_close(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            parquet_path = Path(temp_dir) / "day_sessions.parquet"
-            parquet_path.with_suffix(".csv").write_text(
+            calendar_path = Path(temp_dir) / "day_sessions.csv"
+            calendar_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -213,7 +213,7 @@ class SchedulingTests(TestCase):
 
             expire_at = resolve_effective_entry_expire_at(
                 instruction,
-                session_calendar_path=parquet_path,
+                session_calendar_path=calendar_path,
             )
 
         self.assertEqual(expire_at.isoformat(), "2026-04-30T13:00:00+02:00")

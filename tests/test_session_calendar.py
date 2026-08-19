@@ -11,45 +11,69 @@ from ibkr_trader.orchestration.session_calendar import find_next_session_open
 from ibkr_trader.orchestration.session_calendar import load_session_calendar
 
 
+_CSV_SESSIONS = "\n".join(
+    [
+        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+    ]
+)
+
+
+def _write_empty_parquet_calendar(parquet_path: Path) -> None:
+    import duckdb
+
+    duckdb.execute(
+        """
+        COPY (
+            SELECT
+                DATE '2026-04-30' AS session_date,
+                'Europe/Stockholm' AS timezone,
+                '09:00' AS open_time,
+                '13:00' AS close_time,
+                'override' AS session_kind
+            WHERE false
+        )
+        TO ? (FORMAT PARQUET)
+        """,
+        [str(parquet_path)],
+    )
+
+
 class SessionCalendarTests(unittest.TestCase):
-    def test_load_session_calendar_falls_back_from_parquet_to_csv(self) -> None:
+    def test_a_missing_calendar_does_not_fall_back_to_a_sibling_csv(self) -> None:
+        """Only the resolved file is read. A neighbour nobody published is not data."""
         with TemporaryDirectory() as temp_dir:
             parquet_path = Path(temp_dir) / "day_sessions.parquet"
-            csv_path = parquet_path.with_suffix(".csv")
-            csv_path.write_text(
-                "\n".join(
-                    [
-                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
-                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
-                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            parquet_path.with_suffix(".csv").write_text(_CSV_SESSIONS, encoding="utf-8")
 
-            rows = load_session_calendar(parquet_path)
+            with self.assertRaises(FileNotFoundError):
+                load_session_calendar(parquet_path)
 
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(rows[0].source_path.endswith("day_sessions.csv"))
+    def test_an_empty_calendar_raises_instead_of_reading_a_sibling_csv(self) -> None:
+        try:
+            import duckdb  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("duckdb is required for parquet session-calendar tests")
+
+        with TemporaryDirectory() as temp_dir:
+            parquet_path = Path(temp_dir) / "day_sessions.parquet"
+            _write_empty_parquet_calendar(parquet_path)
+            parquet_path.with_suffix(".csv").write_text(_CSV_SESSIONS, encoding="utf-8")
+
+            with self.assertRaises(ValueError) as caught:
+                load_session_calendar(parquet_path)
+
+        self.assertIn("no sessions", str(caught.exception))
 
     def test_find_next_session_open_uses_next_stockholm_session(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            parquet_path = Path(temp_dir) / "day_sessions.parquet"
-            csv_path = parquet_path.with_suffix(".csv")
-            csv_path.write_text(
-                "\n".join(
-                    [
-                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
-                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
-                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            csv_path = Path(temp_dir) / "day_sessions.csv"
+            csv_path.write_text(_CSV_SESSIONS, encoding="utf-8")
 
             resolution = find_next_session_open(
                 datetime.fromisoformat("2026-04-10T17:30:00+02:00"),
-                session_calendar_path=parquet_path,
+                session_calendar_path=csv_path,
             )
 
         self.assertIsNotNone(resolution)

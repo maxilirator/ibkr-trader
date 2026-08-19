@@ -144,8 +144,8 @@ class SubmissionTests(TestCase):
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -184,8 +184,8 @@ class SubmissionTests(TestCase):
 
     def test_submit_model_routed_batch_persists_for_rl_agent_pickup(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -300,8 +300,8 @@ class SubmissionTests(TestCase):
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -344,8 +344,8 @@ class SubmissionTests(TestCase):
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -378,8 +378,8 @@ class SubmissionTests(TestCase):
 
     def test_submit_execution_batch_rejects_when_kill_switch_is_enabled(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -408,8 +408,8 @@ class SubmissionTests(TestCase):
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",

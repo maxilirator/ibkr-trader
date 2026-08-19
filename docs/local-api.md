@@ -426,11 +426,14 @@ Important current behavior:
 - `only_shortable=true` is the default, so the response is already filtered to `shortable` and `locate_required`
 - set `only_shortable=false` when you want the full scan, including `not_shortable`
 - full-universe scans persist by default; smaller samples or explicit symbol requests persist only when `persist=true`
-- persisted artifacts are written to:
-  `../q-data/xsto/instruments/shortable.txt`
-  `../q-data/xsto/instruments/shortable_or_locate.txt`
-  `../q-data/xsto/meta/shortability/shortability_snapshot_<date>.json`
-  `../q-data/xsto/meta/shortability/shortability_latest.json`
+- persisted artifacts are written under `IBKR_TRADER_OUTPUT_ROOT` (default
+  `var/shortability`), never into a q-data dataset directory:
+  `<output_root>/shortable.txt`
+  `<output_root>/shortable_or_locate.txt`
+  `<output_root>/shortability/shortability_snapshot_<date>.json`
+  `<output_root>/shortability/shortability_latest.json`
+- short-sale validation reads `<output_root>/shortability/shortability_latest.json`,
+  so this endpoint and the `shortability_refresh` CLI update the same snapshot
 - the persisted JSON keeps the full evaluated universe metadata even when the HTTP response is filtered to shortable names
 - the response includes `source`, `source_url`, `source_updated_text`, `snapshot_at`, `universe_as_of_date`, `status_counts`, and the universe source used for the scan
 - IBKR does not expose historical shortability snapshots through this path, so daily history still needs to be stored by us after each run

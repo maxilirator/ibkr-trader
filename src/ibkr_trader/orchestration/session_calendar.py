@@ -102,25 +102,28 @@ def _load_rows_from_parquet(path: Path) -> tuple[SessionCalendarRow, ...]:
 
 @lru_cache(maxsize=8)
 def load_session_calendar(path: Path) -> tuple[SessionCalendarRow, ...]:
+    """Load the calendar file that was resolved for this service.
+
+    Only this file is read. A missing or empty calendar used to fall back to a
+    sibling ``.csv`` the q-data catalog never named, and the result was cached
+    for the rest of the process; a run then scheduled against a calendar nobody
+    published. Stopping here is recoverable, trading on the wrong sessions is not.
+    """
     resolved_path = path.resolve()
     if resolved_path.suffix == ".parquet":
-        if resolved_path.exists():
-            rows = _load_rows_from_parquet(resolved_path)
-            if rows:
-                return rows
+        load_rows = _load_rows_from_parquet
+    elif resolved_path.suffix == ".csv":
+        load_rows = _load_rows_from_csv
+    else:
+        raise ValueError("Session calendar path must end with .parquet or .csv")
 
-        fallback_csv_path = resolved_path.with_suffix(".csv")
-        if fallback_csv_path.exists():
-            return _load_rows_from_csv(fallback_csv_path)
-
+    if not resolved_path.exists():
         raise FileNotFoundError(f"Session calendar not found at {resolved_path}")
 
-    if resolved_path.suffix == ".csv":
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"Session calendar not found at {resolved_path}")
-        return _load_rows_from_csv(resolved_path)
-
-    raise ValueError("Session calendar path must end with .parquet or .csv")
+    rows = load_rows(resolved_path)
+    if not rows:
+        raise ValueError(f"Session calendar at {resolved_path} contains no sessions")
+    return rows
 
 
 def find_next_session_open(

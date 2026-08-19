@@ -11,6 +11,7 @@ from ibkr_trader.ibkr.shortability import (
     ShortabilitySnapshotQuery,
     collect_shortability_snapshot,
     persist_shortability_snapshot,
+    shortability_meta_dir,
 )
 
 
@@ -18,7 +19,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Refresh the Stockholm shortability universe from IBKR and persist "
-            "the resulting symbol lists and JSON snapshot into q-data."
+            "the resulting symbol lists and JSON snapshot under the configured "
+            "output root."
         )
     )
     parser.add_argument(
@@ -97,8 +99,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     persisted = persist_shortability_snapshot(
         snapshot,
-        instruments_dir=app_config.stockholm_instruments_path.parent,
-        meta_dir=app_config.stockholm_identity_path.parent / "shortability",
+        # Refresh output belongs to this service, not to q-data. Writing it
+        # beside the resolved dataset mutated a directory q-data owns and left
+        # the API refresh and this CLI updating two different snapshots.
+        instruments_dir=app_config.output_root,
+        meta_dir=shortability_meta_dir(app_config.output_root),
     )
     print(
         json.dumps(

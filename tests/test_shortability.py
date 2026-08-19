@@ -21,8 +21,10 @@ from ibkr_trader.ibkr.shortability import (
     interpret_shortability_status,
     load_stockholm_identity_map,
     load_stockholm_symbols_from_instruments_file,
+    latest_shortability_snapshot_path,
     parse_official_ibkr_shortable_rows,
     persist_shortability_snapshot,
+    shortability_meta_dir,
 )
 
 
@@ -341,3 +343,22 @@ class ShortabilityTests(TestCase):
             )
             self.assertIn('"snapshot_at": "2026-04-15T23:38:05.631154+00:00"', snapshot_text)
             self.assertIn('"evaluated_entries"', snapshot_text)
+
+    def test_a_persisted_snapshot_lands_where_short_sale_validation_reads_it(self) -> None:
+        """Every writer persists through the same helper, or a refresh updates nothing."""
+        with TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            result = persist_shortability_snapshot(
+                {
+                    "snapshot_at": "2026-04-15T23:38:05.631154+00:00",
+                    "universe_as_of_date": "2026-04-14",
+                    "entries": [{"symbol": "VOLV-B", "status": "shortable"}],
+                },
+                instruments_dir=output_root,
+                meta_dir=shortability_meta_dir(output_root),
+            )
+
+            self.assertEqual(
+                Path(result["latest_snapshot_path"]),
+                latest_shortability_snapshot_path(output_root),
+            )

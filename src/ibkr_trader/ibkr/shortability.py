@@ -19,10 +19,12 @@ from ibkr_trader.ibkr.shortability_common import interpret_shortability_status
 from ibkr_trader.ibkr.shortability_common import parse_official_ibkr_shortable_rows
 from ibkr_trader.ibkr.shortability_files import StockholmInstrumentIdentity
 from ibkr_trader.ibkr.shortability_files import StockholmListedInstrument
+from ibkr_trader.ibkr.shortability_files import latest_shortability_snapshot_path
 from ibkr_trader.ibkr.shortability_files import load_stockholm_identity_map
 from ibkr_trader.ibkr.shortability_files import load_stockholm_symbols_from_instruments_file
 from ibkr_trader.ibkr.shortability_files import persist_shortability_snapshot
 from ibkr_trader.ibkr.shortability_files import serialize_shortability_snapshot
+from ibkr_trader.ibkr.shortability_files import shortability_meta_dir
 
 __all__ = [
     "OfficialIbkrShortableRow",
@@ -43,9 +45,11 @@ __all__ = [
     "collect_shortability_snapshot",
     "fetch_official_ibkr_shortable_rows",
     "interpret_shortability_status",
+    "latest_shortability_snapshot_path",
     "load_stockholm_identity_map",
     "load_stockholm_symbols_from_instruments_file",
     "parse_official_ibkr_shortable_rows",
     "persist_shortability_snapshot",
     "serialize_shortability_snapshot",
+    "shortability_meta_dir",
 ]

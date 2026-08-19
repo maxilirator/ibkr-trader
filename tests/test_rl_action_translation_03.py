@@ -12,7 +12,7 @@ class RLActionTranslationApiTests01(RLActionTranslationApiTestsBase):
 
         with TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            schedule_path = temp_path / "day_sessions.parquet"
+            schedule_path = temp_path / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             database_url = f"sqlite+pysqlite:///{temp_path / 'rl_translate.db'}"
             engine = build_engine(database_url)
@@ -142,7 +142,7 @@ class RLActionTranslationApiTests01(RLActionTranslationApiTestsBase):
 
         with TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            schedule_path = temp_path / "day_sessions.parquet"
+            schedule_path = temp_path / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             database_url = f"sqlite+pysqlite:///{temp_path / 'rl_exit_translate.db'}"
             engine = build_engine(database_url)
@@ -285,7 +285,7 @@ class RLActionTranslationApiTests01(RLActionTranslationApiTestsBase):
 
     def test_short_limit_entry_fills_only_when_stream_crosses_up_to_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             result = _translate(
                 _model_routed_payload(
@@ -325,7 +325,7 @@ class RLActionTranslationApiTests01(RLActionTranslationApiTestsBase):
 
     def test_market_entry_fills_on_next_virtual_runtime_cycle(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             result = _translate(
                 _model_routed_payload(

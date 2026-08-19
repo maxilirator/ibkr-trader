@@ -339,7 +339,7 @@ class IntentReplacementTests(TestCase):
             self.session_factory,
             batch,
             runtime_timezone="America/New_York",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
         )
 
         states = self._states_by_instruction_id()
@@ -407,7 +407,7 @@ class IntentReplacementTests(TestCase):
             self.session_factory,
             batch,
             runtime_timezone="America/New_York",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             deferred_reentry_instruction_ids=deferred_instruction_ids,
         )
 

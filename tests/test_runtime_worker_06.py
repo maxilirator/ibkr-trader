@@ -79,8 +79,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             )
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -132,8 +132,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             raise AssertionError("open exits must not be cancelled before position check")
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -263,8 +263,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -313,8 +313,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             raise AssertionError("matching live exit order should suppress duplicate forced exit")
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -429,8 +429,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             raise AssertionError("recent terminal forced exit must suppress retries")
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -559,8 +559,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -712,8 +712,8 @@ class RuntimeWorkerTests06(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",

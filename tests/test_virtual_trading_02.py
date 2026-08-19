@@ -6,7 +6,7 @@ from tests._virtual_trading_shared import *  # noqa: F401,F403
 class VirtualTradingTests02(VirtualTradingTestsBase):
     def test_virtual_orders_fill_from_stream_snapshot_when_limit_crosses(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             batch = parse_execution_batch_payload(_virtual_payload())
             submit_execution_batch(
@@ -136,7 +136,7 @@ class VirtualTradingTests02(VirtualTradingTestsBase):
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             payload = _virtual_payload()
             payload["instructions"][0]["entry"]["limit_price"] = "55.6802"  # type: ignore[index]

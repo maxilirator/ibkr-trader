@@ -59,8 +59,8 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -145,8 +145,8 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -199,7 +199,7 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_submitter=lambda *args, **kwargs: self.fail(
                 "entry submitter should not be called while kill switch is enabled"
@@ -266,7 +266,7 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_canceler=fake_canceler,
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
@@ -333,7 +333,7 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                 open_orders={
@@ -429,7 +429,7 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             broker_callback_fetcher=lambda: [
                 {
@@ -520,7 +520,7 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
@@ -559,7 +559,7 @@ class RuntimeWorkerTests02(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             broker_snapshot_fetcher=lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("snapshot down")

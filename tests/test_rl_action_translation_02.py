@@ -6,7 +6,7 @@ from tests._rl_action_translation_shared import *  # noqa: F401,F403
 class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
     def test_long_limit_entry_fills_only_when_stream_crosses_down_to_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             result = _translate(
                 _model_routed_payload(
@@ -46,7 +46,7 @@ class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
 
     def test_virtual_decision_bar_matches_training_limit_fill_semantics(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             result = _translate(
                 _model_routed_payload(
@@ -154,7 +154,7 @@ class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
                 self.engine = engine
                 try:
                     with TemporaryDirectory() as temp_dir:
-                        schedule_path = Path(temp_dir) / "day_sessions.parquet"
+                        schedule_path = Path(temp_dir) / "day_sessions.csv"
                         _write_schedule_fixture(schedule_path)
                         bar = case["bar"]
                         replay = simulate_component_session(
@@ -239,7 +239,7 @@ class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
 
     def test_cancel_entry_marks_owned_pending_instruction_cancelled(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             source_payload = _model_routed_payload(
                 instruction_id="long-cancel-entry-1",
@@ -275,7 +275,7 @@ class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
 
     def test_long_take_profit_exit_submits_sell_limit_above_entry_fill(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             source_payload = _model_routed_payload(
                 instruction_id="long-owned-exit-1",
@@ -323,7 +323,7 @@ class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
 
     def test_short_take_profit_exit_submits_buy_limit_below_entry_fill(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             source_payload = _model_routed_payload(
                 instruction_id="short-owned-exit-1",
@@ -369,7 +369,7 @@ class RLActionVirtualExecutionTests01(RLActionVirtualExecutionTestsBase):
 
     def test_clear_exit_cancels_owned_exit_and_keeps_position_open(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             source_payload = _model_routed_payload(
                 instruction_id="long-clear-exit-1",

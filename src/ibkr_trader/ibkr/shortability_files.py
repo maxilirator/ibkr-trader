@@ -160,6 +160,22 @@ def serialize_shortability_snapshot(snapshot: ShortabilitySnapshot) -> dict[str,
     return payload
 
 
+def shortability_meta_dir(output_root: Path) -> Path:
+    """Where this service keeps the shortability snapshots it produces.
+
+    Derived from ``AppConfig.output_root`` and never from a resolved q-data
+    path: shared datasets are owned by q-data. Every writer and the short-sale
+    reader go through this one function, because when they disagreed a refresh
+    stopped updating the snapshot that blocks short orders.
+    """
+    return output_root / "shortability"
+
+
+def latest_shortability_snapshot_path(output_root: Path) -> Path:
+    """The snapshot short-sale validation reads before letting a short through."""
+    return shortability_meta_dir(output_root) / "shortability_latest.json"
+
+
 def _write_symbol_list(path: Path, symbols: tuple[str, ...]) -> None:
     content = "".join(f"{symbol.lower()}\n" for symbol in symbols)
     path.write_text(content, encoding="utf-8")

@@ -17,7 +17,7 @@ class RuntimeWorkerCliTests(TestCase):
             environment="test",
             timezone="Europe/Stockholm",
             database_url="sqlite+pysqlite:///:memory:",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             stockholm_instruments_path=Path("/tmp/all.txt"),
             stockholm_identity_path=Path("/tmp/identity.parquet"),
             api=ApiServerConfig(

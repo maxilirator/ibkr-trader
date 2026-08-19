@@ -126,6 +126,7 @@ from ibkr_trader.ibkr.shortability import ShortabilitySource
 from ibkr_trader.ibkr.shortability import collect_shortability_snapshot
 from ibkr_trader.ibkr.shortability import load_stockholm_identity_map
 from ibkr_trader.ibkr.shortability import persist_shortability_snapshot
+from ibkr_trader.ibkr.shortability import shortability_meta_dir
 from ibkr_trader.ibkr.stockholm_intraday import collect_stockholm_intraday_backfill
 from ibkr_trader.ibkr.tick_stream import collect_tick_stream_sample
 from ibkr_trader.ibkr.session_manager import CanonicalSyncSessions
@@ -845,7 +846,7 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
                 # them from a resolved q-data path would write into an
                 # immutable, versioned dataset directory q-data owns.
                 instruments_dir=app_config.output_root,
-                meta_dir=app_config.output_root / "shortability",
+                meta_dir=shortability_meta_dir(app_config.output_root),
             )
 
         return {
