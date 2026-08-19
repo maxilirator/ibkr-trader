@@ -84,7 +84,8 @@ since a subset check could not have caught key loss.
 
 ## Phase 2 — Fail-closed source-independent bootstrap
 
-Commit `73bc591`. Status: **implemented, independent review pending**.
+Commits `73bc591` (initial), `a4f9011` (review fixes). Status: **implemented,
+reviewed, rejected, fixed; re-verification in progress**.
 
 Added `src/ibkr_trader/bootstrap.py`. With `APP_ENV=production`/`prod`:
 
@@ -106,22 +107,79 @@ Outside production: file optional, `.env` still applies, explicit exports still 
 `APP_ENV=live` is deliberately **not** a production alias — `live` already names
 an RL deployment mode, and the trigger for refusing to start must be unambiguous.
 
+### Independent review
+
+Verdict on `73bc591`: **REJECT**, 2 blockers. Both were reproduced before being
+fixed, and the reproduction is recorded below because it is the strongest
+evidence that the phase's headline guarantee was not initially delivered.
+
+**Blocker 1 (CRITICAL) — a checkout `.env` could declare production.**
+`APP_ENV` was read twice: once before the `.env` load, deciding whether to
+engage the gate, and again after it, deciding whether values were required.
+With `APP_ENV` unset the gate declined to engage, `.env` then set
+`APP_ENV=production`, and the app ran as production against source-tree values.
+Reproduced with the shipped `.env.example` values:
+
+```
+load source      = dotenv | is_production = False   <- gate declined to engage
+APP_ENV after    = production                       <- .env raised it afterwards
+DATABASE_URL     = postgresql://postgres:postgres@localhost:5432/ibkr_trader
+IBKR host/port   = 127.0.0.1 7497                   <- the PAPER port
+```
+
+The documented cutover step said "set `APP_ENV=production`" without saying
+where, and no systemd unit sets it — so following the checklist literally
+produced exactly this. Fixed by removing the second read: `.env` is inspected
+before it is applied, a file declaring production is refused, and
+`AppConfig.from_env()` takes the environment from the load result. Verified
+refused after the fix, with `os.environ` left unpolluted.
+
+**Blocker 2 (HIGH) — raw `PermissionError` escaped both branches.**
+`Path.exists()` propagates `EACCES` rather than returning `False`. The
+documented install produced `root:root 0750 /etc/ibkr-trader`, which the
+unprivileged service user cannot traverse. Confirmed on this host:
+`exists() RAISED PermissionError [Errno 13]`. It also broke *non-production*
+startup, where the file is documented as optional. Access failure is now a
+distinct third answer from "absent": concrete error in production, warning
+outside it.
+
+Non-blocking findings also applied: paper ports refused rather than merely
+defaulted away from (overridable via `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1`);
+`IBKR_PORT` validated as an integer inside the all-problems-at-once report;
+group-writable files rejected; the path override must be absolute in
+production; the load is logged (key names only), as the audit record was
+previously built and discarded.
+
+The review also identified that the test suite would read the real
+`/etc/ibkr-trader/bootstrap.env` — on the live host, pulling production secrets
+into the test process. A `conftest.py` fixture now redirects it.
+
 ### Verification
 
-- `tests/test_bootstrap.py`: 25 passed, including one test per unsafe default
-  proving it is unreachable in production, and one proving no secret value
-  appears in the error message
-- Full suite: **3 failed (pre-existing), 609 passed, 1 skipped**
+- `tests/test_bootstrap.py`: 37 passed, including a regression test per blocker,
+  one test per unsafe default proving it is unreachable in production, and one
+  proving no secret value appears in the error message
+- Full suite: **3 failed (pre-existing), 621 passed, 1 skipped**
+- `ruff check` clean
 - The pre-existing `test_config.py::test_real_environment_overrides_dotenv`
   passes **unmodified**, evidence that non-production semantics are unchanged
 
-### Blocking pre-cutover action
+### Blocking pre-cutover actions
 
-Nothing in this repository sets `APP_ENV`. Fail-closed startup engages **only**
-for `production`/`prod`. The value the live host actually uses must be confirmed
-on that host; if it is anything else, these protections are inactive. The
-checklist is in `docs/bootstrap-configuration.md`. Changing it is an application
-startup change and requires explicit operator approval.
+1. Nothing in this repository sets `APP_ENV`, and fail-closed startup engages
+   **only** for `production`/`prod`. The value the live host uses must be
+   confirmed on that host; if it is anything else, these protections are
+   inactive.
+2. `APP_ENV=production` must be set in the **systemd unit**. Setting it in the
+   checkout `.env` is now refused at startup, by design.
+3. If the live `.env` currently contains `APP_ENV`, it must be removed, or the
+   application will refuse to start after this change is deployed.
+4. `/etc/ibkr-trader` must be traversable and the file readable by the
+   unprivileged service user. Verify with the commands in
+   `docs/bootstrap-configuration.md`, not by assumption.
+
+All four change application startup behaviour and require explicit operator
+approval before being applied to the live host.
 
 ## Open findings requiring a decision
 
