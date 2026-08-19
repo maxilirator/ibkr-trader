@@ -77,8 +77,8 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -258,8 +258,8 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             }
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -384,8 +384,8 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             return {}
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -478,8 +478,8 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             return {}
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -625,8 +625,8 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             return {}
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -696,7 +696,7 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 20, 10, tzinfo=timezone.utc),
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                 open_orders={},
@@ -797,7 +797,7 @@ class RuntimeWorkerTests07(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 20, 10, tzinfo=timezone.utc),
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                 open_orders={},

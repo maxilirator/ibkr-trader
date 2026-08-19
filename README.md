@@ -173,19 +173,24 @@ See [docs/local-api.md](docs/local-api.md) for endpoint behavior and [docs/instr
 
 ## Shortability Refresh
 
-To persist the full Stockholm shortability universe into `q-data`, run:
+To persist the full Stockholm shortability universe, run:
 
 ```bash
 source .venv/bin/activate
 PYTHONPATH=src python -m ibkr_trader.ibkr.shortability_refresh
 ```
 
-That writes:
+That writes under `IBKR_TRADER_OUTPUT_ROOT` (default `var/shortability`), which is
+this service's own output root and never a q-data dataset directory:
 
-- `../q-data/xsto/instruments/shortable.txt`
-- `../q-data/xsto/instruments/shortable_or_locate.txt`
-- `../q-data/xsto/meta/shortability/shortability_snapshot_<date>.json`
-- `../q-data/xsto/meta/shortability/shortability_latest.json`
+- `<output_root>/shortable.txt`
+- `<output_root>/shortable_or_locate.txt`
+- `<output_root>/shortability/shortability_snapshot_<date>.json`
+- `<output_root>/shortability/shortability_latest.json`
+
+Short-sale validation reads `shortability_latest.json` from that same location, so
+the CLI and the `POST /v1/market-data/shortability-snapshot` endpoint both refresh
+what blocks short orders.
 
 ## Database foundation
 

@@ -98,7 +98,7 @@ class RuntimeWorkerTests08(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 13, 7, 1, tzinfo=timezone.utc),
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                 open_orders={},
@@ -495,7 +495,7 @@ class RuntimeWorkerTests08(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 8, 30, tzinfo=timezone.utc),
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
                 open_orders={},

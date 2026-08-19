@@ -207,7 +207,7 @@ class VirtualTradingTests01(VirtualTradingTestsBase):
 
     def test_virtual_trading_round_trip_uses_market_watch_and_fixed_fee(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             batch = parse_execution_batch_payload(_virtual_payload())
 
@@ -316,7 +316,7 @@ class VirtualTradingTests01(VirtualTradingTestsBase):
 
     def test_virtual_exit_fill_cancels_open_exit_sibling(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             payload = deepcopy(_virtual_payload())
             payload["instructions"][0]["exit"]["catastrophic_stop_loss_pct"] = "0.15"
@@ -397,7 +397,7 @@ class VirtualTradingTests01(VirtualTradingTestsBase):
 
     def test_virtual_entry_target_notional_converts_to_whole_share_quantity(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             payload = deepcopy(_virtual_payload())
             instruction_payload = payload["instructions"][0]
@@ -464,7 +464,7 @@ class VirtualTradingTests01(VirtualTradingTestsBase):
         self,
     ) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             ensure_virtual_account_record(
                 self.session_factory,
@@ -535,7 +535,7 @@ class VirtualTradingTests01(VirtualTradingTestsBase):
 
     def test_virtual_quote_marks_open_positions_and_account_nav(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             ensure_virtual_account_record(
                 self.session_factory,
@@ -617,7 +617,7 @@ class VirtualTradingTests01(VirtualTradingTestsBase):
 
     def test_virtual_position_snapshots_keep_rl_owner_metadata(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
             ensure_virtual_account_record(
                 self.session_factory,

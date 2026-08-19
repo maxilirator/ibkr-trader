@@ -15,6 +15,7 @@ from ibkr_trader.config import AppConfig
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import PositionSide
 from ibkr_trader.ibkr.errors import IbkrDependencyError
+from ibkr_trader.ibkr.shortability_files import latest_shortability_snapshot_path
 
 _SHORT_MINIMUM_EQUITY_EUR = Decimal("2000")
 _NON_SHORTABLE_ACCOUNT_TYPES = {"CASH", "ISK"}
@@ -201,8 +202,12 @@ def _normalize_stockholm_symbol_variants(symbol: str) -> tuple[str, ...]:
 
 
 def _stockholm_shortability_snapshot_path() -> Path:
+    # The snapshot is this service's own artefact, so it is read from where the
+    # refresh writes it. It used to be guessed from a resolved q-data path,
+    # which both reached into a dataset directory q-data owns and stopped
+    # matching the writer once that moved to output_root.
     app_config = AppConfig.from_env()
-    return app_config.stockholm_identity_path.parent / "shortability" / "shortability_latest.json"
+    return latest_shortability_snapshot_path(app_config.output_root)
 
 
 def _load_stockholm_shortability_snapshot(

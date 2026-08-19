@@ -8,7 +8,8 @@ reading something plausible.
 
 Resolution also verifies the published content hash. The catalog records it,
 and checking it here turns a truncated or half-written file into an error at
-read time instead of a strange result much later.
+read time instead of a strange result much later. An entry with no hash is
+rejected too: unverifiable and corrupt look the same from here.
 """
 from __future__ import annotations
 
@@ -58,17 +59,42 @@ def _entry(catalog: Path, dataset_id: str) -> dict[str, Any]:
         ) from exc
 
 
+def _published_file(catalog: Path, dataset_id: str, entry: dict[str, Any]) -> Path:
+    """Join the entry's ``relative_path`` under the catalog directory, and only under it.
+
+    An absolute path or a ``..`` component lets a catalog entry name a file
+    outside the published tree, which reintroduces exactly the "read whatever is
+    at this path" failure the catalog exists to prevent.
+    """
+    raw_relative_path = str(entry.get("relative_path", ""))
+    relative = Path(raw_relative_path)
+    if not raw_relative_path or relative.is_absolute() or ".." in relative.parts:
+        raise QDataContractError(
+            f"q-data catalog entry for {dataset_id!r} has an unusable relative_path "
+            f"{raw_relative_path!r}: it must name a file inside the catalog directory."
+        )
+    return catalog.parent / relative
+
+
 def resolve_dataset(catalog: Path, dataset_id: str, *, verify_hash: bool = True) -> Path:
     """Return the published file for ``dataset_id``, verifying its content hash."""
     entry = _entry(catalog, dataset_id)
-    path = catalog.parent / str(entry["relative_path"])
+    path = _published_file(catalog, dataset_id, entry)
     if not path.is_file():
         raise QDataContractError(f"q-data catalog points {dataset_id!r} to missing file {path}")
-    expected = str(entry.get("content_hash", ""))
-    if verify_hash and expected and _sha256(path) != expected:
-        raise QDataContractError(
-            f"q-data dataset {dataset_id!r} does not match its published checksum: {path}"
-        )
+    if verify_hash:
+        # An entry without a published hash is unverifiable, and an unverifiable
+        # dataset is indistinguishable from a truncated or hand-edited one.
+        expected = str(entry.get("content_hash", "")).strip()
+        if not expected:
+            raise QDataContractError(
+                f"q-data catalog entry for {dataset_id!r} publishes no content_hash, so "
+                f"{path} cannot be verified. Republish the dataset with its checksum."
+            )
+        if _sha256(path) != expected:
+            raise QDataContractError(
+                f"q-data dataset {dataset_id!r} does not match its published checksum: {path}"
+            )
     return path
 
 

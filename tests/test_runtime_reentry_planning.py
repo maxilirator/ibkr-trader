@@ -45,7 +45,7 @@ class RuntimeReentryPlanningTests(RuntimeWorkerTestCase):
         first_promotion = promote_due_reentry_waiting_for_flat(
             self.session_factory,
             cycle_at=datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             submission_lead_time=timedelta(seconds=60),
         )
         self.assertEqual(first_promotion, [])
@@ -69,7 +69,7 @@ class RuntimeReentryPlanningTests(RuntimeWorkerTestCase):
         second_promotion = promote_due_reentry_waiting_for_flat(
             self.session_factory,
             cycle_at=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             submission_lead_time=timedelta(seconds=60),
         )
 
@@ -119,7 +119,7 @@ class RuntimeReentryPlanningTests(RuntimeWorkerTestCase):
         promoted = promote_due_reentry_waiting_for_flat(
             self.session_factory,
             cycle_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             submission_lead_time=timedelta(seconds=60),
         )
 

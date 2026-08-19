@@ -9,7 +9,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             submit_due_entries=False,
         )
 
@@ -140,7 +140,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
@@ -188,7 +188,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             broker_snapshot_fetcher=fake_snapshot_fetcher,
         )
@@ -218,7 +218,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.config,
             due_instruction_ids=["runtime-aapl-1"],
             cycle_started_at=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             timeout=10,
             kill_switch_enabled=False,
             entry_submitter=lambda *args, **kwargs: self.fail(
@@ -286,7 +286,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.config,
             due_instruction_ids=["runtime-aapl-1"],
             cycle_started_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             timeout=10,
             kill_switch_enabled=False,
             entry_submitter=fake_submitter,
@@ -334,7 +334,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.config,
             due_instruction_ids=["runtime-aapl-1"],
             cycle_started_at=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             timeout=10,
             kill_switch_enabled=False,
             entry_submitter=lambda *args, **kwargs: self.fail(
@@ -444,7 +444,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             market_data_readiness_checker=readiness_checker,
@@ -558,7 +558,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             market_data_readiness_checker=lambda *args: {
@@ -699,7 +699,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 20, 0, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             broker_snapshot_fetcher=lambda *args, **kwargs: BrokerRuntimeSnapshot(
@@ -818,7 +818,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             broker_snapshot_fetcher=lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -909,7 +909,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_submitter=fake_submitter,
             broker_snapshot_fetcher=lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -942,7 +942,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 20, 5, tzinfo=timezone.utc),
             entry_submitter=lambda *args, **kwargs: self.fail(
                 "expired pending entries must not be submitted"
@@ -979,8 +979,8 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
         )
 
         with TemporaryDirectory() as temp_dir:
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
-            schedule_path.with_suffix(".csv").write_text(
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
+            schedule_path.write_text(
                 "\n".join(
                     [
                         "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
@@ -1030,7 +1030,7 @@ class RuntimeWorkerTests01(RuntimeWorkerTestCase):
             self.session_factory,
             self.config,
             runtime_timezone="Europe/Stockholm",
-            session_calendar_path=Path("/tmp/day_sessions.parquet"),
+            session_calendar_path=Path("/tmp/day_sessions.csv"),
             now=datetime(2026, 4, 10, 19, 56, tzinfo=timezone.utc),
             entry_submitter=lambda *args, **kwargs: (_ for _ in ()).throw(
                 ValueError("insufficient funds")

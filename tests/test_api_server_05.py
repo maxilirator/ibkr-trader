@@ -102,7 +102,7 @@ class ApiServerTests05(ApiServerTestCase):
                     environment="test",
                     timezone="Europe/Stockholm",
                     database_url=database_url,
-                    session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                    session_calendar_path=Path("/tmp/day_sessions.csv"),
                     stockholm_instruments_path=Path("/tmp/all.txt"),
                     stockholm_identity_path=Path("/tmp/identity.parquet"),
                     api=ApiServerConfig(
@@ -169,7 +169,7 @@ class ApiServerTests05(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             engine.dispose()
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
 
             app = create_app(
@@ -286,7 +286,7 @@ class ApiServerTests05(ApiServerTestCase):
                     environment="test",
                     timezone="Europe/Stockholm",
                     database_url=database_url,
-                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    session_calendar_path=Path(temp_dir) / "day_sessions.csv",
                     stockholm_instruments_path=Path("/tmp/all.txt"),
                     stockholm_identity_path=Path("/tmp/identity.parquet"),
                     api=ApiServerConfig(
@@ -332,7 +332,7 @@ class ApiServerTests05(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             engine.dispose()
-            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
 
             app = create_app(
@@ -402,7 +402,7 @@ class ApiServerTests05(ApiServerTestCase):
                     environment="test",
                     timezone="Europe/Stockholm",
                     database_url=database_url,
-                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    session_calendar_path=Path(temp_dir) / "day_sessions.csv",
                     stockholm_instruments_path=Path("/tmp/all.txt"),
                     stockholm_identity_path=Path("/tmp/identity.parquet"),
                     api=ApiServerConfig(
@@ -548,7 +548,7 @@ class ApiServerTests05(ApiServerTestCase):
                     environment="test",
                     timezone="Europe/Stockholm",
                     database_url=database_url,
-                    session_calendar_path=Path(temp_dir) / "day_sessions.parquet",
+                    session_calendar_path=Path(temp_dir) / "day_sessions.csv",
                     stockholm_instruments_path=Path("/tmp/all.txt"),
                     stockholm_identity_path=Path("/tmp/identity.parquet"),
                     api=ApiServerConfig(
@@ -597,7 +597,7 @@ class ApiServerTests05(ApiServerTestCase):
                 environment="test",
                 timezone="Europe/Stockholm",
                 database_url="sqlite+pysqlite:///:memory:",
-                session_calendar_path=Path("/tmp/day_sessions.parquet"),
+                session_calendar_path=Path("/tmp/day_sessions.csv"),
                 stockholm_instruments_path=Path("/tmp/all.txt"),
                 stockholm_identity_path=Path("/tmp/identity.parquet"),
                 api=ApiServerConfig(

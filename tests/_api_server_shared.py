@@ -119,7 +119,7 @@ def _sample_submit_payload() -> dict[str, object]:
 
 
 def _write_schedule_fixture(schedule_path: Path) -> None:
-    schedule_path.with_suffix(".csv").write_text(
+    schedule_path.write_text(
         "\n".join(
             [
                 "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
