@@ -377,3 +377,83 @@ run **on the host after deploying**. Exit code 1 on mismatch.
 `.github/workflows/ci.yml` adds CI, which did not exist. Lint is scoped to the
 modules this programme introduced rather than repo-wide, because the existing
 ruff backlog is large and a gate that fails on day one gets switched off.
+
+## Phase 2 — perimeter hardening (commit `3dee144`)
+
+A red-team exploit hunt and a deployment-safety review ran in parallel against
+the hardened gate. The gate's **internal** logic held: all seven previously
+closed escalation routes stayed closed under attack. What did not hold was its
+**perimeter** — three more instances of the same defect class, sitting just
+outside the function that had been hardened.
+
+| Route | Effect | Resolution |
+| --- | --- | --- |
+| `IBKR_TRADER_BOOTSTRAP_ENV` accepted any absolute path | Production read the checkout `.env` — rule 1 defeated through its own escape hatch. Reproduced. | Paths inside the source tree are refused |
+| Only the file's own mode was checked | A `0600` file in a world-writable directory can be unlinked and replaced by any local user; a symlink aims a well-permissioned path at attacker content while the audit records the link. Reproduced. | Parent-directory writability and file ownership checked; resolved path recorded |
+| Duplicate keys resolved rather than refused | First-wins here, last-wins in a shell and in systemd `EnvironmentFile=`, so an operator verifying the file from a shell saw a different value than the gate used — how a paper port hides behind a live one | Duplicates refused outright |
+
+Also closed: `Q_DATA_CATALOG_PATH` was presence-checked but not shape-checked, so
+a path pointing at nothing still died deep in startup with the exact
+`QDataContractError` that requiring the key was meant to prevent; a comment-only
+value (`DATABASE_URL=# TODO`) passed; an unreadable or non-UTF-8 checkout `.env`
+crashed development startup with a raw traceback where the protected file in the
+same branch was guarded; and `production"`, `production!`, `production|live`
+escaped the malformed-production check.
+
+The comment-only rejection is scoped to the four required keys, none of which can
+legitimately begin with `#` (a DSN starts with a scheme, a host with a hostname, a
+port with digits, a catalog with `/`). A password *containing* `#` is unaffected.
+
+### Correctness defects found by the deployment review
+
+- **`PAPER_TRADING_PORTS` was inverted for this deployment.** `{7497, 7496}` —
+  but `7496` is TWS **live** and `4002` is IB Gateway **paper**. This host runs
+  IB Gateway, so the guard refused a live port while waving the paper port
+  through. Now `{7497, 4002}`.
+- **The malformed-production check was a substring match**, so `nonprod`,
+  `preprod`, `non-production` and `prod-eu` would all have **failed to start** —
+  the inverse failure, a self-inflicted outage. Narrowed to values that become an
+  exact alias once comment, quote and punctuation noise is stripped.
+
+## Phase 3 — independent review
+
+Verdict on `3423d44`: **REJECT**, one disqualifying finding, which had already
+been found and fixed in `a541278` before the review landed.
+
+**The registry reported a stored database row as `effective_value` with
+`source: "database"` — asserting the runtime was using a value nothing reads.**
+`config.py` resolves every one of these keys from `getenv`. The dashboard would
+have stated, in a badge, the value of `EXECUTION_RUNTIME_ENABLED` — the
+order-submission flag — sourced from a table no code path consults. A fabricated
+success state on an operator console, and precisely what the module's own
+docstring claimed to avoid.
+
+Now reported honestly and separately: `runtime_value` (operative),
+`stored_value` (recorded intent, not applied), and `drifted` when they disagree.
+The payload states `stored_values_are_applied: false` outright.
+
+Other findings, all applied:
+
+| Finding | Resolution |
+| --- | --- |
+| Boolean coercion diverged from `config.py` — `off` means *enabled* there, disabled here. Active mis-report once the registry began reading the environment. | Both share `config.py::env_flag_is_enabled`; a test walks every boolean setting across ten spellings |
+| Parse errors echoed the raw stored value, so a credential in the wrong row reached a page whose header says secrets are not stored here | Value described (length, type), never quoted |
+| Secret denylist missed `PW`, `AUTH`, `SESSION`, `PASSPHRASE`, `BEARER`, `COOKIE`, `SALT`, `SIGNING`, `PIN`, `APIKEY`, `PRIVATEKEY` | Widened; documented as the second of two layers, not as airtight |
+| The "no secret reaches the payload" test built its payload from an **empty** database and could never fail | Inserts secret-named and secret-valued rows and asserts values are absent |
+| Dashboard rendered from the server's category list; a truncated list produced a blank page reading as "nothing configured" | Categories derived from the settings themselves |
+| Docs claimed changes are recorded in `runtime_setting_event`; nothing writes it | Documented as reserved and unwritten; `updated_by`/`updated_at` marked self-reported and unverified |
+
+Verified correct by the reviewer: genuinely read-only (no write route, no
+`actions`, no writer in `src/`); undeclared rows expose the key name only, never
+the value; all 18 declared defaults match `config.py` exactly; `create_all` adds
+the two tables safely to a populated database; no `{@html}` anywhere; nav
+unaffected.
+
+## Current state
+
+- Suite: **694 passed, 1 skipped, 0 failed**
+- Phases 1-4 implemented, reviewed, and remediated
+- Phase 5 (cutover) and Phase 6 (stability observation) **not started** — both
+  require explicit Mattias approval and live-host access
+- Nothing deployed. No live host contacted. Gateway, watchdog restart authority,
+  kill switch, and RL runner mode all untouched.
