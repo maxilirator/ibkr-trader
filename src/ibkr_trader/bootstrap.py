@@ -188,12 +188,30 @@ def _parse_env_text(text: str) -> dict[str, str]:
     from ibkr_trader.config import _parse_env_line
 
     values: dict[str, str] = {}
+    duplicates: list[str] = []
     for raw_line in text.splitlines():
         parsed = _parse_env_line(raw_line)
         if parsed is None:
             continue
         key, value = parsed
-        values.setdefault(key, value)
+        if key in values:
+            duplicates.append(key)
+            continue
+        values[key] = value
+
+    if duplicates:
+        # Refused rather than resolved. This parser is first-wins, but POSIX
+        # `. file` and systemd EnvironmentFile= are both last-wins, so a
+        # duplicated key means the gate and an operator verifying the file from
+        # a shell would be looking at different values - which is how a paper
+        # port hides behind a live one.
+        raise BootstrapConfigurationError(
+            "Environment file contains duplicate keys: "
+            f"{', '.join(sorted(set(duplicates)))}. Different tools resolve "
+            "duplicates differently (this parser takes the first, a shell and "
+            "systemd take the last), so the file has no single meaning. Remove "
+            "the duplicates."
+        )
     return values
 
 
@@ -228,11 +246,15 @@ def _strip_value_noise(value: str) -> str:
     cleaned = (value or "").strip()
     # `APP_ENV=production # live`: '#' does not start a comment mid-value (that
     # would corrupt passwords containing '#'), so the comment is part of the value.
-    if "#" in cleaned:
-        cleaned = cleaned.split("#", 1)[0].strip()
+    for separator in ("#", "|"):
+        if separator in cleaned:
+            cleaned = cleaned.split(separator, 1)[0].strip()
     if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
         cleaned = cleaned[1:-1].strip()
-    return cleaned.strip(";,.").strip().lower()
+    # Strip unbalanced quotes and trailing punctuation from both ends. An
+    # earlier version stripped only `;,.` and balanced quotes, so `production"`,
+    # `production!` and `production-` all degraded silently to development.
+    return cleaned.strip("\"';,.!|-_/\\ \t").strip().lower()
 
 
 def _looks_like_production(value: str) -> bool:
@@ -280,6 +302,77 @@ def _describe_access_failure(path: Path, exc: OSError) -> str:
         f"{path.parent} and read the file. Check ownership and mode on both "
         "the directory and the file."
     )
+
+
+def _assert_protected_location(path: Path) -> Path:
+    """Verify the file's *neighbourhood*, not just its own mode.
+
+    Checking the file alone is not enough. A ``0600`` file inside a
+    world-writable directory can be unlinked and replaced by any local user, and
+    a symlink can point a correctly-permissioned path at content the service
+    user controls. Both leave the file's own mode looking impeccable.
+
+    Also refuses a path inside the source tree. The override variable is read
+    from the same ambient environment this module treats as untrustworthy, and
+    without this it can aim production straight at the checkout ``.env`` - the
+    exact thing rule 1 exists to prevent, defeated through the escape hatch.
+
+    Returns the fully resolved path, so what gets recorded and read is the real
+    target rather than the link.
+    """
+    from ibkr_trader.config import PROJECT_ROOT
+
+    if _bootstrap_path_exists(path) is False:
+        # Let the read produce the "does not exist" message, which is the more
+        # actionable one. Location checks on a path that is not there would only
+        # obscure it.
+        return path
+
+    resolved = path.resolve()
+
+    try:
+        resolved.relative_to(PROJECT_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise BootstrapConfigurationError(
+            f"Bootstrap environment file {resolved} is inside the source tree "
+            f"({PROJECT_ROOT}). Production configuration must live outside the "
+            "checkout, or it moves with whichever source tree the process "
+            "started from."
+        )
+
+    parent = resolved.parent
+    try:
+        parent_mode = parent.stat().st_mode
+    except OSError as exc:
+        raise BootstrapConfigurationError(
+            _describe_access_failure(parent, exc)
+        ) from exc
+
+    if parent_mode & (stat.S_IWOTH | stat.S_IWGRP):
+        raise BootstrapConfigurationError(
+            f"Directory {parent} is group- or world-writable "
+            f"(mode {stat.filemode(parent_mode)}). Anyone able to write there "
+            "can replace the bootstrap file regardless of its own permissions. "
+            f"Fix with: chmod go-w {parent}"
+        )
+
+    try:
+        owner = resolved.stat().st_uid
+    except OSError as exc:
+        raise BootstrapConfigurationError(
+            _describe_access_failure(resolved, exc)
+        ) from exc
+
+    if owner not in {0, os.geteuid()}:
+        raise BootstrapConfigurationError(
+            f"Bootstrap environment file {resolved} is owned by uid {owner}, "
+            f"which is neither root nor the service user (uid {os.geteuid()}). "
+            "A file owned by another account can be rewritten without notice."
+        )
+
+    return resolved
 
 
 def _assert_not_world_accessible(path: Path) -> None:
@@ -357,10 +450,15 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
     production outage one restart-and-discover-the-next-missing-key at a time is
     exactly the loop this check exists to avoid.
     """
+    # A value that is only a comment is not a value. The parser deliberately
+    # does not treat '#' as starting a mid-value comment (that would corrupt
+    # passwords containing it), so "DATABASE_URL=# TODO" would otherwise pass
+    # the presence check with a nonsense value.
     missing = [
         key
         for key in REQUIRED_PRODUCTION_KEYS
         if not (values.get(key) or "").strip()
+        or (values.get(key) or "").strip().startswith("#")
     ]
     has_account = any(
         (values.get(key) or "").strip() for key in REQUIRED_PRODUCTION_ACCOUNT_KEYS
@@ -391,6 +489,21 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
     # Presence of the key was never the point: 7497/7496 are the paper ports,
     # and copying values across from .env is the most likely way this file gets
     # populated. Refusing here is narrow and explicitly overridable.
+    # Presence was never the point for this one either. An unset catalog and a
+    # catalog pointing at nothing both end in the same QDataContractError deep
+    # in startup, which is what requiring the key was meant to prevent.
+    catalog = (values.get("Q_DATA_CATALOG_PATH") or "").strip()
+    if catalog and not catalog.startswith("#"):
+        catalog_path = Path(catalog)
+        if not catalog_path.is_absolute():
+            problems.append(
+                f"Q_DATA_CATALOG_PATH={catalog!r} is not an absolute path"
+            )
+        elif not catalog_path.is_file():
+            problems.append(
+                f"Q_DATA_CATALOG_PATH={catalog!r} does not point to a file"
+            )
+
     if port in PAPER_TRADING_PORTS and not _paper_port_acknowledged(values):
         problems.append(
             f"IBKR_PORT={port} is an IBKR paper-trading port. If that is "
@@ -491,6 +604,11 @@ def load_runtime_environment(
                 "the protected environment must be identified by absolute path."
             )
 
+        # Validate the location before the contents: a file in an untrustworthy
+        # place should be refused whatever it happens to contain. The resolved
+        # path is used from here on so a symlink cannot make the audit record
+        # name something other than what was read.
+        path = _assert_protected_location(path)
         values = _read_bootstrap_file(path)
         _assert_required_keys_present(values, path)
 
@@ -571,12 +689,27 @@ def load_runtime_environment(
 
     dotenv_values: dict[str, str] = {}
     if _bootstrap_path_exists(resolved_dotenv):
-        dotenv_values = _parse_env_text(
-            resolved_dotenv.read_text(encoding="utf-8")
-        )
-        _assert_cannot_declare_production(
-            dotenv_values, resolved_dotenv, "checkout-local .env"
-        )
+        try:
+            dotenv_text = resolved_dotenv.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # Unlike the protected file in the branch above, this was previously
+            # unguarded: an unreadable, non-UTF-8, or directory .env took down
+            # development startup with a raw traceback.
+            warnings.append(
+                f"Checkout .env {resolved_dotenv} could not be read ({exc}); "
+                "continuing without it."
+            )
+        else:
+            try:
+                dotenv_values = _parse_env_text(dotenv_text)
+            except BootstrapConfigurationError as exc:
+                # Duplicate keys in a development .env are informational here.
+                warnings.append(str(exc))
+                dotenv_values = {}
+            else:
+                _assert_cannot_declare_production(
+                    dotenv_values, resolved_dotenv, "checkout-local .env"
+                )
 
     # An ambient APP_ENV that looks production must not reach here at all: the
     # caller resolved a non-production environment, so a production-looking

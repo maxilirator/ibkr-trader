@@ -35,10 +35,19 @@ second way to change trading behaviour alongside the operator controls. A test
 asserts that no write method is registered on the route.
 
 Populating or changing a stored value is therefore an administrative action
-against the database, recorded in `runtime_setting_event`. Adding a governed
-write path is out of scope for this phase and would require explicit approval,
-since several of these settings (for example `EXECUTION_RUNTIME_ENABLED`) change
-trading behaviour.
+against the database. Adding a governed write path is out of scope for this
+phase and would require explicit approval, since several of these settings (for
+example `EXECUTION_RUNTIME_ENABLED`) change trading behaviour.
+
+**`runtime_setting_event` is reserved and currently unwritten.** No code path
+creates a row in it. It exists so the governed write path has an audit table to
+write to when it is built; until then there is no audit trail for setting
+changes, and this document does not pretend otherwise.
+
+For the same reason, `updated_by` and `updated_at` are **self-reported and
+unverified**. A raw SQL `UPDATE` does not fire SQLAlchemy's `onupdate`, so
+`updated_at` reflects when the row was inserted, and `updated_by` is whatever
+string was typed. Read them as a note-to-self, not as provenance.
 
 ## Runtime value vs stored value
 

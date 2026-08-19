@@ -6,8 +6,18 @@
   $: undeclaredKeys = data.undeclaredKeys ?? [];
   $: errorCount = data.errorCount ?? 0;
   $: driftCount = data.driftCount ?? 0;
+  $: readOnly = data.readOnly !== false;
 
-  $: byCategory = categories.map((category) => ({
+  // Categories are derived from the settings themselves, with the server list
+  // used only for ordering. Driving the render off the server list alone meant
+  // a truncated or empty `categories` produced a blank page with no message,
+  // which reads as "nothing is configured" rather than as a failure.
+  $: presentCategories = [...new Set(settings.map((setting) => setting.category))];
+  $: orderedCategories = [
+    ...categories.filter((category) => presentCategories.includes(category)),
+    ...presentCategories.filter((category) => !categories.includes(category)).sort()
+  ];
+  $: byCategory = orderedCategories.map((category) => ({
     category,
     rows: settings.filter((setting) => setting.category === category)
   }));
@@ -36,7 +46,7 @@
         stored here; they live in the protected bootstrap environment file.
       </p>
     </div>
-    <span class="badge read-only">Read only</span>
+    <span class="badge read-only">{readOnly ? 'Read only' : 'Writable'}</span>
   </header>
 
   {#if driftCount > 0}
@@ -108,6 +118,9 @@
                 {row.updated_by ?? '—'}
                 {#if row.updated_at}
                   <small>{row.updated_at}</small>
+                {/if}
+                {#if row.has_stored_value}
+                  <small>self-reported, not verified</small>
                 {/if}
               </td>
             </tr>

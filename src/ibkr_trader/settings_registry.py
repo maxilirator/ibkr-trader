@@ -57,18 +57,43 @@ class SettingType(StrEnum):
     BOOLEAN = "boolean"
 
 
-#: Substrings that mark a key as secret-bearing. Matching is on the key name, so
-#: this is a structural guard rather than a content check: it prevents a secret
-#: from ever being *declared* as a database-backed setting.
+#: Substrings that mark a key as secret-bearing.
+#:
+#: A denylist cannot be airtight and is not claimed to be: it is the second of
+#: two layers. The first is that a setting must be *declared* in
+#: ``SETTING_DEFINITIONS`` to be read at all, so an undeclared key can never
+#: contribute a value regardless of its name. This list exists to make an
+#: obviously-wrong declaration fail loudly at import time rather than at review
+#: time.
+#:
+#: Underscore-free spellings are listed separately because ``PRIVATE_KEY`` alone
+#: does not match ``PRIVATEKEY``.
 SECRET_KEY_MARKERS = (
     "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "PASS",
     "SECRET",
     "TOKEN",
     "CREDENTIAL",
     "PRIVATE_KEY",
+    "PRIVATEKEY",
+    "PRIVATE",
     "API_KEY",
+    "APIKEY",
+    "AUTH",
+    "BEARER",
+    "COOKIE",
+    "SESSION",
+    "SALT",
+    "SIGNING",
+    "SIGNATURE",
+    "CERT",
+    "PIN",
     "DATABASE_URL",
     "DSN",
+    "_PW",
+    "_KEY",
 )
 
 
@@ -345,17 +370,28 @@ def _runtime_value(definition: SettingDefinition) -> tuple[Any, str, str | None]
     default. Read from ``os.environ`` rather than from an ``AppConfig`` so this
     stays a pure lookup and cannot trigger a configuration load.
     """
+    from ibkr_trader.config import env_flag_is_enabled
+
     raw = environ.get(definition.key)
     if raw is None or not raw.strip():
         return definition.default, "default", None
+
+    if definition.value_type is SettingType.BOOLEAN:
+        # Use config.py's own coercion, not the stricter parse() used for stored
+        # values. They disagree on real input - config treats "off" and any
+        # unrecognised word as *enabled* - and reporting anything other than
+        # what the runtime acts on is the whole failure this module guards.
+        return env_flag_is_enabled(raw), "environment", None
+
     try:
         return definition.parse(raw), "environment", None
     except ValueError as exc:
         return (
             definition.default,
             "default",
-            f"Environment value {raw!r} is not a valid {definition.value_type} "
-            f"({exc}); the runtime falls back to the default.",
+            f"Environment value for {definition.key} is not a valid "
+            f"{definition.value_type} ({exc}); the runtime falls back to the "
+            "default.",
         )
 
 
@@ -387,9 +423,13 @@ def _resolve(
         stored_value: Any = definition.parse(record.value)
     except ValueError as exc:
         stored_value = None
+        # The value is described, never echoed. Nothing validates the *content*
+        # of a stored value, so a credential pasted into the wrong row would
+        # otherwise be reflected onto a page whose own header says secrets are
+        # not stored here.
         stored_error = (
-            f"Stored value {record.value!r} is not a valid "
-            f"{definition.value_type} ({exc})."
+            f"Stored value ({len(record.value)} characters) is not a valid "
+            f"{definition.value_type}: {type(exc).__name__}."
         )
         error = f"{error} {stored_error}" if error else stored_error
 

@@ -553,11 +553,22 @@ class EscalationClassRegressionTests(TestCase):
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(BootstrapConfigurationError):
-                    load_runtime_environment(
+                # Duplicate keys are now refused outright by the parser, so this
+                # .env is reported and skipped rather than partially applied.
+                # Either outcome is acceptable; smuggling production is not.
+                try:
+                    result = load_runtime_environment(
                         bootstrap_path=root / "absent.env", dotenv_path=dotenv
                     )
-                self.assertIsNone(os.environ.get("APP_ENV"))
+                except BootstrapConfigurationError:
+                    pass
+                else:
+                    self.assertFalse(result.is_production)
+                    self.assertTrue(
+                        any("duplicate keys" in w for w in result.warnings),
+                        result.warnings,
+                    )
+                self.assertNotEqual(os.environ.get("APP_ENV"), "production")
                 self.assertIsNone(os.environ.get("IBKR_PORT"))
 
     def test_reversed_duplicate_order_resolves_to_the_inspected_value(self) -> None:
@@ -951,3 +962,194 @@ class CacheCannotBypassTheGateTests(TestCase):
                 # Still refused on the second attempt: nothing was cached.
                 with self.assertRaises(BootstrapConfigurationError):
                     load_runtime_environment()
+
+
+class ProtectedLocationTests(TestCase):
+    """The file's neighbourhood must be trustworthy, not just its own mode.
+
+    These are perimeter defects: the gate's internal logic was sound, but the
+    path override, the parent directory and symlinks all sat outside the
+    function that had been hardened.
+    """
+
+    def _complete(self, root: Path, extra: str = "") -> Path:
+        catalog = root / "catalog.json"
+        catalog.write_text("{}", encoding="utf-8")
+        path = root / "bootstrap.env"
+        path.write_text(
+            "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
+            f"IBKR_PORT=4001\nIBKR_ACCOUNT_ID=U1\n"
+            f"Q_DATA_CATALOG_PATH={catalog}\n{extra}",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_a_path_inside_the_source_tree_is_refused(self) -> None:
+        """Otherwise the override aims production straight at the checkout .env,
+        defeating rule 1 through its own escape hatch."""
+        from ibkr_trader.config import PROJECT_ROOT
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(BootstrapConfigurationError) as ctx:
+                load_runtime_environment(
+                    environment="production",
+                    bootstrap_path=PROJECT_ROOT / ".env.example",
+                )
+        self.assertIn("inside the source tree", str(ctx.exception))
+
+    def test_a_world_writable_parent_directory_is_refused(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "etc"
+            root.mkdir()
+            path = self._complete(root)
+            root.chmod(0o777)
+            try:
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(BootstrapConfigurationError) as ctx:
+                        load_runtime_environment(
+                            environment="production", bootstrap_path=path
+                        )
+            finally:
+                root.chmod(0o755)
+        self.assertIn("writable", str(ctx.exception))
+
+    def test_a_group_writable_parent_directory_is_refused(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "etc"
+            root.mkdir()
+            path = self._complete(root)
+            root.chmod(0o775)
+            try:
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(BootstrapConfigurationError):
+                        load_runtime_environment(
+                            environment="production", bootstrap_path=path
+                        )
+            finally:
+                root.chmod(0o755)
+
+    def test_a_symlink_records_the_resolved_target(self) -> None:
+        """The audit record must name what was read, not the link."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "etc"
+            root.mkdir()
+            real = self._complete(root)
+            link = root / "link.env"
+            link.symlink_to(real)
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    environment="production", bootstrap_path=link
+                )
+        self.assertEqual(result.path, real.resolve())
+
+    def test_a_sane_protected_location_is_accepted(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "etc"
+            root.mkdir()
+            root.chmod(0o750)
+            path = self._complete(root)
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    environment="production", bootstrap_path=path
+                )
+        self.assertTrue(result.is_production)
+
+
+class DuplicateKeyTests(TestCase):
+    def test_duplicate_keys_in_the_protected_file_are_refused(self) -> None:
+        """This parser is first-wins; a shell and systemd EnvironmentFile= are
+        last-wins. A duplicated key means an operator verifying the file from a
+        shell sees a different value than the gate used."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = root / "catalog.json"
+            catalog.write_text("{}", encoding="utf-8")
+            path = _write_bootstrap(
+                root,
+                "IBKR_PORT=4001\nIBKR_PORT=4002\nDATABASE_URL=x\nIBKR_HOST=h\n"
+                f"IBKR_ACCOUNT_ID=U1\nQ_DATA_CATALOG_PATH={catalog}\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("duplicate keys", str(ctx.exception))
+        self.assertIn("IBKR_PORT", str(ctx.exception))
+
+
+class CatalogAndCommentValueTests(TestCase):
+    def _bootstrap(self, root: Path, catalog: str) -> Path:
+        return _write_bootstrap(
+            root,
+            "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=h\nIBKR_PORT=4001\n"
+            f"IBKR_ACCOUNT_ID=U1\nQ_DATA_CATALOG_PATH={catalog}\n",
+        )
+
+    def test_a_catalog_path_pointing_nowhere_is_refused(self) -> None:
+        """Presence alone was never the point: an unset and a wrong catalog both
+        end in the same QDataContractError deep inside startup."""
+        with TemporaryDirectory() as temp_dir:
+            path = self._bootstrap(Path(temp_dir), "/nope/missing.json")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("Q_DATA_CATALOG_PATH", str(ctx.exception))
+
+    def test_a_relative_catalog_path_is_refused(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = self._bootstrap(Path(temp_dir), "relative/catalog.json")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("absolute", str(ctx.exception))
+
+    def test_a_comment_only_value_counts_as_missing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = root / "catalog.json"
+            catalog.write_text("{}", encoding="utf-8")
+            path = _write_bootstrap(
+                root,
+                "DATABASE_URL=# TODO fill me in\nIBKR_HOST=h\nIBKR_PORT=4001\n"
+                f"IBKR_ACCOUNT_ID=U1\nQ_DATA_CATALOG_PATH={catalog}\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("DATABASE_URL", str(ctx.exception))
+
+
+class UnreadableDotenvTests(TestCase):
+    """Development startup must not die on a malformed checkout .env."""
+
+    def test_non_utf8_dotenv_is_a_warning_not_a_crash(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dotenv = root / ".env"
+            dotenv.write_bytes(b"\xff\xfe\x00binary")
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    bootstrap_path=root / "absent.env", dotenv_path=dotenv
+                )
+        self.assertFalse(result.is_production)
+        self.assertTrue(result.warnings)
+
+    def test_a_directory_dotenv_is_a_warning_not_a_crash(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dotenv = root / ".env"
+            dotenv.mkdir()
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    bootstrap_path=root / "absent.env", dotenv_path=dotenv
+                )
+        self.assertFalse(result.is_production)
+        self.assertTrue(result.warnings)

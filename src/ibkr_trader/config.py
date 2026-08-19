@@ -85,6 +85,23 @@ def _output_root() -> Path:
     """
     return _resolve_project_path(getenv("IBKR_TRADER_OUTPUT_ROOT", "var/shortability"))
 
+#: Values that switch a boolean environment flag off. Anything else - including
+#: an unrecognised word - reads as enabled.
+FALSE_ENV_FLAG_VALUES = frozenset({"0", "false", "no"})
+
+
+def env_flag_is_enabled(raw_value: str) -> bool:
+    """Coerce a boolean environment flag exactly as :class:`AppConfig` does.
+
+    Exported so the settings registry can report the same answer the runtime
+    acts on. A second, stricter implementation elsewhere would disagree on real
+    inputs - ``off`` reads as *enabled* here, because it is not in the false set
+    - and a dashboard that says "disabled" while the supervisor is running is
+    worse than no dashboard.
+    """
+    return raw_value.strip().lower() not in FALSE_ENV_FLAG_VALUES
+
+
 def _parse_env_list(raw_value: str) -> tuple[str, ...]:
     return tuple(
         value.strip()

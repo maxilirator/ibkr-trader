@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from sqlalchemy.orm import sessionmaker
 
+from ibkr_trader.config import FALSE_ENV_FLAG_VALUES, env_flag_is_enabled
 from ibkr_trader.db.base import build_engine, create_schema, session_scope
 from ibkr_trader.db.models import RuntimeSettingRecord
 from ibkr_trader.settings_registry import (
@@ -208,7 +209,10 @@ class SettingsRegistryReadTests(TestCase):
             if item.key == "MARKET_DATA_BACKFILL_BATCH_SIZE"
         )
         self.assertIsNotNone(setting.error)
-        self.assertIn("three", setting.error)
+        # Described, not echoed: nothing validates the content of a stored
+        # value, so it must not be reflected back onto the page.
+        self.assertNotIn("three", setting.error)
+        self.assertIn("integer", setting.error)
         # Shown as unset rather than as a value, and the runtime is unaffected.
         self.assertIsNone(setting.stored_value)
         self.assertEqual(setting.runtime_value, setting.default_value)
@@ -241,15 +245,65 @@ class SettingsRegistryReadTests(TestCase):
         self.assertEqual(len(payload["settings"]), len(SETTING_DEFINITIONS))
         self.assertIn("market-stream", payload["categories"])
 
-    def test_payload_contains_no_secret_bearing_key(self) -> None:
+    def test_a_stored_secret_value_never_reaches_the_payload(self) -> None:
+        """The property that actually matters.
+
+        The earlier version of this test built a payload from an EMPTY database
+        and asserted no marker substring appeared, which could never fail: no
+        declared key contains a marker. It asserted nothing about stored rows.
+        """
         with TemporaryDirectory() as temp_dir:
             factory = self._session_factory(temp_dir)
+            with session_scope(factory) as session:
+                # An undeclared row whose key and value both look secret.
+                session.add(
+                    RuntimeSettingRecord(
+                        setting_key="IBKR_PASSWORD",
+                        value="hunter2-LEAKED",
+                        value_type="string",
+                        note="should never be rendered",
+                    )
+                )
+                # A declared row whose value is unparseable and secret-looking,
+                # which is the path that used to echo the raw value in an error.
+                session.add(
+                    RuntimeSettingRecord(
+                        setting_key="MARKET_DATA_BACKFILL_BATCH_SIZE",
+                        value="SUPERSECRET-TOKEN",
+                        value_type="integer",
+                    )
+                )
             payload = serialize_settings_registry(read_settings_registry(factory))
 
-        serialized = repr(payload).upper()
-        for marker in SECRET_KEY_MARKERS:
-            with self.subTest(marker=marker):
-                self.assertNotIn(marker, serialized)
+        serialized = repr(payload)
+        self.assertNotIn("hunter2-LEAKED", serialized)
+        self.assertNotIn("SUPERSECRET-TOKEN", serialized)
+        self.assertNotIn("should never be rendered", serialized)
+        # The undeclared key NAME is surfaced on purpose, so the operator can
+        # see the row exists; its value is not.
+        self.assertIn("IBKR_PASSWORD", payload["undeclared_keys"])
+
+    def test_parse_error_describes_the_value_without_echoing_it(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            factory = self._session_factory(temp_dir)
+            with session_scope(factory) as session:
+                session.add(
+                    RuntimeSettingRecord(
+                        setting_key="MARKET_DATA_BACKFILL_BATCH_SIZE",
+                        value="s3cr3t-value",
+                        value_type="integer",
+                    )
+                )
+            snapshot = read_settings_registry(factory)
+
+        setting = next(
+            item
+            for item in snapshot.settings
+            if item.key == "MARKET_DATA_BACKFILL_BATCH_SIZE"
+        )
+        self.assertIsNotNone(setting.error)
+        self.assertNotIn("s3cr3t-value", setting.error)
+        self.assertIn("12 characters", setting.error)
 
 
 class SettingsApiTests(TestCase):
@@ -447,3 +501,49 @@ class RuntimeValueTruthfulnessTests(TestCase):
                     definition.default,
                     f"{definition.key}: registry default disagrees with config.py",
                 )
+
+
+class BooleanCoercionAgreementTests(TestCase):
+    """The registry must coerce boolean flags exactly as `config.py` does.
+
+    A second, stricter implementation disagreed on real input: `off` reads as
+    *enabled* to config.py because it is not in the false set, but a strict
+    parser reads it as disabled. A dashboard reporting "disabled" while the
+    supervisor is running is worse than no dashboard.
+    """
+
+    def _session_factory(self, temp_dir: str) -> sessionmaker:
+        database_path = Path(temp_dir) / "bools.db"
+        engine = build_engine(f"sqlite+pysqlite:///{database_path}")
+        create_schema(engine)
+        return sessionmaker(bind=engine, expire_on_commit=False)
+
+    def test_registry_agrees_with_config_for_every_flag_spelling(self) -> None:
+        boolean_keys = [
+            d.key for d in SETTING_DEFINITIONS if d.value_type is SettingType.BOOLEAN
+        ]
+        self.assertTrue(boolean_keys)
+
+        with TemporaryDirectory() as temp_dir:
+            factory = self._session_factory(temp_dir)
+            for raw in ("off", "on", "0", "1", "false", "true", "no", "yes", "maybe", "OFF"):
+                for key in boolean_keys:
+                    with self.subTest(raw=raw, key=key):
+                        with patch.dict(os.environ, {key: raw}, clear=True):
+                            snapshot = read_settings_registry(factory)
+                        setting = next(
+                            s for s in snapshot.settings if s.key == key
+                        )
+                        self.assertEqual(
+                            setting.runtime_value,
+                            env_flag_is_enabled(raw),
+                            f"{key}={raw!r}: registry disagrees with config.py",
+                        )
+                        self.assertEqual(setting.runtime_source, "environment")
+
+    def test_config_still_uses_the_shared_false_set(self) -> None:
+        """If config.py stops using this helper's semantics, the registry would
+        start misreporting; fail here instead."""
+        source = Path("src/ibkr_trader/config.py").read_text(encoding="utf-8")
+        self.assertIn('{"0", "false", "no"}', source)
+        self.assertEqual(FALSE_ENV_FLAG_VALUES, frozenset({"0", "false", "no"}))
