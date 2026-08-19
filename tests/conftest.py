@@ -47,3 +47,22 @@ def q_data_catalog(tmp_path_factory: pytest.TempPathFactory) -> Path:
     catalog = write_catalog(tmp_path_factory.mktemp("q-data"))
     os.environ.setdefault("Q_DATA_CATALOG_PATH", str(catalog))
     return catalog
+
+
+@pytest.fixture(autouse=True, scope="session")
+def isolated_bootstrap_env(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep the test suite away from the real /etc/ibkr-trader/bootstrap.env.
+
+    ``AppConfig.from_env()`` resolves the protected bootstrap path. On the live
+    host that file exists and holds production secrets, so without this the
+    suite would read them into the test process - and would fail outright on a
+    host where /etc/ibkr-trader is not traversable by the test user.
+
+    Tests that need a specific bootstrap file pass ``bootstrap_path`` explicitly;
+    those that clear the environment with ``clear=True`` drop this override and
+    get the real default path, which is correct because they also assert on
+    absence rather than reading a file.
+    """
+    path = tmp_path_factory.mktemp("bootstrap") / "absent-bootstrap.env"
+    os.environ.setdefault("IBKR_TRADER_BOOTSTRAP_ENV", str(path))
+    return path

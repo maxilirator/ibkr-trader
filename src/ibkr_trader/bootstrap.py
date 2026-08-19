@@ -32,10 +32,14 @@ payload. Only key names appear.
 
 from __future__ import annotations
 
+import logging
+import os
 import stat
 from dataclasses import dataclass, field
 from os import environ, getenv
 from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
 
 #: Protected location of the production bootstrap environment.
 DEFAULT_BOOTSTRAP_ENV_PATH = Path("/etc/ibkr-trader/bootstrap.env")
@@ -68,6 +72,22 @@ REQUIRED_PRODUCTION_KEYS = (
 #: At least one of these must be present and non-empty in production, so the
 #: runtime always knows which IBKR account it is acting for.
 REQUIRED_PRODUCTION_ACCOUNT_KEYS = ("IBKR_ACCOUNT_ID", "IBKR_ACCOUNT_IDS")
+
+#: IBKR paper-trading ports. Pointing the live runtime at one of these is the
+#: specific accident this module exists to prevent, so it is refused rather
+#: than merely defaulted away from.
+PAPER_TRADING_PORTS = frozenset({7497, 7496})
+
+#: Records a deliberate decision to run production against a paper port.
+PAPER_PORT_ACKNOWLEDGEMENT_KEY = "IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION"
+
+
+def _paper_port_acknowledged(values: dict[str, str]) -> bool:
+    return (values.get(PAPER_PORT_ACKNOWLEDGEMENT_KEY) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 class BootstrapConfigurationError(RuntimeError):
@@ -136,6 +156,29 @@ def _parse_env_text(text: str) -> dict[str, str]:
     return values
 
 
+def _bootstrap_path_exists(path: Path) -> bool | None:
+    """Whether the bootstrap file exists, or ``None`` if that is unknowable.
+
+    ``Path.exists()`` does not swallow ``EACCES``: when the service user cannot
+    traverse the parent directory it raises rather than returning ``False``.
+    That is a third answer - "cannot tell" - and it must be distinguished from
+    "absent", because the two need different handling in each branch.
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return None
+
+
+def _describe_access_failure(path: Path, exc: OSError) -> str:
+    return (
+        f"Bootstrap environment file {path} could not be accessed: {exc}. The "
+        f"service runs as uid {os.geteuid()}, which must be able to traverse "
+        f"{path.parent} and read the file. Check ownership and mode on both "
+        "the directory and the file."
+    )
+
+
 def _assert_not_world_accessible(path: Path) -> None:
     """Refuse to use a secrets file that any local user can read.
 
@@ -158,9 +201,27 @@ def _assert_not_world_accessible(path: Path) -> None:
             f"chmod o= {path}"
         )
 
+    # Group *read* is allowed so a service group can share the file. Group
+    # *write* is not: anyone in that group could redirect DATABASE_URL to
+    # another database, or change IBKR_PORT, without touching this code.
+    if mode & stat.S_IWGRP:
+        raise BootstrapConfigurationError(
+            f"Bootstrap environment file {path} is group-writable "
+            f"(mode {stat.filemode(mode)}). Anyone in that group could "
+            "redirect the ledger database or the Gateway port. Fix with: "
+            f"chmod g-w {path}"
+        )
+
 
 def _read_bootstrap_file(path: Path) -> dict[str, str]:
-    if not path.exists():
+    try:
+        exists = path.exists()
+    except OSError as exc:
+        raise BootstrapConfigurationError(
+            _describe_access_failure(path, exc)
+        ) from exc
+
+    if not exists:
         raise BootstrapConfigurationError(
             f"Bootstrap environment file {path} does not exist. Production "
             "startup is fail-closed and will not fall back to checkout-local "
@@ -211,6 +272,30 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
             f"{' or '.join(REQUIRED_PRODUCTION_ACCOUNT_KEYS)}"
         )
 
+    # Shape, not just presence. Without this an unparseable port survives to a
+    # bare ValueError from int() much later, defeating report-everything-at-once.
+    raw_port = (values.get("IBKR_PORT") or "").strip()
+    port: int | None = None
+    if raw_port:
+        try:
+            port = int(raw_port)
+        except ValueError:
+            problems.append(
+                f"IBKR_PORT is not an integer ({raw_port!r}); note that a "
+                "trailing '# comment' is part of the value, not a comment"
+            )
+
+    # Presence of the key was never the point: 7497/7496 are the paper ports,
+    # and copying values across from .env is the most likely way this file gets
+    # populated. Refusing here is narrow and explicitly overridable.
+    if port in PAPER_TRADING_PORTS and not _paper_port_acknowledged(values):
+        problems.append(
+            f"IBKR_PORT={port} is an IBKR paper-trading port. If that is "
+            f"genuinely intended in production, set "
+            f"{PAPER_PORT_ACKNOWLEDGEMENT_KEY}=1 in the same file to record "
+            "the decision"
+        )
+
     if problems:
         raise BootstrapConfigurationError(
             f"Bootstrap environment file {path} is incomplete for production: "
@@ -256,6 +341,18 @@ def load_runtime_environment(
     path = bootstrap_path or bootstrap_env_path()
 
     if production:
+        # The override is read from the same ambient environment this design
+        # treats as untrustworthy. A relative or home-relative path would let a
+        # stray export redirect production configuration to a user-writable
+        # file, reintroducing source-dependence through the back door.
+        if not path.is_absolute():
+            raise BootstrapConfigurationError(
+                f"{BOOTSTRAP_ENV_PATH_VAR}={str(path)!r} is not an absolute "
+                "path. In production the protected environment must be "
+                "identified by absolute path so it cannot be relocated by the "
+                "process's working directory."
+            )
+
         values = _read_bootstrap_file(path)
         _assert_required_keys_present(values, path)
 
@@ -273,6 +370,18 @@ def load_runtime_environment(
         # into a non-production value and thereby disable its own enforcement.
         environ["APP_ENV"] = resolved_environment
 
+        # Key names only; the payload is value-free by construction. Without
+        # this a production start leaves no trace of which file was read or
+        # which ambient values it replaced.
+        LOGGER.info(
+            "Production bootstrap loaded from %s: %d key(s) applied", path, len(values)
+        )
+        if overridden:
+            LOGGER.warning(
+                "Bootstrap file overrode ambient environment values for: %s",
+                ", ".join(overridden),
+            )
+
         return BootstrapLoadResult(
             environment=resolved_environment,
             is_production=True,
@@ -287,7 +396,15 @@ def load_runtime_environment(
     applied: list[str] = []
     source = "none"
 
-    if path.exists():
+    exists = _bootstrap_path_exists(path)
+    if exists is None:
+        # Unreadable /etc is not fatal here: the file is documented as optional
+        # outside production, and a dev box or CI runner must still start.
+        warnings.append(
+            f"Bootstrap environment file {path} could not be accessed; "
+            "continuing without it because it is optional outside production."
+        )
+    elif exists:
         try:
             values = _read_bootstrap_file(path)
         except BootstrapConfigurationError as exc:
@@ -300,15 +417,50 @@ def load_runtime_environment(
             source = "bootstrap"
 
     resolved_dotenv = dotenv_path or DEFAULT_ENV_FILE
+    effective_environment = resolved_environment
+
     if resolved_dotenv.exists():
+        # Inspected before it is applied. Production was decided *before* this
+        # load, so a checkout-local file that declares itself production would
+        # otherwise escalate after the gate had already declined to engage: the
+        # protected file would never be opened, and every value - including the
+        # throwaway DATABASE_URL and the paper IBKR_PORT - would come from the
+        # source tree while the process reported environment=production.
+        # Declaring production is exactly the decision a checkout may not make.
+        # Checking first also means a rejected file leaves os.environ untouched.
+        dotenv_values = _parse_env_text(
+            resolved_dotenv.read_text(encoding="utf-8")
+        )
+        # setdefault semantics: an ambient APP_ENV wins over the file's.
+        declared = getenv("APP_ENV") or dotenv_values.get("APP_ENV", "")
+        if is_production_environment(declared):
+            raise BootstrapConfigurationError(
+                f"{resolved_dotenv} sets APP_ENV={declared!r}, but a "
+                "checkout-local .env must not declare production. Production is "
+                "selected by the service environment (systemd Environment=), so "
+                "that it cannot be redefined by whichever source tree the "
+                "process started from. Remove APP_ENV from that file."
+            )
+
         load_dotenv_file(resolved_dotenv)
+        effective_environment = getenv("APP_ENV", resolved_environment)
         source = "bootstrap+dotenv" if source == "bootstrap" else "dotenv"
 
+    if _bootstrap_path_exists(path) is not True:
+        path = None
+
+    LOGGER.info(
+        "Runtime environment resolved: environment=%s source=%s path=%s",
+        effective_environment,
+        source,
+        path,
+    )
+
     return BootstrapLoadResult(
-        environment=resolved_environment,
+        environment=effective_environment,
         is_production=False,
         source=source,
-        path=path if path.exists() else None,
+        path=path,
         applied_keys=tuple(sorted(set(applied))),
         overridden_keys=(),
         warnings=tuple(warnings),

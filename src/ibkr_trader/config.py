@@ -238,9 +238,14 @@ class AppConfig:
         # Resolves the protected bootstrap file in production and the
         # checkout-local .env otherwise. Raises rather than starting on
         # incomplete production configuration.
-        load_runtime_environment()
+        #
+        # The environment is taken from the load result rather than re-read
+        # from os.environ: a second read after the .env load is what previously
+        # let a checkout-local file declare production *after* the gate had
+        # already decided not to engage.
+        bootstrap = load_runtime_environment()
+        environment = bootstrap.environment
 
-        environment = getenv("APP_ENV", "dev")
         if is_production_environment(environment):
             # No default: the development default points at a local throwaway
             # database, and silently using it in production would write the

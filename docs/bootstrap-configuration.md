@@ -30,6 +30,27 @@ refuses to start if it cannot be trusted.
 Secrets never go in PostgreSQL. Non-secret operational settings never go in
 `bootstrap.env`, so that changing one does not require touching a secrets file.
 
+## Where `APP_ENV` must be set
+
+**In the systemd unit, never in `.env`.**
+
+```ini
+[Service]
+Environment=APP_ENV=production
+```
+
+A checkout-local `.env` that sets `APP_ENV=production` is **refused** at startup.
+This is not a style preference. Production is decided before `.env` is read, so
+a `.env` that declared production would escalate *after* the gate had already
+declined to engage: the protected file would never be opened, and every value —
+including the throwaway `DATABASE_URL` and the paper `IBKR_PORT` — would come
+from the source tree while the process reported `environment=production`. That is
+exactly the failure this mechanism exists to prevent, so declaring production is
+a decision a checkout is not allowed to make.
+
+No unit in `ops/systemd/` sets `APP_ENV` today. Adding it is a deliberate step of
+the approved cutover, not a default.
+
 ## Behaviour
 
 Selected by `APP_ENV`.
@@ -69,9 +90,15 @@ to start must be unambiguous.
 
 ## Creating the file
 
+The service runs as an unprivileged user (`systemctl --user`), so it must be
+able to **traverse the directory** as well as read the file. Set the group on
+both; a `root:root 0750` directory is not traversable by the service user and
+produces a permission error at startup.
+
 ```bash
-sudo install -d -m 0750 /etc/ibkr-trader
-sudo install -m 0640 /dev/null /etc/ibkr-trader/bootstrap.env
+SERVICE_GROUP=<the group the trader service runs as>
+sudo install -d -m 0750 -o root -g "$SERVICE_GROUP" /etc/ibkr-trader
+sudo install -m 0640 -o root -g "$SERVICE_GROUP" /dev/null /etc/ibkr-trader/bootstrap.env
 sudo "$EDITOR" /etc/ibkr-trader/bootstrap.env
 ```
 
@@ -84,11 +111,14 @@ IBKR_PORT=4001
 IBKR_ACCOUNT_IDS=U1234567
 ```
 
-Permissions: the file must not be world-readable, writable, or executable.
-`0640` owned by `root:<service group>` is the intended shape. Verify with:
+Permissions: the file must not be world-accessible, and must not be
+group-writable — anyone with group write could redirect the ledger database or
+the Gateway port. `0640 root:<service group>` is the intended shape. Verify both
+the directory and the file, and confirm the service user can actually read it:
 
 ```bash
-stat -c '%A %U:%G %n' /etc/ibkr-trader/bootstrap.env
+stat -c '%A %U:%G %n' /etc/ibkr-trader /etc/ibkr-trader/bootstrap.env
+sudo -u <service user> head -c1 /etc/ibkr-trader/bootstrap.env >/dev/null && echo readable
 ```
 
 Set `IBKR_TRADER_BOOTSTRAP_ENV` to use a different location (tests, staging).
@@ -103,12 +133,16 @@ cutover — not assumed.
 
 Checklist:
 
-1. Confirm the live `APP_ENV` value.
-2. Create `/etc/ibkr-trader/bootstrap.env` with correct permissions and every
-   required key.
-3. Confirm `IBKR_PORT` is the live Gateway port, not `7497`.
+1. Confirm the live `APP_ENV` value and where it is currently set.
+2. Create `/etc/ibkr-trader/bootstrap.env` with correct ownership, mode, and
+   every required key; verify the service user can read it.
+3. Confirm `IBKR_PORT` is the live Gateway port. `7497`/`7496` are refused
+   unless `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1` records the decision.
 4. Confirm `DATABASE_URL` points at the production database.
-5. Only then set `APP_ENV=production`.
+5. Remove any `APP_ENV` from the checkout `.env` — it would now be refused.
+6. Only then add `Environment=APP_ENV=production` to the systemd unit and
+   restart the application services.
 
-Steps 1-5 change application startup behaviour and require explicit operator
-approval before being applied to the live host.
+Steps 1-6 change application startup behaviour and require explicit operator
+approval before being applied to the live host. Restart only the application
+services; do not restart IB Gateway.
