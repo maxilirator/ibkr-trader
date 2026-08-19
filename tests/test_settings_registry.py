@@ -8,9 +8,12 @@ show an operator a value the runtime is not using).
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from sqlalchemy.orm import sessionmaker
 
@@ -135,20 +138,25 @@ class SettingsRegistryReadTests(TestCase):
         create_schema(engine)
         return sessionmaker(bind=engine, expire_on_commit=False)
 
-    def test_absent_rows_resolve_to_declared_defaults(self) -> None:
+    def test_absent_rows_report_the_runtime_default(self) -> None:
         with TemporaryDirectory() as temp_dir:
             factory = self._session_factory(temp_dir)
-            snapshot = read_settings_registry(factory)
+            with patch.dict(os.environ, {}, clear=True):
+                snapshot = read_settings_registry(factory)
 
         self.assertEqual(len(snapshot.settings), len(SETTING_DEFINITIONS))
         self.assertEqual(snapshot.undeclared_keys, ())
         for setting in snapshot.settings:
             with self.subTest(key=setting.key):
-                self.assertEqual(setting.source, "default")
-                self.assertEqual(setting.effective_value, setting.default_value)
+                self.assertEqual(setting.runtime_source, "default")
+                self.assertEqual(setting.runtime_value, setting.default_value)
+                self.assertFalse(setting.has_stored_value)
+                self.assertFalse(setting.drifted)
                 self.assertIsNone(setting.error)
 
-    def test_stored_row_overrides_the_default_and_reports_its_source(self) -> None:
+    def test_stored_row_is_reported_as_stored_not_as_applied(self) -> None:
+        """THE critical property. Nothing in the runtime reads this table, so a
+        stored value must never be presented as the value in effect."""
         with TemporaryDirectory() as temp_dir:
             factory = self._session_factory(temp_dir)
             with session_scope(factory) as session:
@@ -169,9 +177,13 @@ class SettingsRegistryReadTests(TestCase):
             for item in snapshot.settings
             if item.key == "MARKET_STREAM_STALE_AFTER_SECONDS"
         )
-        self.assertEqual(setting.effective_value, 45.0)
-        self.assertEqual(setting.default_value, 180.0)
-        self.assertEqual(setting.source, "database")
+        self.assertEqual(setting.stored_value, 45.0)
+        self.assertTrue(setting.has_stored_value)
+        # The runtime never read the row, so its value is unchanged...
+        self.assertEqual(setting.runtime_value, 180.0)
+        self.assertEqual(setting.runtime_source, "default")
+        # ...and the disagreement is surfaced rather than hidden.
+        self.assertTrue(setting.drifted)
         self.assertEqual(setting.updated_by, "mattias")
         self.assertIsNone(setting.error)
 
@@ -197,8 +209,9 @@ class SettingsRegistryReadTests(TestCase):
         )
         self.assertIsNotNone(setting.error)
         self.assertIn("three", setting.error)
-        # Falls back to the default, and says so.
-        self.assertEqual(setting.effective_value, setting.default_value)
+        # Shown as unset rather than as a value, and the runtime is unaffected.
+        self.assertIsNone(setting.stored_value)
+        self.assertEqual(setting.runtime_value, setting.default_value)
 
     def test_undeclared_stored_rows_are_surfaced(self) -> None:
         """A row nobody declares affects nothing; hiding it would mislead."""
@@ -222,7 +235,9 @@ class SettingsRegistryReadTests(TestCase):
             payload = serialize_settings_registry(read_settings_registry(factory))
 
         self.assertTrue(payload["read_only"])
+        self.assertFalse(payload["stored_values_are_applied"])
         self.assertEqual(payload["error_count"], 0)
+        self.assertEqual(payload["drift_count"], 0)
         self.assertEqual(len(payload["settings"]), len(SETTING_DEFINITIONS))
         self.assertIn("market-stream", payload["categories"])
 
@@ -288,9 +303,12 @@ class SettingsApiTests(TestCase):
         self.assertTrue(body["accepted"])
         self.assertTrue(body["read_only"])
         self.assertEqual(len(body["settings"]), len(SETTING_DEFINITIONS))
+        self.assertFalse(body["stored_values_are_applied"])
         for row in body["settings"]:
-            self.assertIn("effective_value", row)
-            self.assertIn("source", row)
+            self.assertIn("runtime_value", row)
+            self.assertIn("stored_value", row)
+            self.assertIn("runtime_source", row)
+            self.assertIn("drifted", row)
 
     def test_there_is_no_settings_write_endpoint(self) -> None:
         """The registry reports state; it must not become a second way to
@@ -321,3 +339,111 @@ class SettingsApiTests(TestCase):
                 self.assertNotIn("PUT", methods)
                 self.assertNotIn("PATCH", methods)
                 self.assertNotIn("DELETE", methods)
+
+
+class RuntimeValueTruthfulnessTests(TestCase):
+    """The registry must never claim the runtime is using a value it is not.
+
+    `config.py` resolves configuration from the process environment; nothing
+    reads the `runtime_setting` table. Presenting a stored row as the effective
+    value would be a fabricated success state, which is the specific failure the
+    repository rules prohibit.
+    """
+
+    def _session_factory(self, temp_dir: str) -> sessionmaker:
+        database_path = Path(temp_dir) / "truth.db"
+        engine = build_engine(f"sqlite+pysqlite:///{database_path}")
+        create_schema(engine)
+        return sessionmaker(bind=engine, expire_on_commit=False)
+
+    def test_no_declared_setting_is_read_from_the_database_by_config(self) -> None:
+        """Guards the assumption the reporting is built on. If a future change
+        wires the table into config.py, this test should fail and the wording
+        ('stored, not applied') must be revisited."""
+        source = Path("src/ibkr_trader/config.py").read_text(encoding="utf-8")
+        self.assertNotIn("RuntimeSettingRecord", source)
+        self.assertNotIn("settings_registry", source)
+
+    def test_runtime_value_follows_the_environment_not_the_database(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            factory = self._session_factory(temp_dir)
+            with session_scope(factory) as session:
+                session.add(
+                    RuntimeSettingRecord(
+                        setting_key="MARKET_STREAM_MAX_SUBSCRIPTIONS",
+                        value="7",
+                        value_type="integer",
+                    )
+                )
+            with patch.dict(
+                os.environ, {"MARKET_STREAM_MAX_SUBSCRIPTIONS": "33"}, clear=True
+            ):
+                snapshot = read_settings_registry(factory)
+
+        setting = next(
+            item
+            for item in snapshot.settings
+            if item.key == "MARKET_STREAM_MAX_SUBSCRIPTIONS"
+        )
+        self.assertEqual(setting.runtime_value, 33)
+        self.assertEqual(setting.runtime_source, "environment")
+        self.assertEqual(setting.stored_value, 7)
+        self.assertTrue(setting.drifted)
+
+    def test_agreeing_values_are_not_reported_as_drift(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            factory = self._session_factory(temp_dir)
+            with session_scope(factory) as session:
+                session.add(
+                    RuntimeSettingRecord(
+                        setting_key="MARKET_STREAM_MAX_SUBSCRIPTIONS",
+                        value="33",
+                        value_type="integer",
+                    )
+                )
+            with patch.dict(
+                os.environ, {"MARKET_STREAM_MAX_SUBSCRIPTIONS": "33"}, clear=True
+            ):
+                snapshot = read_settings_registry(factory)
+
+        setting = next(
+            item
+            for item in snapshot.settings
+            if item.key == "MARKET_STREAM_MAX_SUBSCRIPTIONS"
+        )
+        self.assertFalse(setting.drifted)
+
+    def test_invalid_environment_value_is_reported_not_hidden(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            factory = self._session_factory(temp_dir)
+            with patch.dict(
+                os.environ, {"MARKET_STREAM_MAX_SUBSCRIPTIONS": "lots"}, clear=True
+            ):
+                snapshot = read_settings_registry(factory)
+
+        setting = next(
+            item
+            for item in snapshot.settings
+            if item.key == "MARKET_STREAM_MAX_SUBSCRIPTIONS"
+        )
+        self.assertIsNotNone(setting.error)
+        self.assertIn("lots", setting.error)
+        self.assertEqual(setting.runtime_value, setting.default_value)
+
+    def test_declared_defaults_match_config_defaults(self) -> None:
+        """A default shown on the dashboard that differs from the real code
+        default is misinformation to an operator."""
+        source = Path("src/ibkr_trader/config.py").read_text(encoding="utf-8")
+        for definition in SETTING_DEFINITIONS:
+            with self.subTest(key=definition.key):
+                match = re.search(
+                    rf'getenv\(\s*"{re.escape(definition.key)}",\s*\n?\s*"([^"]*)"',
+                    source,
+                )
+                if match is None:
+                    self.skipTest(f"{definition.key} not read via getenv in config.py")
+                self.assertEqual(
+                    definition.parse(match.group(1)),
+                    definition.default,
+                    f"{definition.key}: registry default disagrees with config.py",
+                )

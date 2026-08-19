@@ -5,6 +5,7 @@
   $: categories = data.categories ?? [];
   $: undeclaredKeys = data.undeclaredKeys ?? [];
   $: errorCount = data.errorCount ?? 0;
+  $: driftCount = data.driftCount ?? 0;
 
   $: byCategory = categories.map((category) => ({
     category,
@@ -27,19 +28,30 @@
     <div>
       <h1>Runtime settings</h1>
       <p class="subtitle">
-        Declared non-secret operational settings and the value the API actually
-        resolved. Secrets are not stored here &mdash; they live in the protected
-        bootstrap environment file.
+        Declared non-secret operational settings. <strong>Runtime</strong> is what
+        the API process actually resolved and is the operative value.
+        <strong>Stored</strong> is what the database records &mdash; nothing in the
+        runtime reads it, so a stored value is recorded intent, not an applied
+        setting. A difference between the two is flagged as drift. Secrets are not
+        stored here; they live in the protected bootstrap environment file.
       </p>
     </div>
     <span class="badge read-only">Read only</span>
   </header>
 
+  {#if driftCount > 0}
+    <div class="notice warn">
+      <strong>{driftCount} setting{driftCount === 1 ? '' : 's'} differ between the
+      database and the running process.</strong>
+      The runtime value is the one in effect. The stored value is not applied.
+    </div>
+  {/if}
+
   {#if errorCount > 0}
     <div class="notice bad">
       <strong>{errorCount} setting{errorCount === 1 ? '' : 's'} could not be parsed.</strong>
-      The runtime is using the declared default for those; the stored value is not
-      in effect.
+      Where an environment value was invalid the runtime fell back to the declared
+      default; where a stored value was invalid it is shown as unset.
     </div>
   {/if}
 
@@ -62,7 +74,8 @@
         <thead>
           <tr>
             <th>Setting</th>
-            <th>Effective</th>
+            <th>Runtime</th>
+            <th>Stored</th>
             <th>Default</th>
             <th>Source</th>
             <th>Changed by</th>
@@ -70,7 +83,7 @@
         </thead>
         <tbody>
           {#each group.rows as row (row.key)}
-            <tr class:has-error={row.error}>
+            <tr class:has-error={row.error} class:has-drift={row.drifted}>
               <td>
                 <code>{row.key}</code>
                 <small>{row.description}</small>
@@ -78,11 +91,17 @@
                   <small class="error">{row.error}</small>
                 {/if}
               </td>
-              <td class="value">{formatValue(row.effective_value)}</td>
+              <td class="value">{formatValue(row.runtime_value)}</td>
+              <td class="value muted">
+                {row.has_stored_value ? formatValue(row.stored_value) : '—'}
+                {#if row.drifted}
+                  <small class="drift">not applied &mdash; differs from runtime</small>
+                {/if}
+              </td>
               <td class="value muted">{formatValue(row.default_value)}</td>
               <td>
-                <span class="badge" class:db={row.source === 'database'}>
-                  {row.source}
+                <span class="badge" class:db={row.runtime_source === 'environment'}>
+                  {row.runtime_source}
                 </span>
               </td>
               <td class="muted">
@@ -171,6 +190,14 @@
 
   tr.has-error td {
     background: var(--danger-bg);
+  }
+
+  tr.has-drift td {
+    background: color-mix(in oklab, var(--warn) 10%, transparent);
+  }
+
+  small.drift {
+    color: var(--warn);
   }
 
   code {

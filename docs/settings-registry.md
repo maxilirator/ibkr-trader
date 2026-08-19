@@ -40,19 +40,46 @@ write path is out of scope for this phase and would require explicit approval,
 since several of these settings (for example `EXECUTION_RUNTIME_ENABLED`) change
 trading behaviour.
 
+## Runtime value vs stored value
+
+**Nothing in the runtime reads this table.** `config.py` resolves configuration
+from the process environment. A row here is *recorded intent*, not an applied
+setting.
+
+This distinction is the whole design. Reporting a stored row as "the effective
+value" would assert that the runtime is using a value it never reads — a
+fabricated success state of exactly the kind the repository rules prohibit. So
+the registry reports both, separately:
+
+| Field | Meaning |
+| --- | --- |
+| `runtime_value` | What the running process actually resolved. **The operative value.** |
+| `runtime_source` | `environment` or `default` — where `runtime_value` came from |
+| `stored_value` | What the database records. Not consumed by the runtime. |
+| `drifted` | True when a stored value exists and disagrees with `runtime_value` |
+
+`drifted` is the actionable signal: it means someone recorded an intent that the
+running process is not honouring.
+
+The payload also carries `stored_values_are_applied: false`, so no consumer can
+mistake one for the other.
+
 ## Resolution rules
 
-- A setting with **no stored row** resolves to its declared default and reports
-  `source: "default"`. That is a real answer, not a guess: the runtime genuinely
-  uses the default.
-- A setting **with a row** reports `source: "database"`, plus who changed it and
-  when.
-- A stored value that **does not parse** as its declared type is reported as an
-  error against that setting. The effective value falls back to the default and
-  says so. An operator must never be shown a value the runtime is not using.
+- A setting with **no stored row** reports `stored_value: null` and
+  `has_stored_value: false`. `runtime_value` still reports what the process uses.
+- A value that **does not parse** as its declared type is reported as an error
+  against that setting. An invalid *environment* value means the runtime fell
+  back to the default, and that is stated. An invalid *stored* value is shown as
+  unset rather than as a number.
 - A stored row with **no matching definition** is surfaced under
   `undeclared_keys`. Such a row affects nothing — it is either a typo or a
   setting removed from the code — and hiding it would make the page misleading.
+
+If a future change wires this table into `config.py`, the wording above stops
+being true. `test_no_declared_setting_is_read_from_the_database_by_config` fails
+in that case, deliberately, so the claim gets revisited rather than silently
+becoming false.
 
 ## Adding a setting
 
@@ -74,15 +101,20 @@ definition carries a description and category.
     {
       "key": "MARKET_STREAM_STALE_AFTER_SECONDS",
       "value_type": "float",
-      "effective_value": 45.0,
+      "runtime_value": 180.0,
+      "runtime_source": "default",
+      "stored_value": 45.0,
+      "has_stored_value": true,
+      "drifted": true,
       "default_value": 180.0,
-      "source": "database",
       "updated_by": "mattias",
       "error": null
     }
   ],
   "categories": ["broker", "execution", "market-data", "market-stream", "rl"],
   "error_count": 0,
-  "undeclared_keys": []
+  "drift_count": 1,
+  "undeclared_keys": [],
+  "stored_values_are_applied": false
 }
 ```

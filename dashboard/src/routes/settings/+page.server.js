@@ -27,9 +27,11 @@ export async function load({ fetch }) {
     settings: result.body.settings,
     categories: Array.isArray(result.body.categories) ? result.body.categories : [],
     errorCount: Number(result.body.error_count ?? 0),
+    driftCount: Number(result.body.drift_count ?? 0),
     undeclaredKeys: Array.isArray(result.body.undeclared_keys)
       ? result.body.undeclared_keys
       : [],
-    readOnly: result.body.read_only !== false
+    readOnly: result.body.read_only !== false,
+    storedValuesAreApplied: result.body.stored_values_are_applied === true
   };
 }
