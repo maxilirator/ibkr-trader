@@ -605,7 +605,7 @@ class EscalationClassRegressionTests(TestCase):
         """`production # live` matches no alias, so it silently became dev: the
         operator believes production is on while the gate disengages."""
         # Note " prod " is NOT here: it strips to a valid alias and is accepted.
-        for value in ("production # live", "Production;", "prod-eu"):
+        for value in ("production # live", "Production;", '"production"'):
             with self.subTest(value=value):
                 with patch.dict(os.environ, {}, clear=True):
                     with self.assertRaises(BootstrapConfigurationError) as ctx:
@@ -652,3 +652,76 @@ class EscalationClassRegressionTests(TestCase):
                 )
                 self.assertEqual(os.environ["APP_TIMEZONE"], "UTC")
         self.assertFalse(result.is_production)
+
+
+class ProductionDetectionPrecisionTests(TestCase):
+    """The malformed-production check must not become a startup outage.
+
+    An earlier substring test refused any value containing a production token,
+    which would have blocked `nonprod`, `preprod` and `prod-eu` from starting at
+    all. A safety check that takes down legitimate environments is worse than
+    the silent degradation it was guarding against, so both directions are
+    pinned here.
+    """
+
+    LEGITIMATE_NON_PRODUCTION = (
+        "dev",
+        "test",
+        "staging",
+        "nonprod",
+        "non-production",
+        "preprod",
+        "prod-eu",
+        "uat-nonprod",
+        "production-mirror",
+        "reproduction",
+    )
+
+    MALFORMED_PRODUCTION_ATTEMPTS = (
+        "production # live",
+        "Production;",
+        '"production"',
+        "'prod'",
+        "production.",
+    )
+
+    def test_legitimate_non_production_names_start_normally(self) -> None:
+        for value in self.LEGITIMATE_NON_PRODUCTION:
+            with self.subTest(value=value):
+                with TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    with patch.dict(os.environ, {}, clear=True):
+                        result = load_runtime_environment(
+                            environment=value,
+                            bootstrap_path=root / "absent.env",
+                            dotenv_path=root / "absent.dotenv",
+                        )
+                self.assertFalse(result.is_production)
+                self.assertEqual(result.environment, value)
+
+    def test_malformed_production_attempts_are_refused(self) -> None:
+        for value in self.MALFORMED_PRODUCTION_ATTEMPTS:
+            with self.subTest(value=value):
+                with TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    with patch.dict(os.environ, {}, clear=True):
+                        with self.assertRaises(BootstrapConfigurationError):
+                            load_runtime_environment(
+                                environment=value,
+                                bootstrap_path=root / "absent.env",
+                                dotenv_path=root / "absent.dotenv",
+                            )
+
+    def test_exact_aliases_still_engage_the_production_gate(self) -> None:
+        for value in ("production", "prod", " PROD "):
+            with self.subTest(value=value):
+                with TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    with patch.dict(os.environ, {}, clear=True):
+                        # Engaging the gate with no file present must fail closed.
+                        with self.assertRaises(BootstrapConfigurationError) as ctx:
+                            load_runtime_environment(
+                                environment=value,
+                                bootstrap_path=root / "absent.env",
+                            )
+                self.assertIn("does not exist", str(ctx.exception))

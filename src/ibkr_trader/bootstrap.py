@@ -204,19 +204,40 @@ def _assert_cannot_declare_production(
     )
 
 
-def _looks_like_production(value: str) -> bool:
-    """Whether a value is production, or is trying to be.
+def _strip_value_noise(value: str) -> str:
+    """Remove trailing comments, quotes and punctuation from an ``APP_ENV`` value."""
+    cleaned = (value or "").strip()
+    # `APP_ENV=production # live`: '#' does not start a comment mid-value (that
+    # would corrupt passwords containing '#'), so the comment is part of the value.
+    if "#" in cleaned:
+        cleaned = cleaned.split("#", 1)[0].strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned.strip(";,.").strip().lower()
 
-    ``APP_ENV=production # live`` is not equal to any production alias, so a
-    plain equality test silently degrades it to development: the operator
-    believes production is on while the gate quietly disengages. Anything
-    containing a production token is treated as an attempt to select production
-    and is handled as such rather than ignored.
+
+def _looks_like_production(value: str) -> bool:
+    """Whether a value is a *malformed attempt* to select production.
+
+    ``APP_ENV=production # live`` equals no production alias, so plain equality
+    silently degrades it to development: the operator believes production is on
+    while the gate quietly disengages.
+
+    The test is deliberately narrow - it asks whether the value becomes an exact
+    alias once comment, quote and punctuation noise is removed. An earlier
+    substring test was too blunt: ``nonprod``, ``preprod``, ``non-production``
+    and ``prod-eu`` all contain a production token while being legitimately
+    non-production, and refusing them would have turned a safety check into a
+    self-inflicted startup outage.
+
+    Consequence worth knowing: a name like ``prod-eu`` is *not* treated as
+    production. Production is exactly the values in
+    :data:`PRODUCTION_ENVIRONMENTS`; anything else is development, by design.
     """
-    normalized = (value or "").strip().lower()
-    if normalized in PRODUCTION_ENVIRONMENTS:
+    raw = (value or "").strip().lower()
+    if raw in PRODUCTION_ENVIRONMENTS:
         return True
-    return any(token in normalized for token in PRODUCTION_ENVIRONMENTS)
+    return _strip_value_noise(value) in PRODUCTION_ENVIRONMENTS
 
 
 def _bootstrap_path_exists(path: Path) -> bool | None:
