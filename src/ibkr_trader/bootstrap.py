@@ -409,8 +409,17 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
         )
 
 
-#: Result of the process-wide load, cached after the first default-argument call.
-_CACHED_RESULT: BootstrapLoadResult | None = None
+#: Result of the process-wide load, cached after the first default-argument call,
+#: together with the ambient ``APP_ENV`` it was computed from.
+#:
+#: Keyed on ``APP_ENV`` rather than cached unconditionally. An unkeyed cache
+#: reintroduces this module's recurring bug in a new place: a first call with
+#: ``APP_ENV`` unset caches a development result, and a later call after
+#: ``APP_ENV`` became production would be served that stale result and skip the
+#: gate entirely. In a real service ``APP_ENV`` is fixed by the unit at process
+#: start, so this should be unreachable - but "should be unreachable" is what was
+#: believed about the four previous escapes.
+_CACHED_RESULT: tuple[str | None, BootstrapLoadResult] | None = None
 
 
 def reset_runtime_environment_cache() -> None:
@@ -463,7 +472,9 @@ def load_runtime_environment(
         environment is None and bootstrap_path is None and dotenv_path is None
     )
     if uses_defaults and _CACHED_RESULT is not None:
-        return _CACHED_RESULT
+        cached_app_env, cached_result = _CACHED_RESULT
+        if cached_app_env == getenv("APP_ENV"):
+            return cached_result
 
     resolved_environment = (
         environment if environment is not None else getenv("APP_ENV", "dev")
@@ -519,7 +530,7 @@ def load_runtime_environment(
             warnings=(),
         )
         if uses_defaults:
-            _CACHED_RESULT = result
+            _CACHED_RESULT = (getenv("APP_ENV"), result)
         return result
 
     warnings: list[str] = []
@@ -635,7 +646,7 @@ def load_runtime_environment(
         warnings=tuple(warnings),
     )
     if uses_defaults:
-        _CACHED_RESULT = result
+        _CACHED_RESULT = (getenv("APP_ENV"), result)
     return result
 
 

@@ -891,3 +891,63 @@ class BootstrapCachingTests(TestCase):
         self.assertIsNot(explicit, default_call)
         # ...but the first default call did.
         self.assertIs(default_call, cached_call)
+
+
+class CacheCannotBypassTheGateTests(TestCase):
+    """An unkeyed cache would reintroduce this module's recurring bug.
+
+    A first call with APP_ENV unset caches a development result; a later call
+    after APP_ENV became production would be served that stale result and skip
+    the gate entirely. In a real service APP_ENV is fixed by the unit at process
+    start, so this should be unreachable - but "should be unreachable" is what
+    was believed about four previous escapes.
+    """
+
+    def setUp(self) -> None:
+        reset_runtime_environment_cache()
+
+    def tearDown(self) -> None:
+        reset_runtime_environment_cache()
+
+    def test_cached_dev_result_is_not_served_once_app_env_becomes_production(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.dict(
+                os.environ,
+                {BOOTSTRAP_ENV_PATH_VAR: str(root / "absent.env")},
+                clear=True,
+            ):
+                with patch("ibkr_trader.config.DEFAULT_ENV_FILE", root / "none.env"):
+                    first = load_runtime_environment()
+                    self.assertFalse(first.is_production)
+
+                    os.environ["APP_ENV"] = "production"
+                    with self.assertRaises(BootstrapConfigurationError):
+                        load_runtime_environment()
+
+    def test_cache_still_serves_when_app_env_is_unchanged(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("ibkr_trader.config.DEFAULT_ENV_FILE", root / "none.env"):
+                    self.assertIs(
+                        load_runtime_environment(), load_runtime_environment()
+                    )
+
+    def test_production_result_is_cached_only_after_full_validation(self) -> None:
+        """A refused load must leave nothing cached for a later call to reuse."""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            incomplete = _write_bootstrap(root, "IBKR_HOST=127.0.0.1\n")
+            with patch.dict(
+                os.environ,
+                {"APP_ENV": "production", BOOTSTRAP_ENV_PATH_VAR: str(incomplete)},
+                clear=True,
+            ):
+                with self.assertRaises(BootstrapConfigurationError):
+                    load_runtime_environment()
+                # Still refused on the second attempt: nothing was cached.
+                with self.assertRaises(BootstrapConfigurationError):
+                    load_runtime_environment()
