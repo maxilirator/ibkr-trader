@@ -107,10 +107,11 @@ def enqueue_market_data_backfill_request(
             and row.covered_until is not None
             and _is_at_least(row.covered_until, requested_until)
         )
-        already_pending = (
-            row.status in {BACKFILL_STATUS_PENDING, BACKFILL_STATUS_RUNNING, BACKFILL_STATUS_FAILED_RETRYABLE}
-            and _is_at_least(row.requested_until, requested_until)
-        )
+        already_pending = row.status in {
+            BACKFILL_STATUS_PENDING,
+            BACKFILL_STATUS_RUNNING,
+            BACKFILL_STATUS_FAILED_RETRYABLE,
+        } and _is_at_least(row.requested_until, requested_until)
         if already_covered:
             serialized = serialize_market_data_backfill_request(row)
             serialized["enqueue_action"] = "already_covered"
@@ -301,9 +302,7 @@ def list_market_data_backfill_requests(
         {str(symbol).strip().upper() for symbol in symbols or [] if str(symbol).strip()}
     )
     normalized_statuses = [
-        str(status).strip().upper()
-        for status in statuses or []
-        if str(status).strip()
+        str(status).strip().upper() for status in statuses or [] if str(status).strip()
     ]
     with session_scope(session_factory) as session:
         statement = select(MarketDataBackfillRequestRecord)
@@ -336,7 +335,18 @@ def run_due_market_data_backfills(
     limit: int,
     timeout: int,
     source: str = DEFAULT_BACKFILL_SOURCE,
+    maintenance_mode_is_enabled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    if maintenance_mode_is_enabled is not None and maintenance_mode_is_enabled():
+        return {
+            "skipped": True,
+            "skip_reason": "broker_maintenance_mode_enabled",
+            "claimed_count": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "completed": [],
+            "failed": [],
+        }
     claimed = claim_due_market_data_backfill_requests(
         session_factory,
         limit=limit,
@@ -413,7 +423,9 @@ def run_due_market_data_backfills(
                     )
                 )
             break
-        except Exception as exc:  # pragma: no cover - exercised through tests with fakes.
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - exercised through tests with fakes.
             LOGGER.warning(
                 "Failed to backfill market data for %s.",
                 request.get("symbol"),
@@ -450,6 +462,7 @@ class BackgroundMarketDataBackfillService:
         interval_seconds: float,
         batch_size: int,
         timeout_seconds: int,
+        maintenance_mode_is_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._broker_config = broker_config
@@ -457,6 +470,7 @@ class BackgroundMarketDataBackfillService:
         self._interval_seconds = max(float(interval_seconds), 1.0)
         self._batch_size = max(int(batch_size), 1)
         self._timeout_seconds = max(int(timeout_seconds), 1)
+        self._maintenance_mode_is_enabled = maintenance_mode_is_enabled
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_result: dict[str, Any] | None = None
@@ -489,6 +503,7 @@ class BackgroundMarketDataBackfillService:
                 execute_historical=self._execute_historical,
                 limit=self._batch_size,
                 timeout=self._timeout_seconds,
+                maintenance_mode_is_enabled=self._maintenance_mode_is_enabled,
             )
             self._last_result = result
             self._last_error = None
@@ -504,9 +519,7 @@ class BackgroundMarketDataBackfillService:
             "batch_size": self._batch_size,
             "timeout_seconds": self._timeout_seconds,
             "last_run_at": (
-                self._last_run_at.isoformat()
-                if self._last_run_at is not None
-                else None
+                self._last_run_at.isoformat() if self._last_run_at is not None else None
             ),
             "last_error": self._last_error,
             "last_result": self._last_result,
@@ -517,7 +530,9 @@ class BackgroundMarketDataBackfillService:
             try:
                 self.run_once()
             except Exception:
-                LOGGER.warning("Market data backfill worker cycle failed.", exc_info=True)
+                LOGGER.warning(
+                    "Market data backfill worker cycle failed.", exc_info=True
+                )
             self._stop_event.wait(self._interval_seconds)
 
 
@@ -570,7 +585,9 @@ def _normalized_request_fields(
     use_rth: bool,
 ) -> dict[str, Any]:
     raw_instrument = dict(instrument or {})
-    normalized_symbol = str(symbol or raw_instrument.get("symbol") or "").strip().upper()
+    normalized_symbol = (
+        str(symbol or raw_instrument.get("symbol") or "").strip().upper()
+    )
     if not normalized_symbol:
         raise ValueError("symbol is required")
     normalized_trade_date = str(trade_date).strip()
@@ -580,7 +597,9 @@ def _normalized_request_fields(
         "symbol": normalized_symbol,
         "exchange": _normalize_text(raw_instrument.get("exchange"), default="SMART"),
         "currency": _normalize_text(raw_instrument.get("currency"), default="SEK"),
-        "security_type": _normalize_text(raw_instrument.get("security_type"), default="STK"),
+        "security_type": _normalize_text(
+            raw_instrument.get("security_type"), default="STK"
+        ),
         "primary_exchange": _normalize_optional_text(
             raw_instrument.get("primary_exchange")
         ),

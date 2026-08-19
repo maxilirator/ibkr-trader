@@ -124,10 +124,18 @@ from ibkr_trader.ibkr.tick_stream import collect_tick_stream_sample
 from ibkr_trader.ibkr.session_manager import CanonicalSyncSessions
 from ibkr_trader.orchestration.entry_submission import PersistedInstructionNotFoundError
 from ibkr_trader.orchestration.entry_submission import PersistedInstructionStateError
-from ibkr_trader.orchestration.entry_submission import cancel_persisted_instruction_entry
-from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_cancellation
-from ibkr_trader.orchestration.entry_submission import serialize_persisted_broker_submission
-from ibkr_trader.orchestration.entry_submission import submit_persisted_instruction_entry
+from ibkr_trader.orchestration.entry_submission import (
+    cancel_persisted_instruction_entry,
+)
+from ibkr_trader.orchestration.entry_submission import (
+    serialize_persisted_broker_cancellation,
+)
+from ibkr_trader.orchestration.entry_submission import (
+    serialize_persisted_broker_submission,
+)
+from ibkr_trader.orchestration.entry_submission import (
+    submit_persisted_instruction_entry,
+)
 from ibkr_trader.orchestration.instruction_archive import (
     InstructionArchiveSelectorError,
     archive_instruction_set,
@@ -150,7 +158,9 @@ from ibkr_trader.orchestration.operator_controls import (
     InstructionSetCancellationSelectorError,
     KillSwitchActiveError,
     cancel_instruction_set,
+    read_broker_maintenance_mode_state,
     read_kill_switch_state,
+    set_broker_maintenance_mode_state,
     serialize_instruction_set_cancellation_result,
     serialize_kill_switch_status,
     set_kill_switch_state,
@@ -222,7 +232,9 @@ from ibkr_trader.virtual.execution import cancel_virtual_order
 from ibkr_trader.virtual.execution import ensure_virtual_account_record
 from ibkr_trader.virtual.execution import list_virtual_market_quotes
 from ibkr_trader.virtual.execution import record_virtual_market_quote
-from ibkr_trader.virtual.execution import record_virtual_market_quotes_from_stream_snapshot
+from ibkr_trader.virtual.execution import (
+    record_virtual_market_quotes_from_stream_snapshot,
+)
 from ibkr_trader.virtual.execution import submit_virtual_entry_order
 from ibkr_trader.virtual.execution import submit_virtual_exit_order
 
@@ -253,9 +265,13 @@ def register_operator_routes(app: Any, context: Any) -> None:
     submit_exit_with_primary = context.submit_exit_with_primary
     cancel_order_with_primary = context.cancel_order_with_primary
     fetch_runtime_snapshot_with_primary = context.fetch_runtime_snapshot_with_primary
-    fetch_reconciliation_runtime_snapshot_with_primary = context.fetch_reconciliation_runtime_snapshot_with_primary
+    fetch_reconciliation_runtime_snapshot_with_primary = (
+        context.fetch_reconciliation_runtime_snapshot_with_primary
+    )
     drain_broker_callbacks_with_primary = context.drain_broker_callbacks_with_primary
-    sync_virtual_market_watch_from_stream = context.sync_virtual_market_watch_from_stream
+    sync_virtual_market_watch_from_stream = (
+        context.sync_virtual_market_watch_from_stream
+    )
     market_data_readiness_checker = context.market_data_readiness_checker
     HTTPException = context.HTTPException
     Request = context.Request
@@ -340,6 +356,7 @@ def register_operator_routes(app: Any, context: Any) -> None:
                 else None
             )
             if normalized_candidate_reason_code is not None:
+
                 def candidate_reason_code(candidate: Any) -> Any:
                     instruction_payload = candidate.payload.get("instruction", {})
                     if not isinstance(instruction_payload, dict):
@@ -352,7 +369,8 @@ def register_operator_routes(app: Any, context: Any) -> None:
                 rl_candidates = tuple(
                     candidate
                     for candidate in rl_candidates
-                    if candidate_reason_code(candidate) == normalized_candidate_reason_code
+                    if candidate_reason_code(candidate)
+                    == normalized_candidate_reason_code
                 )
             rl_candidates = rl_candidates[:validated_candidate_limit]
             operator_snapshot_payload = serialize_operator_dashboard_snapshot(
@@ -495,6 +513,33 @@ def register_operator_routes(app: Any, context: Any) -> None:
             "kill_switch": serialize_kill_switch_status(result),
         }
 
+    @app.get("/v1/controls/broker-maintenance-mode")
+    def get_broker_maintenance_mode() -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "broker_maintenance_mode": _serialize_for_json(
+                read_broker_maintenance_mode_state(session_factory)
+            ),
+        }
+
+    @app.post("/v1/controls/broker-maintenance-mode")
+    def update_broker_maintenance_mode(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            enabled, reason, updated_by = parse_kill_switch_payload(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "accepted": True,
+            "broker_maintenance_mode": _serialize_for_json(
+                set_broker_maintenance_mode_state(
+                    session_factory,
+                    enabled=enabled,
+                    reason=reason,
+                    updated_by=updated_by,
+                )
+            ),
+        }
+
     @app.post("/v1/broker-attention/{event_id}/review")
     def review_broker_attention(
         event_id: int,
@@ -544,7 +589,9 @@ def register_operator_routes(app: Any, context: Any) -> None:
         }
 
     @app.post("/v1/reconciliation-issues/archive-open")
-    def archive_open_reconciliation_issue_rows(payload: dict[str, Any]) -> dict[str, Any]:
+    def archive_open_reconciliation_issue_rows(
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         try:
             action, updated_by, note = parse_operator_review_payload(
                 {**payload, "action": payload.get("action", "ARCHIVE")}
@@ -717,7 +764,9 @@ def register_operator_routes(app: Any, context: Any) -> None:
         }
 
     @app.post("/v1/instructions/{instruction_id}/submit-entry")
-    def submit_instruction_entry(instruction_id: str, timeout: int = 10) -> dict[str, Any]:
+    def submit_instruction_entry(
+        instruction_id: str, timeout: int = 10
+    ) -> dict[str, Any]:
         try:
             result = submit_persisted_instruction_entry(
                 session_factory,
@@ -739,9 +788,13 @@ def register_operator_routes(app: Any, context: Any) -> None:
         except ConnectionError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except LookupError as exc:
-            raise HTTPException(status_code=400, detail=broker_exception_detail(exc)) from exc
+            raise HTTPException(
+                status_code=400, detail=broker_exception_detail(exc)
+            ) from exc
         except TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=broker_exception_detail(exc)) from exc
+            raise HTTPException(
+                status_code=504, detail=broker_exception_detail(exc)
+            ) from exc
 
         return {
             "accepted": True,
@@ -760,7 +813,9 @@ def register_operator_routes(app: Any, context: Any) -> None:
         }
 
     @app.post("/v1/instructions/{instruction_id}/cancel-entry")
-    def cancel_instruction_entry(instruction_id: str, timeout: int = 10) -> dict[str, Any]:
+    def cancel_instruction_entry(
+        instruction_id: str, timeout: int = 10
+    ) -> dict[str, Any]:
         try:
             result = cancel_persisted_instruction_entry(
                 session_factory,
@@ -780,9 +835,13 @@ def register_operator_routes(app: Any, context: Any) -> None:
         except ConnectionError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except LookupError as exc:
-            raise HTTPException(status_code=400, detail=broker_exception_detail(exc)) from exc
+            raise HTTPException(
+                status_code=400, detail=broker_exception_detail(exc)
+            ) from exc
         except TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=broker_exception_detail(exc)) from exc
+            raise HTTPException(
+                status_code=504, detail=broker_exception_detail(exc)
+            ) from exc
 
         return {
             "accepted": True,
@@ -823,7 +882,9 @@ def register_operator_routes(app: Any, context: Any) -> None:
     def run_runtime_cycle_once(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request_payload = payload or {}
         try:
-            now_at, timeout, instruction_ids = parse_runtime_cycle_payload(request_payload)
+            now_at, timeout, instruction_ids = parse_runtime_cycle_payload(
+                request_payload
+            )
             result = run_runtime_cycle(
                 session_factory,
                 app_config.ibkr.primary_session(),
@@ -862,10 +923,14 @@ def register_operator_routes(app: Any, context: Any) -> None:
         }
 
     @app.post("/v1/runtime/startup-reconcile")
-    def run_startup_reconciliation_once(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run_startup_reconciliation_once(
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         request_payload = payload or {}
         try:
-            now_at, timeout, instruction_ids = parse_runtime_cycle_payload(request_payload)
+            now_at, timeout, instruction_ids = parse_runtime_cycle_payload(
+                request_payload
+            )
             result = run_startup_reconciliation(
                 session_factory,
                 app_config.ibkr.primary_session(),

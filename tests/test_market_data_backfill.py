@@ -49,6 +49,39 @@ def test_backfill_request_coalesces_symbol_day_until_latest_request() -> None:
         engine.dispose()
 
 
+def test_maintenance_mode_skips_backfill_before_claim_and_preserves_queue() -> None:
+    engine = build_engine("sqlite+pysqlite:///:memory:")
+    create_schema(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        enqueue_market_data_backfill_request(
+            session_factory,
+            symbol="AXFO",
+            trade_date="2026-04-28",
+            requested_until=datetime.fromisoformat("2026-04-28T09:10:00+02:00"),
+            instrument={"exchange": "SMART", "currency": "SEK"},
+            reason="missing_bars",
+        )
+        result = run_due_market_data_backfills(
+            session_factory,
+            broker_config=IbkrConnectionConfig(
+                host="127.0.0.1", port=4001, client_id=8, diagnostic_client_id=7
+            ),
+            execute_historical=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("must not call IBKR")
+            ),
+            limit=1,
+            timeout=10,
+            maintenance_mode_is_enabled=lambda: True,
+        )
+        row = list_market_data_backfill_requests(session_factory)[0]
+        assert result["skipped"] is True
+        assert row["status"] == "PENDING"
+        assert row["attempt_count"] == 0
+    finally:
+        engine.dispose()
+
+
 def test_backfill_claim_recovers_stale_running_leases() -> None:
     engine = build_engine("sqlite+pysqlite:///:memory:")
     create_schema(engine)

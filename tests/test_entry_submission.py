@@ -22,6 +22,9 @@ from ibkr_trader.orchestration.entry_submission import (
     submit_persisted_instruction_entry,
 )
 from ibkr_trader.orchestration.operator_controls import KillSwitchActiveError
+from ibkr_trader.orchestration.operator_controls import (
+    set_broker_maintenance_mode_state,
+)
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
 from ibkr_trader.orchestration.state_machine import ExecutionState
 
@@ -90,7 +93,9 @@ class PersistedEntrySubmissionTests(TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
 
-    def _insert_pending_instruction(self, *, state: str = ExecutionState.ENTRY_PENDING.value) -> None:
+    def _insert_pending_instruction(
+        self, *, state: str = ExecutionState.ENTRY_PENDING.value
+    ) -> None:
         session = self.session_factory()
         try:
             session.add(
@@ -168,9 +173,7 @@ class PersistedEntrySubmissionTests(TestCase):
                 "ibkr_wire_audit": [
                     {
                         "event_type": "outbound_order_request",
-                        "event_at": datetime(
-                            2026, 4, 10, 19, 55, tzinfo=timezone.utc
-                        ),
+                        "event_at": datetime(2026, 4, 10, 19, 55, tzinfo=timezone.utc),
                         "request": {
                             "api_method": "placeOrder",
                             "stage": "live_order_submit",
@@ -215,11 +218,17 @@ class PersistedEntrySubmissionTests(TestCase):
             self.assertEqual(record.broker_client_id, 0)
             self.assertEqual(record.broker_order_status, "PreSubmitted")
 
-            broker_accounts = session.execute(select(BrokerAccountRecord)).scalars().all()
+            broker_accounts = (
+                session.execute(select(BrokerAccountRecord)).scalars().all()
+            )
             broker_orders = session.execute(select(BrokerOrderRecord)).scalars().all()
-            broker_order_events = session.execute(
-                select(BrokerOrderEventRecord).order_by(BrokerOrderEventRecord.id)
-            ).scalars().all()
+            broker_order_events = (
+                session.execute(
+                    select(BrokerOrderEventRecord).order_by(BrokerOrderEventRecord.id)
+                )
+                .scalars()
+                .all()
+            )
             self.assertEqual(len(broker_accounts), 1)
             self.assertEqual(broker_accounts[0].account_key, "DU1234567")
             self.assertEqual(len(broker_orders), 1)
@@ -232,17 +241,25 @@ class PersistedEntrySubmissionTests(TestCase):
                 ["open_order_observed", "entry_order_submitted"],
             )
 
-            events = session.execute(
-                select(InstructionEventRecord).where(
-                    InstructionEventRecord.instruction_id == record.id
+            events = (
+                session.execute(
+                    select(InstructionEventRecord).where(
+                        InstructionEventRecord.instruction_id == record.id
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].event_type, "entry_order_submitted")
             self.assertEqual(events[0].state_before, ExecutionState.ENTRY_PENDING.value)
-            self.assertEqual(events[0].state_after, ExecutionState.ENTRY_SUBMITTED.value)
             self.assertEqual(
-                events[0].payload["broker_submission"]["tws_submission"]["order_state"]["warning_text"],
+                events[0].state_after, ExecutionState.ENTRY_SUBMITTED.value
+            )
+            self.assertEqual(
+                events[0].payload["broker_submission"]["tws_submission"]["order_state"][
+                    "warning_text"
+                ],
                 "Order held in TWS pending manual transmit.",
             )
             self.assertEqual(
@@ -254,7 +271,9 @@ class PersistedEntrySubmissionTests(TestCase):
         finally:
             session.close()
 
-    def test_submit_persisted_instruction_entry_requires_existing_instruction(self) -> None:
+    def test_submit_persisted_instruction_entry_requires_existing_instruction(
+        self,
+    ) -> None:
         with self.assertRaisesRegex(PersistedInstructionNotFoundError, "was not found"):
             submit_persisted_instruction_entry(
                 self.session_factory,
@@ -263,7 +282,9 @@ class PersistedEntrySubmissionTests(TestCase):
                 submitter=lambda *args, **kwargs: {},
             )
 
-    def test_submit_persisted_instruction_entry_requires_entry_pending_state(self) -> None:
+    def test_submit_persisted_instruction_entry_requires_entry_pending_state(
+        self,
+    ) -> None:
         self._insert_pending_instruction(state=ExecutionState.COMPLETED.value)
 
         with self.assertRaisesRegex(PersistedInstructionStateError, "ENTRY_PENDING"):
@@ -274,7 +295,9 @@ class PersistedEntrySubmissionTests(TestCase):
                 submitter=lambda *args, **kwargs: {},
             )
 
-    def test_submit_persisted_instruction_entry_rejects_when_kill_switch_is_enabled(self) -> None:
+    def test_submit_persisted_instruction_entry_rejects_when_kill_switch_is_enabled(
+        self,
+    ) -> None:
         self._insert_pending_instruction()
         set_kill_switch_state(
             self.session_factory,
@@ -284,6 +307,25 @@ class PersistedEntrySubmissionTests(TestCase):
         )
 
         with self.assertRaisesRegex(KillSwitchActiveError, "kill switch"):
+            submit_persisted_instruction_entry(
+                self.session_factory,
+                self.config,
+                "persisted-aapl-1",
+                submitter=lambda *args, **kwargs: {},
+            )
+
+    def test_submit_persisted_instruction_entry_rejects_when_maintenance_mode_is_enabled(
+        self,
+    ) -> None:
+        self._insert_pending_instruction()
+        set_broker_maintenance_mode_state(
+            self.session_factory,
+            enabled=True,
+            reason="Gateway maintenance.",
+            updated_by="test",
+        )
+
+        with self.assertRaisesRegex(KillSwitchActiveError, "maintenance mode"):
             submit_persisted_instruction_entry(
                 self.session_factory,
                 self.config,
@@ -355,23 +397,35 @@ class PersistedEntrySubmissionTests(TestCase):
             self.assertEqual(record.broker_order_status, "Cancelled")
 
             broker_order = session.execute(select(BrokerOrderRecord)).scalar_one()
-            broker_order_events = session.execute(
-                select(BrokerOrderEventRecord).order_by(BrokerOrderEventRecord.id)
-            ).scalars().all()
+            broker_order_events = (
+                session.execute(
+                    select(BrokerOrderEventRecord).order_by(BrokerOrderEventRecord.id)
+                )
+                .scalars()
+                .all()
+            )
             self.assertEqual(broker_order.status, "Cancelled")
             self.assertEqual(
                 [item.event_type for item in broker_order_events],
                 ["entry_order_cancelled"],
             )
 
-            events = session.execute(
-                select(InstructionEventRecord).where(
-                    InstructionEventRecord.instruction_id == record.id
-                ).order_by(InstructionEventRecord.id)
-            ).scalars().all()
+            events = (
+                session.execute(
+                    select(InstructionEventRecord)
+                    .where(InstructionEventRecord.instruction_id == record.id)
+                    .order_by(InstructionEventRecord.id)
+                )
+                .scalars()
+                .all()
+            )
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].event_type, "entry_order_cancelled")
-            self.assertEqual(events[0].state_before, ExecutionState.ENTRY_SUBMITTED.value)
-            self.assertEqual(events[0].state_after, ExecutionState.ENTRY_CANCELLED.value)
+            self.assertEqual(
+                events[0].state_before, ExecutionState.ENTRY_SUBMITTED.value
+            )
+            self.assertEqual(
+                events[0].state_after, ExecutionState.ENTRY_CANCELLED.value
+            )
         finally:
             session.close()

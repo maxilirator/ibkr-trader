@@ -27,6 +27,7 @@ from ibkr_trader.db.models import (
 from ibkr_trader.orchestration.state_machine import ExecutionState
 
 KILL_SWITCH_CONTROL_KEY = "GLOBAL_KILL_SWITCH"
+BROKER_MAINTENANCE_MODE_CONTROL_KEY = "BROKER_MAINTENANCE_MODE"
 
 
 class KillSwitchActiveError(RuntimeError):
@@ -214,7 +215,9 @@ def set_kill_switch_state(
     source: str = "api",
 ) -> KillSwitchStatus:
     event_at = utc_now()
-    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    normalized_reason = (
+        reason.strip() if isinstance(reason, str) and reason.strip() else None
+    )
 
     with session_scope(session_factory) as session:
         record = session.execute(
@@ -267,6 +270,111 @@ def set_kill_switch_state(
         return _build_kill_switch_status(record, event)
 
 
+def _serialize_broker_maintenance_mode(
+    record: OperatorControlRecord | None,
+    event: OperatorControlEventRecord | None,
+) -> dict[str, Any]:
+    return {
+        "control_key": BROKER_MAINTENANCE_MODE_CONTROL_KEY,
+        "enabled": record.enabled if record is not None else False,
+        "reason": record.reason if record is not None else None,
+        "updated_by": record.updated_by if record is not None else None,
+        "last_changed_at": (record.last_changed_at if record is not None else None),
+        "latest_event": (
+            {
+                "event_type": event.event_type,
+                "event_at": event.event_at,
+                "note": event.note,
+            }
+            if event is not None
+            else None
+        ),
+    }
+
+
+def read_broker_maintenance_mode_state(
+    session_factory: sessionmaker[Session],
+) -> dict[str, Any]:
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(OperatorControlRecord).where(
+                OperatorControlRecord.control_key == BROKER_MAINTENANCE_MODE_CONTROL_KEY
+            )
+        ).scalar_one_or_none()
+        return _serialize_broker_maintenance_mode(record, None)
+
+
+def broker_maintenance_mode_is_enabled(session_factory: sessionmaker[Session]) -> bool:
+    return bool(read_broker_maintenance_mode_state(session_factory)["enabled"])
+
+
+def assert_broker_maintenance_mode_inactive(
+    session_factory: sessionmaker[Session],
+) -> None:
+    state = read_broker_maintenance_mode_state(session_factory)
+    if state["enabled"]:
+        suffix = f" Reason: {state['reason']}" if state["reason"] else ""
+        raise KillSwitchActiveError(
+            "Broker maintenance mode is enabled. New entry actions are blocked."
+            f"{suffix}"
+        )
+
+
+def set_broker_maintenance_mode_state(
+    session_factory: sessionmaker[Session],
+    *,
+    enabled: bool,
+    reason: str | None,
+    updated_by: str,
+) -> dict[str, Any]:
+    changed_at = utc_now()
+    normalized_reason = (
+        reason.strip() if isinstance(reason, str) and reason.strip() else None
+    )
+    with session_scope(session_factory) as session:
+        record = session.execute(
+            select(OperatorControlRecord)
+            .where(
+                OperatorControlRecord.control_key == BROKER_MAINTENANCE_MODE_CONTROL_KEY
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if record is None:
+            record = OperatorControlRecord(
+                control_key=BROKER_MAINTENANCE_MODE_CONTROL_KEY,
+                enabled=enabled,
+                reason=normalized_reason,
+                updated_by=updated_by,
+                last_changed_at=changed_at,
+            )
+            session.add(record)
+            session.flush()
+        else:
+            record.enabled = enabled
+            record.reason = normalized_reason
+            record.updated_by = updated_by
+            record.last_changed_at = changed_at
+            session.flush()
+        event = OperatorControlEventRecord(
+            operator_control_id=record.id,
+            event_type=(
+                "broker_maintenance_mode_enabled"
+                if enabled
+                else "broker_maintenance_mode_disabled"
+            ),
+            source="api",
+            event_at=changed_at,
+            enabled=enabled,
+            reason=normalized_reason,
+            updated_by=updated_by,
+            payload={},
+            note="Operator updated the durable broker maintenance mode.",
+        )
+        session.add(event)
+        session.flush()
+        return _serialize_broker_maintenance_mode(record, event)
+
+
 def _build_instruction_set_selector_statement(
     *,
     batch_id: str | None,
@@ -282,7 +390,9 @@ def _build_instruction_set_selector_statement(
     if book_key is not None:
         statement = statement.where(InstructionRecord.book_key == book_key)
     if instruction_ids is not None:
-        statement = statement.where(InstructionRecord.instruction_id.in_(instruction_ids))
+        statement = statement.where(
+            InstructionRecord.instruction_id.in_(instruction_ids)
+        )
     return statement.order_by(InstructionRecord.id)
 
 
@@ -366,7 +476,9 @@ def cancel_instruction_set(
             "batch_id": batch_id,
             "account_key": account_key,
             "book_key": book_key,
-            "instruction_ids": list(instruction_ids) if instruction_ids is not None else None,
+            "instruction_ids": list(instruction_ids)
+            if instruction_ids is not None
+            else None,
         }.items()
         if value is not None
     }
@@ -375,17 +487,23 @@ def cancel_instruction_set(
             "At least one selector is required to cancel an instruction set."
         )
 
-    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    normalized_reason = (
+        reason.strip() if isinstance(reason, str) and reason.strip() else None
+    )
 
     with session_scope(session_factory) as session:
-        matches = session.execute(
-            _build_instruction_set_selector_statement(
-                batch_id=batch_id,
-                account_key=account_key,
-                book_key=book_key,
-                instruction_ids=instruction_ids,
+        matches = (
+            session.execute(
+                _build_instruction_set_selector_statement(
+                    batch_id=batch_id,
+                    account_key=account_key,
+                    book_key=book_key,
+                    instruction_ids=instruction_ids,
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         if not matches:
             raise InstructionSetCancellationNotFoundError(
                 "No persisted instructions matched the requested cancellation selectors."
@@ -460,7 +578,9 @@ def cancel_instruction_set(
                         error=None,
                     )
                 )
-            except Exception as exc:  # pragma: no cover - runtime-side error propagation
+            except (
+                Exception
+            ) as exc:  # pragma: no cover - runtime-side error propagation
                 item_results.append(
                     InstructionSetCancellationItemResult(
                         instruction_id=instruction_id,

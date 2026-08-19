@@ -23,6 +23,9 @@ from ibkr_trader.ibkr.order_execution import submit_order_from_instruction
 from ibkr_trader.ledger.persistence import BROKER_KIND_IBKR
 from ibkr_trader.ledger.persistence import persist_broker_order_cancellation
 from ibkr_trader.ledger.persistence import persist_broker_order_submission
+from ibkr_trader.orchestration.operator_controls import (
+    assert_broker_maintenance_mode_inactive,
+)
 from ibkr_trader.orchestration.operator_controls import assert_kill_switch_inactive
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.virtual.accounts import BROKER_KIND_VIRTUAL
@@ -95,7 +98,9 @@ def _serialize_for_json(payload: Any) -> Any:
     return payload
 
 
-def serialize_persisted_broker_submission(payload: PersistedBrokerSubmission) -> dict[str, Any]:
+def serialize_persisted_broker_submission(
+    payload: PersistedBrokerSubmission,
+) -> dict[str, Any]:
     return _serialize_for_json(asdict(payload))
 
 
@@ -120,6 +125,7 @@ def submit_persisted_instruction_entry(
     submitter: Callable[..., dict[str, Any]] | None = None,
 ) -> PersistedBrokerSubmission:
     assert_kill_switch_inactive(session_factory)
+    assert_broker_maintenance_mode_inactive(session_factory)
     with session_scope(session_factory) as session:
         instruction_record = session.execute(
             select(InstructionRecord)
@@ -146,6 +152,7 @@ def submit_persisted_instruction_entry(
         runtime_submitter = submitter
         if runtime_submitter is None:
             if is_virtual_account_key(instruction.account.account_key):
+
                 def _submit_virtual_entry(
                     broker_config: IbkrConnectionConfig,
                     runtime_instruction: Any,
@@ -284,7 +291,10 @@ def cancel_persisted_instruction_entry(
 
         runtime_canceler = canceler
         if runtime_canceler is None:
-            if instruction_record.is_virtual or is_virtual_account_key(instruction_record.account_key):
+            if instruction_record.is_virtual or is_virtual_account_key(
+                instruction_record.account_key
+            ):
+
                 def _cancel_virtual_entry(
                     broker_config: IbkrConnectionConfig,
                     order_id: int,

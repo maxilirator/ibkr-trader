@@ -14,6 +14,9 @@ from ibkr_trader.db.base import create_session_factory
 from ibkr_trader.db.base import session_scope
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.orchestration.operator_controls import KillSwitchActiveError
+from ibkr_trader.orchestration.operator_controls import (
+    set_broker_maintenance_mode_state,
+)
 from ibkr_trader.orchestration.operator_controls import set_kill_switch_state
 from ibkr_trader.orchestration.state_machine import ExecutionState
 from ibkr_trader.orchestration.submission import SubmissionConflictError
@@ -137,7 +140,9 @@ class SubmissionTests(TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
 
-    def test_submit_execution_batch_persists_instruction_and_initial_event(self) -> None:
+    def test_submit_execution_batch_persists_instruction_and_initial_event(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temp_dir:
             schedule_path = Path(temp_dir) / "day_sessions.parquet"
             schedule_path.with_suffix(".csv").write_text(
@@ -167,11 +172,15 @@ class SubmissionTests(TestCase):
             "resolved",
         )
         self.assertEqual(
-            instruction.runtime_schedule["next_session_exit"]["next_session_open_local"],
+            instruction.runtime_schedule["next_session_exit"][
+                "next_session_open_local"
+            ],
             "2026-04-13T09:00:00+02:00",
         )
         self.assertEqual(instruction.initial_event.event_type, "instruction_submitted")
-        self.assertEqual(instruction.initial_event.state_after, ExecutionState.ENTRY_PENDING.value)
+        self.assertEqual(
+            instruction.initial_event.state_after, ExecutionState.ENTRY_PENDING.value
+        )
 
     def test_submit_model_routed_batch_persists_for_rl_agent_pickup(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -261,7 +270,9 @@ class SubmissionTests(TestCase):
 
         self.assertEqual(batch.instructions[0].execution.model_id, "long_trial_106_v1")
 
-    def test_parse_model_routed_batch_accepts_nested_static_feature_metadata(self) -> None:
+    def test_parse_model_routed_batch_accepts_nested_static_feature_metadata(
+        self,
+    ) -> None:
         payload = _model_routed_payload()
         instruction_payload = payload["instructions"][0]
         assert isinstance(instruction_payload, dict)
@@ -285,7 +296,9 @@ class SubmissionTests(TestCase):
             [0.25, -1.5],
         )
 
-    def test_submit_execution_batch_returns_existing_rows_for_exact_replay(self) -> None:
+    def test_submit_execution_batch_returns_existing_rows_for_exact_replay(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temp_dir:
             schedule_path = Path(temp_dir) / "day_sessions.parquet"
             schedule_path.with_suffix(".csv").write_text(
@@ -315,7 +328,9 @@ class SubmissionTests(TestCase):
             )
 
         self.assertEqual(replay.instruction_count, 1)
-        self.assertEqual(replay.instructions[0].record_id, first.instructions[0].record_id)
+        self.assertEqual(
+            replay.instructions[0].record_id, first.instructions[0].record_id
+        )
         self.assertEqual(
             replay.instructions[0].initial_event.event_id,
             first.instructions[0].initial_event.event_id,
@@ -325,7 +340,9 @@ class SubmissionTests(TestCase):
             rows = session.execute(select(InstructionRecord)).scalars().all()
         self.assertEqual(len(rows), 1)
 
-    def test_submit_execution_batch_rejects_existing_instruction_id_with_changed_payload(self) -> None:
+    def test_submit_execution_batch_rejects_existing_instruction_id_with_changed_payload(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temp_dir:
             schedule_path = Path(temp_dir) / "day_sessions.parquet"
             schedule_path.with_suffix(".csv").write_text(
@@ -383,6 +400,38 @@ class SubmissionTests(TestCase):
                 submit_execution_batch(
                     self.session_factory,
                     parse_execution_batch_payload(_sample_payload()),
+                    runtime_timezone="Europe/Stockholm",
+                    session_calendar_path=schedule_path,
+                )
+
+    def test_submit_execution_batch_rejects_model_routed_instruction_during_maintenance(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            schedule_path = Path(temp_dir) / "day_sessions.parquet"
+            schedule_path.with_suffix(".csv").write_text(
+                "\n".join(
+                    [
+                        "session_date,timezone,open_time,close_time,session_kind,base_calendar,overrides_source",
+                        "2026-04-10,Europe/Stockholm,09:00,17:30,regular,base,override",
+                        "2026-04-13,Europe/Stockholm,09:00,17:30,regular,base,override",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            payload = _sample_payload()
+            payload["instructions"][0]["is_model_routed"] = True
+            set_broker_maintenance_mode_state(
+                self.session_factory,
+                enabled=True,
+                reason="Gateway maintenance.",
+                updated_by="test",
+            )
+
+            with self.assertRaisesRegex(KillSwitchActiveError, "maintenance mode"):
+                submit_execution_batch(
+                    self.session_factory,
+                    parse_execution_batch_payload(payload),
                     runtime_timezone="Europe/Stockholm",
                     session_calendar_path=schedule_path,
                 )

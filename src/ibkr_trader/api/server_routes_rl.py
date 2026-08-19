@@ -670,6 +670,8 @@ def register_rl_routes(app: Any, context: Any) -> None:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RLActionStateError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KillSwitchActiveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SubmissionConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except IbkrDependencyError as exc:

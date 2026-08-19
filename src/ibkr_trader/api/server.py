@@ -179,6 +179,7 @@ from ibkr_trader.orchestration.rl_candidate_rollover import (
     archive_expired_rl_candidates,
     serialize_rl_candidate_rollover_result,
 )
+from ibkr_trader.orchestration.operator_controls import broker_maintenance_mode_is_enabled
 from ibkr_trader.orchestration.runtime_service_state import (
     EXECUTION_RUNTIME_KEY,
     mark_runtime_service_disabled,
@@ -746,6 +747,7 @@ def create_app(config: AppConfig | None = None) -> Any:
         interval_seconds=app_config.market_data_backfill_interval_seconds,
         batch_size=app_config.market_data_backfill_batch_size,
         timeout_seconds=app_config.market_data_backfill_timeout_seconds,
+        maintenance_mode_is_enabled=lambda: broker_maintenance_mode_is_enabled(session_factory),
     )
     market_stream_identity_map = load_stockholm_identity_map(
         app_config.stockholm_identity_path,

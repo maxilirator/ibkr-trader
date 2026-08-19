@@ -18,6 +18,9 @@ from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import InstrumentRecord
 from ibkr_trader.domain.execution_contract import ExecutionInstruction
 from ibkr_trader.domain.execution_contract import ExecutionInstructionBatch
+from ibkr_trader.orchestration.operator_controls import (
+    assert_broker_maintenance_mode_inactive,
+)
 from ibkr_trader.orchestration.operator_controls import assert_kill_switch_inactive
 from ibkr_trader.orchestration.scheduling import BatchRuntimeSchedule
 from ibkr_trader.orchestration.scheduling import InstructionRuntimeSchedule
@@ -184,11 +187,15 @@ def _build_idempotent_replay_batch(
     runtime_timezone: str,
 ) -> SubmittedBatch | None:
     instruction_ids = [instruction.instruction_id for instruction in batch.instructions]
-    records = session.execute(
-        select(InstructionRecord).where(
-            InstructionRecord.instruction_id.in_(instruction_ids)
+    records = (
+        session.execute(
+            select(InstructionRecord).where(
+                InstructionRecord.instruction_id.in_(instruction_ids)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if not records:
         return None
 
@@ -219,14 +226,18 @@ def _build_idempotent_replay_batch(
         )
 
     record_ids = [record.id for record in records_by_instruction_id.values()]
-    initial_events = session.execute(
-        select(InstructionEventRecord)
-        .where(
-            InstructionEventRecord.instruction_id.in_(record_ids),
-            InstructionEventRecord.event_type == "instruction_submitted",
+    initial_events = (
+        session.execute(
+            select(InstructionEventRecord)
+            .where(
+                InstructionEventRecord.instruction_id.in_(record_ids),
+                InstructionEventRecord.event_type == "instruction_submitted",
+            )
+            .order_by(InstructionEventRecord.id)
         )
-        .order_by(InstructionEventRecord.id)
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     events_by_record_id: dict[int, InstructionEventRecord] = {}
     for event in initial_events:
         events_by_record_id.setdefault(event.instruction_id, event)
@@ -267,7 +278,8 @@ def _upsert_instrument(
             InstrumentRecord.symbol == instruction.instrument.symbol,
             InstrumentRecord.exchange == instruction.instrument.exchange,
             InstrumentRecord.currency == instruction.instrument.currency,
-            InstrumentRecord.security_type == instruction.instrument.security_type.value,
+            InstrumentRecord.security_type
+            == instruction.instrument.security_type.value,
         )
     ).scalar_one_or_none()
 
@@ -317,6 +329,7 @@ def submit_execution_batch(
 
     if any(not instruction.is_model_routed for instruction in batch.instructions):
         assert_kill_switch_inactive(session_factory)
+    assert_broker_maintenance_mode_inactive(session_factory)
 
     persisted_instructions: list[SubmittedInstruction] = []
 
@@ -345,7 +358,9 @@ def submit_execution_batch(
                 initial_state = ExecutionState.ENTRY_PENDING.value
             if is_model_routed:
                 if instruction.execution is None:
-                    raise ValueError("execution is required for model-routed instructions")
+                    raise ValueError(
+                        "execution is required for model-routed instructions"
+                    )
                 submit_at = instruction.execution.window.start_at
                 expire_at = instruction.execution.window.end_at
                 order_type = "MODEL_ROUTED"
@@ -383,7 +398,9 @@ def submit_execution_batch(
                 source="api",
                 state_before=None,
                 state_after=initial_state,
-                payload={"runtime_schedule": _serialize_runtime_schedule(runtime_schedule)},
+                payload={
+                    "runtime_schedule": _serialize_runtime_schedule(runtime_schedule)
+                },
                 note=(
                     "Model-routed instruction validated and persisted for RL agent pickup."
                     if is_model_routed

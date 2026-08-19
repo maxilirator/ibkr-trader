@@ -14,9 +14,13 @@ from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.db.models import InstructionSetCancellationRecord
 from ibkr_trader.orchestration.operator_controls import (
+    BROKER_MAINTENANCE_MODE_CONTROL_KEY,
     KILL_SWITCH_CONTROL_KEY,
+    assert_broker_maintenance_mode_inactive,
     cancel_instruction_set,
+    read_broker_maintenance_mode_state,
     read_kill_switch_state,
+    set_broker_maintenance_mode_state,
     set_kill_switch_state,
 )
 from ibkr_trader.orchestration.state_machine import ExecutionState
@@ -128,6 +132,31 @@ class OperatorControlsTests(TestCase):
         self.assertIsNotNone(updated.latest_event)
         self.assertEqual(updated.latest_event.event_type, "kill_switch_enabled")
 
+    def test_broker_maintenance_mode_is_durable_and_independent(self) -> None:
+        initial = read_broker_maintenance_mode_state(self.session_factory)
+        self.assertEqual(initial["control_key"], BROKER_MAINTENANCE_MODE_CONTROL_KEY)
+        self.assertFalse(initial["enabled"])
+        updated = set_broker_maintenance_mode_state(
+            self.session_factory,
+            enabled=True,
+            reason="Maintenance.",
+            updated_by="test-suite",
+        )
+        self.assertTrue(updated["enabled"])
+        self.assertEqual(
+            updated["latest_event"]["event_type"], "broker_maintenance_mode_enabled"
+        )
+        self.assertFalse(read_kill_switch_state(self.session_factory).enabled)
+        set_kill_switch_state(
+            self.session_factory,
+            enabled=True,
+            reason="Freeze.",
+            updated_by="test-suite",
+        )
+        self.assertTrue(
+            read_broker_maintenance_mode_state(self.session_factory)["enabled"]
+        )
+
     def test_cancel_instruction_set_cancels_pending_and_submitted_entries(self) -> None:
         self._insert_instruction(
             instruction_id="instr-pending",
@@ -211,15 +240,19 @@ class OperatorControlsTests(TestCase):
             self.assertEqual(cancellation_request.cancelled_pending_count, 1)
             self.assertEqual(cancellation_request.cancelled_submitted_count, 1)
 
-            pending_events = session.execute(
-                select(InstructionEventRecord)
-                .join(
-                    InstructionRecord,
-                    InstructionRecord.id == InstructionEventRecord.instruction_id,
+            pending_events = (
+                session.execute(
+                    select(InstructionEventRecord)
+                    .join(
+                        InstructionRecord,
+                        InstructionRecord.id == InstructionEventRecord.instruction_id,
+                    )
+                    .where(InstructionRecord.instruction_id == "instr-pending")
+                    .order_by(InstructionEventRecord.id)
                 )
-                .where(InstructionRecord.instruction_id == "instr-pending")
-                .order_by(InstructionEventRecord.id)
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             self.assertEqual(
                 [event.event_type for event in pending_events],
                 ["instruction_set_cancelled"],
