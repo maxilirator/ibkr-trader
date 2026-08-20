@@ -628,3 +628,77 @@ Lower than first reported, but with three specific items to weigh:
 
 The `.git` metadata on the host should be corrected as part of cutover, so that
 the commit hash means something again.
+
+## Phase 5 — cutover attempted, stopped on a verified blocker (2026-08-20)
+
+Cutover was approved by Mattias. It was **not performed.** Pre-flight found a
+condition that would take the trader down on the first restart, and it is not
+recoverable by rolling back configuration alone.
+
+### The blocker
+
+`AppConfig.from_env()` resolves three shared datasets through the q-data catalog
+**unconditionally** — `config.py:283-285`, independent of `APP_ENV`:
+
+```
+session_calendar_path=_q_data_path("xsto.world.calendar")
+stockholm_instruments_path=_q_data_path("xsto.world.universe")
+stockholm_identity_path=_q_data_path("xsto.world.instrument_identity")
+```
+
+`_q_data_path` calls `q_data.resolve()`, which raises when `Q_DATA_CATALOG_PATH`
+is unset. There is no path fallback, by deliberate design.
+
+**There is no q-data catalog anywhere in the estate.** Verified:
+
+| Location | Result |
+| --- | --- |
+| `quant:/mnt/q-data`, `/home/mattias/q-data`, `/srv/q-data` | no `catalog.json` |
+| `quant` — any `catalog.json` under `/mnt`, `/srv`, `/home/mattias` | none found |
+| `quant` — network mounts | none |
+| `q-live-ops:/mnt/q-data` | exists but is an **empty directory** on the root filesystem, not a mount |
+| `quant:/home/mattias/q-data/xsto` | contains the **old layout**: `calendars/`, `instruments/`, `meta/` |
+
+The live `.env` still uses the old form,
+`SESSION_CALENDAR_PATH=../q-data/xsto/calendars/day_sessions.parquet`, which the
+deployed (June) code accepts and the current code no longer does.
+
+Reproduced with the live host's exact environment shape:
+
+```
+QDataContractError: Q_DATA_CATALOG_PATH is not set. Shared q-data inputs are
+resolved only through the q-data catalog; there is no directory fallback...
+```
+
+### Why this is not a configuration fix
+
+`ExecStartPre=python -m ibkr_trader.db.init_schema` calls `AppConfig.from_env()`,
+so `ibkr-trader-api` fails before `ExecStart` and crash-loops on `Restart=always`;
+`ibkr-trader-rl-runner` then fails its health gate. Setting `APP_ENV` back to
+`dev` does not help — the requirement is unconditional. Only rolling the *code*
+back would restore service.
+
+### Not caused by the stabilization work
+
+The catalog-only resolution arrives with `bae8f91`, `b7a2973` and `6d1b972`,
+which are other people's commits inside the 34-commit gap. The trader's data
+contract is ahead of what the data platform has rolled out to this host. The
+`q-data` project owns publishing the catalog, and the estate contains a
+`q-data-cutover-goal` alongside it.
+
+### What must happen first
+
+1. A q-data catalog must exist on `quant` covering `xsto.world.calendar`,
+   `xsto.world.universe` and `xsto.world.instrument_identity`, and
+   `Q_DATA_CATALOG_PATH` must point at it from `/etc/ibkr-trader/bootstrap.env`.
+2. **A catalog must not be hand-generated from whatever files happen to be in
+   `/home/mattias/q-data/xsto`.** That would reconstruct exactly the hazard the
+   change was made to prevent — the module's own docstring records that a
+   six-month-stale file was once read as current. The catalog is q-data's
+   artefact to publish.
+
+Once a catalog is in place, the remaining cutover is the ordinary one: deploy the
+34 commits, add `Q_DATA_CATALOG_PATH`, decide the paper-port question
+(`IBKR_PORT=4002` is the IB Gateway **paper** port), and only then consider
+`APP_ENV=production`. The database needs no migration, and no systemd unit
+changes are involved.
