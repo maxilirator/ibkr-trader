@@ -262,6 +262,39 @@ def mark_market_data_backfill_succeeded(
         return serialize_market_data_backfill_request(row)
 
 
+#: Substrings identifying a failure that re-asking IBKR can never resolve.
+#:
+#: Matched against the message rather than the exception type, because
+#: ``LookupError`` covers both "IBKR says this contract does not exist" (final)
+#: and incidental lookup failures during a Gateway restart (retryable).
+TERMINAL_CONTRACT_ERROR_MARKERS = (
+    "no security definition",       # IBKR error 200
+    "no ibkr contract matched",     # raised by historical_bars when nothing matched
+)
+
+
+def _is_terminal_backfill_failure(exc: Exception) -> bool:
+    """Whether re-asking IBKR could ever produce a different answer.
+
+    A request that can never succeed must not re-enter the queue. The pacing
+    budget is 50 historical requests per 10 minutes, and on a whole-market
+    backfill the permanently-unresolvable names - delisted, never listed on that
+    date, wrong venue - are numerous enough to crowd out real work. Every one of
+    them retried on a 120-second cycle is budget spent re-asking a question IBKR
+    has already answered "no" to.
+
+    Deliberately narrow: only a definite "this contract does not exist" and a
+    malformed request are terminal. Connection, timeout, pacing and circuit
+    failures stay retryable, because those do resolve on their own.
+    """
+    if isinstance(exc, ValueError):
+        # A request IBKR never saw: bad duration, missing currency, and so on.
+        # It will be exactly as malformed on the next attempt.
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in TERMINAL_CONTRACT_ERROR_MARKERS)
+
+
 def mark_market_data_backfill_failed(
     session_factory: sessionmaker[Session],
     *,
@@ -427,18 +460,23 @@ def run_due_market_data_backfills(
             Exception
         ) as exc:  # pragma: no cover - exercised through tests with fakes.
             LOGGER.warning(
-                "Failed to backfill market data for %s.",
+                "Failed to backfill market data for %s (%s).",
                 request.get("symbol"),
+                "terminal" if _is_terminal_backfill_failure(exc) else "retryable",
                 exc_info=True,
             )
+            terminal = _is_terminal_backfill_failure(exc)
             failed.append(
                 mark_market_data_backfill_failed(
                     session_factory,
                     request_id=request_id,
                     error=str(exc),
-                    retryable=True,
+                    retryable=not terminal,
                     retry_after_seconds=120.0,
-                    result_payload={"error_type": type(exc).__name__},
+                    result_payload={
+                        "error_type": type(exc).__name__,
+                        "terminal": terminal,
+                    },
                 )
             )
     return {
