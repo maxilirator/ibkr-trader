@@ -766,3 +766,103 @@ enabled, RL runner still virtual.
    session-scoped. Logging in as the service owner is itself a state change.
 3. Linger should be part of the stability observation gates in Phase 6: a
    service that dies on logout will not survive a bounded observation window.
+
+## Phase 5 — cutover COMPLETED (2026-08-20)
+
+Approved by Mattias. Deployed and running in production on `quant.geisler.se`.
+
+### Blocker resolved first: q-data over NFS
+
+`nas.geisler.se` exports `/mnt/root/q-data` to `*`. Enumerated by speaking the
+RPC mount protocol directly rather than installing anything, then:
+
+- `nfs-common` installed on `quant`; share mounted **read-only** at `/mnt/q-data`
+  (`ro,soft,timeo=100,retrans=3,_netdev,nofail`). Read-only because q-data owns
+  the data and the trader only reads it; `soft` so a network blip fails loudly
+  rather than hanging the order path.
+- Persisted in `/etc/fstab` (backup taken) and re-mounted from fstab to prove the
+  entry parses.
+- `Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json` added to the protected file.
+- **Contract verified as the service user**: all three required datasets resolve
+  *and* pass SHA-256 verification — `xsto.world.calendar` (52,925 B),
+  `xsto.world.universe` (15,334 B), `xsto.world.instrument_identity` (80,079 B).
+  ~148 KB total, so per-order hash verification is negligible.
+
+### Correction found by checking rather than assuming
+
+The live host runs a **live** account (`U25245596`; paper accounts are `DU`-prefixed)
+on a **live** Gateway (`TradingMode=live`, `--mode=live`) whose API port is
+deliberately set to **4002** via IBC's `OverrideTwsApiPort`.
+
+The paper-**port** refusal would therefore have blocked a correct production
+setup. IBKR's 4001/4002/7496/7497 are only defaults; once `OverrideTwsApiPort`
+exists the port carries no information. Replaced with a paper-**account** check
+(`DU` prefix), which is real evidence, overridable via
+`IBKR_ALLOW_PAPER_ACCOUNT_IN_PRODUCTION=1`. `IBKR_PORT` is still shape-checked.
+
+This was the same mistake as the earlier `_looks_like_production` substring rule:
+encoding a convention as if it were a fact, turning a safeguard into a
+self-inflicted outage. Regression test uses the host's real configuration.
+
+### How the deploy was done
+
+Deployment had been `rsync`, which is why the host's `.git` was ~2 months stale.
+This one used a **git bundle**, so the host now has real objects and its commit
+hash means something again.
+
+1. Services stopped (Gateway untouched).
+2. Rollback archive `/root/ibkr-rollback-20260820T134758Z.tar.gz` (7.6 MB).
+3. Live RL state preserved to `/root/ibkr-live-state-…/` — `state.json` (3.6 MB)
+   and `history-cache.json` (614 KB) are **tracked in git**, so `reset --hard`
+   would have destroyed 3.6 MB of live runtime state. Restored afterwards.
+4. `git fetch` from the bundle, `reset --hard`, branch label corrected.
+5. Dashboard rebuilt (`npm run build`) for the new `/settings` route.
+6. **Active-tree comparison run on the host** against locally-recorded evidence:
+   same commit, only differences a build artefact (`egg-info/SOURCES.txt`) and
+   the deliberately-restored runtime state.
+7. Preflight: **GO** — permissions fine, all required keys present, all accounts
+   live, kill switch verified enabled in the target database, no `.env` keys lost.
+8. `APP_ENV` commented out in the checkout `.env`; `APP_ENV=production` set via a
+   systemd **drop-in** per unit, so rollback is deleting one file.
+9. API restarted first with automatic rollback on failure; then dashboard and
+   RL runner.
+
+### Verified live, in production
+
+```
+is_production: True   source: bootstrap   path: /etc/ibkr-trader/bootstrap.env
+overridden   : ['APP_ENV']      <- the file's APP_ENV=dev could not downgrade it
+```
+
+| Check | Result |
+| --- | --- |
+| `/healthz` | `ok`; primary + diagnostic `healthy`, historical `recovering`, circuit closed |
+| Phase 1 recovery policy | live: `market_stream state=streaming usable=True` |
+| Phase 3 `/v1/settings` | 18 settings, `read_only: true`, drift 0, errors 0 |
+| Dashboard `/`, `/settings`, `/ledger`, `/rl` | all HTTP 200 |
+| Global kill switch | **enabled** ("Authorized maintenance hold…") |
+| RL runner | `--execute-virtual` |
+| Legacy `ibgateway.service` | `disabled` |
+| Watchdog restart authority | `WATCHDOG_RESTART_ENABLED=no` |
+| q-data mount | `nas.geisler.se:/mnt/root/q-data` read-only |
+
+Host runs Python 3.12.3 (local tests ran on 3.13.13); `pyproject` requires ≥3.12.
+
+### OUTSTANDING — needs operator approval, not touched
+
+**Two IB Gateway JVMs are running**, which violates "exactly one Gateway process".
+
+| PID | Owner | cgroup | Started | Ports |
+| --- | --- | --- | --- | --- |
+| 2580765 | `ibgateway` | `ibgateway-ibc.service` | 2026-08-19 22:45 | **4002**, 7462 |
+| 2557071 | `mattias` | **`ibgateway.service`** (legacy) | 2026-08-19 12:36 | none |
+
+The dedicated Gateway is correct and is the one serving the trader. The second is
+a **leftover process of the legacy `ibgateway.service`** — the unit is `disabled`,
+so it will not return after a reboot, but disabling a unit does not stop an
+already-running process, and this one predates today's work.
+
+It holds no ports, but it is a second Gateway JVM against the same IBKR login,
+which is the session-conflict class AGENTS.md warns about. **Not stopped:**
+stopping a Gateway requires explicit Mattias approval. Recommended action is to
+stop PID 2557071 only, leaving `ibgateway-ibc.service` untouched.
