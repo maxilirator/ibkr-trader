@@ -866,3 +866,55 @@ It holds no ports, but it is a second Gateway JVM against the same IBKR login,
 which is the session-conflict class AGENTS.md warns about. **Not stopped:**
 stopping a Gateway requires explicit Mattias approval. Recommended action is to
 stop PID 2557071 only, leaving `ibgateway-ibc.service` untouched.
+
+## Phase 6 — bounded stability observation
+
+Five samples at 60-second intervals immediately after cutover, plus restart-churn
+and error gates.
+
+| Gate | Result |
+| --- | --- |
+| `/healthz` | `ok` on all 5 samples |
+| Primary broker session | `healthy` on all 5 |
+| Market stream | `streaming` on all 5 |
+| Broker circuit | closed on all 5 |
+| Dashboard `/settings` | HTTP 200 on all 5 |
+| All three units | `active` on all 5 |
+| **Restart churn** | `NRestarts=0` for all three units |
+| Hard errors in the journal since cutover | **0** (`Traceback`, `BootstrapConfigurationError`, `QDataContractError`) |
+
+This is a short window and is recorded as such: it demonstrates the cutover did
+not destabilise the stack, not that the stack is stable over a trading day. A
+longer observation should follow, and it now has a meaningful prerequisite that
+did not previously hold — `loginctl enable-linger mattias`, without which the
+services die on operator logout and no observation window is trustworthy.
+
+## Programme summary
+
+| Phase | State |
+| --- | --- |
+| 1 — Recovery and stream policy | Deployed; live at `/healthz` under `recovery_policy` |
+| 2 — Fail-closed source-independent bootstrap | Deployed and **engaged**: `is_production=True`, config from `/etc/ibkr-trader/bootstrap.env` |
+| 3 — Non-secret settings registry + dashboard `/settings` | Deployed; 18 settings, read-only, HTTP 200 |
+| 4 — Verifiable release pipeline | Used for the cutover itself; active-tree comparison run on the host |
+| 5 — Application cutover | **Complete** |
+| 6 — Bounded stability observation | Short window passed; longer window outstanding |
+
+Non-negotiables at close: kill switch **enabled**; RL runner **virtual**;
+watchdog restart authority **disabled**; legacy `ibgateway.service` **disabled**;
+dashboard extended, not replaced; no live RL trading.
+
+**One constraint is violated and was deliberately not fixed**: two IB Gateway
+JVMs are running. See the Phase 5 section — stopping a Gateway requires explicit
+operator approval.
+
+### Rollback, if needed
+
+1. Delete `~/.config/systemd/user/ibkr-trader-*.service.d/10-production.conf`,
+   `systemctl --user daemon-reload`, restore `APP_ENV` in `.env`, restart. That
+   reverses only the production flip.
+2. For a full code rollback: `git -C ~/ibkr-trader reset --hard a802b27`, or
+   restore `/root/ibkr-rollback-20260820T134758Z.tar.gz`. Re-restore
+   `/root/ibkr-live-state-20260820T134758Z/` afterwards — `var/rl-runner/state.json`
+   is tracked in git and will otherwise be overwritten.
+3. Do not restart IB Gateway as part of any rollback.
