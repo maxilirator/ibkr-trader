@@ -918,3 +918,86 @@ operator approval.
    `/root/ibkr-live-state-20260820T134758Z/` afterwards — `var/rl-runner/state.json`
    is tracked in git and will otherwise be overwritten.
 3. Do not restart IB Gateway as part of any rollback.
+
+## XSTO 1-minute backfill — 48h whole-market pilot (started 2026-08-20)
+
+### Design corrections that shaped it
+
+The first plan was wrong in two ways, both corrected by Mattias:
+
+1. **The universe is a living list, not a fixed set.** `xsto.world.universe`
+   already carries `instrument`, `start`, `end` per row, so the instrument set is
+   a property of the *date*. Measured: **926 active on 2025-09-01 → 954 on
+   2026-08-19**, 28 newly listed. Crossing today's universe with a date range
+   would request names before they listed and burn the pacing budget discovering
+   that one request at a time. Requests are now generated per session from the
+   universe active on that session.
+2. **Ownership: q-live-ops requests and writes; the trader only reads.** This is
+   already the design — `q-live-ops/configs/retrieval/ibkr.yaml` points at
+   `http://quant.geisler.se:8000` with `historical_client_id: 8` and
+   `output_root: /mnt/q-data/…`. The write path exists on **`docker.geisler.se`**
+   (10.17.0.220), where `q-data-ops-q-data-native-1` has `/mnt/q-data` mounted
+   **rw** and publishes the catalog. An earlier note in this document claimed
+   q-live-ops had no q-data mount; that was checking host `q-live-ops`
+   (10.17.0.108), which is not where the data-ops containers run. The trader's
+   read-only mount on `quant` is correct and deliberate.
+
+### Blocking defect fixed first (`12e72a9`)
+
+Both `mark_market_data_backfill_failed()` call sites passed `retryable=True`
+unconditionally, so `BACKFILL_STATUS_FAILED_FINAL` was unreachable and every
+permanently-dead request re-entered the queue on a 120-second cycle forever.
+
+**Measured in the pilot: a 40% terminal-failure rate** (23 of 58 resolved
+attempts), with errors like
+`IBKR rejected the contract lookup for ABIG: [200] No security definition`.
+Without the fix, two in five requests would have recycled indefinitely against a
+budget of 50 requests per 10 minutes.
+
+Classification matches on message, not exception type, because `LookupError`
+covers both "this contract does not exist" (final) and incidental lookup failures
+during a Gateway restart (retryable).
+
+### Pilot configuration
+
+| Setting | Value | Note |
+| --- | --- | --- |
+| Requests enqueued | **14,310** | 15 whole-market sessions, 954 instruments each |
+| `MARKET_DATA_BACKFILL_BATCH_SIZE` | 3 → **4** | 240/h = 80% of the 300/h ceiling |
+| Headroom left | 20% | so RL observation builds are not starved and misread as backfill breakage |
+| Client id | 8 | historical role, separate from order control (0) and stream (9) |
+| Session close | from the calendar per day | `close_time` + `timezone`; 17:30 Stockholm = **15:30Z** in summer, and XSTO has half-days |
+
+The enqueuer (`scripts/enqueue_xsto_minute_backfill.py`) opens no broker
+connection and is idempotent — `request_key` is unique, so re-running adds
+nothing.
+
+### Baseline at start
+
+```
+queue: PENDING 14,296 | SUCCEEDED 35 | FAILED_FINAL 23 | RUNNING 4
+terminal-failure rate: 40%
+Gateway JVMs: 1        port 4002: 1 listener
+primary: healthy   diagnostic: healthy   circuit: closed
+```
+
+Two observations worth carrying into the window:
+
+- **`historical: unknown`** appears while the backfill runs. That is the Phase 1
+  policy being honest: the session lock is held by the backfill, so its state
+  cannot be observed, and an unobservable session is reported `unknown` rather
+  than guessed. Working as designed.
+- **`market_stream: reconnecting` with zero desired subscriptions.** Not backfill
+  contention — nothing has asked the stream to subscribe since the restart. It
+  does expose a gap in the classifier: "not running, nothing desired" is really
+  *idle*, but `classify_stream_state` only consults `subscription_count` when
+  `running=True`. Worth a follow-up; it under-reports calm as churn.
+
+### What to watch over 48h
+
+```sql
+select status, count(*) from market_data_backfill_request group by status;
+```
+
+Gates: no growth in `FAILED_RETRYABLE`; `NRestarts` stays 0; Gateway JVM count
+stays 1; `circuit open` stays false across at least one Gateway autorestart.
