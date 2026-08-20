@@ -16,7 +16,10 @@ from ibkr_trader.db.models import InstructionSetCancellationRecord
 from ibkr_trader.orchestration.operator_controls import (
     BROKER_MAINTENANCE_MODE_CONTROL_KEY,
     KILL_SWITCH_CONTROL_KEY,
-    assert_broker_maintenance_mode_inactive,
+    KillSwitchActiveError,
+    assert_kill_switch_inactive,
+    kill_switch_is_enabled,
+    seed_kill_switch_if_absent,
     cancel_instruction_set,
     read_broker_maintenance_mode_state,
     read_kill_switch_state,
@@ -117,7 +120,17 @@ class OperatorControlsTests(TestCase):
     def test_set_and_read_kill_switch_state_persists_event(self) -> None:
         initial = read_kill_switch_state(self.session_factory)
         self.assertEqual(initial.control_key, KILL_SWITCH_CONTROL_KEY)
-        self.assertFalse(initial.enabled)
+        # Fail-closed: with no record, absence is not read as approval to trade.
+        self.assertTrue(initial.enabled)
+        self.assertIsNone(initial.record_id)
+
+        set_kill_switch_state(
+            self.session_factory,
+            enabled=False,
+            reason="Operator cleared the halt.",
+            updated_by="dashboard",
+        )
+        self.assertFalse(read_kill_switch_state(self.session_factory).enabled)
 
         updated = set_kill_switch_state(
             self.session_factory,
@@ -145,6 +158,14 @@ class OperatorControlsTests(TestCase):
         self.assertTrue(updated["enabled"])
         self.assertEqual(
             updated["latest_event"]["event_type"], "broker_maintenance_mode_enabled"
+        )
+        # Explicitly disabled first: an absent record now reads as enabled, so
+        # asserting independence requires a recorded decision, not a default.
+        set_kill_switch_state(
+            self.session_factory,
+            enabled=False,
+            reason="Independence check.",
+            updated_by="test-suite",
         )
         self.assertFalse(read_kill_switch_state(self.session_factory).enabled)
         set_kill_switch_state(
@@ -259,3 +280,84 @@ class OperatorControlsTests(TestCase):
             )
         finally:
             session.close()
+
+
+class KillSwitchFailClosedTests(TestCase):
+    """An absent kill-switch record must not read as approval to trade.
+
+    Before this, `_build_kill_switch_status(record=None)` returned
+    `enabled=False`, so `assert_kill_switch_inactive` permitted new entries
+    whenever the row was missing - a fresh database, a failed schema init, or a
+    deleted row silently authorised trading. The rule that the switch stays
+    enabled held only because a row happened to exist.
+    """
+
+    def setUp(self) -> None:
+        self.engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(self.engine)
+        self.session_factory = create_session_factory(self.engine)
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+
+    def test_absent_record_reads_as_enabled(self) -> None:
+        status = read_kill_switch_state(self.session_factory)
+        self.assertTrue(status.enabled)
+        self.assertIsNone(status.record_id)
+        self.assertIn("No kill switch record exists", status.reason)
+
+    def test_absent_record_blocks_new_entries(self) -> None:
+        """The property that matters: absence blocks, it does not permit."""
+        with self.assertRaises(KillSwitchActiveError):
+            assert_kill_switch_inactive(self.session_factory)
+
+    def test_an_explicit_disable_still_permits_entries(self) -> None:
+        """Fail-closed must not mean permanently closed."""
+        set_kill_switch_state(
+            self.session_factory,
+            enabled=False,
+            reason="Operator cleared the halt.",
+            updated_by="test",
+        )
+        assert_kill_switch_inactive(self.session_factory)
+        self.assertFalse(kill_switch_is_enabled(self.session_factory))
+
+    def test_seeding_creates_an_enabled_record_with_an_audit_event(self) -> None:
+        seeded = seed_kill_switch_if_absent(self.session_factory)
+        self.assertIsNotNone(seeded)
+        self.assertTrue(seeded.enabled)
+        self.assertIsNotNone(seeded.record_id)
+        self.assertEqual(seeded.latest_event.event_type, "kill_switch_seeded")
+        # Recorded as seeded, not as an operator decision: claiming a human
+        # made this choice would be fabricated provenance.
+        self.assertEqual(seeded.updated_by, "system:schema-init")
+
+    def test_seeding_is_idempotent(self) -> None:
+        self.assertIsNotNone(seed_kill_switch_if_absent(self.session_factory))
+        self.assertIsNone(seed_kill_switch_if_absent(self.session_factory))
+
+    def test_seeding_never_re_enables_a_deliberately_disabled_switch(self) -> None:
+        """A restart must not quietly reverse an operator's decision."""
+        set_kill_switch_state(
+            self.session_factory,
+            enabled=False,
+            reason="Operator cleared the halt.",
+            updated_by="mattias",
+        )
+        self.assertIsNone(seed_kill_switch_if_absent(self.session_factory))
+        status = read_kill_switch_state(self.session_factory)
+        self.assertFalse(status.enabled)
+        self.assertEqual(status.updated_by, "mattias")
+
+    def test_schema_init_seeds_the_switch(self) -> None:
+        """init_schema runs as ExecStartPre on every service start."""
+        engine = build_engine("sqlite+pysqlite:///:memory:")
+        create_schema(engine)
+        factory = create_session_factory(engine)
+        seed_kill_switch_if_absent(factory)
+        try:
+            status = read_kill_switch_state(factory)
+            self.assertTrue(status.enabled)
+            self.assertIsNotNone(status.record_id)
+        finally:
+            engine.dispose()

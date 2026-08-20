@@ -16,6 +16,7 @@ class ApiServerTests04(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 trader_model = TraderModelRecord(
@@ -192,6 +193,7 @@ class ApiServerTests04(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 model = TraderModelRecord(
@@ -395,6 +397,7 @@ class ApiServerTests04(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 for instruction_id, expire_at in (
@@ -541,6 +544,7 @@ class ApiServerTests04(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 broker_account = BrokerAccountRecord(
@@ -767,6 +771,7 @@ class ApiServerTests04(ApiServerTestCase):
             database_url = f"sqlite+pysqlite:///{database_path}"
             engine = build_engine(database_url)
             create_schema(engine)
+            disable_kill_switch_for_test(create_session_factory(engine))
             engine.dispose()
 
             app = create_app(

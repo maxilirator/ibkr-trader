@@ -49,6 +49,7 @@ from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
+from tests._kill_switch_test_support import disable_kill_switch_for_test
 from ibkr_trader.db.models import AccountSnapshotRecord
 from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderEventRecord

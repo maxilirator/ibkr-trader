@@ -126,11 +126,24 @@ def _build_kill_switch_status(
     latest_event: OperatorControlEventRecord | None,
 ) -> KillSwitchStatus:
     if record is None:
+        # Fail closed. An absent control row used to read as "switch disabled",
+        # so new entries were permitted whenever the row was missing - a fresh
+        # database, a failed schema init, or a deleted row silently authorised
+        # trading. The rule that the kill switch stays enabled then held only
+        # because a row happened to exist, not because anything enforced it.
+        #
+        # Absence is not evidence that trading was approved, so it is treated as
+        # blocked. This can only ever block more than before, never less.
         return KillSwitchStatus(
             record_id=None,
             control_key=KILL_SWITCH_CONTROL_KEY,
-            enabled=False,
-            reason=None,
+            enabled=True,
+            reason=(
+                "No kill switch record exists in this database. Treating the "
+                "switch as enabled because an absent record cannot be read as "
+                "approval to trade. Seed it with db.init_schema, or set it "
+                "explicitly through the operator API."
+            ),
             updated_by=None,
             last_changed_at=None,
             created_at=None,
@@ -191,6 +204,68 @@ def read_kill_switch_state(
     with session_scope(session_factory) as session:
         record, latest_event = _read_kill_switch_record(session)
         return _build_kill_switch_status(record, latest_event)
+
+
+def seed_kill_switch_if_absent(
+    session_factory: sessionmaker[Session],
+) -> KillSwitchStatus | None:
+    """Create the kill switch record, enabled, when the database has none.
+
+    The read path already fails closed on an absent record, so this is not what
+    makes the system safe - it makes the state *visible*. Without a row the
+    dashboard shows a switch with no history and no timestamp, and an operator
+    cannot tell "deliberately enabled" from "never configured".
+
+    Seeded rather than operator-set, and the audit event says so, because
+    recording this as an operator decision would be a fabricated provenance for
+    something nobody actually did.
+
+    Returns the seeded status, or ``None`` when a record already existed. Never
+    modifies an existing record: if the switch was deliberately disabled, that
+    decision stands and is not quietly reversed by a restart.
+    """
+    event_at = utc_now()
+    with session_scope(session_factory) as session:
+        existing = session.execute(
+            select(OperatorControlRecord)
+            .where(OperatorControlRecord.control_key == KILL_SWITCH_CONTROL_KEY)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if existing is not None:
+            return None
+
+        record = OperatorControlRecord(
+            control_key=KILL_SWITCH_CONTROL_KEY,
+            enabled=True,
+            reason=(
+                "Seeded enabled on schema initialisation. No operator has made "
+                "a decision about this switch yet."
+            ),
+            updated_by="system:schema-init",
+            last_changed_at=event_at,
+        )
+        session.add(record)
+        session.flush()
+
+        event = OperatorControlEventRecord(
+            operator_control_id=record.id,
+            event_type="kill_switch_seeded",
+            source="schema-init",
+            event_at=event_at,
+            enabled=True,
+            reason=record.reason,
+            updated_by="system:schema-init",
+            payload={"seeded": True},
+            note=(
+                "Created by schema initialisation, not by an operator. The "
+                "switch starts enabled so that an unconfigured database cannot "
+                "authorise trading."
+            ),
+        )
+        session.add(event)
+        session.flush()
+
+        return _build_kill_switch_status(record, event)
 
 
 def kill_switch_is_enabled(session_factory: sessionmaker[Session]) -> bool:

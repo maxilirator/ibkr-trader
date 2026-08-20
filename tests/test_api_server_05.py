@@ -16,6 +16,7 @@ class ApiServerTests05(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 broker_account = BrokerAccountRecord(
@@ -168,6 +169,7 @@ class ApiServerTests05(ApiServerTestCase):
             database_url = f"sqlite+pysqlite:///{database_path}"
             engine = build_engine(database_url)
             create_schema(engine)
+            disable_kill_switch_for_test(create_session_factory(engine))
             engine.dispose()
             schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
@@ -279,6 +281,7 @@ class ApiServerTests05(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             engine.dispose()
 
             app = create_app(
@@ -331,6 +334,7 @@ class ApiServerTests05(ApiServerTestCase):
             database_url = f"sqlite+pysqlite:///{database_path}"
             engine = build_engine(database_url)
             create_schema(engine)
+            disable_kill_switch_for_test(create_session_factory(engine))
             engine.dispose()
             schedule_path = Path(temp_dir) / "day_sessions.csv"
             _write_schedule_fixture(schedule_path)
@@ -395,6 +399,7 @@ class ApiServerTests05(ApiServerTestCase):
             database_url = f"sqlite+pysqlite:///{database_path}"
             engine = build_engine(database_url)
             create_schema(engine)
+            disable_kill_switch_for_test(create_session_factory(engine))
             engine.dispose()
 
             app = create_app(
@@ -471,6 +476,7 @@ class ApiServerTests05(ApiServerTestCase):
 
             engine = build_engine(database_url)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 account = (
@@ -517,6 +523,7 @@ class ApiServerTests05(ApiServerTestCase):
             engine = build_engine(database_url)
             create_schema(engine)
             session_factory = create_session_factory(engine)
+            disable_kill_switch_for_test(session_factory)
             session = session_factory()
             try:
                 session.add(
