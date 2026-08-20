@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -36,11 +37,10 @@ if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ibkr_trader.bootstrap import (  # noqa: E402
-    PAPER_TRADING_PORTS,
+    PAPER_ACCOUNT_ACKNOWLEDGEMENT_KEY,
+    PAPER_ACCOUNT_PREFIX,
     REQUIRED_PRODUCTION_ACCOUNT_KEYS,
     REQUIRED_PRODUCTION_KEYS,
-    BootstrapConfigurationError,
-    _assert_not_world_accessible,
     _parse_env_text,
     is_production_environment,
 )
@@ -108,11 +108,25 @@ def _read(path: Path, report: Report, label: str) -> dict[str, str] | None:
 
 
 def check_permissions(path: Path, report: Report) -> None:
+    """Self-contained on purpose: this tool must not break when the loader's
+    private helpers are refactored, which is exactly what happened once."""
     try:
-        _assert_not_world_accessible(path)
-        report.note(f"bootstrap file permissions acceptable: {path}")
-    except BootstrapConfigurationError as exc:
-        report.block(str(exc))
+        mode = path.stat().st_mode
+        parent_mode = path.parent.stat().st_mode
+    except OSError as exc:
+        report.block(f"could not inspect {path}: {exc}")
+        return
+    if mode & (stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH):
+        report.block(f"{path} is world-accessible (mode {stat.filemode(mode)})")
+    elif mode & stat.S_IWGRP:
+        report.block(f"{path} is group-writable (mode {stat.filemode(mode)})")
+    else:
+        report.note(f"bootstrap file permissions acceptable ({stat.filemode(mode)})")
+    if parent_mode & (stat.S_IWOTH | stat.S_IWGRP) and not parent_mode & stat.S_ISVTX:
+        report.block(
+            f"{path.parent} is group- or world-writable "
+            f"(mode {stat.filemode(parent_mode)}); the file can be replaced"
+        )
 
 
 def check_required_keys(values: dict[str, str], report: Report) -> None:
@@ -130,21 +144,35 @@ def check_required_keys(values: dict[str, str], report: Report) -> None:
 
 
 def check_port(values: dict[str, str], report: Report) -> None:
+    """Shape only. IBKR's default ports are a convention, and IBC's
+    OverrideTwsApiPort means a live Gateway can legitimately listen anywhere."""
     raw = (values.get("IBKR_PORT") or "").strip()
     if not raw:
         return
     try:
-        port = int(raw)
+        report.note(f"IBKR_PORT={int(raw)} parses as an integer")
     except ValueError:
         report.block(f"IBKR_PORT is not an integer: {raw!r}")
-        return
-    if port in PAPER_TRADING_PORTS:
+
+
+def check_account(values: dict[str, str], report: Report) -> None:
+    """A paper account in production is the mistake worth refusing."""
+    paper = sorted({
+        a.strip().upper()
+        for key in REQUIRED_PRODUCTION_ACCOUNT_KEYS
+        for a in (values.get(key) or "").split(",")
+        if a.strip().upper().startswith(PAPER_ACCOUNT_PREFIX)
+    })
+    ack = (values.get(PAPER_ACCOUNT_ACKNOWLEDGEMENT_KEY) or "").strip().lower()
+    if paper and ack not in {"1", "true", "yes"}:
         report.block(
-            f"IBKR_PORT={port} is a PAPER trading port "
-            "(IB Gateway paper 4002, TWS paper 7497)"
+            f"account(s) {', '.join(paper)} are IBKR PAPER accounts "
+            f"({PAPER_ACCOUNT_PREFIX} prefix)"
         )
+    elif paper:
+        report.warn(f"running production on paper account(s) {', '.join(paper)} (acknowledged)")
     else:
-        report.note(f"IBKR_PORT={port} is not a known paper port")
+        report.note("all configured IBKR accounts are live (no DU prefix)")
 
 
 def check_app_env(dotenv: dict[str, str], report: Report) -> None:
@@ -273,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         check_permissions(args.bootstrap, report)
         check_required_keys(bootstrap, report)
         check_port(bootstrap, report)
+        check_account(bootstrap, report)
         if not args.skip_kill_switch:
             check_kill_switch(bootstrap, report)
 
