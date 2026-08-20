@@ -11,7 +11,7 @@ Baseline commit: `b7a2973` ("Resolve shared q-data through the catalog only")
 
 | Constraint | State | Evidence |
 | --- | --- | --- |
-| Global kill switch enabled | Untouched by this work — **but see Open finding 1** | No change to `orchestration/operator_controls.py` in `ddb394f`/`73bc591` |
+| Global kill switch enabled | **Now enforced** (`59dfdd9`, approved by Mattias): an absent record reads as *enabled*. Live row verified `enabled=True` before the change, so live impact is nil. | `tests/test_operator_controls.py::KillSwitchFailClosedTests` |
 | One dedicated Gateway; legacy `ibgateway.service` disabled | Untouched | No change to `ops/systemd/*`; no Gateway restart or config change performed |
 | Watchdog restart authority disabled | Untouched | `ops/systemd/ibgateway-api-watchdog.service` still sets `WATCHDOG_RESTART_ENABLED=no` |
 | RL runner virtual | Untouched | `ops/systemd/ibkr-trader-rl-runner.service` still passes `--execute-virtual` only |
@@ -34,9 +34,9 @@ Baseline `b7a2973`: **3 failed, 538 passed, 1 skipped**.
 | `test_order_preview.py::test_preview_flags_invalid_stockholm_short_before_submit` | `tests/conftest.py::write_catalog` never creates `shortability/shortability_latest.json`; `FileNotFoundError` | No — test fixture gap |
 | `test_order_execution_01.py::test_submit_order_from_batch_rejects_explicit_short_on_non_shortable_stockholm_account` | Same fixture gap | No — test fixture gap |
 
-These three remain failing and unmodified. They are a **Phase 4 prerequisite**:
-a release gate cannot pass while they are red, so they must be fixed or
-explicitly quarantined with justification before Phase 4 completes.
+> **Superseded.** All three were fixed in `e7a8ca5`; none was a product defect.
+> See "Test baseline — now green" below. The suite is green, which is what
+> Phase 4's matched-tests gate requires.
 
 ## Phase 1 — Recovery and stream policy
 
