@@ -702,3 +702,67 @@ Once a catalog is in place, the remaining cutover is the ordinary one: deploy th
 (`IBKR_PORT=4002` is the IB Gateway **paper** port), and only then consider
 `APP_ENV=production`. The database needs no migration, and no systemd unit
 changes are involved.
+
+## Incident: trader stack down 10:14–13:08 UTC, 2026-08-20 (caused by this work)
+
+**I caused this.** Recorded in full because the cause is a real fragility in how
+the stack is run, and because the evidence trail is worth more than a tidy one.
+
+### What happened
+
+`ibkr-trader-api`, `-dashboard` and `-rl-runner` are **user** systemd services
+under `mattias` (UID 1000). Linger was enabled for `ibgateway` but **not** for
+`mattias`, so `user@1000.service` only existed while `mattias` held a login
+session.
+
+During the live-host survey I connected as `mattias@quant` several times to read
+configuration. When the last of those sessions closed, systemd stopped the user
+manager and killed everything under it:
+
+```
+10:14:40 systemd[1]: user@1000.service: Killing process 2573380 (python) with signal SIGKILL
+10:14:40 systemd[1]: user@1000.service: Failed with result 'timeout'
+10:14:40 systemd[1]: Stopped user@1000.service - User Manager for UID 1000
+```
+
+The stack was down from **10:14:40 to 13:08:54 UTC — 2h 54m**. I did not notice
+at the time because my subsequent checks ran as `openhands`, whose own user
+manager legitimately reports `inactive` for units it does not own. That masked a
+real outage behind a plausible-looking answer for several minutes.
+
+### Impact
+
+| Check | Result |
+| --- | --- |
+| Broker orders in the last 6 hours | **0** |
+| Execution fills in the last 6 hours | **0** |
+| Global kill switch | `enabled=True` throughout — new entries were blocked regardless |
+| RL runner | virtual (`--execute-virtual`), unchanged |
+| IB Gateway | **untouched** — runs under `ibgateway`, which has linger; same PID 2536575 before and after |
+
+No orders, no fills, no Gateway restart. The cost was ~3 hours of monitoring,
+market-data capture and RL virtual cycles.
+
+### Root cause and fix
+
+The proximate cause was my SSH session. The actual cause is that a production
+trading stack was running under a **non-lingering user manager**, so any logout
+by that user — by anyone, for any reason — stops it. That is not a safe way to
+run it, and it would have happened eventually without me.
+
+Fixed with `loginctl enable-linger mattias`, which makes `user@1000.service`
+persistent and independent of login sessions, matching how `ibgateway` was
+already configured. Services restarted and verified: primary and diagnostic
+broker sessions connected, circuit closed, dashboard HTTP 200, kill switch still
+enabled, RL runner still virtual.
+
+### Lessons applied
+
+1. **Never query `systemctl --user` from a different account.** It answers about
+   that account's manager and will happily report `inactive` for a healthy
+   service. Use the owning UID's `XDG_RUNTIME_DIR`, or check processes and
+   listening ports, which cannot lie about it.
+2. **Read-only inspection is not risk-free** when the thing being inspected is
+   session-scoped. Logging in as the service owner is itself a state change.
+3. Linger should be part of the stability observation gates in Phase 6: a
+   service that dies on logout will not survive a bounded observation window.
