@@ -519,3 +519,46 @@ without the exemption no `/tmp`-based deployment or test would start.
   is accepted.
 
 Suite: **699 passed, 1 skipped, 0 failed.**
+
+## Live host survey (2026-08-20)
+
+Gathered read-only from `quant.geisler.se` as the `openhands` account. No
+service was restarted, no configuration changed, no Gateway contacted. Secret
+values were never printed — key names and non-secret values only.
+
+| Fact | Finding |
+| --- | --- |
+| **Global kill switch** | `GLOBAL_KILL_SWITCH enabled=True`, set 2026-08-18 by `openhands-on-behalf-of-mattias`. The approved fail-closed change therefore has **nil live impact** — verified, not assumed. |
+| `BROKER_MAINTENANCE_MODE` | No row. Unchanged by this work (still defaults to off). |
+| `APP_ENV` | `dev` in `/home/mattias/ibkr-trader/.env` **and** in `/etc/ibkr-trader/bootstrap.env`. **No systemd unit sets it.** |
+| `IBKR_PORT` | `4002` in both — the **IB Gateway paper port**. |
+| `/etc/ibkr-trader/bootstrap.env` | Already exists (32 lines, modified 2026-08-19). `-rw-r----- root:mattias`, directory `drwxr-x--- root:mattias`. |
+| Ancestor permissions | `/` and `/etc` are `drwxr-xr-x root:root`. Clean. |
+| `Q_DATA_CATALOG_PATH` | **Absent** from `bootstrap.env` and from `.env`. |
+| Services | `ibkr-trader-api`, `-dashboard`, `-rl-runner` all active. |
+| Deployed commit | `f2c806c`, with uncommitted local modifications. **Not an ancestor of baseline `b7a2973`**, and `src/ibkr_trader/q_data.py` is absent. |
+
+### What this means for cutover
+
+1. **Fail-closed startup is currently inactive.** `APP_ENV=dev` everywhere, so
+   none of the Phase 2 protections are engaged on the live host today.
+2. **The permissions are already correct.** The existing `0640 root:mattias`
+   file inside a `0750 root:mattias` directory passes every location, ownership
+   and mode check, including the ancestor-writability walk.
+3. **`Q_DATA_CATALOG_PATH` must be added before cutover.** It is required, has no
+   default, and is currently supplied by neither file.
+4. **The live host runs on the IB Gateway paper port (4002).** Cutover will be
+   refused unless either the port is changed to `4001` or
+   `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1` records a deliberate decision to stay
+   on paper. Staying on paper is consistent with "the RL runner remains virtual"
+   and "do not enable live RL trading", but it is an operator decision, not one
+   this work should make.
+5. **The deployed code has diverged from this branch.** `f2c806c` is not an
+   ancestor of the baseline, the deployed tree carries uncommitted edits, and it
+   predates the q-data catalog change. Deploying this branch is therefore not a
+   small delta, and the divergence must be reconciled before Phase 5. This is
+   exactly what the Phase 4 active-tree comparison exists to make visible.
+
+`bootstrap.env` also sets `APP_ENV=dev`, which is accepted: a bootstrap file may
+not declare *production*, but a non-production value is fine, and at cutover the
+unit's `APP_ENV=production` overrides it and is recorded in `overridden_keys`.
