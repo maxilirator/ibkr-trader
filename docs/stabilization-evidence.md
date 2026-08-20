@@ -536,7 +536,7 @@ values were never printed — key names and non-secret values only.
 | Ancestor permissions | `/` and `/etc` are `drwxr-xr-x root:root`. Clean. |
 | `Q_DATA_CATALOG_PATH` | **Absent** from `bootstrap.env` and from `.env`. |
 | Services | `ibkr-trader-api`, `-dashboard`, `-rl-runner` all active. |
-| Deployed commit | `f2c806c`, with uncommitted local modifications. **Not an ancestor of baseline `b7a2973`**, and `src/ibkr_trader/q_data.py` is absent. |
+| Deployed commit | Git metadata says `f2c806c`, but that is **wrong** — see "Deployed-code divergence, corrected" below. |
 
 ### What this means for cutover
 
@@ -553,12 +553,78 @@ values were never printed — key names and non-secret values only.
    on paper. Staying on paper is consistent with "the RL runner remains virtual"
    and "do not enable live RL trading", but it is an operator decision, not one
    this work should make.
-5. **The deployed code has diverged from this branch.** `f2c806c` is not an
-   ancestor of the baseline, the deployed tree carries uncommitted edits, and it
-   predates the q-data catalog change. Deploying this branch is therefore not a
-   small delta, and the divergence must be reconciled before Phase 5. This is
-   exactly what the Phase 4 active-tree comparison exists to make visible.
+5. **The deployed code lags this branch by 34 commits.** See the corrected
+   analysis below; an earlier version of this note overstated both the size and
+   the nature of the gap.
 
 `bootstrap.env` also sets `APP_ENV=dev`, which is accepted: a bootstrap file may
 not declare *production*, but a non-production value is fine, and at cutover the
 unit's `APP_ENV=production` overrides it and is recorded in `overridden_keys`.
+
+## Deployed-code divergence, corrected (2026-08-20)
+
+An earlier entry in this document claimed the deployed commit was "not an
+ancestor of baseline `b7a2973`" and that the tree carried "uncommitted edits".
+**Both statements were wrong**, and the error is recorded here rather than
+quietly edited away because it changed the recommendation.
+
+The ancestry claim came from running `git merge-base --is-ancestor f2c806c
+b7a2973` **on the live host**, where `b7a2973` does not exist. The non-zero exit
+was a *missing object*, not a false ancestry. Run in a repository that has both
+objects, `f2c806c` is a direct ancestor of `HEAD`.
+
+### What the host is actually running
+
+`git status` on the host reports 146 modified tracked files, including core
+trading code. That is not hand-editing. Hashing all 140 `src/**/*.py` files on
+the host and comparing them against every commit in range shows:
+
+| Result | Finding |
+| --- | --- |
+| Files matching **no commit** in history | **0** — there is no unversioned or hand-edited code in production |
+| Files identical to `a802b27` (2026-06-09) | 136 / 140 (97.1%) |
+| The other 4 files | Match `51708c6` and `d4bc5e1` (2026-06-03/04) |
+
+So production runs a **file-copy snapshot taken around 2026-06-04 to 06-09**,
+while the host's `.git` still points at `f2c806c` (2026-04-17). The 146
+"modifications" are the difference between the copied tree and the stale git
+metadata — deployment is `rsync`, and `.git` was never advanced.
+
+**This is precisely the failure mode the Phase 4 active-tree comparison exists to
+detect**: the commit hash is not evidence of what is running, and here it is
+wrong by roughly two months. It is a live demonstration that the check is
+necessary rather than theoretical.
+
+### The real gap
+
+Measured from what production actually runs (`a802b27`), not from the stale
+metadata:
+
+| Measure | Value |
+| --- | --- |
+| Commits behind | **34** (not 95) |
+| — from this stabilization session | 24 |
+| — from other work | 10 |
+| `src/` delta | 37 files, +4283 / −268 |
+| `ops/` delta | **only** the new `bootstrap.env.example` — **no systemd unit changes** |
+| Database schema | **Already at HEAD.** No missing columns. Only `runtime_setting` / `runtime_setting_event` are absent, and `create_all` adds tables. |
+
+The 10 non-stabilization commits are four documentation/architecture commits, two
+merges, the q-data catalog change (`bae8f91`, `b7a2973`, `6d1b972`), broker
+maintenance mode (`ac4c3ac`), and the retired-model routing policy (`38c2427`).
+
+### What this changes about cutover risk
+
+Lower than first reported, but with three specific items to weigh:
+
+1. **`Q_DATA_CATALOG_PATH` becomes required** — the q-data catalog change is
+   inside the gap, which is exactly why production runs fine without it today
+   and will not afterwards.
+2. **Two trading-path files change from others' work**: `submission.py` (+45) and
+   `rl/runner_loop.py` (+72), plus the retired-model routing policy, which can
+   reject model-routed instructions that are accepted today.
+3. **No service definitions change**, so cutover is a code and configuration
+   change only — no unit edits, and no reason to touch IB Gateway.
+
+The `.git` metadata on the host should be corrected as part of cutover, so that
+the commit hash means something again.
