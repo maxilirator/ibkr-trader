@@ -161,10 +161,12 @@ Checklist:
    (`systemctl --user show ibkr-trader-api -p Environment`, and `grep APP_ENV .env`).
 2. Create `/etc/ibkr-trader/bootstrap.env` with correct ownership, mode, and
    every required key; verify the service user can read it.
-3. Confirm `IBKR_PORT` is the **live** port. IB Gateway: live `4001`, paper
-   `4002`. TWS: live `7496`, paper `7497`. The paper ports are refused unless
-   `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1` records the decision. Note
-   `.env.example` ships `4002`, so do not copy that value across unchecked.
+3. Confirm `IBKR_PORT` matches the Gateway's configured API port. The port is
+   **not** validated beyond being an integer: IBKR's 4001/4002/7496/7497 are
+   only defaults, and IBC's `OverrideTwsApiPort` means a live Gateway can
+   legitimately listen anywhere. What *is* refused is a **paper account**
+   (`DU` prefix), unless `IBKR_ALLOW_PAPER_ACCOUNT_IN_PRODUCTION=1` records the
+   decision. The account number is evidence; the port is a convention.
 4. Confirm `DATABASE_URL` points at the production database, and that the kill
    switch still reads enabled there. The preflight checks this.
 5. Copy across every `.env` key that should survive; the preflight lists what
