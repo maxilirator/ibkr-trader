@@ -32,6 +32,17 @@ class TerminalFailureTests(TestCase):
         exc = LookupError("No IBKR contract matched FOO on SFB SEK.")
         self.assertTrue(_is_terminal_backfill_failure(exc))
 
+    def test_hmds_no_data_is_terminal(self) -> None:
+        """IBKR error 162. Requests are per (symbol, trade_date), so "no data"
+        is permanent for that pair. Measured as the dominant failure on the
+        live 48h pilot, where it drove attempt_count to 261."""
+        exc = LookupError(
+            "IBKR rejected the historical data request for 36GRP: "
+            "162 Historical Market Data Service error message:"
+            "HMDS query returned no data: 36GRP@SMART Trades"
+        )
+        self.assertTrue(_is_terminal_backfill_failure(exc))
+
     def test_a_malformed_request_is_terminal(self) -> None:
         """It will be exactly as malformed on the next attempt."""
         self.assertTrue(_is_terminal_backfill_failure(ValueError("duration is required")))

@@ -265,11 +265,19 @@ def mark_market_data_backfill_succeeded(
 #: Substrings identifying a failure that re-asking IBKR can never resolve.
 #:
 #: Matched against the message rather than the exception type, because
-#: ``LookupError`` covers both "IBKR says this contract does not exist" (final)
-#: and incidental lookup failures during a Gateway restart (retryable).
+#: ``LookupError`` covers both a permanent "no" from IBKR (final) and incidental
+#: lookup failures during a Gateway restart (retryable).
 TERMINAL_CONTRACT_ERROR_MARKERS = (
-    "no security definition",       # IBKR error 200
-    "no ibkr contract matched",     # raised by historical_bars when nothing matched
+    "no security definition",       # IBKR error 200: the contract does not exist
+    "no ibkr contract matched",     # historical_bars found no match at all
+    # IBKR error 162. Requests are per (symbol, trade_date), so "no data" is a
+    # permanent answer for that pair: the instrument did not trade that session,
+    # or has no intraday history that far back. Measured on the live host, this
+    # is the single largest cost in a whole-market backfill - each occurrence
+    # blocks the one historical client for the full request timeout, and before
+    # this marker existed the same request was retried indefinitely
+    # (attempt_count reached 261 on the 48h pilot).
+    "hmds query returned no data",
 )
 
 
