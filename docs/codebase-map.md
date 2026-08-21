@@ -11,6 +11,11 @@ Use this document for static, local orientation only.
 - Do **not** deploy this checkout or use the service declarations below as permission to change a host.
 - Do **not** infer or claim production readiness from this map. Readiness has separate checks and open qualifications in [`docs/current-status.md`](current-status.md), [`docs/rl-operational-readiness.md`](rl-operational-readiness.md), and [`scripts/check_operational_readiness.py`](../scripts/check_operational_readiness.py).
 
+For a domain-level inventory of the broker execution and feedback path — model-to-order
+translation, order lifecycle, identifiers, interfaces, feedback ranking, observability,
+deployment, and failure modes, plus proposed graph facts — see
+[`docs/broker-execution-feedback-inventory.md`](broker-execution-feedback-inventory.md).
+
 ## Runtime topology and entry points
 
 The checked-in deployed topology has three application processes, not one process per
