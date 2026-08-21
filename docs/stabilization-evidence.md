@@ -1084,3 +1084,53 @@ error 162 classified as retryable (`attempt_count` reached 261), and a 45-second
 timeout paid on every no-data answer. Both are now addressed — the first fixed,
 the second dissolved by monthly requests, which give 22x fewer chances to hit a
 dead pair.
+
+## Pivot to monthly requests (2026-08-21)
+
+Approved option: retire the un-started daily rows and re-enqueue monthly.
+
+- **16,085 retired** — all `1 D`, `PENDING`, `attempt_count=0`, from
+  `xsto-1min-48h-pilot` and `xsto-1min-nightly`. Marked `FAILED_FINAL` with
+  `last_error='superseded by 1 M monthly backfill on 2026-08-21'`, following the
+  codebase's existing precedent for superseded requests. **1,131 real results
+  (SUCCEEDED / FAILED_FINAL) were kept.**
+- **12,250 monthly requests enqueued** covering 2025-08 .. 2026-08.
+  The dry run picked up `2026-04-30 close 11:00Z` (half-day) and
+  `2026-02-27 close 16:30Z` (winter time), confirming the calendar handling.
+- Confirmed live: completed monthly requests return **exactly 11,220 bars**,
+  matching the probe. An illiquid name (`2CUREX`) returned 11,187 — genuinely
+  missing minutes, not truncation.
+
+### Correction to the earlier ETA
+
+The earlier note estimated "~41 hours at the 300/h ceiling". **That was wrong.**
+Measured drain rate is **82 requests/hour** — essentially identical to the daily
+rate, because throughput is bounded by the **45-second timeout paid on every
+no-data answer**, not by the pacing budget. Pacing never binds; it sits idle.
+
+What monthly actually buys is data *density*, not request rate:
+
+| | Requests/hour | Bars/hour | 12 months, whole market |
+| --- | --- | --- | --- |
+| Daily (`1 D`) | 82 | ~42,000 | 238,500 requests ≈ **121 days** |
+| Monthly (`1 M`) | 82 | **~920,000** | 12,250 requests ≈ **6.2 days** |
+
+So the win is real and large — 121 days to 6 days — but it comes from 22x fewer
+requests, not from going faster.
+
+### The remaining lever, unused
+
+The 45-second timeout is now the only binding constraint. Measured evidence: a
+`1 M` request returning 11,220 bars completes in **~1 second**; the timeout is
+45x that. Reducing `MARKET_DATA_BACKFILL_TIMEOUT_SECONDS`:
+
+| Timeout | Worst-case rate | 12-month ETA |
+| --- | --- | --- |
+| 45s (current) | 80/h | ~6.2 days |
+| 20s | 180/h | ~2.8 days |
+| 15s | 240/h | ~2.1 days |
+
+Not changed: the observed 1-second response is from liquid names, and an
+illiquid instrument may legitimately take longer. Lowering it trades a small
+risk of truncating slow-but-valid responses for roughly 3x throughput, which is
+an operator decision rather than a code fix.
