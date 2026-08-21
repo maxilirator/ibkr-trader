@@ -261,6 +261,15 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
         "broker",
     ),
     _define(
+        "IBKR_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS",
+        SettingType.FLOAT,
+        21600.0,
+        "How long a terminal 'no security definition' contract lookup is "
+        "cached before IBKR is asked again. Non-positive disables negative "
+        "caching, so every lookup re-pays the full broker timeout.",
+        "broker",
+    ),
+    _define(
         "EXECUTION_RUNTIME_ENABLED",
         SettingType.BOOLEAN,
         False,

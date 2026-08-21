@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from ibkr_trader.config import IbkrConnectionConfig
+from ibkr_trader.ibkr.historical_bars import CachedContractLookupError
 from ibkr_trader.ibkr.stockholm_intraday import (
     StockholmInstrumentIdentity,
     StockholmIntradayBackfillQuery,
@@ -51,6 +52,7 @@ class StockholmIntradayBackfillTests(TestCase):
             timeout: int = 20,
             app: object | None = None,
             contract_details_cache: object | None = None,
+            negative_contract_cache_ttl_seconds: float = 0.0,
         ) -> dict[str, object]:
             if query.symbol == "ABERA":
                 raise LookupError("IBKR rejected the contract lookup for ABERA")
@@ -171,6 +173,7 @@ class StockholmIntradayBackfillTests(TestCase):
             timeout: int = 20,
             app: object | None = None,
             contract_details_cache: object | None = None,
+            negative_contract_cache_ttl_seconds: float = 0.0,
         ) -> dict[str, object]:
             calls.append(query.what_to_show)
             return {
@@ -241,6 +244,7 @@ class StockholmIntradayBackfillTests(TestCase):
             timeout: int = 20,
             app: object | None = None,
             contract_details_cache: object | None = None,
+            negative_contract_cache_ttl_seconds: float = 0.0,
         ) -> dict[str, object]:
             nonlocal monotonic_now
             monotonic_now += 2.0
@@ -413,6 +417,7 @@ class StockholmIntradayBackfillTests(TestCase):
             timeout: int = 20,
             app: object | None = None,
             contract_details_cache: object | None = None,
+            negative_contract_cache_ttl_seconds: float = 0.0,
         ) -> dict[str, object]:
             calls.append(query.symbol)
             return {
@@ -545,6 +550,7 @@ class StockholmIntradayBackfillTests(TestCase):
             timeout: int = 20,
             app: object | None = None,
             contract_details_cache: object | None = None,
+            negative_contract_cache_ttl_seconds: float = 0.0,
         ) -> dict[str, object]:
             nonlocal monotonic_now
             monotonic_now += 2.0
@@ -596,3 +602,93 @@ class StockholmIntradayBackfillTests(TestCase):
         self.assertTrue(payload["summary"]["budget_exhausted"])
         self.assertEqual(payload["universe"]["next_cursor"], "beta")
         self.assertLessEqual(payload["summary"]["elapsed_seconds"], 4.0)
+
+    def test_cached_negative_lookup_still_appears_in_entries_and_summary(self) -> None:
+        # A cached-negative contract lookup (the read_historical_bars negative
+        # cache short-circuiting a broker call) must be visible the same way a
+        # fresh lookup failure is - reported in `entries` with status
+        # "lookup_error" - but distinguishable via a dedicated summary counter
+        # and the entry's `cache_hit` flag, so an operator can tell "IBKR said
+        # no, again" apart from "IBKR said no, right now".
+        identities = {
+            "abera": StockholmInstrumentIdentity(
+                slug="abera",
+                company_name="Abera Bioscience",
+                share_class=None,
+                isin="SE0015245097",
+                ticker_alias="ABERA",
+                yahoo_symbol="ABERA.ST",
+            ),
+            "abig": StockholmInstrumentIdentity(
+                slug="abig",
+                company_name="Abigroup",
+                share_class=None,
+                isin="SE0015245098",
+                ticker_alias="ABIG",
+                yahoo_symbol="ABIG.ST",
+            ),
+        }
+
+        def fake_read_historical_bars(
+            config: object,
+            query: object,
+            *,
+            timeout: int = 20,
+            app: object | None = None,
+            contract_details_cache: object | None = None,
+            negative_contract_cache_ttl_seconds: float = 0.0,
+        ) -> dict[str, object]:
+            if query.symbol == "ABERA":
+                raise CachedContractLookupError(
+                    "IBKR rejected the contract lookup for ABERA: [200] No "
+                    "security definition has been found for the request "
+                    "(cached, no broker call made)"
+                )
+            if query.symbol == "ABIG":
+                raise LookupError(
+                    "IBKR rejected the contract lookup for ABIG: [200] No "
+                    "security definition has been found for the request"
+                )
+            raise AssertionError(f"unexpected symbol {query.symbol}")
+
+        query = StockholmIntradayBackfillQuery(
+            as_of_date=date(2026, 4, 24),
+            what_to_show=("TRADES",),
+            max_symbols=2,
+            include_remapped=False,
+            sleep_seconds=0.0,
+        )
+
+        with patch(
+            "ibkr_trader.ibkr.stockholm_intraday._load_current_stockholm_universe",
+            return_value=["abera", "abig"],
+        ), patch(
+            "ibkr_trader.ibkr.stockholm_intraday._load_stockholm_identity_map",
+            return_value=identities,
+        ), patch(
+            "ibkr_trader.ibkr.stockholm_intraday.read_historical_bars",
+            side_effect=fake_read_historical_bars,
+        ):
+            payload = collect_stockholm_intraday_backfill(
+                IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4002,
+                    client_id=7,
+                    diagnostic_client_id=7,
+                    account_id="U1234567",
+                ),
+                query,
+                instruments_path=Path("/tmp/all.txt"),
+                identity_path=Path("/tmp/identity.parquet"),
+                timeout=5,
+                app=object(),
+            )
+
+        entries_by_slug = {entry["slug"]: entry for entry in payload["entries"]}
+        self.assertEqual(entries_by_slug["abera"]["status"], "lookup_error")
+        self.assertTrue(entries_by_slug["abera"]["cache_hit"])
+        self.assertEqual(entries_by_slug["abig"]["status"], "lookup_error")
+        self.assertFalse(entries_by_slug["abig"]["cache_hit"])
+
+        self.assertEqual(payload["summary"]["lookup_error_count"], 2)
+        self.assertEqual(payload["summary"]["cached_lookup_error_count"], 1)

@@ -13,7 +13,12 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from ibkr_trader.config import IbkrConnectionConfig
-from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
+from ibkr_trader.ibkr.historical_bars import (
+    DEFAULT_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS,
+    CachedContractLookupError,
+    HistoricalBarsQuery,
+    read_historical_bars,
+)
 
 
 DEFAULT_STOCKHOLM_INTRADAY_TYPES = (
@@ -385,6 +390,7 @@ def collect_stockholm_intraday_backfill(
     identity_path: Path,
     timeout: int = 20,
     app: Any | None = None,
+    negative_contract_cache_ttl_seconds: float = DEFAULT_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS,
 ) -> dict[str, Any]:
     query.validate()
     started_monotonic = runtime_time.monotonic()
@@ -428,6 +434,7 @@ def collect_stockholm_intraday_backfill(
                     "flags": [],
                     "resolved_contract": None,
                     "series": {},
+                    "cache_hit": False,
                 }
             )
             last_complete_cursor = slug
@@ -453,6 +460,7 @@ def collect_stockholm_intraday_backfill(
             "flags": [],
             "resolved_contract": None,
             "series": {},
+            "cache_hit": False,
         }
 
         requested_series = list(query.what_to_show)
@@ -501,7 +509,17 @@ def collect_stockholm_intraday_backfill(
                 timeout=first_call_timeout,
                 app=app,
                 contract_details_cache=contract_details_cache,
+                negative_contract_cache_ttl_seconds=negative_contract_cache_ttl_seconds,
             )
+        except CachedContractLookupError as exc:
+            entry["status"] = "lookup_error"
+            entry["detail"] = str(exc)
+            entry["cache_hit"] = True
+            entries.append(entry)
+            last_complete_cursor = slug
+            if query.sleep_seconds > 0:
+                runtime_time.sleep(query.sleep_seconds)
+            continue
         except LookupError as exc:
             entry["status"] = "lookup_error"
             entry["detail"] = str(exc)
@@ -592,6 +610,7 @@ def collect_stockholm_intraday_backfill(
                     timeout=series_call_timeout,
                     app=app,
                     contract_details_cache=contract_details_cache,
+                    negative_contract_cache_ttl_seconds=negative_contract_cache_ttl_seconds,
                 )
                 entry["series"][series_name] = {
                     "status": "ok",
@@ -655,6 +674,11 @@ def collect_stockholm_intraday_backfill(
             "processed_symbol_count": len(entries),
             "ok_count": sum(1 for entry in entries if entry["status"] == "ok"),
             "lookup_error_count": sum(1 for entry in entries if entry["status"] == "lookup_error"),
+            "cached_lookup_error_count": sum(
+                1
+                for entry in entries
+                if entry["status"] == "lookup_error" and entry.get("cache_hit")
+            ),
             "timeout_count": sum(1 for entry in entries if entry["status"] == "timeout"),
             "error_count": sum(1 for entry in entries if entry["status"] == "error"),
             "partial_count": sum(1 for entry in entries if entry["status"] == "partial"),

@@ -624,6 +624,9 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
                     query,
                     timeout=timeout,
                     app=broker_app,
+                    negative_contract_cache_ttl_seconds=(
+                        app_config.ibkr_negative_contract_cache_ttl_seconds
+                    ),
                 )
             )
         except (KeyError, ValueError) as exc:
@@ -653,6 +656,9 @@ def register_broker_market_routes(app: Any, context: Any) -> None:
                     identity_path=app_config.stockholm_identity_path,
                     timeout=timeout,
                     app=broker_app,
+                    negative_contract_cache_ttl_seconds=(
+                        app_config.ibkr_negative_contract_cache_ttl_seconds
+                    ),
                 ),
             )
         except ValueError as exc:

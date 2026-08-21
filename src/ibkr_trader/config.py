@@ -223,6 +223,11 @@ class AppConfig:
     ibkr_api_pacing_timeout_seconds: float = 2.0
     ibkr_market_data_line_limit: int = 80
     ibkr_historical_requests_per_10_minutes: int = 50
+    #: How long a "this instrument does not exist" contract-lookup result is
+    #: trusted without asking IBKR again. Long enough to cover one continuous
+    #: backfill run, short enough that a genuinely new listing is retried
+    #: within about a session. Non-positive disables negative caching.
+    ibkr_negative_contract_cache_ttl_seconds: float = 21600.0
     rl_observed_bar_min_coverage_ratio: float = 0.8
     market_stream_auto_reconnect_enabled: bool = True
     market_stream_reconnect_interval_seconds: float = 15.0
@@ -333,6 +338,9 @@ class AppConfig:
             ),
             ibkr_historical_requests_per_10_minutes=int(
                 getenv("IBKR_HISTORICAL_REQUESTS_PER_10_MINUTES", "50")
+            ),
+            ibkr_negative_contract_cache_ttl_seconds=float(
+                getenv("IBKR_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS", "21600")
             ),
             rl_observed_bar_min_coverage_ratio=float(
                 getenv("RL_OBSERVED_BAR_MIN_COVERAGE_RATIO", "0.8")
