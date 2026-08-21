@@ -83,8 +83,21 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"sessions needing backfill: {[d.isoformat() for d, _ in missing]}")
         total = 0
+        stale_universe = False
         for day, close_at in missing:
             symbols = universe_active_on(config.stockholm_instruments_path, day)
+            if not symbols:
+                # The universe dataset does not yet cover this session. Enqueuing
+                # nothing is correct - guessing an instrument list would be worse -
+                # but it must not look like success, or the dataset silently stops
+                # growing the day q-data's universe publish falls behind.
+                print(
+                    f"  {day}: 0 instruments active - the universe dataset does not "
+                    f"cover this session yet ({config.stockholm_instruments_path.name}); "
+                    "nothing enqueued"
+                )
+                stale_universe = True
+                continue
             if args.dry_run:
                 print(f"  {day}: would enqueue {len(symbols)} (dry run)")
                 total += len(symbols)
@@ -100,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
             total += len(symbols)
             print(f"  {day}: enqueued {len(symbols)}")
         print(f"total {total} request(s)")
+        if stale_universe:
+            print(
+                "WARNING: at least one closed session had no active instruments. "
+                "The nightly backfill cannot extend past the universe dataset, so "
+                "this will keep recurring until q-data republishes it."
+            )
+            return 2
     finally:
         engine.dispose()
     return 0
