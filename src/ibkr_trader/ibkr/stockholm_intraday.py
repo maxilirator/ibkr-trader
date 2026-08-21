@@ -251,19 +251,33 @@ def _build_symbol_page(
                 continue
             seen.add(normalized)
             unique_symbols.append(normalized)
-        page = unique_symbols[:max_symbols]
-        next_cursor = page[-1] if len(unique_symbols) > len(page) and page else None
-        return page, next_cursor
+        return _page_sorted_slugs(
+            sorted(unique_symbols),
+            max_symbols=max_symbols,
+            start_after=start_after,
+        )
 
-    sorted_universe = sorted(universe)
+    return _page_sorted_slugs(
+        sorted(universe),
+        max_symbols=max_symbols,
+        start_after=start_after,
+    )
+
+
+def _page_sorted_slugs(
+    sorted_slugs: list[str],
+    *,
+    max_symbols: int,
+    start_after: str | None,
+) -> tuple[list[str], str | None]:
     start_index = 0
     if start_after:
         normalized_cursor = start_after.strip().lower()
-        while start_index < len(sorted_universe) and sorted_universe[start_index] <= normalized_cursor:
+        while start_index < len(sorted_slugs) and sorted_slugs[start_index] <= normalized_cursor:
             start_index += 1
-    page = sorted_universe[start_index : start_index + max_symbols]
+    page = sorted_slugs[start_index : start_index + max_symbols]
     next_cursor = None
-    if start_index + max_symbols < len(sorted_universe) and page:
+    if start_index + max_symbols < len(sorted_slugs) and page:
         next_cursor = page[-1]
     return page, next_cursor
 
