@@ -41,10 +41,8 @@ from ibkr_trader.api.market_stream_payloads import subscribe_open_order_market_s
 from ibkr_trader.api.operator_stream_overlay import (
     enrich_operator_snapshot_with_market_stream,
 )
-from ibkr_trader.api.observation_streaming import _completed_rl_bar_as_of
 from ibkr_trader.api.observation_streaming import _merge_persisted_stream_bars
 from ibkr_trader.api.observation_streaming import _paused_market_stream_observation
-from ibkr_trader.api.observation_streaming import _rl_backfill_instrument
 from ibkr_trader.api.payloads import enforce_loopback_binding
 from ibkr_trader.api.payloads import is_loopback_host
 from ibkr_trader.api.payloads import parse_account_summary_payload
@@ -97,10 +95,6 @@ from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
-from ibkr_trader.ibkr.market_data_backfill import (
-    BackgroundMarketDataBackfillService,
-    enqueue_market_data_backfill_request,
-)
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
@@ -237,7 +231,6 @@ def register_rl_routes(app: Any, context: Any) -> None:
     broker_sessions = context.broker_sessions
     broker_monitor = context.broker_monitor
     market_stream_service = context.market_stream_service
-    market_data_backfill_worker = context.market_data_backfill_worker
     market_stream_identity_map = context.market_stream_identity_map
     execution_runtime = context.execution_runtime
     with_primary_session = context.with_primary_session
@@ -796,18 +789,11 @@ def register_rl_routes(app: Any, context: Any) -> None:
 
             fetched_symbols: list[str] = []
             streamed_symbols: list[str] = []
-            backfill_requests: list[dict[str, Any]] = []
             source_mode = "provided"
             config_overrides = dict(parsed["config_overrides"])
             config_overrides.setdefault(
                 "min_observed_bar_coverage_ratio",
                 app_config.rl_observed_bar_min_coverage_ratio,
-            )
-            backfill_requested_until = _completed_rl_bar_as_of(
-                as_of=parsed["as_of"],
-                observation_contract=deployment_snapshot["observation_contract"],
-                config_overrides=config_overrides,
-                fallback_timezone=app_config.timezone,
             )
             if not source_bars:
                 fetch = dict(parsed["fetch"])
@@ -841,44 +827,12 @@ def register_rl_routes(app: Any, context: Any) -> None:
                     missing_stream_bars = [
                         symbol for symbol in requested_symbols if symbol not in stream_bars
                     ]
-                    instruments = (
-                        fetch.get("instruments")
-                        if isinstance(fetch.get("instruments"), Mapping)
-                        else {}
-                    )
-                    backfill_missing = bool(fetch.get("backfill_missing", True))
                     session_date = parsed["as_of"].astimezone(
                         ZoneInfo(app_config.timezone)
                     ).date()
-                    if missing_stream_bars and backfill_missing:
-                        for symbol in missing_stream_bars:
-                            backfill_requests.append(
-                                enqueue_market_data_backfill_request(
-                                    session_factory,
-                                    symbol=symbol,
-                                    trade_date=session_date.isoformat(),
-                                    requested_until=backfill_requested_until,
-                                    instrument=_rl_backfill_instrument(
-                                        symbol=symbol,
-                                        fetch=fetch,
-                                        instruments=instruments,
-                                    ),
-                                    reason="rl_market_stream_missing_symbol_bars",
-                                    duration=str(fetch.get("backfill_duration", "2 D")),
-                                    bar_size=str(fetch.get("backfill_bar_size", "1 min")),
-                                    what_to_show=str(
-                                        fetch.get("what_to_show", "TRADES")
-                                    ).upper(),
-                                    use_rth=bool(fetch.get("use_rth", True)),
-                                )
-                            )
                     source_bars = stream_bars
                     streamed_symbols = sorted(stream_bars)
                     source_mode = "market_stream"
-                    missing_request_by_symbol = {
-                        str(request_payload["symbol"]).upper(): request_payload
-                        for request_payload in backfill_requests
-                    }
                     build_symbols = [
                         symbol for symbol in requested_symbols if symbol in source_bars
                     ]
@@ -947,7 +901,7 @@ def register_rl_routes(app: Any, context: Any) -> None:
                                 ),
                                 session_date=session_date,
                                 reason="paused_market_stream_bars_missing_backfill_pending",
-                                backfill_request=missing_request_by_symbol.get(symbol),
+                                backfill_request=None,
                                 min_coverage_ratio=float(
                                     config_overrides[
                                         "min_observed_bar_coverage_ratio"
@@ -956,47 +910,6 @@ def register_rl_routes(app: Any, context: Any) -> None:
                             )
                         )
                     observation["symbols"] = requested_symbols
-                    for symbol, symbol_observation in observation[
-                        "observations"
-                    ].items():
-                        decision = symbol_observation.get("model_decision", {})
-                        if (
-                            isinstance(decision, Mapping)
-                            and decision.get("reason")
-                            == "paused_observed_bar_coverage_below_threshold"
-                            and backfill_missing
-                        ):
-                            backfill_request = enqueue_market_data_backfill_request(
-                                session_factory,
-                                symbol=symbol,
-                                trade_date=session_date.isoformat(),
-                                requested_until=backfill_requested_until,
-                                instrument=_rl_backfill_instrument(
-                                    symbol=symbol,
-                                    fetch=fetch,
-                                    instruments=instruments,
-                                ),
-                                reason="rl_observed_bar_coverage_below_threshold",
-                                duration=str(fetch.get("backfill_duration", "2 D")),
-                                bar_size=str(fetch.get("backfill_bar_size", "1 min")),
-                                what_to_show=str(
-                                    fetch.get("what_to_show", "TRADES")
-                                ).upper(),
-                                use_rth=bool(fetch.get("use_rth", True)),
-                            )
-                            backfill_requests.append(backfill_request)
-                            data_quality = symbol_observation.setdefault(
-                                "data_quality",
-                                {},
-                            )
-                            data_quality["backfill_request"] = backfill_request
-                            decision["backfill_status"] = backfill_request["status"]
-                            decision["backfill_request"] = backfill_request
-                            if isinstance(decision.get("data_quality"), Mapping):
-                                decision["data_quality"] = {
-                                    **decision["data_quality"],
-                                    "backfill_request": backfill_request,
-                                }
                 elif fetch_mode in {"historical", "historical_bars", "ibkr_historical_bars"}:
                     for symbol in requested_symbols:
                         query = HistoricalBarsQuery(
@@ -1069,8 +982,6 @@ def register_rl_routes(app: Any, context: Any) -> None:
             "source_mode": source_mode,
             "fetched_symbols": fetched_symbols,
             "streamed_symbols": streamed_symbols,
-            "backfill_request_count": len(backfill_requests),
-            "backfill_requests": _serialize_for_json(backfill_requests),
             "account_key": deployment_snapshot["account_key"],
             "book_key": deployment_snapshot["book_key"],
             "mode": deployment_snapshot["mode"],

@@ -473,9 +473,6 @@ def run_model_candidates(
             "fetch": {
                 "mode": "market_stream",
                 "bar_limit": 390,
-                "backfill_missing": True,
-                "backfill_duration": "2 D",
-                "backfill_bar_size": "1 min",
                 "instruments": {
                     str(candidate["symbol"]).upper(): dict(candidate_instrument(candidate))
                     for candidate in active_candidates

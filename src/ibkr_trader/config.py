@@ -224,10 +224,6 @@ class AppConfig:
     ibkr_market_data_line_limit: int = 80
     ibkr_historical_requests_per_10_minutes: int = 50
     rl_observed_bar_min_coverage_ratio: float = 0.8
-    market_data_backfill_worker_enabled: bool = True
-    market_data_backfill_interval_seconds: float = 60.0
-    market_data_backfill_batch_size: int = 3
-    market_data_backfill_timeout_seconds: int = 45
     market_stream_auto_reconnect_enabled: bool = True
     market_stream_reconnect_interval_seconds: float = 15.0
     market_stream_max_subscriptions: int = 120
@@ -340,20 +336,6 @@ class AppConfig:
             ),
             rl_observed_bar_min_coverage_ratio=float(
                 getenv("RL_OBSERVED_BAR_MIN_COVERAGE_RATIO", "0.8")
-            ),
-            market_data_backfill_worker_enabled=getenv(
-                "MARKET_DATA_BACKFILL_WORKER_ENABLED",
-                "true",
-            ).lower()
-            not in {"0", "false", "no"},
-            market_data_backfill_interval_seconds=float(
-                getenv("MARKET_DATA_BACKFILL_INTERVAL_SECONDS", "60")
-            ),
-            market_data_backfill_batch_size=int(
-                getenv("MARKET_DATA_BACKFILL_BATCH_SIZE", "3")
-            ),
-            market_data_backfill_timeout_seconds=int(
-                getenv("MARKET_DATA_BACKFILL_TIMEOUT_SECONDS", "45")
             ),
             market_stream_auto_reconnect_enabled=getenv(
                 "MARKET_STREAM_AUTO_RECONNECT_ENABLED",

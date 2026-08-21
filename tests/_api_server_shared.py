@@ -64,7 +64,6 @@ from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.db.models import VirtualMarketQuoteRecord
-from ibkr_trader.ibkr.market_data_backfill import list_market_data_backfill_requests
 from ibkr_trader.ibkr.shortability import ShortabilityMarketDataType
 from ibkr_trader.ibkr.shortability import ShortabilitySource
 from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder

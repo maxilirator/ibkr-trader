@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -395,10 +396,14 @@ class StockholmIntradayBackfillTests(TestCase):
         )
         self.assertIsNone(payload["universe"]["next_cursor"])
 
-    def test_explicit_symbols_not_in_instrument_file_resolve_without_identity(self) -> None:
+    def test_explicit_symbols_not_in_instrument_file_are_reported_without_a_broker_call(
+        self,
+    ) -> None:
         # "gamma" is requested but absent from both the universe list and the
-        # identity map, matching a symbol that IBKR still trades under its
-        # slug even though q-data has no published identity for it.
+        # identity map. It must be reported as unresolvable without ever
+        # reaching IBKR - an unresolvable explicit symbol used to fall back to
+        # a fabricated ticker (its own slug, upper-cased) and burn a full
+        # broker timeout on every page that contained it.
         calls: list[str] = []
 
         def fake_read_historical_bars(
@@ -411,7 +416,11 @@ class StockholmIntradayBackfillTests(TestCase):
         ) -> dict[str, object]:
             calls.append(query.symbol)
             return {
-                "resolved_contract": {"symbol": query.symbol, "local_symbol": query.symbol, "sec_ids": {}},
+                "resolved_contract": {
+                    "symbol": query.symbol,
+                    "local_symbol": query.symbol,
+                    "sec_ids": {"ISIN": query.isin},
+                },
                 "bar_count": 1,
                 "currency": "SEK",
                 "bars": [{"timestamp": "20260424 09:00:00 MET", "close": "10.0"}],
@@ -438,29 +447,152 @@ class StockholmIntradayBackfillTests(TestCase):
         ):
             payload = self._run_explicit_symbols_page(
                 symbols=("sive", "gamma"),
-                max_symbols=1,
+                max_symbols=2,
                 start_after=None,
             )
 
-            second_payload = self._run_explicit_symbols_page(
-                symbols=("sive", "gamma"),
-                max_symbols=1,
-                start_after="gamma",
-            )
-
         self.assertEqual(
-            [entry["slug"] for entry in payload["entries"]],
-            ["gamma"],
+            sorted(entry["slug"] for entry in payload["entries"]),
+            ["gamma", "sive"],
         )
-        gamma_entry = payload["entries"][0]
+        entries_by_slug = {entry["slug"]: entry for entry in payload["entries"]}
+        gamma_entry = entries_by_slug["gamma"]
         self.assertIsNone(gamma_entry["company_name"])
         self.assertIsNone(gamma_entry["ticker_alias"])
-        self.assertEqual(gamma_entry["status"], "ok")
-        self.assertEqual(calls, ["GAMMA", "SIVE"])
-        self.assertEqual(payload["universe"]["next_cursor"], "gamma")
+        self.assertEqual(gamma_entry["status"], "unknown_instrument")
+        self.assertEqual(entries_by_slug["sive"]["status"], "ok")
+        self.assertEqual(calls, ["SIVE"])
+        self.assertEqual(payload["summary"]["unknown_instrument_count"], 1)
+        self.assertIsNone(payload["universe"]["next_cursor"])
 
-        self.assertEqual(
-            [entry["slug"] for entry in second_payload["entries"]],
-            ["sive"],
-        )
-        self.assertIsNone(second_payload["universe"]["next_cursor"])
+    def test_reference_data_is_loaded_once_across_multiple_requests(self) -> None:
+        universe_calls: list[Path] = []
+        identity_calls: list[Path] = []
+
+        def counting_load_universe(path: Path) -> list[str]:
+            universe_calls.append(path)
+            return ["sive"]
+
+        def counting_load_identity(path: Path) -> dict[str, StockholmInstrumentIdentity]:
+            identity_calls.append(path)
+            return {
+                "sive": StockholmInstrumentIdentity(
+                    slug="sive",
+                    company_name="Sivers Semiconductors",
+                    share_class=None,
+                    isin="SE0003917798",
+                    ticker_alias="SIVE",
+                    yahoo_symbol="SIVE.ST",
+                )
+            }
+
+        with TemporaryDirectory() as tmp_dir:
+            instruments_path = Path(tmp_dir) / "universe.parquet"
+            identity_path = Path(tmp_dir) / "identity.parquet"
+            instruments_path.write_bytes(b"universe")
+            identity_path.write_bytes(b"identity")
+
+            with patch(
+                "ibkr_trader.ibkr.stockholm_intraday._load_current_stockholm_universe",
+                side_effect=counting_load_universe,
+            ), patch(
+                "ibkr_trader.ibkr.stockholm_intraday._load_stockholm_identity_map",
+                side_effect=counting_load_identity,
+            ), patch(
+                "ibkr_trader.ibkr.stockholm_intraday.read_historical_bars",
+                return_value={
+                    "resolved_contract": {"symbol": "SIVE", "local_symbol": "SIVE", "sec_ids": {}},
+                    "bar_count": 1,
+                    "currency": "SEK",
+                    "bars": [{"timestamp": "20260424 09:00:00 MET", "close": "10.0"}],
+                },
+            ):
+                for _ in range(3):
+                    collect_stockholm_intraday_backfill(
+                        IbkrConnectionConfig(
+                            host="127.0.0.1",
+                            port=4002,
+                            client_id=7,
+                            diagnostic_client_id=7,
+                            account_id="U1234567",
+                        ),
+                        StockholmIntradayBackfillQuery(
+                            as_of_date=date(2026, 4, 24),
+                            what_to_show=("TRADES",),
+                            max_symbols=1,
+                            max_runtime_seconds=None,
+                            sleep_seconds=0.0,
+                        ),
+                        instruments_path=instruments_path,
+                        identity_path=identity_path,
+                        timeout=5,
+                        app=object(),
+                    )
+
+        self.assertEqual(len(universe_calls), 1)
+        self.assertEqual(len(identity_calls), 1)
+
+    def test_explicit_symbols_budget_truncates_page_with_resumable_cursor(self) -> None:
+        monotonic_now = 0.0
+
+        def fake_monotonic() -> float:
+            return monotonic_now
+
+        def fake_read_historical_bars(
+            config: object,
+            query: object,
+            *,
+            timeout: int = 20,
+            app: object | None = None,
+            contract_details_cache: object | None = None,
+        ) -> dict[str, object]:
+            nonlocal monotonic_now
+            monotonic_now += 2.0
+            return {
+                "resolved_contract": {"symbol": query.symbol, "local_symbol": query.symbol, "sec_ids": {}},
+                "bar_count": 1,
+                "currency": "SEK",
+                "bars": [{"timestamp": "20260424 09:00:00 MET", "close": "10.0"}],
+            }
+
+        with patch(
+            "ibkr_trader.ibkr.stockholm_intraday.runtime_time.monotonic",
+            side_effect=fake_monotonic,
+        ), patch(
+            "ibkr_trader.ibkr.stockholm_intraday._load_current_stockholm_universe",
+            return_value=["alpha", "beta", "gamma", "delta"],
+        ), patch(
+            "ibkr_trader.ibkr.stockholm_intraday._load_stockholm_identity_map",
+            return_value={},
+        ), patch(
+            "ibkr_trader.ibkr.stockholm_intraday.read_historical_bars",
+            side_effect=fake_read_historical_bars,
+        ):
+            payload = collect_stockholm_intraday_backfill(
+                IbkrConnectionConfig(
+                    host="127.0.0.1",
+                    port=4002,
+                    client_id=7,
+                    diagnostic_client_id=7,
+                    account_id="U1234567",
+                ),
+                StockholmIntradayBackfillQuery(
+                    as_of_date=date(2026, 4, 24),
+                    what_to_show=("TRADES",),
+                    max_symbols=4,
+                    start_after=None,
+                    symbols=("delta", "gamma", "beta", "alpha"),
+                    max_runtime_seconds=3.0,
+                    sleep_seconds=0.0,
+                ),
+                instruments_path=Path("/tmp/all.txt"),
+                identity_path=Path("/tmp/identity.parquet"),
+                timeout=10,
+                app=object(),
+            )
+
+        self.assertEqual([entry["slug"] for entry in payload["entries"]], ["alpha", "beta"])
+        self.assertEqual(payload["summary"]["processed_symbol_count"], 2)
+        self.assertTrue(payload["summary"]["budget_exhausted"])
+        self.assertEqual(payload["universe"]["next_cursor"], "beta")
+        self.assertLessEqual(payload["summary"]["elapsed_seconds"], 4.0)

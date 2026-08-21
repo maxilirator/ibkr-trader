@@ -261,27 +261,6 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
         "broker",
     ),
     _define(
-        "MARKET_DATA_BACKFILL_WORKER_ENABLED",
-        SettingType.BOOLEAN,
-        True,
-        "Whether the historical backfill worker runs.",
-        "market-data",
-    ),
-    _define(
-        "MARKET_DATA_BACKFILL_INTERVAL_SECONDS",
-        SettingType.FLOAT,
-        60.0,
-        "Backfill worker poll interval.",
-        "market-data",
-    ),
-    _define(
-        "MARKET_DATA_BACKFILL_BATCH_SIZE",
-        SettingType.INTEGER,
-        3,
-        "Backfill requests processed per cycle.",
-        "market-data",
-    ),
-    _define(
         "EXECUTION_RUNTIME_ENABLED",
         SettingType.BOOLEAN,
         False,
