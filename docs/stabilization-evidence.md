@@ -1001,3 +1001,86 @@ select status, count(*) from market_data_backfill_request group by status;
 
 Gates: no growth in `FAILED_RETRYABLE`; `NRestarts` stays 0; Gateway JVM count
 stays 1; `circuit open` stays false across at least one Gateway autorestart.
+
+## Request efficiency — measured, not assumed (2026-08-21)
+
+Probed against the live Gateway, AZN@XSTO, 1-minute bars, worker paused so
+timings were uncontended:
+
+| Duration | Bars | Time |
+| --- | --- | --- |
+| 1 D | 510 | 0s |
+| 1 W | 2,550 | 0s |
+| **1 M** | **11,220** | **1s** |
+| 2 M | 21,927 | 51s |
+| 3 M | 32,127 | 81s |
+| 6 M | — | timed out at 181s |
+
+Bar counts are exactly linear at 510 per session, so nothing was truncated. The
+knee is at one month: 22x the data for the same second, then response time
+explodes.
+
+**Per-name is unavoidable** — `reqHistoricalData` takes one contract and IBKR
+has no multi-contract historical call.
+
+| Approach | Requests for 12 months, whole market | At the 300/h ceiling |
+| --- | --- | --- |
+| Daily (`1 D`) | ~238,500 | ~33 days |
+| **Monthly (`1 M`)** | **12,250** (measured by dry run) | **~41 hours** |
+
+`build_backfill_request_key` already hashes `duration`, so monthly and daily
+requests for the same symbol cannot collide and the worker needed no change.
+Month requests anchor on the **last real session** of the month, because IBKR
+walks back from the anchor; the dry run picked up `2026-04-30 close 11:00Z`, a
+half-day, confirming the calendar handling.
+
+### The 6 M timeout was an unplanned recovery test, and it passed
+
+It tripped the historical session cooldown (`1 Y` then returned
+`session 'historical' is cooling down`), and the session recovered on its own to
+`healthy` with the circuit never opening.
+
+## Nightly backfill
+
+`ops/systemd/ibkr-trader-nightly-backfill.{service,timer}` — 22:30 Europe/Stockholm,
+`Persistent=true`, 5-minute jitter to avoid starting in lockstep with the q-data
+run on `docker.geisler.se`.
+
+It asks which recent **closed** sessions have no request yet rather than assuming
+yesterday, so a skipped night or a host outage is picked up instead of leaving a
+hole. Sessions that have not closed are skipped, which would otherwise cache a
+partial day under a key that looks complete. Daily granularity is deliberate:
+monthly would re-fetch weeks already held.
+
+First real run enqueued 2,862 requests for 2026-08-17/18/19 and **refused** to
+guess for 2026-08-20:
+
+```
+2026-08-20: 0 instruments active - the universe dataset does not cover this
+session yet; nothing enqueued
+WARNING: ... this will keep recurring until q-data republishes it.
+```
+
+It exits 2 in that case, so systemd records a failure. **That is deliberate**:
+the nightly backfill cannot extend past the universe dataset, and a silent
+success would mean the dataset quietly stops growing the day q-data's universe
+publish falls behind. Expect this unit to report failed until the universe
+covers the latest session.
+
+## Stability at close of the 13h pilot
+
+| Signal | Result |
+| --- | --- |
+| Lock contention | **`lock_wait_ms=0` on all 750 historical operations** |
+| Connection losses | 10x error 1100, 1x 1102 — all self-recovered |
+| Gateway autorestart | occurred; queue survived it |
+| Pacing violations | **0** |
+| Service restarts | **`NRestarts=0`** on all three |
+| Gateway JVMs | 1 throughout |
+| Broker circuit | never opened |
+
+The pilot's real finding was not instability but two throughput defects: IBKR
+error 162 classified as retryable (`attempt_count` reached 261), and a 45-second
+timeout paid on every no-data answer. Both are now addressed — the first fixed,
+the second dissolved by monthly requests, which give 22x fewer chances to hit a
+dead pair.
