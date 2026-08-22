@@ -193,9 +193,35 @@ class NegativeContractCache:
     explicit TTL rather than relying on the caller's dict going out of scope.
     """
 
+    #: Consecutive error-200 observations required before an instrument is
+    #: cached as unresolvable.
+    #:
+    #: IBKR emits error 200 transiently. On 2026-07-31, 562 contracts returned
+    #: "no security definition" in one session against a ~250 baseline, and 258
+    #: of them had resolved normally the day before. Caching a single such
+    #: observation for six hours turned a broker hiccup into hours of missing
+    #: instruments across every session collected in that window.
+    #:
+    #: Two consecutive observations is deterministic and bounded - no retry
+    #: loop, no sleeping - and costs one extra lookup per genuinely dead name,
+    #: once, which the strike counter then remembers.
+    STRIKES_BEFORE_CACHING = 2
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict[ContractDetailsCacheKey, _NegativeContractCacheEntry] = {}
+        #: Instruments this process has ever resolved successfully. An error 200
+        #: for one of these contradicts direct evidence that the contract
+        #: exists, so it is never cached however often it repeats.
+        self._resolved: set[ContractDetailsCacheKey] = set()
+        self._strikes: dict[ContractDetailsCacheKey, int] = {}
+
+    def note_resolved(self, key: ContractDetailsCacheKey) -> None:
+        """Record that this contract resolved, making it immune to negative caching."""
+        with self._lock:
+            self._resolved.add(key)
+            self._strikes.pop(key, None)
+            self._entries.pop(key, None)
 
     def get(self, key: ContractDetailsCacheKey) -> str | None:
         with self._lock:
@@ -207,18 +233,34 @@ class NegativeContractCache:
                 return None
             return entry.detail
 
-    def set(self, key: ContractDetailsCacheKey, detail: str, *, ttl_seconds: float) -> None:
+    def set(self, key: ContractDetailsCacheKey, detail: str, *, ttl_seconds: float) -> bool:
+        """Record an error-200 observation. Returns True if it was cached.
+
+        Refuses to cache when the contract has resolved before in this process,
+        and otherwise requires `STRIKES_BEFORE_CACHING` consecutive observations
+        so a single transient rejection cannot suppress a real instrument for
+        the whole TTL.
+        """
         if ttl_seconds <= 0:
-            return
+            return False
         with self._lock:
+            if key in self._resolved:
+                return False
+            strikes = self._strikes.get(key, 0) + 1
+            self._strikes[key] = strikes
+            if strikes < self.STRIKES_BEFORE_CACHING:
+                return False
             self._entries[key] = _NegativeContractCacheEntry(
                 detail=detail,
                 expires_at_monotonic=time.monotonic() + ttl_seconds,
             )
+            return True
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._resolved.clear()
+            self._strikes.clear()
 
 
 #: Process-wide default store, shared by every `read_historical_bars` caller
@@ -314,6 +356,13 @@ def read_historical_bars(
 
             if contract_details_cache is not None:
                 contract_details_cache[cache_key] = raw_matches
+            if raw_matches and negative_caching_enabled:
+                # Direct evidence this contract exists. Remember it, so a later
+                # transient error 200 for the same instrument can never be
+                # cached as "no security definition" - which is exactly what
+                # cost 2026-07-31 roughly 258 instruments that had resolved the
+                # previous day.
+                negative_cache.note_resolved(cache_key)
             if not raw_matches and negative_caching_enabled:
                 negative_cache.set(
                     cache_key,

@@ -313,21 +313,37 @@ class HistoricalBarsTests(TestCase):
 
         self.assertEqual(wrapper.contract_detail_call_count, 1)
 
+
+    def _exhaust_strikes(self, wrapper, query, negative_cache) -> None:
+        """Drive the lookup up to the caching threshold.
+
+        Caching now needs `STRIKES_BEFORE_CACHING` consecutive error-200s, so a
+        single transient rejection cannot suppress a real instrument for the
+        whole TTL - see NegativeContractCache. These tests are about what the
+        cache does once an instrument is genuinely established as dead, so they
+        reach that state first.
+        """
+        for _ in range(NegativeContractCache.STRIKES_BEFORE_CACHING):
+            with self.assertRaises(LookupError):
+                read_historical_bars(
+                    _connection_config(),
+                    query,
+                    sync_wrapper_cls=lambda timeout: wrapper,
+                    response_timeout_cls=TimeoutError,
+                    contract_cls=_FakeContract,
+                    negative_contract_cache=negative_cache,
+                )
+
     def test_terminal_error_200_is_cached_and_second_lookup_makes_no_broker_call(self) -> None:
         wrapper = _FakeContractLookupFailureWrapper(timeout=5)
         negative_cache = NegativeContractCache()
         query = _abera_query()
 
-        with self.assertRaises(LookupError):
-            read_historical_bars(
-                _connection_config(),
-                query,
-                sync_wrapper_cls=lambda timeout: wrapper,
-                response_timeout_cls=TimeoutError,
-                contract_cls=_FakeContract,
-                negative_contract_cache=negative_cache,
-            )
-        self.assertEqual(wrapper.contract_detail_call_count, 1)
+        self._exhaust_strikes(wrapper, query, negative_cache)
+        self.assertEqual(
+            wrapper.contract_detail_call_count,
+            NegativeContractCache.STRIKES_BEFORE_CACHING,
+        )
 
         with self.assertRaises(CachedContractLookupError):
             read_historical_bars(
@@ -339,7 +355,7 @@ class HistoricalBarsTests(TestCase):
                 negative_contract_cache=negative_cache,
             )
         # No second broker call: the negative cache short-circuited it.
-        self.assertEqual(wrapper.contract_detail_call_count, 1)
+        self.assertEqual(wrapper.contract_detail_call_count, NegativeContractCache.STRIKES_BEFORE_CACHING)
 
     def test_plain_timeout_without_broker_error_is_not_cached_and_is_retried(self) -> None:
         wrapper = _FakeContractLookupFailureWrapper(timeout=5)
@@ -391,11 +407,13 @@ class HistoricalBarsTests(TestCase):
             "ibkr_trader.ibkr.historical_bars.time.monotonic",
             side_effect=lambda: fake_time[0],
         ):
-            negative_cache.set(
-                cache_key,
-                "[200] No security definition has been found for the request",
-                ttl_seconds=10.0,
-            )
+            # Two observations, because one is treated as possibly transient.
+            for _ in range(NegativeContractCache.STRIKES_BEFORE_CACHING):
+                negative_cache.set(
+                    cache_key,
+                    "[200] No security definition has been found for the request",
+                    ttl_seconds=10.0,
+                )
             self.assertIsNotNone(negative_cache.get(cache_key))
 
             fake_time[0] += 11.0
@@ -411,17 +429,20 @@ class HistoricalBarsTests(TestCase):
             "ibkr_trader.ibkr.historical_bars.time.monotonic",
             side_effect=lambda: fake_time[0],
         ):
-            with self.assertRaises(LookupError):
-                read_historical_bars(
-                    _connection_config(),
-                    query,
-                    sync_wrapper_cls=lambda timeout: wrapper,
-                    response_timeout_cls=TimeoutError,
-                    contract_cls=_FakeContract,
-                    negative_contract_cache=negative_cache,
-                    negative_contract_cache_ttl_seconds=10.0,
-                )
-            self.assertEqual(wrapper.contract_detail_call_count, 1)
+            # Reach the caching threshold: one error 200 is treated as
+            # possibly transient and deliberately not cached.
+            for _ in range(NegativeContractCache.STRIKES_BEFORE_CACHING):
+                with self.assertRaises(LookupError):
+                    read_historical_bars(
+                        _connection_config(),
+                        query,
+                        sync_wrapper_cls=lambda timeout: wrapper,
+                        response_timeout_cls=TimeoutError,
+                        contract_cls=_FakeContract,
+                        negative_contract_cache=negative_cache,
+                        negative_contract_cache_ttl_seconds=10.0,
+                    )
+            self.assertEqual(wrapper.contract_detail_call_count, NegativeContractCache.STRIKES_BEFORE_CACHING)
 
             with self.assertRaises(CachedContractLookupError):
                 read_historical_bars(
@@ -433,7 +454,7 @@ class HistoricalBarsTests(TestCase):
                     negative_contract_cache=negative_cache,
                     negative_contract_cache_ttl_seconds=10.0,
                 )
-            self.assertEqual(wrapper.contract_detail_call_count, 1)
+            self.assertEqual(wrapper.contract_detail_call_count, NegativeContractCache.STRIKES_BEFORE_CACHING)
 
             fake_time[0] += 11.0
 
@@ -449,7 +470,7 @@ class HistoricalBarsTests(TestCase):
                 )
             # TTL expired: the cache no longer short-circuits, so a fresh
             # broker call happens.
-            self.assertEqual(wrapper.contract_detail_call_count, 2)
+            self.assertEqual(wrapper.contract_detail_call_count, NegativeContractCache.STRIKES_BEFORE_CACHING + 1)
 
     def test_negative_caching_disabled_when_ttl_is_non_positive(self) -> None:
         wrapper = _FakeContractLookupFailureWrapper(timeout=5)
