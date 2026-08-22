@@ -68,11 +68,17 @@ def _serialize_sec_ids(raw_sec_ids: Any) -> dict[str, str]:
     return sec_ids
 
 
-def _extract_broker_error_message(
+def _extract_latest_broker_error(
     app: Any,
     *,
     include_known_order_ids: bool = False,
-) -> str | None:
+) -> tuple[int, str] | None:
+    """Return the (error_code, error_string) of the most recent broker error.
+
+    Shared by `_extract_broker_error_message` (formats it for a human-readable
+    exception) and callers that need to classify the error code itself, such
+    as deciding whether a contract-lookup failure is terminal.
+    """
     raw_errors = getattr(app, "errors", {})
     if not raw_errors:
         return None
@@ -105,6 +111,27 @@ def _extract_broker_error_message(
     if error_code is None or not error_string:
         return None
 
+    try:
+        error_code_int = int(error_code)
+    except (TypeError, ValueError):
+        return None
+
+    return error_code_int, str(error_string)
+
+
+def _extract_broker_error_message(
+    app: Any,
+    *,
+    include_known_order_ids: bool = False,
+) -> str | None:
+    latest_error = _extract_latest_broker_error(
+        app,
+        include_known_order_ids=include_known_order_ids,
+    )
+    if latest_error is None:
+        return None
+
+    error_code, error_string = latest_error
     return f"[{error_code}] {error_string}"
 
 

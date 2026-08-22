@@ -49,6 +49,7 @@ from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
+from tests._kill_switch_test_support import disable_kill_switch_for_test
 from ibkr_trader.db.models import AccountSnapshotRecord
 from ibkr_trader.db.models import BrokerAccountRecord
 from ibkr_trader.db.models import BrokerOrderEventRecord
@@ -63,7 +64,6 @@ from ibkr_trader.db.models import ReconciliationRunRecord
 from ibkr_trader.db.models import TraderDeploymentRecord
 from ibkr_trader.db.models import TraderModelRecord
 from ibkr_trader.db.models import VirtualMarketQuoteRecord
-from ibkr_trader.ibkr.market_data_backfill import list_market_data_backfill_requests
 from ibkr_trader.ibkr.shortability import ShortabilityMarketDataType
 from ibkr_trader.ibkr.shortability import ShortabilitySource
 from ibkr_trader.ibkr.runtime_snapshot import BrokerOpenOrder

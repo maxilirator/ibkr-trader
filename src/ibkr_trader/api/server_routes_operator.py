@@ -44,7 +44,6 @@ from ibkr_trader.api.operator_stream_overlay import (
 from ibkr_trader.api.observation_streaming import _completed_rl_bar_as_of
 from ibkr_trader.api.observation_streaming import _merge_persisted_stream_bars
 from ibkr_trader.api.observation_streaming import _paused_market_stream_observation
-from ibkr_trader.api.observation_streaming import _rl_backfill_instrument
 from ibkr_trader.api.payloads import enforce_loopback_binding
 from ibkr_trader.api.payloads import is_loopback_host
 from ibkr_trader.api.payloads import parse_account_summary_payload
@@ -97,10 +96,6 @@ from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
-from ibkr_trader.ibkr.market_data_backfill import (
-    BackgroundMarketDataBackfillService,
-    enqueue_market_data_backfill_request,
-)
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
@@ -257,7 +252,6 @@ def register_operator_routes(app: Any, context: Any) -> None:
     broker_sessions = context.broker_sessions
     broker_monitor = context.broker_monitor
     market_stream_service = context.market_stream_service
-    market_data_backfill_worker = context.market_data_backfill_worker
     market_stream_identity_map = context.market_stream_identity_map
     execution_runtime = context.execution_runtime
     with_primary_session = context.with_primary_session

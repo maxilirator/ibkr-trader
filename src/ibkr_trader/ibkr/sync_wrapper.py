@@ -703,7 +703,14 @@ def load_sync_wrapper_class() -> type[Any]:
             if req_id in self.contract_details:
                 del self.contract_details[req_id]
             self.reqContractDetails(req_id, contract)
-            return self._wait_for_response(req_id, "contract_details", timeout)
+            try:
+                return self._wait_for_response(req_id, "contract_details", timeout)
+            finally:
+                # `req_id` is never reused (it's an ever-incrementing counter), so
+                # nothing else will ever read or clear this entry - without this,
+                # every contract lookup leaves its result in `self.contract_details`
+                # for the lifetime of the long-lived historical session.
+                self.contract_details.pop(req_id, None)
 
         def place_order_sync(
             self,
@@ -766,6 +773,15 @@ def load_sync_wrapper_class() -> type[Any]:
                 return self._wait_for_response(req_id, "account_summary", timeout)
             finally:
                 self.cancelAccountSummary(req_id)
+                # Same retention bug as get_historical_data/get_contract_details
+                # had before 8a630bb: the entry is deleted before the request,
+                # which is dead code because req_id never repeats, and never
+                # after the response is read. Cancelling the subscription stops
+                # further callbacks but leaves the accumulated result behind for
+                # the lifetime of this long-lived session. Lower call volume than
+                # the historical path, so it was deprioritised then; closing it
+                # now so no known per-request retention mechanism remains.
+                self.account_summary.pop(req_id, None)
 
         def get_open_orders(self, timeout: int = 3) -> dict[int, Any]:
             self.open_orders = {}
@@ -801,7 +817,15 @@ def load_sync_wrapper_class() -> type[Any]:
                 False,
                 [],
             )
-            return self._wait_for_response(req_id, "historical_data", timeout)
+            try:
+                return self._wait_for_response(req_id, "historical_data", timeout)
+            finally:
+                # Same reasoning as `get_contract_details`: `req_id` is never
+                # reused, so the bar list for every historical request would
+                # otherwise sit in `self.historical_data` for the process
+                # lifetime of the long-lived historical session - this is what
+                # grew the API process by ~300MB/hour under sustained backfill.
+                self.historical_data.pop(req_id, None)
 
         def marketRule(self, marketRuleId: int, priceIncrements: list[Any]) -> None:  # noqa: N802
             self._set_event(marketRuleId, "market_rule", list(priceIncrements or []))

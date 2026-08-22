@@ -11,6 +11,7 @@ from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.db.base import build_engine
 from ibkr_trader.db.base import create_schema
 from ibkr_trader.db.base import create_session_factory
+from tests._kill_switch_test_support import disable_kill_switch_for_test
 from ibkr_trader.db.models import InstructionEventRecord
 from ibkr_trader.db.models import InstructionRecord
 from ibkr_trader.domain.execution_payloads import parse_execution_batch_payload
@@ -29,6 +30,9 @@ class IntentReplacementTests(TestCase):
         self.engine = build_engine("sqlite+pysqlite:///:memory:")
         create_schema(self.engine)
         self.session_factory = create_session_factory(self.engine)
+        # An absent kill-switch record now reads as enabled, so this
+        # precondition has to be stated rather than assumed.
+        disable_kill_switch_for_test(self.session_factory)
         self.config = IbkrConnectionConfig(
             host="127.0.0.1",
             port=7497,

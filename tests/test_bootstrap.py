@@ -21,7 +21,7 @@ from ibkr_trader.bootstrap import (
     BootstrapConfigurationError,
     bootstrap_env_path,
     is_production_environment,
-    PAPER_TRADING_PORTS,
+    PAPER_ACCOUNT_PREFIX,
     load_runtime_environment,
     require_production_value,
     reset_runtime_environment_cache,
@@ -456,58 +456,6 @@ class UnreadableBootstrapTests(TestCase):
         self.assertTrue(any("could not be accessed" in w for w in result.warnings))
 
 
-class PaperPortRefusalTests(TestCase):
-    def _bootstrap_with_port(self, root: Path, port: str, extra: str = "") -> Path:
-        return _write_bootstrap(
-            root,
-            "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
-            "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n"
-            f"IBKR_PORT={port}\nIBKR_ACCOUNT_ID=U1\n{extra}",
-        )
-
-    def test_paper_port_is_refused_in_production(self) -> None:
-        for port in ("7497", "4002"):
-            with self.subTest(port=port):
-                with TemporaryDirectory() as temp_dir:
-                    path = self._bootstrap_with_port(Path(temp_dir), port)
-                    with patch.dict(os.environ, {}, clear=True):
-                        with self.assertRaises(BootstrapConfigurationError) as ctx:
-                            load_runtime_environment(
-                                environment="production", bootstrap_path=path
-                            )
-                self.assertIn("paper-trading port", str(ctx.exception))
-
-    def test_paper_port_can_be_deliberately_acknowledged(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            path = self._bootstrap_with_port(
-                Path(temp_dir), "7497", "IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1\n"
-            )
-            with patch.dict(os.environ, {}, clear=True):
-                result = load_runtime_environment(
-                    environment="production", bootstrap_path=path
-                )
-        self.assertTrue(result.is_production)
-
-    def test_live_port_is_accepted(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            path = self._bootstrap_with_port(Path(temp_dir), "4001")
-            with patch.dict(os.environ, {}, clear=True):
-                result = load_runtime_environment(
-                    environment="production", bootstrap_path=path
-                )
-        self.assertTrue(result.is_production)
-
-    def test_unparseable_port_is_reported_by_bootstrap_not_by_int(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            path = self._bootstrap_with_port(Path(temp_dir), "4001 # live port")
-            with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(BootstrapConfigurationError) as ctx:
-                    load_runtime_environment(
-                        environment="production", bootstrap_path=path
-                    )
-        self.assertIn("IBKR_PORT is not an integer", str(ctx.exception))
-
-
 class BootstrapPermissionTests(TestCase):
     def test_group_writable_file_is_rejected(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -801,42 +749,6 @@ class BranchAndEnvironmentMustAgreeTests(TestCase):
                         environment="production", bootstrap_path=root / "absent.env"
                     )
         self.assertIn("does not exist", str(ctx.exception))
-
-
-class PaperPortConventionTests(TestCase):
-    """The IBKR port convention is easy to invert, and inverting it here is
-    worse than having no check: it refuses a live port while waving the paper
-    port through.
-
-        TWS         live 7496   paper 7497
-        IB Gateway  live 4001   paper 4002
-
-    This deployment runs IB Gateway, so 4002 is the one that matters.
-    """
-
-    def test_paper_ports_are_the_paper_ones(self) -> None:
-        self.assertIn(7497, PAPER_TRADING_PORTS)   # TWS paper
-        self.assertIn(4002, PAPER_TRADING_PORTS)   # IB Gateway paper
-
-    def test_live_ports_are_not_treated_as_paper(self) -> None:
-        self.assertNotIn(4001, PAPER_TRADING_PORTS)  # IB Gateway live
-        self.assertNotIn(7496, PAPER_TRADING_PORTS)  # TWS live
-
-    def test_gateway_paper_port_is_refused_in_production(self) -> None:
-        """4002 is what .env.example ships; it must not reach production."""
-        with TemporaryDirectory() as temp_dir:
-            path = _write_bootstrap(
-                Path(temp_dir),
-                "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
-                "Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json\n"
-                "IBKR_PORT=4002\nIBKR_ACCOUNT_ID=U1\n",
-            )
-            with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(BootstrapConfigurationError) as ctx:
-                    load_runtime_environment(
-                        environment="production", bootstrap_path=path
-                    )
-        self.assertIn("paper-trading port", str(ctx.exception))
 
 
 class QDataCatalogRequirementTests(TestCase):
@@ -1256,3 +1168,86 @@ class AtomicValidationTests(TestCase):
                         environment="production", bootstrap_path=path
                     )
         self.assertIn("UTF-8", str(ctx.exception))
+
+
+class PaperAccountRefusalTests(TestCase):
+    """The account is evidence; the port is only a convention.
+
+    An earlier rule refused IBKR's default paper *ports*. That was wrong: IBC
+    exposes OverrideTwsApiPort, and the live host legitimately runs a live
+    Gateway (TradingMode=live, account U…) on port 4002. The rule would have
+    refused a correct production setup — a self-inflicted outage rather than a
+    safeguard.
+    """
+
+    def _bootstrap(self, root: Path, accounts: str, port: str = "4001",
+                   extra: str = "") -> Path:
+        catalog = root / "catalog.json"
+        catalog.write_text("{}", encoding="utf-8")
+        return _write_bootstrap(
+            root,
+            "DATABASE_URL=postgresql://u@h/db\nIBKR_HOST=127.0.0.1\n"
+            f"IBKR_PORT={port}\nIBKR_ACCOUNT_IDS={accounts}\n"
+            f"Q_DATA_CATALOG_PATH={catalog}\n{extra}",
+        )
+
+    def test_the_live_hosts_actual_configuration_is_accepted(self) -> None:
+        """Regression for the real setup: live account on port 4002."""
+        with TemporaryDirectory() as temp_dir:
+            path = self._bootstrap(
+                Path(temp_dir), "U25245595,U25245596", port="4002"
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    environment="production", bootstrap_path=path
+                )
+        self.assertTrue(result.is_production)
+
+    def test_a_paper_account_is_refused(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = self._bootstrap(Path(temp_dir), "DU1234567")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        message = str(ctx.exception)
+        self.assertIn("DU1234567", message)
+        self.assertIn("paper account", message)
+
+    def test_one_paper_account_among_live_ones_is_refused(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = self._bootstrap(Path(temp_dir), "U111,DU222,U333")
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(BootstrapConfigurationError) as ctx:
+                    load_runtime_environment(
+                        environment="production", bootstrap_path=path
+                    )
+        self.assertIn("DU222", str(ctx.exception))
+
+    def test_a_paper_account_can_be_deliberately_acknowledged(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = self._bootstrap(
+                Path(temp_dir), "DU1234567",
+                extra="IBKR_ALLOW_PAPER_ACCOUNT_IN_PRODUCTION=1\n",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                result = load_runtime_environment(
+                    environment="production", bootstrap_path=path
+                )
+        self.assertTrue(result.is_production)
+
+    def test_no_port_value_is_ever_refused(self) -> None:
+        """Every IBKR default port must be accepted; only shape is validated."""
+        for port in ("4001", "4002", "7496", "7497", "5000"):
+            with self.subTest(port=port):
+                with TemporaryDirectory() as temp_dir:
+                    path = self._bootstrap(Path(temp_dir), "U1234567", port=port)
+                    with patch.dict(os.environ, {}, clear=True):
+                        result = load_runtime_environment(
+                            environment="production", bootstrap_path=path
+                        )
+                self.assertTrue(result.is_production)
+
+    def test_prefix_constant_is_the_ibkr_paper_prefix(self) -> None:
+        self.assertEqual(PAPER_ACCOUNT_PREFIX, "DU")

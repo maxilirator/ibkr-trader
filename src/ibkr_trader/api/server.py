@@ -46,7 +46,6 @@ from ibkr_trader.api.operator_stream_overlay import (
 from ibkr_trader.api.observation_streaming import _completed_rl_bar_as_of
 from ibkr_trader.api.observation_streaming import _merge_persisted_stream_bars
 from ibkr_trader.api.observation_streaming import _paused_market_stream_observation
-from ibkr_trader.api.observation_streaming import _rl_backfill_instrument
 from ibkr_trader.api.payloads import enforce_loopback_binding
 from ibkr_trader.api.payloads import is_loopback_host
 from ibkr_trader.api.payloads import parse_account_summary_payload
@@ -103,10 +102,6 @@ from ibkr_trader.ibkr.broker_circuit import BrokerHealthCircuit
 from ibkr_trader.ibkr.errors import IbkrDependencyError
 from ibkr_trader.ibkr.gateway_diagnostics import read_ibgateway_diagnostics
 from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
-from ibkr_trader.ibkr.market_data_backfill import (
-    BackgroundMarketDataBackfillService,
-    enqueue_market_data_backfill_request,
-)
 from ibkr_trader.ibkr.market_stream import LiveMarketDataStreamService
 from ibkr_trader.ibkr.order_execution import cancel_broker_order
 from ibkr_trader.ibkr.order_execution import submit_order_from_batch
@@ -179,7 +174,6 @@ from ibkr_trader.orchestration.rl_candidate_rollover import (
     archive_expired_rl_candidates,
     serialize_rl_candidate_rollover_result,
 )
-from ibkr_trader.orchestration.operator_controls import broker_maintenance_mode_is_enabled
 from ibkr_trader.orchestration.runtime_service_state import (
     EXECUTION_RUNTIME_KEY,
     mark_runtime_service_disabled,
@@ -740,15 +734,6 @@ def create_app(config: AppConfig | None = None) -> Any:
         virtual_market_sync=sync_virtual_market_watch_from_stream,
         market_data_readiness_checker=market_stream_entry_readiness_checker,
     )
-    market_data_backfill_worker = BackgroundMarketDataBackfillService(
-        session_factory,
-        broker_config=app_config.ibkr.historical_session(),
-        execute_historical=with_historical_session,
-        interval_seconds=app_config.market_data_backfill_interval_seconds,
-        batch_size=app_config.market_data_backfill_batch_size,
-        timeout_seconds=app_config.market_data_backfill_timeout_seconds,
-        maintenance_mode_is_enabled=lambda: broker_maintenance_mode_is_enabled(session_factory),
-    )
     market_stream_identity_map = load_stockholm_identity_map(
         app_config.stockholm_identity_path,
     )
@@ -774,15 +759,9 @@ def create_app(config: AppConfig | None = None) -> Any:
                 runtime_key=EXECUTION_RUNTIME_KEY,
                 note="Execution runtime disabled by EXECUTION_RUNTIME_ENABLED=false.",
             )
-        if (
-            app_config.market_data_backfill_worker_enabled
-            and app_config.environment != "test"
-        ):
-            market_data_backfill_worker.start()
         try:
             yield
         finally:
-            market_data_backfill_worker.stop()
             market_stream_service.stop()
             execution_runtime.stop()
             broker_monitor.stop()
@@ -799,7 +778,6 @@ def create_app(config: AppConfig | None = None) -> Any:
     app.state.broker_circuit = broker_circuit
     app.state.broker_monitor = broker_monitor
     app.state.execution_runtime = execution_runtime
-    app.state.market_data_backfill_worker = market_data_backfill_worker
     app.state.market_stream_service = market_stream_service
     app.state.market_stream_identity_map = market_stream_identity_map
 
@@ -831,7 +809,6 @@ def create_app(config: AppConfig | None = None) -> Any:
         broker_pacing_governor=broker_pacing_governor,
         broker_monitor=broker_monitor,
         market_stream_service=market_stream_service,
-        market_data_backfill_worker=market_data_backfill_worker,
         market_stream_identity_map=market_stream_identity_map,
         execution_runtime=execution_runtime,
         with_primary_session=with_primary_session,

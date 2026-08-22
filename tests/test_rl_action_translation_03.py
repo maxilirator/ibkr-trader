@@ -17,6 +17,7 @@ class RLActionTranslationApiTests01(RLActionTranslationApiTestsBase):
             database_url = f"sqlite+pysqlite:///{temp_path / 'rl_translate.db'}"
             engine = build_engine(database_url)
             create_schema(engine)
+            disable_kill_switch_for_test(create_session_factory(engine))
             engine.dispose()
 
             app = create_app(
@@ -147,6 +148,7 @@ class RLActionTranslationApiTests01(RLActionTranslationApiTestsBase):
             database_url = f"sqlite+pysqlite:///{temp_path / 'rl_exit_translate.db'}"
             engine = build_engine(database_url)
             create_schema(engine)
+            disable_kill_switch_for_test(create_session_factory(engine))
             engine.dispose()
 
             app = create_app(

@@ -411,7 +411,7 @@ def test_runner_reports_stale_bar_without_calling_model_or_translator(monkeypatc
 
     assert translated == []
     assert observation_payloads[0]["as_of"] == "2026-05-05T09:10:00+02:00"
-    assert observation_payloads[0]["fetch"]["backfill_duration"] == "2 D"
+    assert observation_payloads[0]["fetch"]["mode"] == "market_stream"
     assert heartbeats[-1]["status"] == "degraded"
     assert (
         heartbeats[-1]["runtime_error"]

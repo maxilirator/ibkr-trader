@@ -7,12 +7,18 @@ from datetime import time
 import math
 from pathlib import Path
 import re
+import threading
 import time as runtime_time
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from ibkr_trader.config import IbkrConnectionConfig
-from ibkr_trader.ibkr.historical_bars import HistoricalBarsQuery, read_historical_bars
+from ibkr_trader.ibkr.historical_bars import (
+    DEFAULT_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS,
+    CachedContractLookupError,
+    HistoricalBarsQuery,
+    read_historical_bars,
+)
 
 
 DEFAULT_STOCKHOLM_INTRADAY_TYPES = (
@@ -142,6 +148,48 @@ def _load_stockholm_identity_map(path: Path) -> dict[str, StockholmInstrumentIde
     return identity_map
 
 
+#: Both the explicit-symbols and universe-cursor paths resolve the same two
+#: /mnt/q-data parquet files on every call. That mount is read-only NFS, and
+#: an explicit-symbols request can be paged over dozens of HTTP calls just
+#: like the universe path is - each one re-reading and re-parsing the same
+#: files was pure waste. Keyed on path + mtime/size so a republished dataset
+#: (new version, same path) is picked up without a restart.
+_REFERENCE_DATA_CACHE_LOCK = threading.Lock()
+_REFERENCE_DATA_CACHE: dict[tuple[str, int, int], Any] = {}
+
+
+def _reference_data_cache_key(path: Path) -> tuple[str, int, int] | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return (str(path), stat_result.st_mtime_ns, stat_result.st_size)
+
+
+def _load_cached_reference_data(path: Path, loader: Callable[[Path], Any]) -> Any:
+    key = _reference_data_cache_key(path)
+    if key is None:
+        # Nothing on disk to key a cache entry on (or an already-vanished
+        # NFS mount) - fall back to loading directly rather than caching
+        # under a key that can't detect the file changing later.
+        return loader(path)
+    with _REFERENCE_DATA_CACHE_LOCK:
+        if key in _REFERENCE_DATA_CACHE:
+            return _REFERENCE_DATA_CACHE[key]
+    value = loader(path)
+    with _REFERENCE_DATA_CACHE_LOCK:
+        _REFERENCE_DATA_CACHE[key] = value
+    return value
+
+
+def _cached_stockholm_universe(path: Path) -> list[str]:
+    return _load_cached_reference_data(path, _load_current_stockholm_universe)
+
+
+def _cached_stockholm_identity_map(path: Path) -> dict[str, StockholmInstrumentIdentity]:
+    return _load_cached_reference_data(path, _load_stockholm_identity_map)
+
+
 def _normalize_token(value: str | None) -> str | None:
     if value is None:
         return None
@@ -251,19 +299,33 @@ def _build_symbol_page(
                 continue
             seen.add(normalized)
             unique_symbols.append(normalized)
-        page = unique_symbols[:max_symbols]
-        next_cursor = page[-1] if len(unique_symbols) > len(page) and page else None
-        return page, next_cursor
+        return _page_sorted_slugs(
+            sorted(unique_symbols),
+            max_symbols=max_symbols,
+            start_after=start_after,
+        )
 
-    sorted_universe = sorted(universe)
+    return _page_sorted_slugs(
+        sorted(universe),
+        max_symbols=max_symbols,
+        start_after=start_after,
+    )
+
+
+def _page_sorted_slugs(
+    sorted_slugs: list[str],
+    *,
+    max_symbols: int,
+    start_after: str | None,
+) -> tuple[list[str], str | None]:
     start_index = 0
     if start_after:
         normalized_cursor = start_after.strip().lower()
-        while start_index < len(sorted_universe) and sorted_universe[start_index] <= normalized_cursor:
+        while start_index < len(sorted_slugs) and sorted_slugs[start_index] <= normalized_cursor:
             start_index += 1
-    page = sorted_universe[start_index : start_index + max_symbols]
+    page = sorted_slugs[start_index : start_index + max_symbols]
     next_cursor = None
-    if start_index + max_symbols < len(sorted_universe) and page:
+    if start_index + max_symbols < len(sorted_slugs) and page:
         next_cursor = page[-1]
     return page, next_cursor
 
@@ -328,6 +390,7 @@ def collect_stockholm_intraday_backfill(
     identity_path: Path,
     timeout: int = 20,
     app: Any | None = None,
+    negative_contract_cache_ttl_seconds: float = DEFAULT_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS,
 ) -> dict[str, Any]:
     query.validate()
     started_monotonic = runtime_time.monotonic()
@@ -336,8 +399,9 @@ def collect_stockholm_intraday_backfill(
         if query.max_runtime_seconds is not None
         else None
     )
-    universe = _load_current_stockholm_universe(instruments_path)
-    identity_map = _load_stockholm_identity_map(identity_path)
+    universe = _cached_stockholm_universe(instruments_path)
+    identity_map = _cached_stockholm_identity_map(identity_path)
+    known_universe = set(universe)
     page_slugs, next_cursor = _build_symbol_page(
         universe,
         max_symbols=query.max_symbols,
@@ -350,6 +414,32 @@ def collect_stockholm_intraday_backfill(
     budget_exhausted = False
     last_complete_cursor = query.start_after
     for index, slug in enumerate(page_slugs):
+        identity = identity_map.get(slug)
+
+        if slug not in known_universe and identity is None:
+            entries.append(
+                {
+                    "slug": slug,
+                    "company_name": None,
+                    "share_class": None,
+                    "ticker_alias": None,
+                    "yahoo_symbol": None,
+                    "isin": None,
+                    "status": "unknown_instrument",
+                    "detail": (
+                        "Symbol is not present in the Stockholm universe or "
+                        "identity map; skipped without an IBKR contract lookup."
+                    ),
+                    "classification": None,
+                    "flags": [],
+                    "resolved_contract": None,
+                    "series": {},
+                    "cache_hit": False,
+                }
+            )
+            last_complete_cursor = slug
+            continue
+
         first_call_timeout = _call_timeout(
             base_timeout=timeout,
             deadline_at=deadline_at,
@@ -358,7 +448,6 @@ def collect_stockholm_intraday_backfill(
             budget_exhausted = True
             break
 
-        identity = identity_map.get(slug)
         entry: dict[str, Any] = {
             "slug": slug,
             "company_name": identity.company_name if identity is not None else None,
@@ -371,6 +460,7 @@ def collect_stockholm_intraday_backfill(
             "flags": [],
             "resolved_contract": None,
             "series": {},
+            "cache_hit": False,
         }
 
         requested_series = list(query.what_to_show)
@@ -419,7 +509,17 @@ def collect_stockholm_intraday_backfill(
                 timeout=first_call_timeout,
                 app=app,
                 contract_details_cache=contract_details_cache,
+                negative_contract_cache_ttl_seconds=negative_contract_cache_ttl_seconds,
             )
+        except CachedContractLookupError as exc:
+            entry["status"] = "lookup_error"
+            entry["detail"] = str(exc)
+            entry["cache_hit"] = True
+            entries.append(entry)
+            last_complete_cursor = slug
+            if query.sleep_seconds > 0:
+                runtime_time.sleep(query.sleep_seconds)
+            continue
         except LookupError as exc:
             entry["status"] = "lookup_error"
             entry["detail"] = str(exc)
@@ -510,6 +610,7 @@ def collect_stockholm_intraday_backfill(
                     timeout=series_call_timeout,
                     app=app,
                     contract_details_cache=contract_details_cache,
+                    negative_contract_cache_ttl_seconds=negative_contract_cache_ttl_seconds,
                 )
                 entry["series"][series_name] = {
                     "status": "ok",
@@ -573,11 +674,19 @@ def collect_stockholm_intraday_backfill(
             "processed_symbol_count": len(entries),
             "ok_count": sum(1 for entry in entries if entry["status"] == "ok"),
             "lookup_error_count": sum(1 for entry in entries if entry["status"] == "lookup_error"),
+            "cached_lookup_error_count": sum(
+                1
+                for entry in entries
+                if entry["status"] == "lookup_error" and entry.get("cache_hit")
+            ),
             "timeout_count": sum(1 for entry in entries if entry["status"] == "timeout"),
             "error_count": sum(1 for entry in entries if entry["status"] == "error"),
             "partial_count": sum(1 for entry in entries if entry["status"] == "partial"),
             "skipped_remapped_count": sum(
                 1 for entry in entries if entry["status"] == "skipped_remapped"
+            ),
+            "unknown_instrument_count": sum(
+                1 for entry in entries if entry["status"] == "unknown_instrument"
             ),
             "unsupported_series_count": sum(
                 1

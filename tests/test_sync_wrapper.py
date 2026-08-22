@@ -485,6 +485,81 @@ class SyncWrapperTests(TestCase):
         self.assertNotIn(41, app.executions)
         self.assertIn(41, app._closed_execution_request_ids_lookup)
 
+    def test_get_contract_details_cleans_up_request_buffer_after_success(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app._next_local_request_id = lambda: 41  # type: ignore[method-assign]
+
+        def fake_req_contract_details(req_id: int, contract: object) -> None:
+            app.contract_details[req_id] = [SimpleNamespace(contract=contract)]
+
+        app.reqContractDetails = fake_req_contract_details  # type: ignore[method-assign]
+
+        matches = app.get_contract_details(SimpleNamespace(symbol="SIVE"), timeout=1)
+
+        self.assertEqual(len(matches), 1)
+        self.assertNotIn(41, app.contract_details)
+
+    def test_get_historical_data_cleans_up_request_buffer_after_success(self) -> None:
+        # Reproduces the 2026-08-22 production leak: the historical session is
+        # long-lived (checked out and returned per request, never reconnected),
+        # so anything `get_historical_data` leaves in `self.historical_data`
+        # survives for the process lifetime. Across a multi-thousand-symbol
+        # backfill this grew the API process by ~300MB/hour until it was OOM.
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app._next_local_request_id = lambda: 41  # type: ignore[method-assign]
+
+        def fake_req_historical_data(*args: object, **kwargs: object) -> None:
+            app.historical_data[41] = [SimpleNamespace(date="20260410 09:00:00")]
+
+        app.reqHistoricalData = fake_req_historical_data  # type: ignore[method-assign]
+
+        bars = app.get_historical_data(
+            SimpleNamespace(symbol="SIVE"),
+            "",
+            "1 D",
+            "1 min",
+            "TRADES",
+            True,
+            1,
+            timeout=1,
+        )
+
+        self.assertEqual(len(bars), 1)
+        self.assertNotIn(41, app.historical_data)
+
+    def test_get_historical_data_cleans_up_request_buffer_after_failure(self) -> None:
+        wrapper_cls = load_sync_wrapper_class()
+        app = wrapper_cls(timeout=1)
+
+        app._next_local_request_id = lambda: 41  # type: ignore[method-assign]
+        app.reqHistoricalData = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+        def fake_wait_for_response(req_id: int, response_name: str, timeout: int):
+            # Simulates the historicalData callback landing before the wait
+            # times out, so a real leak would still be observable here.
+            app.historical_data[req_id] = [SimpleNamespace(date="20260410 09:00:00")]
+            raise TimeoutError("simulated historical data timeout")
+
+        app._wait_for_response = fake_wait_for_response  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(TimeoutError, "simulated historical data timeout"):
+            app.get_historical_data(
+                SimpleNamespace(symbol="SIVE"),
+                "",
+                "1 D",
+                "1 min",
+                "TRADES",
+                True,
+                1,
+                timeout=1,
+            )
+
+        self.assertNotIn(41, app.historical_data)
+
     def test_exec_details_ignores_late_callbacks_for_closed_request(self) -> None:
         wrapper_cls = load_sync_wrapper_class()
         app = wrapper_cls(timeout=1)

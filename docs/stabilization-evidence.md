@@ -11,7 +11,7 @@ Baseline commit: `b7a2973` ("Resolve shared q-data through the catalog only")
 
 | Constraint | State | Evidence |
 | --- | --- | --- |
-| Global kill switch enabled | Untouched by this work — **but see Open finding 1** | No change to `orchestration/operator_controls.py` in `ddb394f`/`73bc591` |
+| Global kill switch enabled | **Now enforced** (`59dfdd9`, approved by Mattias): an absent record reads as *enabled*. Live row verified `enabled=True` before the change, so live impact is nil. | `tests/test_operator_controls.py::KillSwitchFailClosedTests` |
 | One dedicated Gateway; legacy `ibgateway.service` disabled | Untouched | No change to `ops/systemd/*`; no Gateway restart or config change performed |
 | Watchdog restart authority disabled | Untouched | `ops/systemd/ibgateway-api-watchdog.service` still sets `WATCHDOG_RESTART_ENABLED=no` |
 | RL runner virtual | Untouched | `ops/systemd/ibkr-trader-rl-runner.service` still passes `--execute-virtual` only |
@@ -34,9 +34,9 @@ Baseline `b7a2973`: **3 failed, 538 passed, 1 skipped**.
 | `test_order_preview.py::test_preview_flags_invalid_stockholm_short_before_submit` | `tests/conftest.py::write_catalog` never creates `shortability/shortability_latest.json`; `FileNotFoundError` | No — test fixture gap |
 | `test_order_execution_01.py::test_submit_order_from_batch_rejects_explicit_short_on_non_shortable_stockholm_account` | Same fixture gap | No — test fixture gap |
 
-These three remain failing and unmodified. They are a **Phase 4 prerequisite**:
-a release gate cannot pass while they are red, so they must be fixed or
-explicitly quarantined with justification before Phase 4 completes.
+> **Superseded.** All three were fixed in `e7a8ca5`; none was a product defect.
+> See "Test baseline — now green" below. The suite is green, which is what
+> Phase 4's matched-tests gate requires.
 
 ## Phase 1 — Recovery and stream policy
 
@@ -519,3 +519,618 @@ without the exemption no `/tmp`-based deployment or test would start.
   is accepted.
 
 Suite: **699 passed, 1 skipped, 0 failed.**
+
+## Live host survey (2026-08-20)
+
+Gathered read-only from `quant.geisler.se` as the `openhands` account. No
+service was restarted, no configuration changed, no Gateway contacted. Secret
+values were never printed — key names and non-secret values only.
+
+| Fact | Finding |
+| --- | --- |
+| **Global kill switch** | `GLOBAL_KILL_SWITCH enabled=True`, set 2026-08-18 by `openhands-on-behalf-of-mattias`. The approved fail-closed change therefore has **nil live impact** — verified, not assumed. |
+| `BROKER_MAINTENANCE_MODE` | No row. Unchanged by this work (still defaults to off). |
+| `APP_ENV` | `dev` in `/home/mattias/ibkr-trader/.env` **and** in `/etc/ibkr-trader/bootstrap.env`. **No systemd unit sets it.** |
+| `IBKR_PORT` | `4002` in both — the **IB Gateway paper port**. |
+| `/etc/ibkr-trader/bootstrap.env` | Already exists (32 lines, modified 2026-08-19). `-rw-r----- root:mattias`, directory `drwxr-x--- root:mattias`. |
+| Ancestor permissions | `/` and `/etc` are `drwxr-xr-x root:root`. Clean. |
+| `Q_DATA_CATALOG_PATH` | **Absent** from `bootstrap.env` and from `.env`. |
+| Services | `ibkr-trader-api`, `-dashboard`, `-rl-runner` all active. |
+| Deployed commit | Git metadata says `f2c806c`, but that is **wrong** — see "Deployed-code divergence, corrected" below. |
+
+### What this means for cutover
+
+1. **Fail-closed startup is currently inactive.** `APP_ENV=dev` everywhere, so
+   none of the Phase 2 protections are engaged on the live host today.
+2. **The permissions are already correct.** The existing `0640 root:mattias`
+   file inside a `0750 root:mattias` directory passes every location, ownership
+   and mode check, including the ancestor-writability walk.
+3. **`Q_DATA_CATALOG_PATH` must be added before cutover.** It is required, has no
+   default, and is currently supplied by neither file.
+4. **The live host runs on the IB Gateway paper port (4002).** Cutover will be
+   refused unless either the port is changed to `4001` or
+   `IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION=1` records a deliberate decision to stay
+   on paper. Staying on paper is consistent with "the RL runner remains virtual"
+   and "do not enable live RL trading", but it is an operator decision, not one
+   this work should make.
+5. **The deployed code lags this branch by 34 commits.** See the corrected
+   analysis below; an earlier version of this note overstated both the size and
+   the nature of the gap.
+
+`bootstrap.env` also sets `APP_ENV=dev`, which is accepted: a bootstrap file may
+not declare *production*, but a non-production value is fine, and at cutover the
+unit's `APP_ENV=production` overrides it and is recorded in `overridden_keys`.
+
+## Deployed-code divergence, corrected (2026-08-20)
+
+An earlier entry in this document claimed the deployed commit was "not an
+ancestor of baseline `b7a2973`" and that the tree carried "uncommitted edits".
+**Both statements were wrong**, and the error is recorded here rather than
+quietly edited away because it changed the recommendation.
+
+The ancestry claim came from running `git merge-base --is-ancestor f2c806c
+b7a2973` **on the live host**, where `b7a2973` does not exist. The non-zero exit
+was a *missing object*, not a false ancestry. Run in a repository that has both
+objects, `f2c806c` is a direct ancestor of `HEAD`.
+
+### What the host is actually running
+
+`git status` on the host reports 146 modified tracked files, including core
+trading code. That is not hand-editing. Hashing all 140 `src/**/*.py` files on
+the host and comparing them against every commit in range shows:
+
+| Result | Finding |
+| --- | --- |
+| Files matching **no commit** in history | **0** — there is no unversioned or hand-edited code in production |
+| Files identical to `a802b27` (2026-06-09) | 136 / 140 (97.1%) |
+| The other 4 files | Match `51708c6` and `d4bc5e1` (2026-06-03/04) |
+
+So production runs a **file-copy snapshot taken around 2026-06-04 to 06-09**,
+while the host's `.git` still points at `f2c806c` (2026-04-17). The 146
+"modifications" are the difference between the copied tree and the stale git
+metadata — deployment is `rsync`, and `.git` was never advanced.
+
+**This is precisely the failure mode the Phase 4 active-tree comparison exists to
+detect**: the commit hash is not evidence of what is running, and here it is
+wrong by roughly two months. It is a live demonstration that the check is
+necessary rather than theoretical.
+
+### The real gap
+
+Measured from what production actually runs (`a802b27`), not from the stale
+metadata:
+
+| Measure | Value |
+| --- | --- |
+| Commits behind | **34** (not 95) |
+| — from this stabilization session | 24 |
+| — from other work | 10 |
+| `src/` delta | 37 files, +4283 / −268 |
+| `ops/` delta | **only** the new `bootstrap.env.example` — **no systemd unit changes** |
+| Database schema | **Already at HEAD.** No missing columns. Only `runtime_setting` / `runtime_setting_event` are absent, and `create_all` adds tables. |
+
+The 10 non-stabilization commits are four documentation/architecture commits, two
+merges, the q-data catalog change (`bae8f91`, `b7a2973`, `6d1b972`), broker
+maintenance mode (`ac4c3ac`), and the retired-model routing policy (`38c2427`).
+
+### What this changes about cutover risk
+
+Lower than first reported, but with three specific items to weigh:
+
+1. **`Q_DATA_CATALOG_PATH` becomes required** — the q-data catalog change is
+   inside the gap, which is exactly why production runs fine without it today
+   and will not afterwards.
+2. **Two trading-path files change from others' work**: `submission.py` (+45) and
+   `rl/runner_loop.py` (+72), plus the retired-model routing policy, which can
+   reject model-routed instructions that are accepted today.
+3. **No service definitions change**, so cutover is a code and configuration
+   change only — no unit edits, and no reason to touch IB Gateway.
+
+The `.git` metadata on the host should be corrected as part of cutover, so that
+the commit hash means something again.
+
+## Phase 5 — cutover attempted, stopped on a verified blocker (2026-08-20)
+
+Cutover was approved by Mattias. It was **not performed.** Pre-flight found a
+condition that would take the trader down on the first restart, and it is not
+recoverable by rolling back configuration alone.
+
+### The blocker
+
+`AppConfig.from_env()` resolves three shared datasets through the q-data catalog
+**unconditionally** — `config.py:283-285`, independent of `APP_ENV`:
+
+```
+session_calendar_path=_q_data_path("xsto.world.calendar")
+stockholm_instruments_path=_q_data_path("xsto.world.universe")
+stockholm_identity_path=_q_data_path("xsto.world.instrument_identity")
+```
+
+`_q_data_path` calls `q_data.resolve()`, which raises when `Q_DATA_CATALOG_PATH`
+is unset. There is no path fallback, by deliberate design.
+
+**There is no q-data catalog anywhere in the estate.** Verified:
+
+| Location | Result |
+| --- | --- |
+| `quant:/mnt/q-data`, `/home/mattias/q-data`, `/srv/q-data` | no `catalog.json` |
+| `quant` — any `catalog.json` under `/mnt`, `/srv`, `/home/mattias` | none found |
+| `quant` — network mounts | none |
+| `q-live-ops:/mnt/q-data` | exists but is an **empty directory** on the root filesystem, not a mount |
+| `quant:/home/mattias/q-data/xsto` | contains the **old layout**: `calendars/`, `instruments/`, `meta/` |
+
+The live `.env` still uses the old form,
+`SESSION_CALENDAR_PATH=../q-data/xsto/calendars/day_sessions.parquet`, which the
+deployed (June) code accepts and the current code no longer does.
+
+Reproduced with the live host's exact environment shape:
+
+```
+QDataContractError: Q_DATA_CATALOG_PATH is not set. Shared q-data inputs are
+resolved only through the q-data catalog; there is no directory fallback...
+```
+
+### Why this is not a configuration fix
+
+`ExecStartPre=python -m ibkr_trader.db.init_schema` calls `AppConfig.from_env()`,
+so `ibkr-trader-api` fails before `ExecStart` and crash-loops on `Restart=always`;
+`ibkr-trader-rl-runner` then fails its health gate. Setting `APP_ENV` back to
+`dev` does not help — the requirement is unconditional. Only rolling the *code*
+back would restore service.
+
+### Not caused by the stabilization work
+
+The catalog-only resolution arrives with `bae8f91`, `b7a2973` and `6d1b972`,
+which are other people's commits inside the 34-commit gap. The trader's data
+contract is ahead of what the data platform has rolled out to this host. The
+`q-data` project owns publishing the catalog, and the estate contains a
+`q-data-cutover-goal` alongside it.
+
+### What must happen first
+
+1. A q-data catalog must exist on `quant` covering `xsto.world.calendar`,
+   `xsto.world.universe` and `xsto.world.instrument_identity`, and
+   `Q_DATA_CATALOG_PATH` must point at it from `/etc/ibkr-trader/bootstrap.env`.
+2. **A catalog must not be hand-generated from whatever files happen to be in
+   `/home/mattias/q-data/xsto`.** That would reconstruct exactly the hazard the
+   change was made to prevent — the module's own docstring records that a
+   six-month-stale file was once read as current. The catalog is q-data's
+   artefact to publish.
+
+Once a catalog is in place, the remaining cutover is the ordinary one: deploy the
+34 commits, add `Q_DATA_CATALOG_PATH`, decide the paper-port question
+(`IBKR_PORT=4002` is the IB Gateway **paper** port), and only then consider
+`APP_ENV=production`. The database needs no migration, and no systemd unit
+changes are involved.
+
+## Incident: trader stack down 10:14–13:08 UTC, 2026-08-20 (caused by this work)
+
+**I caused this.** Recorded in full because the cause is a real fragility in how
+the stack is run, and because the evidence trail is worth more than a tidy one.
+
+### What happened
+
+`ibkr-trader-api`, `-dashboard` and `-rl-runner` are **user** systemd services
+under `mattias` (UID 1000). Linger was enabled for `ibgateway` but **not** for
+`mattias`, so `user@1000.service` only existed while `mattias` held a login
+session.
+
+During the live-host survey I connected as `mattias@quant` several times to read
+configuration. When the last of those sessions closed, systemd stopped the user
+manager and killed everything under it:
+
+```
+10:14:40 systemd[1]: user@1000.service: Killing process 2573380 (python) with signal SIGKILL
+10:14:40 systemd[1]: user@1000.service: Failed with result 'timeout'
+10:14:40 systemd[1]: Stopped user@1000.service - User Manager for UID 1000
+```
+
+The stack was down from **10:14:40 to 13:08:54 UTC — 2h 54m**. I did not notice
+at the time because my subsequent checks ran as `openhands`, whose own user
+manager legitimately reports `inactive` for units it does not own. That masked a
+real outage behind a plausible-looking answer for several minutes.
+
+### Impact
+
+| Check | Result |
+| --- | --- |
+| Broker orders in the last 6 hours | **0** |
+| Execution fills in the last 6 hours | **0** |
+| Global kill switch | `enabled=True` throughout — new entries were blocked regardless |
+| RL runner | virtual (`--execute-virtual`), unchanged |
+| IB Gateway | **untouched** — runs under `ibgateway`, which has linger; same PID 2536575 before and after |
+
+No orders, no fills, no Gateway restart. The cost was ~3 hours of monitoring,
+market-data capture and RL virtual cycles.
+
+### Root cause and fix
+
+The proximate cause was my SSH session. The actual cause is that a production
+trading stack was running under a **non-lingering user manager**, so any logout
+by that user — by anyone, for any reason — stops it. That is not a safe way to
+run it, and it would have happened eventually without me.
+
+Fixed with `loginctl enable-linger mattias`, which makes `user@1000.service`
+persistent and independent of login sessions, matching how `ibgateway` was
+already configured. Services restarted and verified: primary and diagnostic
+broker sessions connected, circuit closed, dashboard HTTP 200, kill switch still
+enabled, RL runner still virtual.
+
+### Lessons applied
+
+1. **Never query `systemctl --user` from a different account.** It answers about
+   that account's manager and will happily report `inactive` for a healthy
+   service. Use the owning UID's `XDG_RUNTIME_DIR`, or check processes and
+   listening ports, which cannot lie about it.
+2. **Read-only inspection is not risk-free** when the thing being inspected is
+   session-scoped. Logging in as the service owner is itself a state change.
+3. Linger should be part of the stability observation gates in Phase 6: a
+   service that dies on logout will not survive a bounded observation window.
+
+## Phase 5 — cutover COMPLETED (2026-08-20)
+
+Approved by Mattias. Deployed and running in production on `quant.geisler.se`.
+
+### Blocker resolved first: q-data over NFS
+
+`nas.geisler.se` exports `/mnt/root/q-data` to `*`. Enumerated by speaking the
+RPC mount protocol directly rather than installing anything, then:
+
+- `nfs-common` installed on `quant`; share mounted **read-only** at `/mnt/q-data`
+  (`ro,soft,timeo=100,retrans=3,_netdev,nofail`). Read-only because q-data owns
+  the data and the trader only reads it; `soft` so a network blip fails loudly
+  rather than hanging the order path.
+- Persisted in `/etc/fstab` (backup taken) and re-mounted from fstab to prove the
+  entry parses.
+- `Q_DATA_CATALOG_PATH=/mnt/q-data/catalog.json` added to the protected file.
+- **Contract verified as the service user**: all three required datasets resolve
+  *and* pass SHA-256 verification — `xsto.world.calendar` (52,925 B),
+  `xsto.world.universe` (15,334 B), `xsto.world.instrument_identity` (80,079 B).
+  ~148 KB total, so per-order hash verification is negligible.
+
+### Correction found by checking rather than assuming
+
+The live host runs a **live** account (`U25245596`; paper accounts are `DU`-prefixed)
+on a **live** Gateway (`TradingMode=live`, `--mode=live`) whose API port is
+deliberately set to **4002** via IBC's `OverrideTwsApiPort`.
+
+The paper-**port** refusal would therefore have blocked a correct production
+setup. IBKR's 4001/4002/7496/7497 are only defaults; once `OverrideTwsApiPort`
+exists the port carries no information. Replaced with a paper-**account** check
+(`DU` prefix), which is real evidence, overridable via
+`IBKR_ALLOW_PAPER_ACCOUNT_IN_PRODUCTION=1`. `IBKR_PORT` is still shape-checked.
+
+This was the same mistake as the earlier `_looks_like_production` substring rule:
+encoding a convention as if it were a fact, turning a safeguard into a
+self-inflicted outage. Regression test uses the host's real configuration.
+
+### How the deploy was done
+
+Deployment had been `rsync`, which is why the host's `.git` was ~2 months stale.
+This one used a **git bundle**, so the host now has real objects and its commit
+hash means something again.
+
+1. Services stopped (Gateway untouched).
+2. Rollback archive `/root/ibkr-rollback-20260820T134758Z.tar.gz` (7.6 MB).
+3. Live RL state preserved to `/root/ibkr-live-state-…/` — `state.json` (3.6 MB)
+   and `history-cache.json` (614 KB) are **tracked in git**, so `reset --hard`
+   would have destroyed 3.6 MB of live runtime state. Restored afterwards.
+4. `git fetch` from the bundle, `reset --hard`, branch label corrected.
+5. Dashboard rebuilt (`npm run build`) for the new `/settings` route.
+6. **Active-tree comparison run on the host** against locally-recorded evidence:
+   same commit, only differences a build artefact (`egg-info/SOURCES.txt`) and
+   the deliberately-restored runtime state.
+7. Preflight: **GO** — permissions fine, all required keys present, all accounts
+   live, kill switch verified enabled in the target database, no `.env` keys lost.
+8. `APP_ENV` commented out in the checkout `.env`; `APP_ENV=production` set via a
+   systemd **drop-in** per unit, so rollback is deleting one file.
+9. API restarted first with automatic rollback on failure; then dashboard and
+   RL runner.
+
+### Verified live, in production
+
+```
+is_production: True   source: bootstrap   path: /etc/ibkr-trader/bootstrap.env
+overridden   : ['APP_ENV']      <- the file's APP_ENV=dev could not downgrade it
+```
+
+| Check | Result |
+| --- | --- |
+| `/healthz` | `ok`; primary + diagnostic `healthy`, historical `recovering`, circuit closed |
+| Phase 1 recovery policy | live: `market_stream state=streaming usable=True` |
+| Phase 3 `/v1/settings` | 18 settings, `read_only: true`, drift 0, errors 0 |
+| Dashboard `/`, `/settings`, `/ledger`, `/rl` | all HTTP 200 |
+| Global kill switch | **enabled** ("Authorized maintenance hold…") |
+| RL runner | `--execute-virtual` |
+| Legacy `ibgateway.service` | `disabled` |
+| Watchdog restart authority | `WATCHDOG_RESTART_ENABLED=no` |
+| q-data mount | `nas.geisler.se:/mnt/root/q-data` read-only |
+
+Host runs Python 3.12.3 (local tests ran on 3.13.13); `pyproject` requires ≥3.12.
+
+### OUTSTANDING — needs operator approval, not touched
+
+**Two IB Gateway JVMs are running**, which violates "exactly one Gateway process".
+
+| PID | Owner | cgroup | Started | Ports |
+| --- | --- | --- | --- | --- |
+| 2580765 | `ibgateway` | `ibgateway-ibc.service` | 2026-08-19 22:45 | **4002**, 7462 |
+| 2557071 | `mattias` | **`ibgateway.service`** (legacy) | 2026-08-19 12:36 | none |
+
+The dedicated Gateway is correct and is the one serving the trader. The second is
+a **leftover process of the legacy `ibgateway.service`** — the unit is `disabled`,
+so it will not return after a reboot, but disabling a unit does not stop an
+already-running process, and this one predates today's work.
+
+It holds no ports, but it is a second Gateway JVM against the same IBKR login,
+which is the session-conflict class AGENTS.md warns about. **Not stopped:**
+stopping a Gateway requires explicit Mattias approval. Recommended action is to
+stop PID 2557071 only, leaving `ibgateway-ibc.service` untouched.
+
+## Phase 6 — bounded stability observation
+
+Five samples at 60-second intervals immediately after cutover, plus restart-churn
+and error gates.
+
+| Gate | Result |
+| --- | --- |
+| `/healthz` | `ok` on all 5 samples |
+| Primary broker session | `healthy` on all 5 |
+| Market stream | `streaming` on all 5 |
+| Broker circuit | closed on all 5 |
+| Dashboard `/settings` | HTTP 200 on all 5 |
+| All three units | `active` on all 5 |
+| **Restart churn** | `NRestarts=0` for all three units |
+| Hard errors in the journal since cutover | **0** (`Traceback`, `BootstrapConfigurationError`, `QDataContractError`) |
+
+This is a short window and is recorded as such: it demonstrates the cutover did
+not destabilise the stack, not that the stack is stable over a trading day. A
+longer observation should follow, and it now has a meaningful prerequisite that
+did not previously hold — `loginctl enable-linger mattias`, without which the
+services die on operator logout and no observation window is trustworthy.
+
+## Programme summary
+
+| Phase | State |
+| --- | --- |
+| 1 — Recovery and stream policy | Deployed; live at `/healthz` under `recovery_policy` |
+| 2 — Fail-closed source-independent bootstrap | Deployed and **engaged**: `is_production=True`, config from `/etc/ibkr-trader/bootstrap.env` |
+| 3 — Non-secret settings registry + dashboard `/settings` | Deployed; 18 settings, read-only, HTTP 200 |
+| 4 — Verifiable release pipeline | Used for the cutover itself; active-tree comparison run on the host |
+| 5 — Application cutover | **Complete** |
+| 6 — Bounded stability observation | Short window passed; longer window outstanding |
+
+Non-negotiables at close: kill switch **enabled**; RL runner **virtual**;
+watchdog restart authority **disabled**; legacy `ibgateway.service` **disabled**;
+dashboard extended, not replaced; no live RL trading.
+
+**One constraint is violated and was deliberately not fixed**: two IB Gateway
+JVMs are running. See the Phase 5 section — stopping a Gateway requires explicit
+operator approval.
+
+### Rollback, if needed
+
+1. Delete `~/.config/systemd/user/ibkr-trader-*.service.d/10-production.conf`,
+   `systemctl --user daemon-reload`, restore `APP_ENV` in `.env`, restart. That
+   reverses only the production flip.
+2. For a full code rollback: `git -C ~/ibkr-trader reset --hard a802b27`, or
+   restore `/root/ibkr-rollback-20260820T134758Z.tar.gz`. Re-restore
+   `/root/ibkr-live-state-20260820T134758Z/` afterwards — `var/rl-runner/state.json`
+   is tracked in git and will otherwise be overwritten.
+3. Do not restart IB Gateway as part of any rollback.
+
+## XSTO 1-minute backfill — 48h whole-market pilot (started 2026-08-20)
+
+### Design corrections that shaped it
+
+The first plan was wrong in two ways, both corrected by Mattias:
+
+1. **The universe is a living list, not a fixed set.** `xsto.world.universe`
+   already carries `instrument`, `start`, `end` per row, so the instrument set is
+   a property of the *date*. Measured: **926 active on 2025-09-01 → 954 on
+   2026-08-19**, 28 newly listed. Crossing today's universe with a date range
+   would request names before they listed and burn the pacing budget discovering
+   that one request at a time. Requests are now generated per session from the
+   universe active on that session.
+2. **Ownership: q-live-ops requests and writes; the trader only reads.** This is
+   already the design — `q-live-ops/configs/retrieval/ibkr.yaml` points at
+   `http://quant.geisler.se:8000` with `historical_client_id: 8` and
+   `output_root: /mnt/q-data/…`. The write path exists on **`docker.geisler.se`**
+   (10.17.0.220), where `q-data-ops-q-data-native-1` has `/mnt/q-data` mounted
+   **rw** and publishes the catalog. An earlier note in this document claimed
+   q-live-ops had no q-data mount; that was checking host `q-live-ops`
+   (10.17.0.108), which is not where the data-ops containers run. The trader's
+   read-only mount on `quant` is correct and deliberate.
+
+### Blocking defect fixed first (`12e72a9`)
+
+Both `mark_market_data_backfill_failed()` call sites passed `retryable=True`
+unconditionally, so `BACKFILL_STATUS_FAILED_FINAL` was unreachable and every
+permanently-dead request re-entered the queue on a 120-second cycle forever.
+
+**Measured in the pilot: a 40% terminal-failure rate** (23 of 58 resolved
+attempts), with errors like
+`IBKR rejected the contract lookup for ABIG: [200] No security definition`.
+Without the fix, two in five requests would have recycled indefinitely against a
+budget of 50 requests per 10 minutes.
+
+Classification matches on message, not exception type, because `LookupError`
+covers both "this contract does not exist" (final) and incidental lookup failures
+during a Gateway restart (retryable).
+
+### Pilot configuration
+
+| Setting | Value | Note |
+| --- | --- | --- |
+| Requests enqueued | **14,310** | 15 whole-market sessions, 954 instruments each |
+| `MARKET_DATA_BACKFILL_BATCH_SIZE` | 3 → **4** | 240/h = 80% of the 300/h ceiling |
+| Headroom left | 20% | so RL observation builds are not starved and misread as backfill breakage |
+| Client id | 8 | historical role, separate from order control (0) and stream (9) |
+| Session close | from the calendar per day | `close_time` + `timezone`; 17:30 Stockholm = **15:30Z** in summer, and XSTO has half-days |
+
+The enqueuer (`scripts/enqueue_xsto_minute_backfill.py`) opens no broker
+connection and is idempotent — `request_key` is unique, so re-running adds
+nothing.
+
+### Baseline at start
+
+```
+queue: PENDING 14,296 | SUCCEEDED 35 | FAILED_FINAL 23 | RUNNING 4
+terminal-failure rate: 40%
+Gateway JVMs: 1        port 4002: 1 listener
+primary: healthy   diagnostic: healthy   circuit: closed
+```
+
+Two observations worth carrying into the window:
+
+- **`historical: unknown`** appears while the backfill runs. That is the Phase 1
+  policy being honest: the session lock is held by the backfill, so its state
+  cannot be observed, and an unobservable session is reported `unknown` rather
+  than guessed. Working as designed.
+- **`market_stream: reconnecting` with zero desired subscriptions.** Not backfill
+  contention — nothing has asked the stream to subscribe since the restart. It
+  does expose a gap in the classifier: "not running, nothing desired" is really
+  *idle*, but `classify_stream_state` only consults `subscription_count` when
+  `running=True`. Worth a follow-up; it under-reports calm as churn.
+
+### What to watch over 48h
+
+```sql
+select status, count(*) from market_data_backfill_request group by status;
+```
+
+Gates: no growth in `FAILED_RETRYABLE`; `NRestarts` stays 0; Gateway JVM count
+stays 1; `circuit open` stays false across at least one Gateway autorestart.
+
+## Request efficiency — measured, not assumed (2026-08-21)
+
+Probed against the live Gateway, AZN@XSTO, 1-minute bars, worker paused so
+timings were uncontended:
+
+| Duration | Bars | Time |
+| --- | --- | --- |
+| 1 D | 510 | 0s |
+| 1 W | 2,550 | 0s |
+| **1 M** | **11,220** | **1s** |
+| 2 M | 21,927 | 51s |
+| 3 M | 32,127 | 81s |
+| 6 M | — | timed out at 181s |
+
+Bar counts are exactly linear at 510 per session, so nothing was truncated. The
+knee is at one month: 22x the data for the same second, then response time
+explodes.
+
+**Per-name is unavoidable** — `reqHistoricalData` takes one contract and IBKR
+has no multi-contract historical call.
+
+| Approach | Requests for 12 months, whole market | At the 300/h ceiling |
+| --- | --- | --- |
+| Daily (`1 D`) | ~238,500 | ~33 days |
+| **Monthly (`1 M`)** | **12,250** (measured by dry run) | **~41 hours** |
+
+`build_backfill_request_key` already hashes `duration`, so monthly and daily
+requests for the same symbol cannot collide and the worker needed no change.
+Month requests anchor on the **last real session** of the month, because IBKR
+walks back from the anchor; the dry run picked up `2026-04-30 close 11:00Z`, a
+half-day, confirming the calendar handling.
+
+### The 6 M timeout was an unplanned recovery test, and it passed
+
+It tripped the historical session cooldown (`1 Y` then returned
+`session 'historical' is cooling down`), and the session recovered on its own to
+`healthy` with the circuit never opening.
+
+## Nightly backfill
+
+`ops/systemd/ibkr-trader-nightly-backfill.{service,timer}` — 22:30 Europe/Stockholm,
+`Persistent=true`, 5-minute jitter to avoid starting in lockstep with the q-data
+run on `docker.geisler.se`.
+
+It asks which recent **closed** sessions have no request yet rather than assuming
+yesterday, so a skipped night or a host outage is picked up instead of leaving a
+hole. Sessions that have not closed are skipped, which would otherwise cache a
+partial day under a key that looks complete. Daily granularity is deliberate:
+monthly would re-fetch weeks already held.
+
+First real run enqueued 2,862 requests for 2026-08-17/18/19 and **refused** to
+guess for 2026-08-20:
+
+```
+2026-08-20: 0 instruments active - the universe dataset does not cover this
+session yet; nothing enqueued
+WARNING: ... this will keep recurring until q-data republishes it.
+```
+
+It exits 2 in that case, so systemd records a failure. **That is deliberate**:
+the nightly backfill cannot extend past the universe dataset, and a silent
+success would mean the dataset quietly stops growing the day q-data's universe
+publish falls behind. Expect this unit to report failed until the universe
+covers the latest session.
+
+## Stability at close of the 13h pilot
+
+| Signal | Result |
+| --- | --- |
+| Lock contention | **`lock_wait_ms=0` on all 750 historical operations** |
+| Connection losses | 10x error 1100, 1x 1102 — all self-recovered |
+| Gateway autorestart | occurred; queue survived it |
+| Pacing violations | **0** |
+| Service restarts | **`NRestarts=0`** on all three |
+| Gateway JVMs | 1 throughout |
+| Broker circuit | never opened |
+
+The pilot's real finding was not instability but two throughput defects: IBKR
+error 162 classified as retryable (`attempt_count` reached 261), and a 45-second
+timeout paid on every no-data answer. Both are now addressed — the first fixed,
+the second dissolved by monthly requests, which give 22x fewer chances to hit a
+dead pair.
+
+## Pivot to monthly requests (2026-08-21)
+
+Approved option: retire the un-started daily rows and re-enqueue monthly.
+
+- **16,085 retired** — all `1 D`, `PENDING`, `attempt_count=0`, from
+  `xsto-1min-48h-pilot` and `xsto-1min-nightly`. Marked `FAILED_FINAL` with
+  `last_error='superseded by 1 M monthly backfill on 2026-08-21'`, following the
+  codebase's existing precedent for superseded requests. **1,131 real results
+  (SUCCEEDED / FAILED_FINAL) were kept.**
+- **12,250 monthly requests enqueued** covering 2025-08 .. 2026-08.
+  The dry run picked up `2026-04-30 close 11:00Z` (half-day) and
+  `2026-02-27 close 16:30Z` (winter time), confirming the calendar handling.
+- Confirmed live: completed monthly requests return **exactly 11,220 bars**,
+  matching the probe. An illiquid name (`2CUREX`) returned 11,187 — genuinely
+  missing minutes, not truncation.
+
+### Correction to the earlier ETA
+
+The earlier note estimated "~41 hours at the 300/h ceiling". **That was wrong.**
+Measured drain rate is **82 requests/hour** — essentially identical to the daily
+rate, because throughput is bounded by the **45-second timeout paid on every
+no-data answer**, not by the pacing budget. Pacing never binds; it sits idle.
+
+What monthly actually buys is data *density*, not request rate:
+
+| | Requests/hour | Bars/hour | 12 months, whole market |
+| --- | --- | --- | --- |
+| Daily (`1 D`) | 82 | ~42,000 | 238,500 requests ≈ **121 days** |
+| Monthly (`1 M`) | 82 | **~920,000** | 12,250 requests ≈ **6.2 days** |
+
+So the win is real and large — 121 days to 6 days — but it comes from 22x fewer
+requests, not from going faster.
+
+### The remaining lever, unused
+
+The 45-second timeout is now the only binding constraint. Measured evidence: a
+`1 M` request returning 11,220 bars completes in **~1 second**; the timeout is
+45x that. Reducing `MARKET_DATA_BACKFILL_TIMEOUT_SECONDS`:
+
+| Timeout | Worst-case rate | 12-month ETA |
+| --- | --- | --- |
+| 45s (current) | 80/h | ~6.2 days |
+| 20s | 180/h | ~2.8 days |
+| 15s | 240/h | ~2.1 days |
+
+Not changed: the observed 1-second response is from liquid names, and an
+illiquid instrument may legitimately take longer. Lowering it trades a small
+risk of truncating slow-but-valid responses for roughly 3x throughput, which is
+an operator decision rather than a code fix.

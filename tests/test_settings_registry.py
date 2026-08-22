@@ -195,10 +195,10 @@ class SettingsRegistryReadTests(TestCase):
             with session_scope(factory) as session:
                 session.add(
                     RuntimeSettingRecord(
-                        setting_key="MARKET_DATA_BACKFILL_BATCH_SIZE",
+                        setting_key="MARKET_STREAM_MAX_SUBSCRIPTIONS",
                         value="three",
                         value_type="integer",
-                        category="market-data",
+                        category="market-stream",
                     )
                 )
             snapshot = read_settings_registry(factory)
@@ -206,7 +206,7 @@ class SettingsRegistryReadTests(TestCase):
         setting = next(
             item
             for item in snapshot.settings
-            if item.key == "MARKET_DATA_BACKFILL_BATCH_SIZE"
+            if item.key == "MARKET_STREAM_MAX_SUBSCRIPTIONS"
         )
         self.assertIsNotNone(setting.error)
         # Described, not echoed: nothing validates the content of a stored
@@ -268,7 +268,7 @@ class SettingsRegistryReadTests(TestCase):
                 # which is the path that used to echo the raw value in an error.
                 session.add(
                     RuntimeSettingRecord(
-                        setting_key="MARKET_DATA_BACKFILL_BATCH_SIZE",
+                        setting_key="MARKET_STREAM_MAX_SUBSCRIPTIONS",
                         value="SUPERSECRET-TOKEN",
                         value_type="integer",
                     )
@@ -289,7 +289,7 @@ class SettingsRegistryReadTests(TestCase):
             with session_scope(factory) as session:
                 session.add(
                     RuntimeSettingRecord(
-                        setting_key="MARKET_DATA_BACKFILL_BATCH_SIZE",
+                        setting_key="MARKET_STREAM_MAX_SUBSCRIPTIONS",
                         value="s3cr3t-value",
                         value_type="integer",
                     )
@@ -299,7 +299,7 @@ class SettingsRegistryReadTests(TestCase):
         setting = next(
             item
             for item in snapshot.settings
-            if item.key == "MARKET_DATA_BACKFILL_BATCH_SIZE"
+            if item.key == "MARKET_STREAM_MAX_SUBSCRIPTIONS"
         )
         self.assertIsNotNone(setting.error)
         self.assertNotIn("s3cr3t-value", setting.error)

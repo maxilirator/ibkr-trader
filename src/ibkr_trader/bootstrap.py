@@ -62,7 +62,7 @@ PRODUCTION_ENVIRONMENTS = frozenset({"production", "prod"})
 #: Each of these has a default in ``config.py`` that is wrong-but-plausible in
 #: production, which is exactly the failure mode this list exists to prevent:
 #: ``DATABASE_URL`` would point at a local throwaway database, and ``IBKR_PORT``
-#: would point at the paper-trading port rather than the live Gateway.
+#: would point at IBKR's default paper port rather than the configured Gateway.
 #: ``Q_DATA_CATALOG_PATH`` is here for a different reason from the others: it has
 #: no default at all. ``AppConfig.from_env()`` resolves shared datasets through
 #: ``q_data.resolve()``, which fails closed when it is unset. In production the
@@ -81,32 +81,39 @@ REQUIRED_PRODUCTION_KEYS = (
 #: runtime always knows which IBKR account it is acting for.
 REQUIRED_PRODUCTION_ACCOUNT_KEYS = ("IBKR_ACCOUNT_ID", "IBKR_ACCOUNT_IDS")
 
-#: IBKR paper-trading ports. Pointing the live runtime at one of these is the
-#: specific accident this module exists to prevent, so it is refused rather
-#: than merely defaulted away from.
+#: Prefix marking an IBKR *paper* account. Live account numbers start with ``U``;
+#: paper ones start with ``DU``.
 #:
-#: The IBKR convention is easy to get backwards, and getting it backwards here
-#: is worse than having no check at all:
+#: This replaced a check on the API **port**, which was wrong. The port numbers
+#: 7496/7497/4001/4002 are only IBKR's *defaults* - IBC exposes
+#: ``OverrideTwsApiPort``, and this deployment legitimately runs a live Gateway
+#: (``TradingMode=live``, account ``U…``) on port 4002. A port-based rule
+#: therefore refused a correct production setup, which is a self-inflicted
+#: outage rather than a safeguard.
 #:
-#:     TWS          live 7496   paper 7497
-#:     IB Gateway   live 4001   paper 4002
-#:
-#: This deployment runs IB Gateway (``.env.example`` and ``docs/ib-gateway-setup.md``
-#: both use ``4002``), so ``4002`` is the paper port that actually matters here.
-#: An earlier version listed ``{7497, 7496}``, which refused a live TWS port
-#: while letting the Gateway paper port through unchallenged.
-PAPER_TRADING_PORTS = frozenset({7497, 4002})
+#: The account number is evidence; the port is a convention. Trading on a paper
+#: account is the mistake actually worth refusing, and it is directly visible.
+PAPER_ACCOUNT_PREFIX = "DU"
 
-#: Records a deliberate decision to run production against a paper port.
-PAPER_PORT_ACKNOWLEDGEMENT_KEY = "IBKR_ALLOW_PAPER_PORT_IN_PRODUCTION"
+#: Records a deliberate decision to run production against a paper account.
+PAPER_ACCOUNT_ACKNOWLEDGEMENT_KEY = "IBKR_ALLOW_PAPER_ACCOUNT_IN_PRODUCTION"
 
 
-def _paper_port_acknowledged(values: dict[str, str]) -> bool:
-    return (values.get(PAPER_PORT_ACKNOWLEDGEMENT_KEY) or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+def _paper_account_acknowledged(values: dict[str, str]) -> bool:
+    return (
+        values.get(PAPER_ACCOUNT_ACKNOWLEDGEMENT_KEY) or ""
+    ).strip().lower() in {"1", "true", "yes"}
+
+
+def _paper_accounts(values: dict[str, str]) -> list[str]:
+    """Paper account numbers declared in the protected file, if any."""
+    found: list[str] = []
+    for key in REQUIRED_PRODUCTION_ACCOUNT_KEYS:
+        for account in (values.get(key) or "").split(","):
+            account = account.strip().upper()
+            if account.startswith(PAPER_ACCOUNT_PREFIX):
+                found.append(account)
+    return sorted(set(found))
 
 
 class BootstrapConfigurationError(RuntimeError):
@@ -492,20 +499,19 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
 
     # Shape, not just presence. Without this an unparseable port survives to a
     # bare ValueError from int() much later, defeating report-everything-at-once.
+    # Shape only. The value itself is not judged: IBKR's default port numbers
+    # are a convention, and IBC's OverrideTwsApiPort means a live Gateway can
+    # legitimately listen anywhere.
     raw_port = (values.get("IBKR_PORT") or "").strip()
-    port: int | None = None
     if raw_port:
         try:
-            port = int(raw_port)
+            int(raw_port)
         except ValueError:
             problems.append(
                 f"IBKR_PORT is not an integer ({raw_port!r}); note that a "
                 "trailing '# comment' is part of the value, not a comment"
             )
 
-    # Presence of the key was never the point: 7497/7496 are the paper ports,
-    # and copying values across from .env is the most likely way this file gets
-    # populated. Refusing here is narrow and explicitly overridable.
     # Presence was never the point for this one either. An unset catalog and a
     # catalog pointing at nothing both end in the same QDataContractError deep
     # in startup, which is what requiring the key was meant to prevent.
@@ -521,12 +527,16 @@ def _assert_required_keys_present(values: dict[str, str], path: Path) -> None:
                 f"Q_DATA_CATALOG_PATH={catalog!r} does not point to a file"
             )
 
-    if port in PAPER_TRADING_PORTS and not _paper_port_acknowledged(values):
+    # The account, not the port. A paper account in production is a real
+    # mistake and is directly visible; a port number is only a convention and is
+    # overridable in IBC (OverrideTwsApiPort), so it is no evidence at all.
+    paper = _paper_accounts(values)
+    if paper and not _paper_account_acknowledged(values):
         problems.append(
-            f"IBKR_PORT={port} is an IBKR paper-trading port. If that is "
-            f"genuinely intended in production, set "
-            f"{PAPER_PORT_ACKNOWLEDGEMENT_KEY}=1 in the same file to record "
-            "the decision"
+            f"account(s) {', '.join(paper)} are IBKR paper accounts "
+            f"({PAPER_ACCOUNT_PREFIX} prefix). If that is genuinely intended in "
+            f"production, set {PAPER_ACCOUNT_ACKNOWLEDGEMENT_KEY}=1 in the same "
+            "file to record the decision"
         )
 
     if problems:

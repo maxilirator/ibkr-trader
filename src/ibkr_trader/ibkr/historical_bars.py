@@ -3,12 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import threading
+import time
 from typing import Any, MutableMapping, Protocol, runtime_checkable
 
 from ibkr_trader.config import IbkrConnectionConfig
 from ibkr_trader.domain.contract_resolution import ContractResolveQuery
 from ibkr_trader.ibkr.contracts import (
     _extract_broker_error_message,
+    _extract_latest_broker_error,
     build_ibkr_contract,
     serialize_contract_details,
 )
@@ -137,6 +140,93 @@ def _contract_cache_key(query: HistoricalBarsQuery) -> ContractDetailsCacheKey:
     )
 
 
+class CachedContractLookupError(LookupError):
+    """A contract lookup rejected without a broker call, from the negative cache.
+
+    Subclasses `LookupError` so existing `except LookupError` handling (API
+    routes, the Stockholm collector) keeps working unchanged. Callers that
+    care whether a fresh broker round trip happened - to report it separately
+    in a summary, say - can catch this type first.
+    """
+
+
+#: IBKR error codes that mean "this instrument does not exist," as opposed to
+#: "something went wrong right now and might not next time." Only error 200
+#: ("No security definition has been found for the request") qualifies.
+#:
+#: Deliberately narrow, matching the reasoning behind
+#: `TERMINAL_CONTRACT_ERROR_MARKERS` in the backfill-queue module deleted in
+#: 900e2da (`market_data_backfill.py`): connection loss (1100/1101/1102),
+#: pacing rejections, and plain timeouts are not in this set because they
+#: resolve on their own. `_extract_latest_broker_error` already excludes
+#: connectivity errors (they arrive on reqId -1, filtered by the `req_id >= 0`
+#: check), but any other request-scoped error code is treated as retryable
+#: unless it is explicitly listed here.
+TERMINAL_CONTRACT_LOOKUP_ERROR_CODES = frozenset({200})
+
+
+def _is_terminal_contract_lookup_error_code(error_code: int) -> bool:
+    return error_code in TERMINAL_CONTRACT_LOOKUP_ERROR_CODES
+
+
+#: Default TTL for a cached negative contract-resolution result: long enough
+#: to cover one continuous backfill run (many paged HTTP calls resolving the
+#: same permanently-unresolvable names over and over), short enough that a
+#: genuinely new listing - or a corrected identity mapping - is retried within
+#: about a session rather than being blocked indefinitely.
+DEFAULT_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS = 21600.0
+
+
+@dataclass(slots=True)
+class _NegativeContractCacheEntry:
+    detail: str
+    expires_at_monotonic: float
+
+
+class NegativeContractCache:
+    """Process-local cache of contract lookups IBKR has permanently rejected.
+
+    Keyed identically to the positive per-call `contract_details_cache` (via
+    `_contract_cache_key`), so both mechanisms agree on what identifies an
+    instrument. Unlike the positive cache - which callers create fresh per
+    page/request - this is meant to outlive a single call, so entries carry an
+    explicit TTL rather than relying on the caller's dict going out of scope.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[ContractDetailsCacheKey, _NegativeContractCacheEntry] = {}
+
+    def get(self, key: ContractDetailsCacheKey) -> str | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at_monotonic <= time.monotonic():
+                del self._entries[key]
+                return None
+            return entry.detail
+
+    def set(self, key: ContractDetailsCacheKey, detail: str, *, ttl_seconds: float) -> None:
+        if ttl_seconds <= 0:
+            return
+        with self._lock:
+            self._entries[key] = _NegativeContractCacheEntry(
+                detail=detail,
+                expires_at_monotonic=time.monotonic() + ttl_seconds,
+            )
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+#: Process-wide default store, shared by every `read_historical_bars` caller
+#: that does not inject its own (tests inject a fresh instance to avoid
+#: cross-test pollution).
+_NEGATIVE_CONTRACT_CACHE = NegativeContractCache()
+
+
 def read_historical_bars(
     config: IbkrConnectionConfig,
     query: HistoricalBarsQuery,
@@ -148,6 +238,8 @@ def read_historical_bars(
     app: HistoricalBarsSyncWrapperProtocol | None = None,
     contract_details_cache: MutableMapping[ContractDetailsCacheKey, list[Any]]
     | None = None,
+    negative_contract_cache: NegativeContractCache | None = None,
+    negative_contract_cache_ttl_seconds: float = DEFAULT_NEGATIVE_CONTRACT_CACHE_TTL_SECONDS,
 ) -> dict[str, Any]:
     query.validate()
     timeout_cls = response_timeout_cls or _load_response_timeout_class()
@@ -166,39 +258,68 @@ def read_historical_bars(
                 f"with client_id={config.client_id}."
             )
 
+    negative_cache = (
+        negative_contract_cache if negative_contract_cache is not None else _NEGATIVE_CONTRACT_CACHE
+    )
+    negative_caching_enabled = negative_contract_cache_ttl_seconds > 0
+
     try:
-        try:
-            if hasattr(runtime_app, "contract_details"):
-                runtime_app.contract_details.clear()
-            contract_query = ContractResolveQuery(
-                symbol=query.symbol,
-                security_type=query.security_type,
-                exchange=query.exchange,
-                currency=query.currency,
-                primary_exchange=query.primary_exchange,
-                local_symbol=query.local_symbol,
-                isin=query.isin,
-            )
-            ib_contract = build_ibkr_contract(contract_query, contract_cls=contract_cls)
-            cache_key = _contract_cache_key(query)
-            if contract_details_cache is not None and cache_key in contract_details_cache:
-                raw_matches = contract_details_cache[cache_key]
-            else:
+        if hasattr(runtime_app, "contract_details"):
+            runtime_app.contract_details.clear()
+        contract_query = ContractResolveQuery(
+            symbol=query.symbol,
+            security_type=query.security_type,
+            exchange=query.exchange,
+            currency=query.currency,
+            primary_exchange=query.primary_exchange,
+            local_symbol=query.local_symbol,
+            isin=query.isin,
+        )
+        ib_contract = build_ibkr_contract(contract_query, contract_cls=contract_cls)
+        cache_key = _contract_cache_key(query)
+        if contract_details_cache is not None and cache_key in contract_details_cache:
+            raw_matches = contract_details_cache[cache_key]
+        else:
+            if negative_caching_enabled:
+                cached_negative_detail = negative_cache.get(cache_key)
+                if cached_negative_detail is not None:
+                    raise CachedContractLookupError(
+                        f"IBKR rejected the contract lookup for {query.symbol}: "
+                        f"{cached_negative_detail} (cached, no broker call made)"
+                    )
+            try:
                 raw_matches = runtime_app.get_contract_details(
                     ib_contract,
                     timeout=timeout,
                 )
-                if contract_details_cache is not None:
-                    contract_details_cache[cache_key] = raw_matches
-        except timeout_cls as exc:
-            broker_error = _extract_broker_error_message(runtime_app)
-            if broker_error is not None:
-                raise LookupError(
-                    f"IBKR rejected the contract lookup for {query.symbol}: {broker_error}"
+            except timeout_cls as exc:
+                latest_error = _extract_latest_broker_error(runtime_app)
+                if latest_error is not None:
+                    error_code, error_string = latest_error
+                    broker_error = f"[{error_code}] {error_string}"
+                    if negative_caching_enabled and _is_terminal_contract_lookup_error_code(
+                        error_code
+                    ):
+                        negative_cache.set(
+                            cache_key,
+                            broker_error,
+                            ttl_seconds=negative_contract_cache_ttl_seconds,
+                        )
+                    raise LookupError(
+                        f"IBKR rejected the contract lookup for {query.symbol}: {broker_error}"
+                    ) from exc
+                raise TimeoutError(
+                    f"Timed out while resolving {query.symbol} on {query.exchange}."
                 ) from exc
-            raise TimeoutError(
-                f"Timed out while resolving {query.symbol} on {query.exchange}."
-            ) from exc
+
+            if contract_details_cache is not None:
+                contract_details_cache[cache_key] = raw_matches
+            if not raw_matches and negative_caching_enabled:
+                negative_cache.set(
+                    cache_key,
+                    "No IBKR contract matched the request.",
+                    ttl_seconds=negative_contract_cache_ttl_seconds,
+                )
 
         if not raw_matches:
             raise LookupError(

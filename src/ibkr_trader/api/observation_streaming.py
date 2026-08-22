@@ -122,57 +122,6 @@ def _merge_persisted_stream_bars(
     return stream_snapshot, stored_bars
 
 
-def _ibkr_historical_exchange(
-    *,
-    exchange: Any,
-    primary_exchange: Any,
-) -> tuple[str, str | None]:
-    raw_exchange = str(exchange or "").strip().upper()
-    raw_primary = str(primary_exchange or "").strip().upper()
-    if raw_exchange in {"", "XSTO", "STO", "STOCKHOLM"}:
-        return "SMART", raw_primary or "SFB"
-    return raw_exchange, raw_primary or None
-
-
-def _rl_backfill_instrument(
-    *,
-    symbol: str,
-    fetch: Mapping[str, Any],
-    instruments: Mapping[str, Any],
-) -> dict[str, Any]:
-    raw_instrument = instruments.get(symbol) if isinstance(instruments, Mapping) else None
-    if not isinstance(raw_instrument, Mapping):
-        raw_instrument = {}
-    historical_exchange, historical_primary_exchange = _ibkr_historical_exchange(
-        exchange=raw_instrument.get("exchange", fetch.get("exchange", "SMART")),
-        primary_exchange=raw_instrument.get(
-            "primary_exchange",
-            fetch.get("primary_exchange", "SFB"),
-        ),
-    )
-    return {
-        "symbol": symbol,
-        "security_type": str(
-            raw_instrument.get("security_type", fetch.get("security_type", "STK"))
-        ).upper(),
-        "exchange": historical_exchange,
-        "currency": str(
-            raw_instrument.get("currency", fetch.get("currency", "SEK"))
-        ).upper(),
-        "primary_exchange": historical_primary_exchange,
-        "local_symbol": (
-            str(raw_instrument["local_symbol"])
-            if raw_instrument.get("local_symbol") is not None
-            else None
-        ),
-        "isin": (
-            str(raw_instrument["isin"])
-            if raw_instrument.get("isin") is not None
-            else None
-        ),
-    }
-
-
 def _paused_market_stream_observation(
     *,
     symbol: str,
