@@ -773,6 +773,15 @@ def load_sync_wrapper_class() -> type[Any]:
                 return self._wait_for_response(req_id, "account_summary", timeout)
             finally:
                 self.cancelAccountSummary(req_id)
+                # Same retention bug as get_historical_data/get_contract_details
+                # had before 8a630bb: the entry is deleted before the request,
+                # which is dead code because req_id never repeats, and never
+                # after the response is read. Cancelling the subscription stops
+                # further callbacks but leaves the accumulated result behind for
+                # the lifetime of this long-lived session. Lower call volume than
+                # the historical path, so it was deprioritised then; closing it
+                # now so no known per-request retention mechanism remains.
+                self.account_summary.pop(req_id, None)
 
         def get_open_orders(self, timeout: int = 3) -> dict[int, Any]:
             self.open_orders = {}
